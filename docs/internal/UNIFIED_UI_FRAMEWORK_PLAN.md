@@ -1164,14 +1164,14 @@ The **Layout DSL** (Part 5) is a future direction that adds compositional UI bui
 
 ## Files to Create
 
-| File | Purpose | Lines (est.) |
-|------|---------|--------------|
-| `src/view/ui/layout.rs` | `point_in_rect()` helper | ~30 |
-| `src/view/ui/focus.rs` | `FocusManager<T>` | ~60 |
-| `plugins/lib/controls.ts` | `ButtonControl`, `ListControl`, `FocusManager` | ~200 |
-| `plugins/lib/vbuffer.ts` | `VirtualBufferBuilder` | ~100 |
+| File | Purpose | Lines (est.) | Status |
+|------|---------|--------------|--------|
+| `src/view/ui/layout.rs` | `point_in_rect()` helper | ~30 | ✅ Done |
+| `src/view/ui/focus.rs` | `FocusManager<T>` | ~60 | ✅ Done |
+| `plugins/lib/controls.ts` | `ButtonControl`, `ListControl`, `FocusManager`, etc. | ~550 | ✅ Done |
+| `plugins/lib/vbuffer.ts` | `VirtualBufferBuilder` | ~300 | ✅ Done |
 
-**Total new code: ~390 lines** (mostly TypeScript for plugins)
+**Total new code: ~940 lines** (expanded TypeScript library with more controls)
 
 ## Files to Modify
 
@@ -1215,6 +1215,10 @@ The key principle: **extract existing code into shared modules first**, then hav
 | 5 | Migrate `settings/state.rs` to use `FocusManager` | ✅ Done |
 | 6 | Add `MenuLayout` + `MenuHit` to `menu.rs` | ✅ Done |
 | 7 | Add `TabLayout` + `TabHit` to `tabs.rs` | ✅ Done |
+| 8 | Create `plugins/lib/controls.ts` (ButtonControl, ListControl, FocusManager) | ✅ Done |
+| 9 | Create `plugins/lib/vbuffer.ts` (VirtualBufferBuilder) | ✅ Done |
+| 10 | Update `plugins/lib/index.ts` exports | ✅ Done |
+| 11 | Migrate `pkg.ts` to use controls library | Pending |
 
 ---
 

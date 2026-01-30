@@ -1232,6 +1232,24 @@ const pkgTheme: Record<string, ThemeColor> = {
   statusUpdate: { fg: { rgb: [220, 180, 80] } },
 };
 
+/** Extract theme colors with fallback to RGB - simplifies theme access */
+function themeColor(style: ThemeColor): { fg?: string | [number, number, number]; bg?: string | [number, number, number] } {
+  return {
+    fg: style.fg?.theme ?? style.fg?.rgb,
+    bg: style.bg?.theme ?? style.bg?.rgb,
+  };
+}
+
+/** Get fg color from theme style */
+function themeFg(style: ThemeColor): string | [number, number, number] | undefined {
+  return style.fg?.theme ?? style.fg?.rgb;
+}
+
+/** Get bg color from theme style */
+function themeBg(style: ThemeColor): string | [number, number, number] | undefined {
+  return style.bg?.theme ?? style.bg?.rgb;
+}
+
 // Define pkg-manager mode with arrow key navigation
 editor.defineMode(
   "pkg-manager",
@@ -1490,79 +1508,45 @@ function renderPkgManagerUI(): void {
   const availableItems = items.filter(i => !i.installed);
 
   // === HEADER ===
-  builder.styled(" Packages\n", pkgTheme.header.fg?.theme ?? pkgTheme.header.fg?.rgb);
+  builder.styled(" Packages\n", themeFg(pkgTheme.header));
   builder.newline();
 
   // === SEARCH BAR ===
   const searchFocused = isButtonFocused("search");
-  const searchInputWidth = 30;
   const searchText = pkgState.searchQuery || "";
-  const searchDisplay = searchText.length > searchInputWidth - 1
-    ? searchText.slice(0, searchInputWidth - 2) + "…"
-    : searchText.padEnd(searchInputWidth);
+  const searchDisplay = searchText.length > 29 ? searchText.slice(0, 27) + "…" : searchText.padEnd(30);
+  const searchStyle = themeColor(searchFocused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox);
 
-  builder.styled(" Search: ", pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb);
-  const searchStyle = searchFocused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox;
-  builder.styled(
-    searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `,
-    searchStyle.fg?.theme ?? searchStyle.fg?.rgb,
-    searchStyle.bg?.theme ?? searchStyle.bg?.rgb
-  );
+  builder.styled(" Search: ", themeFg(pkgTheme.infoLabel));
+  builder.styled(searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `, searchStyle.fg, searchStyle.bg);
   builder.newline();
 
   // === FILTER BAR ===
-  const filters = [
-    { id: "all", label: "All" },
-    { id: "installed", label: "Installed" },
-    { id: "plugins", label: "Plugins" },
-    { id: "themes", label: "Themes" },
-    { id: "languages", label: "Languages" },
-  ];
+  const filters = ["All", "Installed", "Plugins", "Themes", "Languages"];
+  const filterIds = ["all", "installed", "plugins", "themes", "languages"];
 
   builder.text(" ");
   for (let i = 0; i < filters.length; i++) {
-    const f = filters[i];
-    const isActive = pkgState.filter === f.id;
+    const isActive = pkgState.filter === filterIds[i];
     const isFocused = isButtonFocused("filter", i);
-
-    let btnFg: string | [number, number, number] | undefined;
-    let btnBg: string | [number, number, number] | undefined;
-
-    if (isFocused && isActive) {
-      btnFg = pkgTheme.buttonFocused.fg?.theme ?? pkgTheme.buttonFocused.fg?.rgb;
-      btnBg = pkgTheme.buttonFocused.bg?.theme ?? pkgTheme.buttonFocused.bg?.rgb;
-    } else if (isFocused) {
-      btnFg = pkgTheme.filterFocused.fg?.theme ?? pkgTheme.filterFocused.fg?.rgb;
-      btnBg = pkgTheme.filterFocused.bg?.theme ?? pkgTheme.filterFocused.bg?.rgb;
-    } else if (isActive) {
-      btnFg = pkgTheme.filterActive.fg?.theme ?? pkgTheme.filterActive.fg?.rgb;
-      btnBg = pkgTheme.filterActive.bg?.theme ?? pkgTheme.filterActive.bg?.rgb;
-    } else {
-      btnFg = pkgTheme.filterInactive.fg?.theme ?? pkgTheme.filterInactive.fg?.rgb;
-    }
-
-    const btn = new ButtonControl(f.label, isFocused ? FocusState.Focused : FocusState.Normal);
-    const btnOutput = btn.render();
-    // Override styles with our theme colors
-    builder.styled(btnOutput.text, btnFg, btnBg);
+    const style = themeColor(
+      isFocused ? (isActive ? pkgTheme.buttonFocused : pkgTheme.filterFocused)
+                : (isActive ? pkgTheme.filterActive : pkgTheme.filterInactive)
+    );
+    const btn = new ButtonControl(filters[i], isFocused ? FocusState.Focused : FocusState.Normal);
+    builder.styled(btn.render().text, style.fg, style.bg);
   }
 
   builder.text("  ");
 
   // Sync button
   const syncFocused = isButtonFocused("sync");
-  const syncBtn = new ButtonControl("Sync", syncFocused ? FocusState.Focused : FocusState.Normal);
-  const syncOutput = syncBtn.render();
-  const syncStyle = syncFocused ? pkgTheme.buttonFocused : pkgTheme.button;
-  builder.styled(
-    syncOutput.text,
-    syncStyle.fg?.theme ?? syncStyle.fg?.rgb,
-    syncStyle.bg?.theme ?? syncStyle.bg?.rgb
-  );
+  const syncStyle = themeColor(syncFocused ? pkgTheme.buttonFocused : pkgTheme.button);
+  builder.styled(new ButtonControl("Sync", syncFocused ? FocusState.Focused : FocusState.Normal).render().text, syncStyle.fg, syncStyle.bg);
   builder.newline();
 
   // === TOP SEPARATOR ===
-  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", pkgTheme.separator.fg?.rgb);
+  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", themeFg(pkgTheme.separator));
 
   // === SPLIT VIEW: Package list on left, Details on right ===
   const leftLines = buildLeftPanel(installedItems, availableItems, items);
@@ -1583,7 +1567,7 @@ function renderPkgManagerUI(): void {
     }
 
     // Divider
-    builder.styled("│", pkgTheme.divider.fg?.rgb);
+    builder.styled("│", themeFg(pkgTheme.divider));
 
     // Right side
     const rightText = rightItem ? " " + rightItem.text : "";
@@ -1597,7 +1581,7 @@ function renderPkgManagerUI(): void {
   }
 
   // === BOTTOM SEPARATOR ===
-  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", pkgTheme.separator.fg?.rgb);
+  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", themeFg(pkgTheme.separator));
 
   // === HELP LINE ===
   let helpText = " ↑↓ Navigate  Tab Next  / Search  Enter ";
@@ -1613,7 +1597,7 @@ function renderPkgManagerUI(): void {
     helpText += "Select";
   }
   helpText += "  Esc Close\n";
-  builder.styled(helpText, pkgTheme.help.fg?.theme ?? pkgTheme.help.fg?.rgb);
+  builder.styled(helpText, themeFg(pkgTheme.help));
 
   // Build and apply to buffer
   builder.build();
@@ -1634,13 +1618,11 @@ function buildLeftPanel(
 ): PanelLine[] {
   const lines: PanelLine[] = [];
   const listFocused = pkgState.focus.type === "list";
+  const selected = themeColor(pkgTheme.selected);
 
   // Installed section
   if (installedItems.length > 0) {
-    lines.push({
-      text: `INSTALLED (${installedItems.length})`,
-      fg: pkgTheme.sectionTitle.fg?.theme ?? pkgTheme.sectionTitle.fg?.rgb,
-    });
+    lines.push({ text: `INSTALLED (${installedItems.length})`, fg: themeFg(pkgTheme.sectionTitle) });
 
     let idx = 0;
     for (const item of installedItems) {
@@ -1651,18 +1633,10 @@ function buildLeftPanel(
       const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
       const line = `${prefix} ${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
 
-      if (isSelected) {
-        lines.push({
-          text: line,
-          fg: pkgTheme.selected.fg?.theme ?? pkgTheme.selected.fg?.rgb,
-          bg: pkgTheme.selected.bg?.theme ?? pkgTheme.selected.bg?.rgb,
-        });
-      } else {
-        lines.push({
-          text: line,
-          fg: pkgTheme.installed.fg?.theme ?? pkgTheme.installed.fg?.rgb,
-        });
-      }
+      lines.push(isSelected
+        ? { text: line, fg: selected.fg, bg: selected.bg }
+        : { text: line, fg: themeFg(pkgTheme.installed) }
+      );
       idx++;
     }
   }
@@ -1670,10 +1644,7 @@ function buildLeftPanel(
   // Available section
   if (availableItems.length > 0) {
     if (lines.length > 0) lines.push({ text: "" });
-    lines.push({
-      text: `AVAILABLE (${availableItems.length})`,
-      fg: pkgTheme.sectionTitle.fg?.theme ?? pkgTheme.sectionTitle.fg?.rgb,
-    });
+    lines.push({ text: `AVAILABLE (${availableItems.length})`, fg: themeFg(pkgTheme.sectionTitle) });
 
     let idx = installedItems.length;
     for (const item of availableItems) {
@@ -1683,18 +1654,10 @@ function buildLeftPanel(
       const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
       const line = `${prefix} ${name.padEnd(22)} [${typeTag}]`;
 
-      if (isSelected) {
-        lines.push({
-          text: line,
-          fg: pkgTheme.selected.fg?.theme ?? pkgTheme.selected.fg?.rgb,
-          bg: pkgTheme.selected.bg?.theme ?? pkgTheme.selected.bg?.rgb,
-        });
-      } else {
-        lines.push({
-          text: line,
-          fg: pkgTheme.available.fg?.theme ?? pkgTheme.available.fg?.rgb,
-        });
-      }
+      lines.push(isSelected
+        ? { text: line, fg: selected.fg, bg: selected.bg }
+        : { text: line, fg: themeFg(pkgTheme.available) }
+      );
       idx++;
     }
   }
@@ -1702,12 +1665,12 @@ function buildLeftPanel(
   // Empty state
   if (allItems.length === 0) {
     if (pkgState.isLoading) {
-      lines.push({ text: "Loading...", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
+      lines.push({ text: "Loading...", fg: themeFg(pkgTheme.emptyState) });
     } else if (!isRegistrySynced()) {
-      lines.push({ text: "Registry not synced", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
-      lines.push({ text: "Tab to Sync button", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
+      lines.push({ text: "Registry not synced", fg: themeFg(pkgTheme.emptyState) });
+      lines.push({ text: "Tab to Sync button", fg: themeFg(pkgTheme.emptyState) });
     } else {
-      lines.push({ text: "No packages found", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
+      lines.push({ text: "No packages found", fg: themeFg(pkgTheme.emptyState) });
     }
   }
 
@@ -1720,86 +1683,49 @@ function buildRightPanel(selectedItem: PackageListItem | null): PanelLine[] {
 
   if (selectedItem) {
     // Package name
-    lines.push({
-      text: selectedItem.name,
-      fg: pkgTheme.header.fg?.theme ?? pkgTheme.header.fg?.rgb,
-    });
-    lines.push({
-      text: "─".repeat(Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2)),
-      fg: pkgTheme.separator.fg?.rgb,
-    });
+    lines.push({ text: selectedItem.name, fg: themeFg(pkgTheme.header) });
+    lines.push({ text: "─".repeat(Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2)), fg: themeFg(pkgTheme.separator) });
 
     // Version / Author / License
     let metaLine = `v${selectedItem.version}`;
     if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
     if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
     if (metaLine.length > DETAIL_WIDTH - 2) metaLine = metaLine.slice(0, DETAIL_WIDTH - 5) + "...";
-    lines.push({
-      text: metaLine,
-      fg: pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb,
-    });
+    lines.push({ text: metaLine, fg: themeFg(pkgTheme.infoLabel) });
 
     lines.push({ text: "" });
 
     // Description (wrapped)
     const descText = selectedItem.description || "No description available";
-    const descLines = wrapText(descText, DETAIL_WIDTH - 2);
-    for (const line of descLines) {
-      lines.push({
-        text: line,
-        fg: pkgTheme.description.fg?.theme ?? pkgTheme.description.fg?.rgb,
-      });
+    for (const line of wrapText(descText, DETAIL_WIDTH - 2)) {
+      lines.push({ text: line, fg: themeFg(pkgTheme.description) });
     }
 
     lines.push({ text: "" });
 
     // Keywords
     if (selectedItem.keywords && selectedItem.keywords.length > 0) {
-      const kwText = selectedItem.keywords.slice(0, 4).join(", ");
-      lines.push({
-        text: `Tags: ${kwText}`,
-        fg: pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb,
-      });
+      lines.push({ text: `Tags: ${selectedItem.keywords.slice(0, 4).join(", ")}`, fg: themeFg(pkgTheme.infoLabel) });
       lines.push({ text: "" });
     }
 
     // Repository URL
     if (selectedItem.repository) {
-      let displayUrl = selectedItem.repository
-        .replace(/^https?:\/\//, "")
-        .replace(/\.git$/, "");
-      if (displayUrl.length > DETAIL_WIDTH - 2) {
-        displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
-      }
-      lines.push({
-        text: displayUrl,
-        fg: pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb,
-      });
+      let displayUrl = selectedItem.repository.replace(/^https?:\/\//, "").replace(/\.git$/, "");
+      if (displayUrl.length > DETAIL_WIDTH - 2) displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
+      lines.push({ text: displayUrl, fg: themeFg(pkgTheme.infoLabel) });
       lines.push({ text: "" });
     }
 
     // Action buttons
-    const actions = getActionButtons();
-    for (let i = 0; i < actions.length; i++) {
+    for (let i = 0; i < getActionButtons().length; i++) {
       const focused = isButtonFocused("action", i);
-      const btn = new ButtonControl(actions[i], focused ? FocusState.Focused : FocusState.Normal);
-      const btnOutput = btn.render();
-      const btnStyle = focused ? pkgTheme.buttonFocused : pkgTheme.button;
-      lines.push({
-        text: btnOutput.text,
-        fg: btnStyle.fg?.theme ?? btnStyle.fg?.rgb,
-        bg: btnStyle.bg?.theme ?? btnStyle.bg?.rgb,
-      });
+      const style = themeColor(focused ? pkgTheme.buttonFocused : pkgTheme.button);
+      lines.push({ text: new ButtonControl(getActionButtons()[i], focused ? FocusState.Focused : FocusState.Normal).render().text, fg: style.fg, bg: style.bg });
     }
   } else {
-    lines.push({
-      text: "Select a package",
-      fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb,
-    });
-    lines.push({
-      text: "to view details",
-      fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb,
-    });
+    lines.push({ text: "Select a package", fg: themeFg(pkgTheme.emptyState) });
+    lines.push({ text: "to view details", fg: themeFg(pkgTheme.emptyState) });
   }
 
   return lines;

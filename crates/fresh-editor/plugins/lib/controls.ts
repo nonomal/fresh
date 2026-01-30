@@ -420,6 +420,10 @@ export class GroupedListControl<T> {
   private _maxVisible: number;
   private _selectionPrefix: string;
   private _emptyPrefix: string;
+  private _titleFg: string | RGB;
+  private _selectedFg: string | RGB;
+  private _selectedBg: string | RGB;
+  private _itemFg?: string | RGB;
 
   constructor(
     public groups: ListGroup<T>[],
@@ -428,11 +432,23 @@ export class GroupedListControl<T> {
       maxVisible?: number;
       selectionPrefix?: string;
       emptyPrefix?: string;
+      /** Title foreground color */
+      titleFg?: string | RGB;
+      /** Selected item foreground */
+      selectedFg?: string | RGB;
+      /** Selected item background */
+      selectedBg?: string | RGB;
+      /** Normal item foreground (optional) */
+      itemFg?: string | RGB;
     } = {}
   ) {
     this._maxVisible = options.maxVisible ?? 10;
     this._selectionPrefix = options.selectionPrefix ?? "▸ ";
     this._emptyPrefix = options.emptyPrefix ?? "  ";
+    this._titleFg = options.titleFg ?? "syntax.keyword";
+    this._selectedFg = options.selectedFg ?? "ui.menu_active_fg";
+    this._selectedBg = options.selectedBg ?? "ui.menu_active_bg";
+    this._itemFg = options.itemFg;
   }
 
   /**
@@ -482,7 +498,7 @@ export class GroupedListControl<T> {
       styles.push({
         start: charOffset,
         end: charOffset + titleLine.length,
-        fg: "syntax.keyword",
+        fg: this._titleFg,
         bold: true,
       });
       charOffset += titleLine.length + 1;
@@ -498,8 +514,14 @@ export class GroupedListControl<T> {
           styles.push({
             start: charOffset,
             end: charOffset + line.length,
-            fg: "ui.menu_active_fg",
-            bg: "ui.menu_active_bg",
+            fg: this._selectedFg,
+            bg: this._selectedBg,
+          });
+        } else if (this._itemFg) {
+          styles.push({
+            start: charOffset,
+            end: charOffset + line.length,
+            fg: this._itemFg,
           });
         }
 
@@ -512,6 +534,45 @@ export class GroupedListControl<T> {
       text: lines.join("\n"),
       styles,
     };
+  }
+
+  /**
+   * Render to individual lines - useful for split-view layouts
+   * Returns array of line objects with text and optional styling
+   */
+  renderLines(): Array<{ text: string; fg?: string | RGB; bg?: string | RGB; isTitle?: boolean }> {
+    const result: Array<{ text: string; fg?: string | RGB; bg?: string | RGB; isTitle?: boolean }> = [];
+    let itemIndex = 0;
+
+    for (const group of this.groups) {
+      // Blank line between groups
+      if (result.length > 0) {
+        result.push({ text: "" });
+      }
+
+      // Group title
+      result.push({
+        text: group.title,
+        fg: this._titleFg,
+        isTitle: true,
+      });
+
+      // Group items
+      for (const item of group.items) {
+        const selected = itemIndex === this.selectedIndex;
+        const prefix = selected ? this._selectionPrefix : this._emptyPrefix;
+        const line = prefix + this.renderItem(item, selected, itemIndex);
+
+        if (selected) {
+          result.push({ text: line, fg: this._selectedFg, bg: this._selectedBg });
+        } else {
+          result.push({ text: line, fg: this._itemFg });
+        }
+        itemIndex++;
+      }
+    }
+
+    return result;
   }
 }
 

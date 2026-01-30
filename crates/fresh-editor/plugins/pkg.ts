@@ -23,8 +23,11 @@ import { Finder } from "./lib/finder.ts";
 import {
   ButtonControl,
   FocusState,
+  GroupedListControl,
+  TextInputControl,
   VirtualBufferBuilder,
 } from "./lib/index.ts";
+import type { ListGroup } from "./lib/index.ts";
 
 const editor = getEditor();
 
@@ -1598,71 +1601,65 @@ interface PanelLine {
   bg?: string | [number, number, number];
 }
 
-/** Build the left panel (package list) */
+/** Format a package item for the list - handles both installed and available */
+function formatPackageItem(item: PackageListItem, _selected: boolean, _index: number): string {
+  if (item.installed) {
+    const status = item.updateAvailable ? "↑" : "✓";
+    const ver = item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
+    const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
+    return `${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
+  } else {
+    const typeTag = item.packageType === "theme" ? "T" : item.packageType === "language" ? "L" : "P";
+    const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
+    return `${name.padEnd(22)} [${typeTag}]`;
+  }
+}
+
+/** Build the left panel (package list) using GroupedListControl */
 function buildLeftPanel(
   installedItems: PackageListItem[],
   availableItems: PackageListItem[],
   allItems: PackageListItem[]
 ): PanelLine[] {
-  const lines: PanelLine[] = [];
-  const listFocused = pkgState.focus.type === "list";
-  const selected = themeColor(pkgTheme.selected);
-
-  // Installed section
-  if (installedItems.length > 0) {
-    lines.push({ text: `INSTALLED (${installedItems.length})`, fg: themeFg(pkgTheme.sectionTitle) });
-
-    let idx = 0;
-    for (const item of installedItems) {
-      const isSelected = idx === pkgState.selectedIndex;
-      const prefix = isSelected && listFocused ? "▸" : " ";
-      const status = item.updateAvailable ? "↑" : "✓";
-      const ver = item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
-      const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
-      const line = `${prefix} ${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
-
-      lines.push(isSelected
-        ? { text: line, fg: selected.fg, bg: selected.bg }
-        : { text: line, fg: themeFg(pkgTheme.installed) }
-      );
-      idx++;
-    }
-  }
-
-  // Available section
-  if (availableItems.length > 0) {
-    if (lines.length > 0) lines.push({ text: "" });
-    lines.push({ text: `AVAILABLE (${availableItems.length})`, fg: themeFg(pkgTheme.sectionTitle) });
-
-    let idx = installedItems.length;
-    for (const item of availableItems) {
-      const isSelected = idx === pkgState.selectedIndex;
-      const prefix = isSelected && listFocused ? "▸" : " ";
-      const typeTag = item.packageType === "theme" ? "T" : item.packageType === "language" ? "L" : "P";
-      const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
-      const line = `${prefix} ${name.padEnd(22)} [${typeTag}]`;
-
-      lines.push(isSelected
-        ? { text: line, fg: selected.fg, bg: selected.bg }
-        : { text: line, fg: themeFg(pkgTheme.available) }
-      );
-      idx++;
-    }
-  }
-
   // Empty state
   if (allItems.length === 0) {
     if (pkgState.isLoading) {
-      lines.push({ text: "Loading...", fg: themeFg(pkgTheme.emptyState) });
+      return [{ text: "Loading...", fg: themeFg(pkgTheme.emptyState) }];
     } else if (!isRegistrySynced()) {
-      lines.push({ text: "Registry not synced", fg: themeFg(pkgTheme.emptyState) });
-      lines.push({ text: "Tab to Sync button", fg: themeFg(pkgTheme.emptyState) });
+      return [
+        { text: "Registry not synced", fg: themeFg(pkgTheme.emptyState) },
+        { text: "Tab to Sync button", fg: themeFg(pkgTheme.emptyState) },
+      ];
     } else {
-      lines.push({ text: "No packages found", fg: themeFg(pkgTheme.emptyState) });
+      return [{ text: "No packages found", fg: themeFg(pkgTheme.emptyState) }];
     }
   }
 
-  return lines;
+  const listFocused = pkgState.focus.type === "list";
+  const groups: ListGroup<PackageListItem>[] = [];
+
+  if (installedItems.length > 0) {
+    groups.push({ title: `INSTALLED (${installedItems.length})`, items: installedItems });
+  }
+  if (availableItems.length > 0) {
+    groups.push({ title: `AVAILABLE (${availableItems.length})`, items: availableItems });
+  }
+
+  const list = new GroupedListControl<PackageListItem>(groups, formatPackageItem, {
+    selectionPrefix: listFocused ? "▸ " : "  ",
+    emptyPrefix: "  ",
+    titleFg: themeFg(pkgTheme.sectionTitle),
+    selectedFg: themeFg(pkgTheme.selected),
+    selectedBg: themeBg(pkgTheme.selected),
+  });
+  list.selectedIndex = pkgState.selectedIndex;
+
+  // Convert renderLines output to PanelLine format
+  return list.renderLines().map(line => ({
+    text: line.text,
+    fg: line.fg as PanelLine["fg"],
+    bg: line.bg as PanelLine["bg"],
+  }));
 }
 
 /** Build the right panel (package details) */

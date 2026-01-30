@@ -1218,7 +1218,7 @@ The key principle: **extract existing code into shared modules first**, then hav
 | 8 | Create `plugins/lib/controls.ts` (ButtonControl, ListControl, FocusManager) | ✅ Done |
 | 9 | Create `plugins/lib/vbuffer.ts` (VirtualBufferBuilder) | ✅ Done |
 | 10 | Update `plugins/lib/index.ts` exports | ✅ Done |
-| 11 | Migrate `pkg.ts` to use controls library | Pending |
+| 11 | Migrate `pkg.ts` to use controls library | ✅ Done |
 
 ---
 

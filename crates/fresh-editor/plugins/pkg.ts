@@ -1584,20 +1584,8 @@ function renderPkgManagerUI(): void {
   builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", themeFg(pkgTheme.separator));
 
   // === HELP LINE ===
-  let helpText = " ↑↓ Navigate  Tab Next  / Search  Enter ";
-  if (pkgState.focus.type === "action") {
-    helpText += "Activate";
-  } else if (pkgState.focus.type === "filter") {
-    helpText += "Filter";
-  } else if (pkgState.focus.type === "sync") {
-    helpText += "Sync";
-  } else if (pkgState.focus.type === "search") {
-    helpText += "Search";
-  } else {
-    helpText += "Select";
-  }
-  helpText += "  Esc Close\n";
-  builder.styled(helpText, themeFg(pkgTheme.help));
+  const actionLabel = { action: "Activate", filter: "Filter", sync: "Sync", search: "Search", list: "Select" }[pkgState.focus.type] || "Select";
+  builder.styled(` ↑↓ Navigate  Tab Next  / Search  Enter ${actionLabel}  Esc Close\n`, themeFg(pkgTheme.help));
 
   // Build and apply to buffer
   builder.build();

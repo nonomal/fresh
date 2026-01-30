@@ -13,22 +13,18 @@
  * - Version pinning with tags, branches, or commits
  * - Lockfile for reproducibility
  *
- * TODO: Plugin UI Component Library
- * ---------------------------------
- * The UI code in this plugin manually constructs buttons, lists, split views,
- * and focus management using raw text property entries. This is verbose and
- * error-prone. We need a shared UI component library that plugins can use to
- * build interfaces in virtual buffers:
- *
- * - Buttons, lists, scroll bars, tabs, split views, text inputs, etc.
- * - Automatic keyboard navigation and focus management
- * - Theme-aware styling
- *
- * The editor's settings UI already implements similar components - these could
- * be unified into a shared framework. See PLUGIN_MARKETPLACE_DESIGN.md for details.
+ * UI Implementation:
+ * Uses the shared controls library (lib/controls.ts, lib/vbuffer.ts) for
+ * building the package manager interface with automatic styling and
+ * UTF-8 byte offset handling.
  */
 
 import { Finder } from "./lib/finder.ts";
+import {
+  ButtonControl,
+  FocusState,
+  VirtualBufferBuilder,
+} from "./lib/index.ts";
 
 const editor = getEditor();
 
@@ -1478,10 +1474,15 @@ function wrapText(text: string, maxWidth: number): string[] {
 }
 
 /**
- * Build virtual buffer entries for the package manager (split-view layout)
+ * Render the package manager UI using VirtualBufferBuilder
+ *
+ * This replaces the old buildListViewEntries() and applyPkgManagerHighlighting()
+ * functions with a cleaner implementation using the controls library.
  */
-function buildListViewEntries(): TextPropertyEntry[] {
-  const entries: TextPropertyEntry[] = [];
+function renderPkgManagerUI(): void {
+  if (pkgState.bufferId === null) return;
+
+  const builder = new VirtualBufferBuilder(pkgState.bufferId, "pkg");
   const items = getFilteredItems();
   const selectedItem = items.length > 0 && pkgState.selectedIndex < items.length
     ? items[pkgState.selectedIndex] : null;
@@ -1489,15 +1490,10 @@ function buildListViewEntries(): TextPropertyEntry[] {
   const availableItems = items.filter(i => !i.installed);
 
   // === HEADER ===
-  entries.push({
-    text: " Packages\n",
-    properties: { type: "header" },
-  });
+  builder.styled(" Packages\n", pkgTheme.header.fg?.theme ?? pkgTheme.header.fg?.rgb);
+  builder.newline();
 
-  // Empty line after header
-  entries.push({ text: "\n", properties: { type: "blank" } });
-
-  // === SEARCH BAR (input-style) ===
+  // === SEARCH BAR ===
   const searchFocused = isButtonFocused("search");
   const searchInputWidth = 30;
   const searchText = pkgState.searchQuery || "";
@@ -1505,15 +1501,17 @@ function buildListViewEntries(): TextPropertyEntry[] {
     ? searchText.slice(0, searchInputWidth - 2) + "…"
     : searchText.padEnd(searchInputWidth);
 
-  entries.push({ text: " Search: ", properties: { type: "search-label" } });
-  entries.push({
-    text: searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `,
-    properties: { type: "search-input", focused: searchFocused },
-  });
-  entries.push({ text: "\n", properties: { type: "newline" } });
+  builder.styled(" Search: ", pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb);
+  const searchStyle = searchFocused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox;
+  builder.styled(
+    searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `,
+    searchStyle.fg?.theme ?? searchStyle.fg?.rgb,
+    searchStyle.bg?.theme ?? searchStyle.bg?.rgb
+  );
+  builder.newline();
 
-  // === FILTER BAR with focusable buttons ===
-  const filters: Array<{ id: string; label: string }> = [
+  // === FILTER BAR ===
+  const filters = [
     { id: "all", label: "All" },
     { id: "installed", label: "Installed" },
     { id: "plugins", label: "Plugins" },
@@ -1521,164 +1519,54 @@ function buildListViewEntries(): TextPropertyEntry[] {
     { id: "languages", label: "Languages" },
   ];
 
-  // Build filter buttons with position tracking
-  let filterBarParts: Array<{ text: string; type: string; focused?: boolean; active?: boolean }> = [];
-  filterBarParts.push({ text: " ", type: "spacer" });
-
+  builder.text(" ");
   for (let i = 0; i < filters.length; i++) {
     const f = filters[i];
     const isActive = pkgState.filter === f.id;
     const isFocused = isButtonFocused("filter", i);
-    // Always reserve space for brackets - show [ ] when focused, spaces when not
-    const leftBracket = isFocused ? "[" : " ";
-    const rightBracket = isFocused ? "]" : " ";
-    filterBarParts.push({
-      text: `${leftBracket} ${f.label} ${rightBracket}`,
-      type: "filter-btn",
-      focused: isFocused,
-      active: isActive,
-    });
+
+    let btnFg: string | [number, number, number] | undefined;
+    let btnBg: string | [number, number, number] | undefined;
+
+    if (isFocused && isActive) {
+      btnFg = pkgTheme.buttonFocused.fg?.theme ?? pkgTheme.buttonFocused.fg?.rgb;
+      btnBg = pkgTheme.buttonFocused.bg?.theme ?? pkgTheme.buttonFocused.bg?.rgb;
+    } else if (isFocused) {
+      btnFg = pkgTheme.filterFocused.fg?.theme ?? pkgTheme.filterFocused.fg?.rgb;
+      btnBg = pkgTheme.filterFocused.bg?.theme ?? pkgTheme.filterFocused.bg?.rgb;
+    } else if (isActive) {
+      btnFg = pkgTheme.filterActive.fg?.theme ?? pkgTheme.filterActive.fg?.rgb;
+      btnBg = pkgTheme.filterActive.bg?.theme ?? pkgTheme.filterActive.bg?.rgb;
+    } else {
+      btnFg = pkgTheme.filterInactive.fg?.theme ?? pkgTheme.filterInactive.fg?.rgb;
+    }
+
+    const btn = new ButtonControl(f.label, isFocused ? FocusState.Focused : FocusState.Normal);
+    const btnOutput = btn.render();
+    // Override styles with our theme colors
+    builder.styled(btnOutput.text, btnFg, btnBg);
   }
 
-  filterBarParts.push({ text: "  ", type: "spacer" });
+  builder.text("  ");
 
-  // Sync button - always reserve space for brackets
+  // Sync button
   const syncFocused = isButtonFocused("sync");
-  const syncLeft = syncFocused ? "[" : " ";
-  const syncRight = syncFocused ? "]" : " ";
-  filterBarParts.push({ text: `${syncLeft} Sync ${syncRight}`, type: "sync-btn", focused: syncFocused });
-
-  // Emit each filter bar part as separate entry for individual styling
-  for (const part of filterBarParts) {
-    entries.push({
-      text: part.text,
-      properties: {
-        type: part.type,
-        focused: part.focused,
-        active: part.active,
-      },
-    });
-  }
-  entries.push({ text: "\n", properties: { type: "newline" } });
+  const syncBtn = new ButtonControl("Sync", syncFocused ? FocusState.Focused : FocusState.Normal);
+  const syncOutput = syncBtn.render();
+  const syncStyle = syncFocused ? pkgTheme.buttonFocused : pkgTheme.button;
+  builder.styled(
+    syncOutput.text,
+    syncStyle.fg?.theme ?? syncStyle.fg?.rgb,
+    syncStyle.bg?.theme ?? syncStyle.bg?.rgb
+  );
+  builder.newline();
 
   // === TOP SEPARATOR ===
-  entries.push({
-    text: " " + "─".repeat(TOTAL_WIDTH - 2) + "\n",
-    properties: { type: "separator" },
-  });
+  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", pkgTheme.separator.fg?.rgb);
 
   // === SPLIT VIEW: Package list on left, Details on right ===
-
-  // Build left panel lines (package list)
-  const leftLines: Array<{ text: string; type: string; selected?: boolean; installed?: boolean }> = [];
-
-  // Installed section
-  if (installedItems.length > 0) {
-    leftLines.push({ text: `INSTALLED (${installedItems.length})`, type: "section-title" });
-
-    let idx = 0;
-    for (const item of installedItems) {
-      const isSelected = idx === pkgState.selectedIndex;
-      const listFocused = pkgState.focus.type === "list";
-      const prefix = isSelected && listFocused ? "▸" : " ";
-      const status = item.updateAvailable ? "↑" : "✓";
-      const ver = item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
-      const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
-      const line = `${prefix} ${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
-      leftLines.push({ text: line, type: "package-row", selected: isSelected, installed: true });
-      idx++;
-    }
-  }
-
-  // Available section
-  if (availableItems.length > 0) {
-    if (leftLines.length > 0) leftLines.push({ text: "", type: "blank" });
-    leftLines.push({ text: `AVAILABLE (${availableItems.length})`, type: "section-title" });
-
-    let idx = installedItems.length;
-    for (const item of availableItems) {
-      const isSelected = idx === pkgState.selectedIndex;
-      const listFocused = pkgState.focus.type === "list";
-      const prefix = isSelected && listFocused ? "▸" : " ";
-      const typeTag = item.packageType === "theme" ? "T" : item.packageType === "language" ? "L" : "P";
-      const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
-      const line = `${prefix} ${name.padEnd(22)} [${typeTag}]`;
-      leftLines.push({ text: line, type: "package-row", selected: isSelected, installed: false });
-      idx++;
-    }
-  }
-
-  // Empty state for left panel
-  if (items.length === 0) {
-    if (pkgState.isLoading) {
-      leftLines.push({ text: "Loading...", type: "empty-state" });
-    } else if (!isRegistrySynced()) {
-      leftLines.push({ text: "Registry not synced", type: "empty-state" });
-      leftLines.push({ text: "Tab to Sync button", type: "empty-state" });
-    } else {
-      leftLines.push({ text: "No packages found", type: "empty-state" });
-    }
-  }
-
-  // Build right panel lines (details for selected package)
-  const rightLines: Array<{ text: string; type: string; focused?: boolean; btnIndex?: number }> = [];
-
-  if (selectedItem) {
-    // Package name
-    rightLines.push({ text: selectedItem.name, type: "detail-title" });
-    rightLines.push({ text: "─".repeat(Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2)), type: "detail-sep" });
-
-    // Version / Author / License on one line
-    let metaLine = `v${selectedItem.version}`;
-    if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
-    if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
-    if (metaLine.length > DETAIL_WIDTH - 2) metaLine = metaLine.slice(0, DETAIL_WIDTH - 5) + "...";
-    rightLines.push({ text: metaLine, type: "detail-meta" });
-
-    rightLines.push({ text: "", type: "blank" });
-
-    // Description (wrapped)
-    const descText = selectedItem.description || "No description available";
-    const descLines = wrapText(descText, DETAIL_WIDTH - 2);
-    for (const line of descLines) {
-      rightLines.push({ text: line, type: "detail-desc" });
-    }
-
-    rightLines.push({ text: "", type: "blank" });
-
-    // Keywords
-    if (selectedItem.keywords && selectedItem.keywords.length > 0) {
-      const kwText = selectedItem.keywords.slice(0, 4).join(", ");
-      rightLines.push({ text: `Tags: ${kwText}`, type: "detail-tags" });
-      rightLines.push({ text: "", type: "blank" });
-    }
-
-    // Repository URL
-    if (selectedItem.repository) {
-      // Shorten URL for display (remove protocol, truncate if needed)
-      let displayUrl = selectedItem.repository
-        .replace(/^https?:\/\//, "")
-        .replace(/\.git$/, "");
-      if (displayUrl.length > DETAIL_WIDTH - 2) {
-        displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
-      }
-      rightLines.push({ text: displayUrl, type: "detail-url" });
-      rightLines.push({ text: "", type: "blank" });
-    }
-
-    // Action buttons - always reserve space for brackets
-    const actions = getActionButtons();
-    for (let i = 0; i < actions.length; i++) {
-      const focused = isButtonFocused("action", i);
-      const leftBracket = focused ? "[" : " ";
-      const rightBracket = focused ? "]" : " ";
-      const btnText = `${leftBracket} ${actions[i]} ${rightBracket}`;
-      rightLines.push({ text: btnText, type: "action-btn", focused, btnIndex: i });
-    }
-  } else {
-    rightLines.push({ text: "Select a package", type: "empty-state" });
-    rightLines.push({ text: "to view details", type: "empty-state" });
-  }
+  const leftLines = buildLeftPanel(installedItems, availableItems, items);
+  const rightLines = buildRightPanel(selectedItem);
 
   // Merge left and right panels into rows
   const maxRows = Math.max(leftLines.length, rightLines.length, 8);
@@ -1687,38 +1575,29 @@ function buildListViewEntries(): TextPropertyEntry[] {
     const rightItem = rightLines[i];
 
     // Left side (padded to fixed width)
-    const leftText = leftItem ? (" " + leftItem.text) : "";
-    entries.push({
-      text: leftText.padEnd(LIST_WIDTH),
-      properties: {
-        type: leftItem?.type || "blank",
-        selected: leftItem?.selected,
-        installed: leftItem?.installed,
-      },
-    });
+    const leftText = leftItem ? (" " + leftItem.text).padEnd(LIST_WIDTH) : " ".repeat(LIST_WIDTH);
+    if (leftItem) {
+      builder.styled(leftText, leftItem.fg, leftItem.bg);
+    } else {
+      builder.text(leftText);
+    }
 
     // Divider
-    entries.push({ text: "│", properties: { type: "divider" } });
+    builder.styled("│", pkgTheme.divider.fg?.rgb);
 
     // Right side
-    const rightText = rightItem ? (" " + rightItem.text) : "";
-    entries.push({
-      text: rightText,
-      properties: {
-        type: rightItem?.type || "blank",
-        focused: rightItem?.focused,
-        btnIndex: rightItem?.btnIndex,
-      },
-    });
+    const rightText = rightItem ? " " + rightItem.text : "";
+    if (rightItem) {
+      builder.styled(rightText, rightItem.fg, rightItem.bg);
+    } else {
+      builder.text(rightText);
+    }
 
-    entries.push({ text: "\n", properties: { type: "newline" } });
+    builder.newline();
   }
 
   // === BOTTOM SEPARATOR ===
-  entries.push({
-    text: " " + "─".repeat(TOTAL_WIDTH - 2) + "\n",
-    properties: { type: "separator" },
-  });
+  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", pkgTheme.separator.fg?.rgb);
 
   // === HELP LINE ===
   let helpText = " ↑↓ Navigate  Tab Next  / Search  Enter ";
@@ -1734,184 +1613,204 @@ function buildListViewEntries(): TextPropertyEntry[] {
     helpText += "Select";
   }
   helpText += "  Esc Close\n";
+  builder.styled(helpText, pkgTheme.help.fg?.theme ?? pkgTheme.help.fg?.rgb);
 
-  entries.push({
-    text: helpText,
-    properties: { type: "help" },
-  });
-
-  return entries;
+  // Build and apply to buffer
+  builder.build();
 }
 
-/**
- * Calculate UTF-8 byte length of a string.
- * Needed because string.length returns character count, not byte count.
- * Unicode chars like ▸ and ─ are 1 char but 3 bytes in UTF-8.
- */
-function utf8ByteLength(str: string): number {
-  let bytes = 0;
-  for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
-    if (code < 0x80) {
-      bytes += 1;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xD800 && code <= 0xDBFF) {
-      // Surrogate pair = 4 bytes, skip low surrogate
-      bytes += 4;
-      i++;
+/** Line item for the split-view panels */
+interface PanelLine {
+  text: string;
+  fg?: string | [number, number, number];
+  bg?: string | [number, number, number];
+}
+
+/** Build the left panel (package list) */
+function buildLeftPanel(
+  installedItems: PackageListItem[],
+  availableItems: PackageListItem[],
+  allItems: PackageListItem[]
+): PanelLine[] {
+  const lines: PanelLine[] = [];
+  const listFocused = pkgState.focus.type === "list";
+
+  // Installed section
+  if (installedItems.length > 0) {
+    lines.push({
+      text: `INSTALLED (${installedItems.length})`,
+      fg: pkgTheme.sectionTitle.fg?.theme ?? pkgTheme.sectionTitle.fg?.rgb,
+    });
+
+    let idx = 0;
+    for (const item of installedItems) {
+      const isSelected = idx === pkgState.selectedIndex;
+      const prefix = isSelected && listFocused ? "▸" : " ";
+      const status = item.updateAvailable ? "↑" : "✓";
+      const ver = item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
+      const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
+      const line = `${prefix} ${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
+
+      if (isSelected) {
+        lines.push({
+          text: line,
+          fg: pkgTheme.selected.fg?.theme ?? pkgTheme.selected.fg?.rgb,
+          bg: pkgTheme.selected.bg?.theme ?? pkgTheme.selected.bg?.rgb,
+        });
+      } else {
+        lines.push({
+          text: line,
+          fg: pkgTheme.installed.fg?.theme ?? pkgTheme.installed.fg?.rgb,
+        });
+      }
+      idx++;
+    }
+  }
+
+  // Available section
+  if (availableItems.length > 0) {
+    if (lines.length > 0) lines.push({ text: "" });
+    lines.push({
+      text: `AVAILABLE (${availableItems.length})`,
+      fg: pkgTheme.sectionTitle.fg?.theme ?? pkgTheme.sectionTitle.fg?.rgb,
+    });
+
+    let idx = installedItems.length;
+    for (const item of availableItems) {
+      const isSelected = idx === pkgState.selectedIndex;
+      const prefix = isSelected && listFocused ? "▸" : " ";
+      const typeTag = item.packageType === "theme" ? "T" : item.packageType === "language" ? "L" : "P";
+      const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
+      const line = `${prefix} ${name.padEnd(22)} [${typeTag}]`;
+
+      if (isSelected) {
+        lines.push({
+          text: line,
+          fg: pkgTheme.selected.fg?.theme ?? pkgTheme.selected.fg?.rgb,
+          bg: pkgTheme.selected.bg?.theme ?? pkgTheme.selected.bg?.rgb,
+        });
+      } else {
+        lines.push({
+          text: line,
+          fg: pkgTheme.available.fg?.theme ?? pkgTheme.available.fg?.rgb,
+        });
+      }
+      idx++;
+    }
+  }
+
+  // Empty state
+  if (allItems.length === 0) {
+    if (pkgState.isLoading) {
+      lines.push({ text: "Loading...", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
+    } else if (!isRegistrySynced()) {
+      lines.push({ text: "Registry not synced", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
+      lines.push({ text: "Tab to Sync button", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
     } else {
-      bytes += 3;
+      lines.push({ text: "No packages found", fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb });
     }
   }
-  return bytes;
+
+  return lines;
 }
 
-/**
- * Apply theme-aware highlighting to the package manager view
- */
-function applyPkgManagerHighlighting(): void {
-  if (pkgState.bufferId === null) return;
+/** Build the right panel (package details) */
+function buildRightPanel(selectedItem: PackageListItem | null): PanelLine[] {
+  const lines: PanelLine[] = [];
 
-  // Clear existing overlays
-  editor.clearNamespace(pkgState.bufferId, "pkg");
+  if (selectedItem) {
+    // Package name
+    lines.push({
+      text: selectedItem.name,
+      fg: pkgTheme.header.fg?.theme ?? pkgTheme.header.fg?.rgb,
+    });
+    lines.push({
+      text: "─".repeat(Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2)),
+      fg: pkgTheme.separator.fg?.rgb,
+    });
 
-  const entries = buildListViewEntries();
-  let byteOffset = 0;
+    // Version / Author / License
+    let metaLine = `v${selectedItem.version}`;
+    if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
+    if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
+    if (metaLine.length > DETAIL_WIDTH - 2) metaLine = metaLine.slice(0, DETAIL_WIDTH - 5) + "...";
+    lines.push({
+      text: metaLine,
+      fg: pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb,
+    });
 
-  for (const entry of entries) {
-    const props = entry.properties as Record<string, unknown>;
-    const len = utf8ByteLength(entry.text);
+    lines.push({ text: "" });
 
-    // Determine theme colors based on entry type
-    let themeStyle: ThemeColor | null = null;
-
-    switch (props.type) {
-      case "header":
-        themeStyle = pkgTheme.header;
-        break;
-
-      case "section-title":
-        themeStyle = pkgTheme.sectionTitle;
-        break;
-
-      case "filter-btn":
-        if (props.focused && props.active) {
-          // Both focused and active - use focused style
-          themeStyle = pkgTheme.buttonFocused;
-        } else if (props.focused) {
-          // Only focused (not the active filter)
-          themeStyle = pkgTheme.filterFocused;
-        } else if (props.active) {
-          // Active filter but not focused
-          themeStyle = pkgTheme.filterActive;
-        } else {
-          themeStyle = pkgTheme.filterInactive;
-        }
-        break;
-
-      case "sync-btn":
-        themeStyle = props.focused ? pkgTheme.buttonFocused : pkgTheme.button;
-        break;
-
-      case "search-label":
-        themeStyle = pkgTheme.infoLabel;
-        break;
-
-      case "search-input":
-        // Search input field styling - distinct background
-        themeStyle = props.focused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox;
-        break;
-
-      case "package-row":
-        if (props.selected) {
-          themeStyle = pkgTheme.selected;
-        } else if (props.installed) {
-          themeStyle = pkgTheme.installed;
-        } else {
-          themeStyle = pkgTheme.available;
-        }
-        break;
-
-      case "detail-title":
-        themeStyle = pkgTheme.header;
-        break;
-
-      case "detail-sep":
-      case "separator":
-        themeStyle = pkgTheme.separator;
-        break;
-
-      case "divider":
-        themeStyle = pkgTheme.divider;
-        break;
-
-      case "detail-meta":
-      case "detail-tags":
-      case "detail-url":
-        themeStyle = pkgTheme.infoLabel;
-        break;
-
-      case "detail-desc":
-        themeStyle = pkgTheme.description;
-        break;
-
-      case "action-btn":
-        themeStyle = props.focused ? pkgTheme.buttonFocused : pkgTheme.button;
-        break;
-
-      case "help":
-        themeStyle = pkgTheme.help;
-        break;
-
-      case "empty-state":
-        themeStyle = pkgTheme.emptyState;
-        break;
+    // Description (wrapped)
+    const descText = selectedItem.description || "No description available";
+    const descLines = wrapText(descText, DETAIL_WIDTH - 2);
+    for (const line of descLines) {
+      lines.push({
+        text: line,
+        fg: pkgTheme.description.fg?.theme ?? pkgTheme.description.fg?.rgb,
+      });
     }
 
-    if (themeStyle) {
-      const fg = themeStyle.fg;
-      const bg = themeStyle.bg;
+    lines.push({ text: "" });
 
-      // Build overlay options - prefer theme keys, fallback to RGB
-      const options: Record<string, unknown> = {};
-
-      if (fg?.theme) {
-        options.fg = fg.theme;
-      } else if (fg?.rgb) {
-        options.fg = fg.rgb;
-      }
-
-      if (bg?.theme) {
-        options.bg = bg.theme;
-      } else if (bg?.rgb) {
-        options.bg = bg.rgb;
-      }
-
-      if (Object.keys(options).length > 0) {
-        editor.addOverlay(
-          pkgState.bufferId,
-          "pkg",
-          byteOffset,
-          byteOffset + len,
-          options
-        );
-      }
+    // Keywords
+    if (selectedItem.keywords && selectedItem.keywords.length > 0) {
+      const kwText = selectedItem.keywords.slice(0, 4).join(", ");
+      lines.push({
+        text: `Tags: ${kwText}`,
+        fg: pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb,
+      });
+      lines.push({ text: "" });
     }
 
-    byteOffset += len;
+    // Repository URL
+    if (selectedItem.repository) {
+      let displayUrl = selectedItem.repository
+        .replace(/^https?:\/\//, "")
+        .replace(/\.git$/, "");
+      if (displayUrl.length > DETAIL_WIDTH - 2) {
+        displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
+      }
+      lines.push({
+        text: displayUrl,
+        fg: pkgTheme.infoLabel.fg?.theme ?? pkgTheme.infoLabel.fg?.rgb,
+      });
+      lines.push({ text: "" });
+    }
+
+    // Action buttons
+    const actions = getActionButtons();
+    for (let i = 0; i < actions.length; i++) {
+      const focused = isButtonFocused("action", i);
+      const btn = new ButtonControl(actions[i], focused ? FocusState.Focused : FocusState.Normal);
+      const btnOutput = btn.render();
+      const btnStyle = focused ? pkgTheme.buttonFocused : pkgTheme.button;
+      lines.push({
+        text: btnOutput.text,
+        fg: btnStyle.fg?.theme ?? btnStyle.fg?.rgb,
+        bg: btnStyle.bg?.theme ?? btnStyle.bg?.rgb,
+      });
+    }
+  } else {
+    lines.push({
+      text: "Select a package",
+      fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb,
+    });
+    lines.push({
+      text: "to view details",
+      fg: pkgTheme.emptyState.fg?.theme ?? pkgTheme.emptyState.fg?.rgb,
+    });
   }
+
+  return lines;
 }
+
 
 /**
  * Update the package manager view
  */
 function updatePkgManagerView(): void {
-  if (pkgState.bufferId === null) return;
-
-  const entries = buildListViewEntries();
-  editor.setVirtualBufferContent(pkgState.bufferId, entries);
-  applyPkgManagerHighlighting();
+  renderPkgManagerUI();
 }
 
 /**
@@ -1941,17 +1840,14 @@ async function openPackageManager(): Promise<void> {
   pkgState.items = buildPackageList();
   pkgState.isLoading = false;
 
-  // Build initial entries
-  const entries = buildListViewEntries();
-
-  // Create virtual buffer
+  // Create virtual buffer with placeholder content (will be rendered immediately after)
   const result = await editor.createVirtualBufferInExistingSplit({
     name: "*Packages*",
     mode: "pkg-manager",
     readOnly: true,
     editingDisabled: true,
     showCursors: false,
-    entries: entries,
+    entries: [{ text: "", properties: {} }],
     splitId: pkgState.splitId!,
     showLineNumbers: false,
   });
@@ -1959,8 +1855,8 @@ async function openPackageManager(): Promise<void> {
   pkgState.bufferId = result.bufferId;
   pkgState.isOpen = true;
 
-  // Apply initial highlighting
-  applyPkgManagerHighlighting();
+  // Render initial UI
+  renderPkgManagerUI();
 
   // Sync registry in background and update view when done
   // User can still interact with installed packages during sync

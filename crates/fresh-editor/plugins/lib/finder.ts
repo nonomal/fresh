@@ -239,7 +239,7 @@ export function defaultFuzzyFilter<T>(
   items: T[],
   query: string,
   format: (item: T, index: number) => DisplayEntry,
-  maxResults: number = 100
+  maxResults: number = 100,
 ): T[] {
   if (query === "" || query.trim() === "") {
     return items.slice(0, maxResults);
@@ -296,7 +296,7 @@ export function parseGrepLine(line: string): {
  */
 export function parseGrepOutput(
   stdout: string,
-  maxResults: number = 100
+  maxResults: number = 100,
 ): Array<{ file: string; line: number; column: number; content: string }> {
   const results: Array<{
     file: string;
@@ -462,10 +462,12 @@ export class Finder<T> {
       this.editor.startPromptWithInitial(
         options.title,
         this.config.id,
-        options.initialQuery
+        options.initialQuery,
       );
     } else {
-      this.editor.debug(`[Finder] calling startPrompt with title="${options.title}", id="${this.config.id}"`);
+      this.editor.debug(
+        `[Finder] calling startPrompt with title="${options.title}", id="${this.config.id}"`,
+      );
       const result = this.editor.startPrompt(options.title, this.config.id);
       this.editor.debug(`[Finder] startPrompt returned: ${result}`);
     }
@@ -598,7 +600,10 @@ export class Finder<T> {
 
     // Register event handlers
     this.editor.on("prompt_changed", `${this.handlerPrefix}_changed`);
-    this.editor.on("prompt_selection_changed", `${this.handlerPrefix}_selection`);
+    this.editor.on(
+      "prompt_selection_changed",
+      `${this.handlerPrefix}_selection`,
+    );
     this.editor.on("prompt_confirmed", `${this.handlerPrefix}_confirmed`);
     this.editor.on("prompt_cancelled", `${this.handlerPrefix}_cancelled`);
   }
@@ -624,7 +629,7 @@ export class Finder<T> {
       this.allItems,
       query,
       this.config.format,
-      this.config.maxResults
+      this.config.maxResults,
     );
   }
 
@@ -649,7 +654,7 @@ export class Finder<T> {
 
   private async runSearch(
     query: string,
-    source: SearchSource<T>
+    source: SearchSource<T>,
   ): Promise<void> {
     const debounceMs = source.debounceMs ?? 150;
     const minQueryLength = source.minQueryLength ?? 2;
@@ -711,7 +716,7 @@ export class Finder<T> {
           // Parse as grep output by default
           const parsed = parseGrepOutput(
             result.stdout,
-            this.config.maxResults
+            this.config.maxResults,
           ) as unknown as T[];
           this.updatePromptResults(parsed);
 
@@ -772,7 +777,7 @@ export class Finder<T> {
         description: entry.description,
         value: `${i}`,
         disabled: false,
-      })
+      }),
     );
 
     this.editor.setPromptSuggestions(suggestions);
@@ -810,10 +815,10 @@ export class Finder<T> {
         this.editor.openFile(
           entry.location.file,
           entry.location.line,
-          entry.location.column
+          entry.location.column,
         );
         this.editor.setStatus(
-          `Opened ${entry.location.file}:${entry.location.line}`
+          `Opened ${entry.location.file}:${entry.location.line}`,
         );
       }
     } else {
@@ -883,13 +888,18 @@ export class Finder<T> {
 
       const contextLines = this.getContextLines();
       const startLine = Math.max(0, entry.location.line - 1 - contextLines);
-      const endLine = Math.min(lines.length, entry.location.line + contextLines);
+      const endLine = Math.min(
+        lines.length,
+        entry.location.line + contextLines,
+      );
 
       const entries: TextPropertyEntry[] = [];
 
       // Header
       entries.push({
-        text: `  ${entry.location.file}:${entry.location.line}:${entry.location.column ?? 1}\n`,
+        text: `  ${entry.location.file}:${entry.location.line}:${
+          entry.location.column ?? 1
+        }\n`,
         properties: { type: "header" },
       });
       entries.push({
@@ -920,7 +930,7 @@ export class Finder<T> {
           this.previewModeName,
           "special",
           [["q", "close_buffer"]],
-          true
+          true,
         );
 
         // Create preview split
@@ -945,7 +955,10 @@ export class Finder<T> {
         }
       } else {
         // Update existing preview
-        this.editor.setVirtualBufferContent(this.previewState.bufferId, entries);
+        this.editor.setVirtualBufferContent(
+          this.previewState.bufferId,
+          entries,
+        );
       }
     } catch (e) {
       this.editor.debug(`[Finder] Failed to update preview: ${e}`);
@@ -978,7 +991,7 @@ export class Finder<T> {
         ["Return", `${this.handlerPrefix}_panel_select`],
         ["Escape", `${this.handlerPrefix}_panel_close`],
       ],
-      true
+      true,
     );
 
     // Select handler
@@ -1014,7 +1027,7 @@ export class Finder<T> {
       const itemIndex = self.panelState.lineToItemIndex.get(data.line);
       if (itemIndex !== undefined && itemIndex < self.panelState.items.length) {
         self.editor.setStatus(
-          `Item ${itemIndex + 1}/${self.panelState.items.length}`
+          `Item ${itemIndex + 1}/${self.panelState.items.length}`,
         );
       }
     };
@@ -1064,7 +1077,9 @@ export class Finder<T> {
 
     try {
       const result = await this.editor.createVirtualBufferInSplit({
-        name: `*${this.config.id.charAt(0).toUpperCase() + this.config.id.slice(1)}*`,
+        name: `*${
+          this.config.id.charAt(0).toUpperCase() + this.config.id.slice(1)
+        }*`,
         mode: this.modeName,
         readOnly: true,
         entries,
@@ -1082,7 +1097,9 @@ export class Finder<T> {
         this.applyPanelHighlighting();
 
         const count = this.panelState.items.length;
-        this.editor.setStatus(`${title}: ${count} item${count !== 1 ? "s" : ""}`);
+        this.editor.setStatus(
+          `${title}: ${count} item${count !== 1 ? "s" : ""}`,
+        );
       } else {
         this.editor.setStatus("Failed to open panel");
       }
@@ -1180,16 +1197,15 @@ export class Finder<T> {
   }
 
   private buildItemEntry(entry: DisplayEntry): TextPropertyEntry {
-    const severityIcon =
-      entry.severity === "error"
-        ? "[E]"
-        : entry.severity === "warning"
-          ? "[W]"
-          : entry.severity === "info"
-            ? "[I]"
-            : entry.severity === "hint"
-              ? "[H]"
-              : "";
+    const severityIcon = entry.severity === "error"
+      ? "[E]"
+      : entry.severity === "warning"
+      ? "[W]"
+      : entry.severity === "info"
+      ? "[I]"
+      : entry.severity === "hint"
+      ? "[H]"
+      : "";
 
     const prefix = severityIcon ? `${severityIcon} ` : "  ";
     const desc = entry.description ? `  ${entry.description}` : "";
@@ -1220,7 +1236,7 @@ export class Finder<T> {
 
   private onPanelSelect(): void {
     const itemIndex = this.panelState.lineToItemIndex.get(
-      this.panelState.cursorLine
+      this.panelState.cursorLine,
     );
     if (itemIndex === undefined) {
       this.editor.setStatus("No item selected");
@@ -1240,10 +1256,10 @@ export class Finder<T> {
       this.editor.openFile(
         entry.location.file,
         entry.location.line,
-        entry.location.column
+        entry.location.column,
       );
       this.editor.setStatus(
-        `Jumped to ${entry.location.file}:${entry.location.line}`
+        `Jumped to ${entry.location.file}:${entry.location.line}`,
       );
     }
   }
@@ -1416,7 +1432,7 @@ export function getRelativePath(editor: EditorAPI, filePath: string): string {
  * Create a simple live provider from a getter function
  */
 export function createLiveProvider<T>(
-  getItems: () => T[]
+  getItems: () => T[],
 ): FinderProvider<T> & { notify: () => void } {
   const listeners: Array<() => void> = [];
 

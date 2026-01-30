@@ -22,12 +22,19 @@
 import { Finder } from "./lib/finder.ts";
 import {
   ButtonControl,
+  FilterBar,
   FocusState,
   GroupedListControl,
-  TextInputControl,
+  HelpBar,
+  SplitView,
   VirtualBufferBuilder,
 } from "./lib/index.ts";
-import type { ListGroup } from "./lib/index.ts";
+import type {
+  FilterOption,
+  KeyBinding,
+  ListGroup,
+  PanelLine,
+} from "./lib/index.ts";
 
 const editor = getEditor();
 
@@ -38,7 +45,11 @@ const editor = getEditor();
 const CONFIG_DIR = editor.getConfigDir();
 const PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "plugins", "packages");
 const THEMES_PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "themes", "packages");
-const LANGUAGES_PACKAGES_DIR = editor.pathJoin(CONFIG_DIR, "languages", "packages");
+const LANGUAGES_PACKAGES_DIR = editor.pathJoin(
+  CONFIG_DIR,
+  "languages",
+  "packages",
+);
 const INDEX_DIR = editor.pathJoin(PACKAGES_DIR, ".index");
 const CACHE_DIR = editor.pathJoin(PACKAGES_DIR, ".cache");
 const LOCKFILE_PATH = editor.pathJoin(CONFIG_DIR, "fresh.lock");
@@ -192,14 +203,18 @@ function hashString(str: string): string {
  * Run a git command without prompting for credentials.
  * Uses git config options to prevent interactive prompts (cross-platform).
  */
-async function gitCommand(args: string[]): Promise<{ exit_code: number; stdout: string; stderr: string }> {
+async function gitCommand(
+  args: string[],
+): Promise<{ exit_code: number; stdout: string; stderr: string }> {
   // Use git config options to disable credential prompts (works on Windows and Unix)
   // -c credential.helper= disables credential helper
   // -c core.askPass= disables askpass program
   const gitArgs = [
-    "-c", "credential.helper=",
-    "-c", "core.askPass=",
-    ...args
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.askPass=",
+    ...args,
   ];
   const result = await editor.spawnProcess("git", gitArgs);
   return result;
@@ -315,22 +330,36 @@ async function syncRegistry(): Promise<void> {
     if (editor.fileExists(indexPath)) {
       // Update existing
       editor.setStatus(`Updating registry: ${source}...`);
-      const result = await gitCommand(["-C", `${indexPath}`, "pull", "--ff-only"]);
+      const result = await gitCommand([
+        "-C",
+        `${indexPath}`,
+        "pull",
+        "--ff-only",
+      ]);
       if (result.exit_code === 0) {
         synced++;
       } else {
         const errorMsg = result.stderr.includes("Could not resolve host")
           ? "Network error"
-          : result.stderr.includes("Authentication") || result.stderr.includes("403")
+          : result.stderr.includes("Authentication") ||
+              result.stderr.includes("403")
           ? "Authentication failed (check if repo is public)"
           : result.stderr.split("\n")[0] || "Unknown error";
         errors.push(`${source}: ${errorMsg}`);
-        editor.warn(`[pkg] Failed to update registry ${source}: ${result.stderr}`);
+        editor.warn(
+          `[pkg] Failed to update registry ${source}: ${result.stderr}`,
+        );
       }
     } else {
       // Clone new
       editor.setStatus(`Cloning registry: ${source}...`);
-      const result = await gitCommand(["clone", "--depth", "1", `${source}`, `${indexPath}`]);
+      const result = await gitCommand([
+        "clone",
+        "--depth",
+        "1",
+        `${source}`,
+        `${indexPath}`,
+      ]);
       if (result.exit_code === 0) {
         synced++;
       } else {
@@ -338,11 +367,14 @@ async function syncRegistry(): Promise<void> {
           ? "Network error"
           : result.stderr.includes("not found") || result.stderr.includes("404")
           ? "Repository not found"
-          : result.stderr.includes("Authentication") || result.stderr.includes("403")
+          : result.stderr.includes("Authentication") ||
+              result.stderr.includes("403")
           ? "Authentication failed (check if repo is public)"
           : result.stderr.split("\n")[0] || "Unknown error";
         errors.push(`${source}: ${errorMsg}`);
-        editor.warn(`[pkg] Failed to clone registry ${source}: ${result.stderr}`);
+        editor.warn(
+          `[pkg] Failed to clone registry ${source}: ${result.stderr}`,
+        );
       }
     }
   }
@@ -353,7 +385,11 @@ async function syncRegistry(): Promise<void> {
   }
 
   if (errors.length > 0) {
-    editor.setStatus(`Registry: ${synced}/${sources.length} synced. Errors: ${errors.join("; ")}`);
+    editor.setStatus(
+      `Registry: ${synced}/${sources.length} synced. Errors: ${
+        errors.join("; ")
+      }`,
+    );
   } else {
     editor.setStatus(`Registry synced (${synced}/${sources.length} sources)`);
   }
@@ -369,31 +405,44 @@ function loadRegistry(type: "plugins" | "themes" | "languages"): RegistryData {
   const merged: RegistryData = {
     schema_version: 1,
     updated: new Date().toISOString(),
-    packages: {}
+    packages: {},
   };
 
   for (const source of sources) {
     // Try git index first
-    const indexPath = editor.pathJoin(INDEX_DIR, hashString(source), `${type}.json`);
+    const indexPath = editor.pathJoin(
+      INDEX_DIR,
+      hashString(source),
+      `${type}.json`,
+    );
     editor.debug(`[pkg] checking index path: ${indexPath}`);
     let data = readJsonFile<RegistryData>(indexPath);
 
     // Fall back to cache if index not available
     if (!data?.packages) {
-      const cachePath = editor.pathJoin(CACHE_DIR, `${hashString(source)}_${type}.json`);
+      const cachePath = editor.pathJoin(
+        CACHE_DIR,
+        `${hashString(source)}_${type}.json`,
+      );
       data = readJsonFile<RegistryData>(cachePath);
       if (data?.packages) {
         editor.debug(`[pkg] using cached data for ${type}`);
       }
     }
 
-    editor.debug(`[pkg] data loaded: ${data ? 'yes' : 'no'}, packages: ${data?.packages ? Object.keys(data.packages).length : 0}`);
+    editor.debug(
+      `[pkg] data loaded: ${data ? "yes" : "no"}, packages: ${
+        data?.packages ? Object.keys(data.packages).length : 0
+      }`,
+    );
     if (data?.packages) {
       Object.assign(merged.packages, data.packages);
     }
   }
 
-  editor.debug(`[pkg] total merged packages: ${Object.keys(merged.packages).length}`);
+  editor.debug(
+    `[pkg] total merged packages: ${Object.keys(merged.packages).length}`,
+  );
   return merged;
 }
 
@@ -408,7 +457,10 @@ async function cacheRegistry(): Promise<void> {
     const sourceHash = hashString(source);
     for (const type of ["plugins", "themes", "languages"] as const) {
       const indexPath = editor.pathJoin(INDEX_DIR, sourceHash, `${type}.json`);
-      const cachePath = editor.pathJoin(CACHE_DIR, `${sourceHash}_${type}.json`);
+      const cachePath = editor.pathJoin(
+        CACHE_DIR,
+        `${sourceHash}_${type}.json`,
+      );
 
       const data = readJsonFile<RegistryData>(indexPath);
       if (data?.packages && Object.keys(data.packages).length > 0) {
@@ -430,7 +482,10 @@ function isRegistrySynced(): boolean {
       return true;
     }
     // Check cache
-    const cachePath = editor.pathJoin(CACHE_DIR, `${hashString(source)}_plugins.json`);
+    const cachePath = editor.pathJoin(
+      CACHE_DIR,
+      `${hashString(source)}_plugins.json`,
+    );
     if (editor.fileExists(cachePath)) {
       return true;
     }
@@ -445,10 +500,14 @@ function isRegistrySynced(): boolean {
 /**
  * Get list of installed packages
  */
-function getInstalledPackages(type: "plugin" | "theme" | "language"): InstalledPackage[] {
-  const packagesDir = type === "plugin" ? PACKAGES_DIR
-                    : type === "theme" ? THEMES_PACKAGES_DIR
-                    : LANGUAGES_PACKAGES_DIR;
+function getInstalledPackages(
+  type: "plugin" | "theme" | "language",
+): InstalledPackage[] {
+  const packagesDir = type === "plugin"
+    ? PACKAGES_DIR
+    : type === "theme"
+    ? THEMES_PACKAGES_DIR
+    : LANGUAGES_PACKAGES_DIR;
   const packages: InstalledPackage[] = [];
 
   if (!editor.fileExists(packagesDir)) {
@@ -482,7 +541,7 @@ function getInstalledPackages(type: "plugin" | "theme" | "language"): InstalledP
           type,
           source,
           version: manifest?.version || "unknown",
-          manifest
+          manifest,
         });
       }
     }
@@ -511,14 +570,17 @@ interface ValidationResult {
  * 2. package.json has required fields (name, type)
  * 3. Entry file exists (for plugins)
  */
-function validatePackage(packageDir: string, packageName: string): ValidationResult {
+function validatePackage(
+  packageDir: string,
+  packageName: string,
+): ValidationResult {
   const manifestPath = editor.pathJoin(packageDir, "package.json");
 
   // Check package.json exists
   if (!editor.fileExists(manifestPath)) {
     return {
       valid: false,
-      error: `Missing package.json - expected at ${manifestPath}`
+      error: `Missing package.json - expected at ${manifestPath}`,
     };
   }
 
@@ -527,7 +589,7 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
   if (!manifest) {
     return {
       valid: false,
-      error: "Invalid package.json - could not parse JSON"
+      error: "Invalid package.json - could not parse JSON",
     };
   }
 
@@ -535,21 +597,26 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
   if (!manifest.name) {
     return {
       valid: false,
-      error: "Invalid package.json - missing 'name' field"
+      error: "Invalid package.json - missing 'name' field",
     };
   }
 
   if (!manifest.type) {
     return {
       valid: false,
-      error: "Invalid package.json - missing 'type' field (should be 'plugin', 'theme', or 'language')"
+      error:
+        "Invalid package.json - missing 'type' field (should be 'plugin', 'theme', or 'language')",
     };
   }
 
-  if (manifest.type !== "plugin" && manifest.type !== "theme" && manifest.type !== "language") {
+  if (
+    manifest.type !== "plugin" && manifest.type !== "theme" &&
+    manifest.type !== "language"
+  ) {
     return {
       valid: false,
-      error: `Invalid package.json - 'type' must be 'plugin', 'theme', or 'language', got '${manifest.type}'`
+      error:
+        `Invalid package.json - 'type' must be 'plugin', 'theme', or 'language', got '${manifest.type}'`,
     };
   }
 
@@ -567,7 +634,8 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 
       return {
         valid: false,
-        error: `Missing entry file '${entryFile}' - check fresh.entry in package.json`
+        error:
+          `Missing entry file '${entryFile}' - check fresh.entry in package.json`,
       };
     }
 
@@ -576,20 +644,27 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 
   // For language packs, validate at least one component is defined
   if (manifest.type === "language") {
-    if (!manifest.fresh?.grammar && !manifest.fresh?.language && !manifest.fresh?.lsp) {
+    if (
+      !manifest.fresh?.grammar && !manifest.fresh?.language &&
+      !manifest.fresh?.lsp
+    ) {
       return {
         valid: false,
-        error: "Language package must define at least one of: grammar, language, or lsp"
+        error:
+          "Language package must define at least one of: grammar, language, or lsp",
       };
     }
 
     // Validate grammar file exists if specified
     if (manifest.fresh?.grammar?.file) {
-      const grammarPath = editor.pathJoin(packageDir, manifest.fresh.grammar.file);
+      const grammarPath = editor.pathJoin(
+        packageDir,
+        manifest.fresh.grammar.file,
+      );
       if (!editor.fileExists(grammarPath)) {
         return {
           valid: false,
-          error: `Grammar file not found: ${manifest.fresh.grammar.file}`
+          error: `Grammar file not found: ${manifest.fresh.grammar.file}`,
         };
       }
     }
@@ -613,13 +688,15 @@ async function installPackage(
   url: string,
   name?: string,
   type: "plugin" | "theme" | "language" = "plugin",
-  version?: string
+  version?: string,
 ): Promise<boolean> {
   const parsed = parsePackageUrl(url);
   const packageName = name || parsed.name;
-  const packagesDir = type === "plugin" ? PACKAGES_DIR
-                    : type === "theme" ? THEMES_PACKAGES_DIR
-                    : LANGUAGES_PACKAGES_DIR;
+  const packagesDir = type === "plugin"
+    ? PACKAGES_DIR
+    : type === "theme"
+    ? THEMES_PACKAGES_DIR
+    : LANGUAGES_PACKAGES_DIR;
   const targetDir = editor.pathJoin(packagesDir, packageName);
 
   if (editor.fileExists(targetDir)) {
@@ -636,7 +713,12 @@ async function installPackage(
     return await installFromMonorepo(parsed, packageName, targetDir, version);
   } else {
     // Standard installation: clone directly
-    return await installFromRepo(parsed.repoUrl, packageName, targetDir, version);
+    return await installFromRepo(
+      parsed.repoUrl,
+      packageName,
+      targetDir,
+      version,
+    );
   }
 }
 
@@ -647,7 +729,7 @@ async function installFromRepo(
   repoUrl: string,
   packageName: string,
   targetDir: string,
-  version?: string
+  version?: string,
 ): Promise<boolean> {
   // Clone the repository
   const cloneArgs = ["clone"];
@@ -659,11 +741,13 @@ async function installFromRepo(
   const result = await gitCommand(cloneArgs);
 
   if (result.exit_code !== 0) {
-    const errorMsg = result.stderr.includes("not found") || result.stderr.includes("404")
-      ? "Repository not found"
-      : result.stderr.includes("Authentication") || result.stderr.includes("403")
-      ? "Access denied (repository may be private)"
-      : result.stderr.split("\n")[0] || "Clone failed";
+    const errorMsg =
+      result.stderr.includes("not found") || result.stderr.includes("404")
+        ? "Repository not found"
+        : result.stderr.includes("Authentication") ||
+            result.stderr.includes("403")
+        ? "Access denied (repository may be private)"
+        : result.stderr.split("\n")[0] || "Clone failed";
     editor.setStatus(`Failed to install ${packageName}: ${errorMsg}`);
     return false;
   }
@@ -672,7 +756,9 @@ async function installFromRepo(
   if (version && version !== "latest") {
     const checkoutResult = await checkoutVersion(targetDir, version);
     if (!checkoutResult) {
-      editor.setStatus(`Installed ${packageName} but failed to checkout version ${version}`);
+      editor.setStatus(
+        `Installed ${packageName} but failed to checkout version ${version}`,
+      );
     }
   }
 
@@ -691,15 +777,29 @@ async function installFromRepo(
   // Dynamically load plugins, reload themes, or load language packs
   if (manifest?.type === "plugin" && validation.entryPath) {
     await editor.loadPlugin(validation.entryPath);
-    editor.setStatus(`Installed and activated ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed and activated ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else if (manifest?.type === "theme") {
     editor.reloadThemes();
-    editor.setStatus(`Installed theme ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed theme ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else if (manifest?.type === "language") {
     await loadLanguagePack(targetDir, manifest);
-    editor.setStatus(`Installed language pack ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed language pack ${packageName}${
+        manifest ? ` v${manifest.version}` : ""
+      }`,
+    );
   } else {
-    editor.setStatus(`Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+    editor.setStatus(
+      `Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`,
+    );
   }
   return true;
 }
@@ -717,7 +817,7 @@ async function installFromMonorepo(
   parsed: ParsedPackageUrl,
   packageName: string,
   targetDir: string,
-  version?: string
+  version?: string,
 ): Promise<boolean> {
   const tempDir = `/tmp/fresh-pkg-${hashString(parsed.repoUrl)}-${Date.now()}`;
 
@@ -732,9 +832,11 @@ async function installFromMonorepo(
 
     const cloneResult = await gitCommand(cloneArgs);
     if (cloneResult.exit_code !== 0) {
-      const errorMsg = cloneResult.stderr.includes("not found") || cloneResult.stderr.includes("404")
+      const errorMsg = cloneResult.stderr.includes("not found") ||
+          cloneResult.stderr.includes("404")
         ? "Repository not found"
-        : cloneResult.stderr.includes("Authentication") || cloneResult.stderr.includes("403")
+        : cloneResult.stderr.includes("Authentication") ||
+            cloneResult.stderr.includes("403")
         ? "Access denied (repository may be private)"
         : cloneResult.stderr.split("\n")[0] || "Clone failed";
       editor.setStatus(`Failed to clone repository: ${errorMsg}`);
@@ -756,7 +858,11 @@ async function installFromMonorepo(
 
     // Copy subdirectory to target
     editor.setStatus(`Installing ${packageName} from ${parsed.subpath}...`);
-    const copyResult = await editor.spawnProcess("cp", ["-r", subpathDir, targetDir]);
+    const copyResult = await editor.spawnProcess("cp", [
+      "-r",
+      subpathDir,
+      targetDir,
+    ]);
     if (copyResult.exit_code !== 0) {
       editor.setStatus(`Failed to copy package: ${copyResult.stderr}`);
       await editor.spawnProcess("rm", ["-rf", tempDir]);
@@ -766,7 +872,9 @@ async function installFromMonorepo(
     // Validate package structure
     const validation = validatePackage(targetDir, packageName);
     if (!validation.valid) {
-      editor.warn(`[pkg] Invalid package '${packageName}': ${validation.error}`);
+      editor.warn(
+        `[pkg] Invalid package '${packageName}': ${validation.error}`,
+      );
       editor.setStatus(`Failed to install ${packageName}: ${validation.error}`);
       // Clean up the invalid package
       await editor.spawnProcess("rm", ["-rf", targetDir]);
@@ -779,24 +887,41 @@ async function installFromMonorepo(
       repository: parsed.repoUrl,
       subpath: parsed.subpath,
       installed_from: `${parsed.repoUrl}#${parsed.subpath}`,
-      installed_at: new Date().toISOString()
+      installed_at: new Date().toISOString(),
     };
-    await writeJsonFile(editor.pathJoin(targetDir, ".fresh-source.json"), sourceInfo);
+    await writeJsonFile(
+      editor.pathJoin(targetDir, ".fresh-source.json"),
+      sourceInfo,
+    );
 
     const manifest = validation.manifest;
 
     // Dynamically load plugins, reload themes, or load language packs
     if (manifest?.type === "plugin" && validation.entryPath) {
       await editor.loadPlugin(validation.entryPath);
-      editor.setStatus(`Installed and activated ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed and activated ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else if (manifest?.type === "theme") {
       editor.reloadThemes();
-      editor.setStatus(`Installed theme ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed theme ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else if (manifest?.type === "language") {
       await loadLanguagePack(targetDir, manifest);
-      editor.setStatus(`Installed language pack ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed language pack ${packageName}${
+          manifest ? ` v${manifest.version}` : ""
+        }`,
+      );
     } else {
-      editor.setStatus(`Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`);
+      editor.setStatus(
+        `Installed ${packageName}${manifest ? ` v${manifest.version}` : ""}`,
+      );
     }
     return true;
   } finally {
@@ -808,12 +933,18 @@ async function installFromMonorepo(
 /**
  * Load a language pack (register grammar, language config, and LSP server)
  */
-async function loadLanguagePack(packageDir: string, manifest: PackageManifest): Promise<void> {
+async function loadLanguagePack(
+  packageDir: string,
+  manifest: PackageManifest,
+): Promise<void> {
   const langId = manifest.name;
 
   // Register grammar if present
   if (manifest.fresh?.grammar) {
-    const grammarPath = editor.pathJoin(packageDir, manifest.fresh.grammar.file);
+    const grammarPath = editor.pathJoin(
+      packageDir,
+      manifest.fresh.grammar.file,
+    );
     const extensions = manifest.fresh.grammar.extensions || [];
     editor.registerGrammar(langId, grammarPath, extensions);
   }
@@ -829,10 +960,12 @@ async function loadLanguagePack(packageDir: string, manifest: PackageManifest): 
       tabSize: lang.tabSize ?? null,
       autoIndent: lang.autoIndent ?? null,
       showWhitespaceTabs: lang.showWhitespaceTabs ?? null,
-      formatter: lang.formatter ? {
-        command: lang.formatter.command,
-        args: lang.formatter.args ?? [],
-      } : null,
+      formatter: lang.formatter
+        ? {
+          command: lang.formatter.command,
+          args: lang.formatter.args ?? [],
+        }
+        : null,
     });
   }
 
@@ -854,13 +987,21 @@ async function loadLanguagePack(packageDir: string, manifest: PackageManifest): 
 /**
  * Checkout a specific version in a package directory
  */
-async function checkoutVersion(pkgPath: string, version: string): Promise<boolean> {
+async function checkoutVersion(
+  pkgPath: string,
+  version: string,
+): Promise<boolean> {
   let target: string;
 
   if (version === "latest") {
     // Get latest tag
-    const tagsResult = await gitCommand(["-C", `${pkgPath}`, "tag", "--sort=-v:refname"]);
-    const tags = tagsResult.stdout.split("\n").filter(t => t.trim());
+    const tagsResult = await gitCommand([
+      "-C",
+      `${pkgPath}`,
+      "tag",
+      "--sort=-v:refname",
+    ]);
+    const tags = tagsResult.stdout.split("\n").filter((t) => t.trim());
     target = tags[0] || "HEAD";
   } else if (version.startsWith("^") || version.startsWith("~")) {
     // Semver matching - find best matching tag
@@ -884,18 +1025,26 @@ async function checkoutVersion(pkgPath: string, version: string): Promise<boolea
 /**
  * Find best semver matching version
  */
-async function findMatchingSemver(pkgPath: string, spec: string): Promise<string> {
-  const tagsResult = await gitCommand(["-C", `${pkgPath}`, "tag", "--sort=-v:refname"]);
-  const tags = tagsResult.stdout.split("\n").filter(t => t.trim());
+async function findMatchingSemver(
+  pkgPath: string,
+  spec: string,
+): Promise<string> {
+  const tagsResult = await gitCommand([
+    "-C",
+    `${pkgPath}`,
+    "tag",
+    "--sort=-v:refname",
+  ]);
+  const tags = tagsResult.stdout.split("\n").filter((t) => t.trim());
 
   // Simple semver matching (^ means compatible, ~ means patch only)
   const prefix = spec.startsWith("^") ? "^" : "~";
   const baseVersion = spec.slice(1);
-  const [major, minor] = baseVersion.split(".").map(n => parseInt(n, 10));
+  const [major, minor] = baseVersion.split(".").map((n) => parseInt(n, 10));
 
   for (const tag of tags) {
     const version = tag.replace(/^v/, "");
-    const [tagMajor, tagMinor] = version.split(".").map(n => parseInt(n, 10));
+    const [tagMajor, tagMinor] = version.split(".").map((n) => parseInt(n, 10));
 
     if (prefix === "^") {
       // Compatible: same major
@@ -930,7 +1079,9 @@ async function updatePackage(pkg: InstalledPackage): Promise<boolean> {
       // Use listPlugins to find the correct runtime plugin name
       if (pkg.type === "plugin") {
         const loadedPlugins = await editor.listPlugins();
-        const plugin = loadedPlugins.find((p: { path: string }) => p.path.startsWith(pkg.path));
+        const plugin = loadedPlugins.find((p: { path: string }) =>
+          p.path.startsWith(pkg.path)
+        );
         if (plugin) {
           await editor.reloadPlugin(plugin.name);
         }
@@ -943,7 +1094,8 @@ async function updatePackage(pkg: InstalledPackage): Promise<boolean> {
   } else {
     const errorMsg = result.stderr.includes("Could not resolve host")
       ? "Network error"
-      : result.stderr.includes("Authentication") || result.stderr.includes("403")
+      : result.stderr.includes("Authentication") ||
+          result.stderr.includes("403")
       ? "Authentication failed"
       : result.stderr.split("\n")[0] || "Update failed";
     editor.setStatus(`Failed to update ${pkg.name}: ${errorMsg}`);
@@ -961,7 +1113,9 @@ async function removePackage(pkg: InstalledPackage): Promise<boolean> {
   // Use listPlugins to find the correct runtime plugin name by matching path
   if (pkg.type === "plugin") {
     const loadedPlugins = await editor.listPlugins();
-    const plugin = loadedPlugins.find((p: { path: string }) => p.path.startsWith(pkg.path));
+    const plugin = loadedPlugins.find((p: { path: string }) =>
+      p.path.startsWith(pkg.path)
+    );
     if (plugin) {
       await editor.unloadPlugin(plugin.name).catch(() => {});
     }
@@ -1003,7 +1157,9 @@ async function updateAllPackages(): Promise<void> {
   let failed = 0;
 
   for (const pkg of all) {
-    editor.setStatus(`Updating ${pkg.name} (${updated + failed + 1}/${all.length})...`);
+    editor.setStatus(
+      `Updating ${pkg.name} (${updated + failed + 1}/${all.length})...`,
+    );
     const result = await gitCommand(["-C", `${pkg.path}`, "pull", "--ff-only"]);
 
     if (result.exit_code === 0) {
@@ -1015,7 +1171,11 @@ async function updateAllPackages(): Promise<void> {
     }
   }
 
-  editor.setStatus(`Update complete: ${updated} updated, ${all.length - updated - failed} unchanged, ${failed} failed`);
+  editor.setStatus(
+    `Update complete: ${updated} updated, ${
+      all.length - updated - failed
+    } unchanged, ${failed} failed`,
+  );
 }
 
 // =============================================================================
@@ -1035,18 +1195,23 @@ async function generateLockfile(): Promise<void> {
   const lockfile: Lockfile = {
     lockfile_version: 1,
     generated: new Date().toISOString(),
-    packages: {}
+    packages: {},
   };
 
   for (const pkg of all) {
     // Get current commit
-    const commitResult = await gitCommand(["-C", `${pkg.path}`, "rev-parse", "HEAD"]);
+    const commitResult = await gitCommand([
+      "-C",
+      `${pkg.path}`,
+      "rev-parse",
+      "HEAD",
+    ]);
     const commit = commitResult.stdout.trim();
 
     lockfile.packages[pkg.name] = {
       source: pkg.source,
       commit,
-      version: pkg.version
+      version: pkg.version,
     };
   }
 
@@ -1073,7 +1238,11 @@ async function installFromLockfile(): Promise<void> {
   let failed = 0;
 
   for (const [name, entry] of Object.entries(lockfile.packages)) {
-    editor.setStatus(`Installing ${name} (${installed + failed + 1}/${Object.keys(lockfile.packages).length})...`);
+    editor.setStatus(
+      `Installing ${name} (${installed + failed + 1}/${
+        Object.keys(lockfile.packages).length
+      })...`,
+    );
 
     // Check if already installed
     const pluginPath = editor.pathJoin(PACKAGES_DIR, name);
@@ -1083,7 +1252,12 @@ async function installFromLockfile(): Promise<void> {
       // Already installed, just checkout the commit
       const path = editor.fileExists(pluginPath) ? pluginPath : themePath;
       await gitCommand(["-C", `${path}`, "fetch"]);
-      const result = await gitCommand(["-C", `${path}`, "checkout", entry.commit]);
+      const result = await gitCommand([
+        "-C",
+        `${path}`,
+        "checkout",
+        entry.commit,
+      ]);
       if (result.exit_code === 0) {
         installed++;
       } else {
@@ -1092,7 +1266,11 @@ async function installFromLockfile(): Promise<void> {
     } else {
       // Need to clone
       await ensureDir(PACKAGES_DIR);
-      const result = await gitCommand(["clone", `${entry.source}`, `${pluginPath}`]);
+      const result = await gitCommand([
+        "clone",
+        `${entry.source}`,
+        `${pluginPath}`,
+      ]);
 
       if (result.exit_code === 0) {
         await gitCommand(["-C", `${pluginPath}`, "checkout", entry.commit]);
@@ -1103,7 +1281,9 @@ async function installFromLockfile(): Promise<void> {
     }
   }
 
-  editor.setStatus(`Lockfile install complete: ${installed} installed, ${failed} failed`);
+  editor.setStatus(
+    `Lockfile install complete: ${installed} installed, ${failed} failed`,
+  );
 }
 
 // =============================================================================
@@ -1134,11 +1314,11 @@ interface PackageListItem {
 
 // Focus target types for Tab navigation
 type FocusTarget =
-  | { type: "filter"; index: number }  // 0=All, 1=Installed, 2=Plugins, 3=Themes, 4=Languages
+  | { type: "filter"; index: number } // 0=All, 1=Installed, 2=Plugins, 3=Themes, 4=Languages
   | { type: "sync" }
   | { type: "search" }
-  | { type: "list" }  // Package list (use arrows to navigate)
-  | { type: "action"; index: number };  // Action buttons for selected package
+  | { type: "list" } // Package list (use arrows to navigate)
+  | { type: "action"; index: number }; // Action buttons for selected package
 
 interface PkgManagerState {
   isOpen: boolean;
@@ -1149,7 +1329,7 @@ interface PkgManagerState {
   searchQuery: string;
   items: PackageListItem[];
   selectedIndex: number;
-  focus: FocusTarget;  // What element has Tab focus
+  focus: FocusTarget; // What element has Tab focus
   isLoading: boolean;
 }
 
@@ -1183,7 +1363,7 @@ const pkgTheme: Record<string, ThemeColor> = {
   available: { fg: { theme: "editor.fg", rgb: [200, 200, 210] } },
   selected: {
     fg: { theme: "ui.menu_active_fg", rgb: [255, 255, 255] },
-    bg: { theme: "ui.menu_active_bg", rgb: [50, 80, 120] }
+    bg: { theme: "ui.menu_active_bg", rgb: [50, 80, 120] },
   },
 
   // Descriptions and details
@@ -1201,14 +1381,14 @@ const pkgTheme: Record<string, ThemeColor> = {
   // Filter buttons
   filterActive: {
     fg: { rgb: [255, 255, 255] },
-    bg: { theme: "syntax.keyword", rgb: [60, 100, 160] }
+    bg: { theme: "syntax.keyword", rgb: [60, 100, 160] },
   },
   filterInactive: {
     fg: { rgb: [160, 160, 170] },
   },
   filterFocused: {
     fg: { rgb: [255, 255, 255] },
-    bg: { rgb: [80, 80, 90] }
+    bg: { rgb: [80, 80, 90] },
   },
 
   // Action buttons
@@ -1217,17 +1397,17 @@ const pkgTheme: Record<string, ThemeColor> = {
   },
   buttonFocused: {
     fg: { rgb: [255, 255, 255] },
-    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] }
+    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] },
   },
 
   // Search box - distinct input field appearance
   searchBox: {
     fg: { rgb: [200, 200, 210] },
-    bg: { rgb: [40, 42, 48] }
+    bg: { rgb: [40, 42, 48] },
   },
   searchBoxFocused: {
     fg: { rgb: [255, 255, 255] },
-    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] }
+    bg: { theme: "syntax.keyword", rgb: [60, 110, 180] },
   },
 
   // Status indicators
@@ -1236,7 +1416,12 @@ const pkgTheme: Record<string, ThemeColor> = {
 };
 
 /** Extract theme colors with fallback to RGB - simplifies theme access */
-function themeColor(style: ThemeColor): { fg?: string | [number, number, number]; bg?: string | [number, number, number] } {
+function themeColor(
+  style: ThemeColor,
+): {
+  fg?: string | [number, number, number];
+  bg?: string | [number, number, number];
+} {
   return {
     fg: style.fg?.theme ?? style.fg?.rgb,
     bg: style.bg?.theme ?? style.bg?.rgb,
@@ -1244,12 +1429,16 @@ function themeColor(style: ThemeColor): { fg?: string | [number, number, number]
 }
 
 /** Get fg color from theme style */
-function themeFg(style: ThemeColor): string | [number, number, number] | undefined {
+function themeFg(
+  style: ThemeColor,
+): string | [number, number, number] | undefined {
   return style.fg?.theme ?? style.fg?.rgb;
 }
 
 /** Get bg color from theme style */
-function themeBg(style: ThemeColor): string | [number, number, number] | undefined {
+function themeBg(
+  style: ThemeColor,
+): string | [number, number, number] | undefined {
   return style.bg?.theme ?? style.bg?.rgb;
 }
 
@@ -1266,7 +1455,7 @@ editor.defineMode(
     ["Escape", "pkg_back_or_close"],
     ["/", "pkg_search"],
   ],
-  true // read-only
+  true, // read-only
 );
 
 // Define pkg-detail mode for package details view
@@ -1281,7 +1470,7 @@ editor.defineMode(
     ["S-Tab", "pkg_prev_button"],
     ["Escape", "pkg_back_or_close"],
   ],
-  true // read-only
+  true, // read-only
 );
 
 /**
@@ -1296,7 +1485,13 @@ function buildPackageList(): PackageListItem[] {
   const installedLanguages = getInstalledPackages("language");
   const installedMap = new Map<string, InstalledPackage>();
 
-  for (const pkg of [...installedPlugins, ...installedThemes, ...installedLanguages]) {
+  for (
+    const pkg of [
+      ...installedPlugins,
+      ...installedThemes,
+      ...installedLanguages,
+    ]
+  ) {
     installedMap.set(pkg.name, pkg);
     items.push({
       type: "installed",
@@ -1399,26 +1594,26 @@ function getFilteredItems(): PackageListItem[] {
   // Apply filter
   switch (pkgState.filter) {
     case "installed":
-      items = items.filter(i => i.installed);
+      items = items.filter((i) => i.installed);
       break;
     case "plugins":
-      items = items.filter(i => i.packageType === "plugin");
+      items = items.filter((i) => i.packageType === "plugin");
       break;
     case "themes":
-      items = items.filter(i => i.packageType === "theme");
+      items = items.filter((i) => i.packageType === "theme");
       break;
     case "languages":
-      items = items.filter(i => i.packageType === "language");
+      items = items.filter((i) => i.packageType === "language");
       break;
   }
 
   // Apply search (case insensitive)
   if (pkgState.searchQuery) {
     const query = pkgState.searchQuery.toLowerCase();
-    items = items.filter(i =>
+    items = items.filter((i) =>
       i.name.toLowerCase().includes(query) ||
       (i.description && i.description.toLowerCase().includes(query)) ||
-      (i.keywords && i.keywords.some(k => k.toLowerCase().includes(query)))
+      (i.keywords && i.keywords.some((k) => k.toLowerCase().includes(query)))
     );
   }
 
@@ -1444,7 +1639,7 @@ function formatNumber(n: number | undefined): string {
 }
 
 // Layout constants
-const LIST_WIDTH = 36;  // Width of left panel (package list)
+const LIST_WIDTH = 36; // Width of left panel (package list)
 const TOTAL_WIDTH = 88; // Total width of UI
 const DETAIL_WIDTH = TOTAL_WIDTH - LIST_WIDTH - 3; // Right panel width (minus divider)
 
@@ -1487,7 +1682,9 @@ function wrapText(text: string, maxWidth: number): string[] {
       currentLine += (currentLine ? " " : "") + word;
     } else {
       if (currentLine) lines.push(currentLine);
-      currentLine = word.length > maxWidth ? word.slice(0, maxWidth - 1) + "…" : word;
+      currentLine = word.length > maxWidth
+        ? word.slice(0, maxWidth - 1) + "…"
+        : word;
     }
   }
   if (currentLine) lines.push(currentLine);
@@ -1506,9 +1703,10 @@ function renderPkgManagerUI(): void {
   const builder = new VirtualBufferBuilder(pkgState.bufferId, "pkg");
   const items = getFilteredItems();
   const selectedItem = items.length > 0 && pkgState.selectedIndex < items.length
-    ? items[pkgState.selectedIndex] : null;
-  const installedItems = items.filter(i => i.installed);
-  const availableItems = items.filter(i => !i.installed);
+    ? items[pkgState.selectedIndex]
+    : null;
+  const installedItems = items.filter((i) => i.installed);
+  const availableItems = items.filter((i) => !i.installed);
 
   // === HEADER ===
   builder.styled(" Packages\n", themeFg(pkgTheme.header));
@@ -1517,100 +1715,133 @@ function renderPkgManagerUI(): void {
   // === SEARCH BAR ===
   const searchFocused = isButtonFocused("search");
   const searchText = pkgState.searchQuery || "";
-  const searchDisplay = searchText.length > 29 ? searchText.slice(0, 27) + "…" : searchText.padEnd(30);
-  const searchStyle = themeColor(searchFocused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox);
+  const searchDisplay = searchText.length > 29
+    ? searchText.slice(0, 27) + "…"
+    : searchText.padEnd(30);
+  const searchStyle = themeColor(
+    searchFocused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox,
+  );
 
   builder.styled(" Search: ", themeFg(pkgTheme.infoLabel));
-  builder.styled(searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `, searchStyle.fg, searchStyle.bg);
+  builder.styled(
+    searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `,
+    searchStyle.fg,
+    searchStyle.bg,
+  );
   builder.newline();
 
   // === FILTER BAR ===
-  const filters = ["All", "Installed", "Plugins", "Themes", "Languages"];
-  const filterIds = ["all", "installed", "plugins", "themes", "languages"];
-
-  builder.text(" ");
-  for (let i = 0; i < filters.length; i++) {
-    const isActive = pkgState.filter === filterIds[i];
-    const isFocused = isButtonFocused("filter", i);
-    const style = themeColor(
-      isFocused ? (isActive ? pkgTheme.buttonFocused : pkgTheme.filterFocused)
-                : (isActive ? pkgTheme.filterActive : pkgTheme.filterInactive)
-    );
-    const btn = new ButtonControl(filters[i], isFocused ? FocusState.Focused : FocusState.Normal);
-    builder.styled(btn.render().text, style.fg, style.bg);
-  }
-
-  builder.text("  ");
+  const filterOptions: FilterOption[] = [
+    { id: "all", label: "All" },
+    { id: "installed", label: "Installed" },
+    { id: "plugins", label: "Plugins" },
+    { id: "themes", label: "Themes" },
+    { id: "languages", label: "Languages" },
+  ];
+  const focusedFilterIdx = pkgState.focus.type === "filter"
+    ? pkgState.focus.index
+    : -1;
+  const filterBar = new FilterBar(
+    filterOptions,
+    pkgState.filter,
+    focusedFilterIdx,
+    {
+      activeFg: themeFg(pkgTheme.filterActive),
+      activeBg: themeBg(pkgTheme.filterActive),
+      inactiveFg: themeFg(pkgTheme.filterInactive),
+      focusedFg: themeFg(pkgTheme.filterFocused),
+      focusedBg: themeBg(pkgTheme.filterFocused),
+    },
+  );
+  builder.text(" ").control(filterBar.render()).text("  ");
 
   // Sync button
   const syncFocused = isButtonFocused("sync");
-  const syncStyle = themeColor(syncFocused ? pkgTheme.buttonFocused : pkgTheme.button);
-  builder.styled(new ButtonControl("Sync", syncFocused ? FocusState.Focused : FocusState.Normal).render().text, syncStyle.fg, syncStyle.bg);
+  const syncStyle = themeColor(
+    syncFocused ? pkgTheme.buttonFocused : pkgTheme.button,
+  );
+  builder.styled(
+    new ButtonControl(
+      "Sync",
+      syncFocused ? FocusState.Focused : FocusState.Normal,
+    ).render().text,
+    syncStyle.fg,
+    syncStyle.bg,
+  );
   builder.newline();
 
   // === TOP SEPARATOR ===
-  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", themeFg(pkgTheme.separator));
+  builder.styled(
+    " " + "─".repeat(TOTAL_WIDTH - 2) + "\n",
+    themeFg(pkgTheme.separator),
+  );
 
   // === SPLIT VIEW: Package list on left, Details on right ===
   const leftLines = buildLeftPanel(installedItems, availableItems, items);
   const rightLines = buildRightPanel(selectedItem);
 
-  // Merge left and right panels into rows
-  const maxRows = Math.max(leftLines.length, rightLines.length, 8);
-  for (let i = 0; i < maxRows; i++) {
-    const leftItem = leftLines[i];
-    const rightItem = rightLines[i];
-
-    // Left side (padded to fixed width)
-    const leftText = leftItem ? (" " + leftItem.text).padEnd(LIST_WIDTH) : " ".repeat(LIST_WIDTH);
-    if (leftItem) {
-      builder.styled(leftText, leftItem.fg, leftItem.bg);
-    } else {
-      builder.text(leftText);
-    }
-
-    // Divider
-    builder.styled("│", themeFg(pkgTheme.divider));
-
-    // Right side
-    const rightText = rightItem ? " " + rightItem.text : "";
-    if (rightItem) {
-      builder.styled(rightText, rightItem.fg, rightItem.bg);
-    } else {
-      builder.text(rightText);
-    }
-
-    builder.newline();
-  }
+  const splitView = new SplitView(leftLines, rightLines, {
+    leftWidth: LIST_WIDTH,
+    divider: "│",
+    dividerFg: themeFg(pkgTheme.divider),
+    minRows: 8,
+    leftPadding: " ",
+    rightPadding: " ",
+  });
+  builder.control(splitView.render());
 
   // === BOTTOM SEPARATOR ===
-  builder.styled(" " + "─".repeat(TOTAL_WIDTH - 2) + "\n", themeFg(pkgTheme.separator));
+  builder.styled(
+    " " + "─".repeat(TOTAL_WIDTH - 2) + "\n",
+    themeFg(pkgTheme.separator),
+  );
 
   // === HELP LINE ===
-  const actionLabel = { action: "Activate", filter: "Filter", sync: "Sync", search: "Search", list: "Select" }[pkgState.focus.type] || "Select";
-  builder.styled(` ↑↓ Navigate  Tab Next  / Search  Enter ${actionLabel}  Esc Close\n`, themeFg(pkgTheme.help));
+  const actionLabel = {
+    action: "Activate",
+    filter: "Filter",
+    sync: "Sync",
+    search: "Search",
+    list: "Select",
+  }[pkgState.focus.type] || "Select";
+  const helpBindings: KeyBinding[] = [
+    { key: "↑↓", action: "Navigate" },
+    { key: "Tab", action: "Next" },
+    { key: "/", action: "Search" },
+    { key: "Enter", action: actionLabel },
+    { key: "Esc", action: "Close" },
+  ];
+  const helpBar = new HelpBar(helpBindings, { fg: themeFg(pkgTheme.help) });
+  builder.control(helpBar.render()).newline();
 
   // Build and apply to buffer
   builder.build();
 }
 
-/** Line item for the split-view panels */
-interface PanelLine {
-  text: string;
-  fg?: string | [number, number, number];
-  bg?: string | [number, number, number];
-}
-
 /** Format a package item for the list - handles both installed and available */
-function formatPackageItem(item: PackageListItem, _selected: boolean, _index: number): string {
+function formatPackageItem(
+  item: PackageListItem,
+  _selected: boolean,
+  _index: number,
+): string {
   if (item.installed) {
     const status = item.updateAvailable ? "↑" : "✓";
-    const ver = item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
-    const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
+    const ver = item.version.length > 7
+      ? item.version.slice(0, 6) + "…"
+      : item.version;
+    const name = item.name.length > 18
+      ? item.name.slice(0, 17) + "…"
+      : item.name;
     return `${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
   } else {
-    const typeTag = item.packageType === "theme" ? "T" : item.packageType === "language" ? "L" : "P";
-    const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
+    const typeTag = item.packageType === "theme"
+      ? "T"
+      : item.packageType === "language"
+      ? "L"
+      : "P";
+    const name = item.name.length > 22
+      ? item.name.slice(0, 21) + "…"
+      : item.name;
     return `${name.padEnd(22)} [${typeTag}]`;
   }
 }
@@ -1619,7 +1850,7 @@ function formatPackageItem(item: PackageListItem, _selected: boolean, _index: nu
 function buildLeftPanel(
   installedItems: PackageListItem[],
   availableItems: PackageListItem[],
-  allItems: PackageListItem[]
+  allItems: PackageListItem[],
 ): PanelLine[] {
   // Empty state
   if (allItems.length === 0) {
@@ -1639,23 +1870,33 @@ function buildLeftPanel(
   const groups: ListGroup<PackageListItem>[] = [];
 
   if (installedItems.length > 0) {
-    groups.push({ title: `INSTALLED (${installedItems.length})`, items: installedItems });
+    groups.push({
+      title: `INSTALLED (${installedItems.length})`,
+      items: installedItems,
+    });
   }
   if (availableItems.length > 0) {
-    groups.push({ title: `AVAILABLE (${availableItems.length})`, items: availableItems });
+    groups.push({
+      title: `AVAILABLE (${availableItems.length})`,
+      items: availableItems,
+    });
   }
 
-  const list = new GroupedListControl<PackageListItem>(groups, formatPackageItem, {
-    selectionPrefix: listFocused ? "▸ " : "  ",
-    emptyPrefix: "  ",
-    titleFg: themeFg(pkgTheme.sectionTitle),
-    selectedFg: themeFg(pkgTheme.selected),
-    selectedBg: themeBg(pkgTheme.selected),
-  });
+  const list = new GroupedListControl<PackageListItem>(
+    groups,
+    formatPackageItem,
+    {
+      selectionPrefix: listFocused ? "▸ " : "  ",
+      emptyPrefix: "  ",
+      titleFg: themeFg(pkgTheme.sectionTitle),
+      selectedFg: themeFg(pkgTheme.selected),
+      selectedBg: themeBg(pkgTheme.selected),
+    },
+  );
   list.selectedIndex = pkgState.selectedIndex;
 
   // Convert renderLines output to PanelLine format
-  return list.renderLines().map(line => ({
+  return list.renderLines().map((line) => ({
     text: line.text,
     fg: line.fg as PanelLine["fg"],
     bg: line.bg as PanelLine["bg"],
@@ -1669,13 +1910,20 @@ function buildRightPanel(selectedItem: PackageListItem | null): PanelLine[] {
   if (selectedItem) {
     // Package name
     lines.push({ text: selectedItem.name, fg: themeFg(pkgTheme.header) });
-    lines.push({ text: "─".repeat(Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2)), fg: themeFg(pkgTheme.separator) });
+    lines.push({
+      text: "─".repeat(
+        Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2),
+      ),
+      fg: themeFg(pkgTheme.separator),
+    });
 
     // Version / Author / License
     let metaLine = `v${selectedItem.version}`;
     if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
     if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
-    if (metaLine.length > DETAIL_WIDTH - 2) metaLine = metaLine.slice(0, DETAIL_WIDTH - 5) + "...";
+    if (metaLine.length > DETAIL_WIDTH - 2) {
+      metaLine = metaLine.slice(0, DETAIL_WIDTH - 5) + "...";
+    }
     lines.push({ text: metaLine, fg: themeFg(pkgTheme.infoLabel) });
 
     lines.push({ text: "" });
@@ -1690,14 +1938,20 @@ function buildRightPanel(selectedItem: PackageListItem | null): PanelLine[] {
 
     // Keywords
     if (selectedItem.keywords && selectedItem.keywords.length > 0) {
-      lines.push({ text: `Tags: ${selectedItem.keywords.slice(0, 4).join(", ")}`, fg: themeFg(pkgTheme.infoLabel) });
+      lines.push({
+        text: `Tags: ${selectedItem.keywords.slice(0, 4).join(", ")}`,
+        fg: themeFg(pkgTheme.infoLabel),
+      });
       lines.push({ text: "" });
     }
 
     // Repository URL
     if (selectedItem.repository) {
-      let displayUrl = selectedItem.repository.replace(/^https?:\/\//, "").replace(/\.git$/, "");
-      if (displayUrl.length > DETAIL_WIDTH - 2) displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
+      let displayUrl = selectedItem.repository.replace(/^https?:\/\//, "")
+        .replace(/\.git$/, "");
+      if (displayUrl.length > DETAIL_WIDTH - 2) {
+        displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
+      }
       lines.push({ text: displayUrl, fg: themeFg(pkgTheme.infoLabel) });
       lines.push({ text: "" });
     }
@@ -1705,8 +1959,17 @@ function buildRightPanel(selectedItem: PackageListItem | null): PanelLine[] {
     // Action buttons
     for (let i = 0; i < getActionButtons().length; i++) {
       const focused = isButtonFocused("action", i);
-      const style = themeColor(focused ? pkgTheme.buttonFocused : pkgTheme.button);
-      lines.push({ text: new ButtonControl(getActionButtons()[i], focused ? FocusState.Focused : FocusState.Normal).render().text, fg: style.fg, bg: style.bg });
+      const style = themeColor(
+        focused ? pkgTheme.buttonFocused : pkgTheme.button,
+      );
+      lines.push({
+        text: new ButtonControl(
+          getActionButtons()[i],
+          focused ? FocusState.Focused : FocusState.Normal,
+        ).render().text,
+        fg: style.fg,
+        bg: style.bg,
+      });
     }
   } else {
     lines.push({ text: "Select a package", fg: themeFg(pkgTheme.emptyState) });
@@ -1715,7 +1978,6 @@ function buildRightPanel(selectedItem: PackageListItem | null): PanelLine[] {
 
   return lines;
 }
-
 
 /**
  * Update the package manager view
@@ -1808,11 +2070,11 @@ function closePackageManager(): void {
 function getFocusOrder(): FocusTarget[] {
   const order: FocusTarget[] = [
     { type: "search" },
-    { type: "filter", index: 0 },  // All
-    { type: "filter", index: 1 },  // Installed
-    { type: "filter", index: 2 },  // Plugins
-    { type: "filter", index: 3 },  // Themes
-    { type: "filter", index: 4 },  // Languages
+    { type: "filter", index: 0 }, // All
+    { type: "filter", index: 1 }, // Installed
+    { type: "filter", index: 2 }, // Plugins
+    { type: "filter", index: 3 }, // Themes
+    { type: "filter", index: 4 }, // Languages
     { type: "sync" },
     { type: "list" },
   ];
@@ -1845,7 +2107,7 @@ function getCurrentFocusIndex(): number {
 }
 
 // Navigation commands
-globalThis.pkg_nav_up = function(): void {
+globalThis.pkg_nav_up = function (): void {
   if (!pkgState.isOpen) return;
 
   const items = getFilteredItems();
@@ -1857,19 +2119,22 @@ globalThis.pkg_nav_up = function(): void {
   updatePkgManagerView();
 };
 
-globalThis.pkg_nav_down = function(): void {
+globalThis.pkg_nav_down = function (): void {
   if (!pkgState.isOpen) return;
 
   const items = getFilteredItems();
   if (items.length === 0) return;
 
   // Always focus list and navigate (auto-focus behavior)
-  pkgState.selectedIndex = Math.min(items.length - 1, pkgState.selectedIndex + 1);
+  pkgState.selectedIndex = Math.min(
+    items.length - 1,
+    pkgState.selectedIndex + 1,
+  );
   pkgState.focus = { type: "list" };
   updatePkgManagerView();
 };
 
-globalThis.pkg_next_button = function(): void {
+globalThis.pkg_next_button = function (): void {
   if (!pkgState.isOpen) return;
 
   const order = getFocusOrder();
@@ -1879,7 +2144,7 @@ globalThis.pkg_next_button = function(): void {
   updatePkgManagerView();
 };
 
-globalThis.pkg_prev_button = function(): void {
+globalThis.pkg_prev_button = function (): void {
   if (!pkgState.isOpen) return;
 
   const order = getFocusOrder();
@@ -1889,14 +2154,20 @@ globalThis.pkg_prev_button = function(): void {
   updatePkgManagerView();
 };
 
-globalThis.pkg_activate = async function(): Promise<void> {
+globalThis.pkg_activate = async function (): Promise<void> {
   if (!pkgState.isOpen) return;
 
   const focus = pkgState.focus;
 
   // Handle filter button activation
   if (focus.type === "filter") {
-    const filters = ["all", "installed", "plugins", "themes", "languages"] as const;
+    const filters = [
+      "all",
+      "installed",
+      "plugins",
+      "themes",
+      "languages",
+    ] as const;
     pkgState.filter = filters[focus.index];
     pkgState.selectedIndex = 0;
     pkgState.items = buildPackageList();
@@ -1952,18 +2223,25 @@ globalThis.pkg_activate = async function(): Promise<void> {
       await removePackage(item.installedPackage);
       pkgState.items = buildPackageList();
       const newItems = getFilteredItems();
-      pkgState.selectedIndex = Math.min(pkgState.selectedIndex, Math.max(0, newItems.length - 1));
+      pkgState.selectedIndex = Math.min(
+        pkgState.selectedIndex,
+        Math.max(0, newItems.length - 1),
+      );
       pkgState.focus = { type: "list" };
       updatePkgManagerView();
     } else if (actionName === "Install" && item.registryEntry) {
-      await installPackage(item.registryEntry.repository, item.name, item.packageType);
+      await installPackage(
+        item.registryEntry.repository,
+        item.name,
+        item.packageType,
+      );
       pkgState.items = buildPackageList();
       updatePkgManagerView();
     }
   }
 };
 
-globalThis.pkg_back_or_close = function(): void {
+globalThis.pkg_back_or_close = function (): void {
   if (!pkgState.isOpen) return;
 
   // If focus is on action buttons, go back to list
@@ -1977,28 +2255,32 @@ globalThis.pkg_back_or_close = function(): void {
   closePackageManager();
 };
 
-globalThis.pkg_scroll_up = function(): void {
+globalThis.pkg_scroll_up = function (): void {
   // Just move cursor up in detail view
   editor.executeAction("move_up");
 };
 
-globalThis.pkg_scroll_down = function(): void {
+globalThis.pkg_scroll_down = function (): void {
   // Just move cursor down in detail view
   editor.executeAction("move_down");
 };
 
-globalThis.pkg_search = function(): void {
+globalThis.pkg_search = function (): void {
   if (!pkgState.isOpen) return;
 
   // Pre-fill with current search query so typing replaces it
   if (pkgState.searchQuery) {
-    editor.startPromptWithInitial("Search packages: ", "pkg-search", pkgState.searchQuery);
+    editor.startPromptWithInitial(
+      "Search packages: ",
+      "pkg-search",
+      pkgState.searchQuery,
+    );
   } else {
     editor.startPrompt("Search packages: ", "pkg-search");
   }
 };
 
-globalThis.onPkgSearchConfirmed = function(args: {
+globalThis.onPkgSearchConfirmed = function (args: {
   prompt_type: string;
   selected_index: number | null;
   input: string;
@@ -2021,13 +2303,13 @@ const registryFinder = new Finder<[string, RegistryEntry]>(editor, {
   format: ([name, entry]) => ({
     label: name,
     description: entry.description,
-    metadata: { name, entry }
+    metadata: { name, entry },
   }),
   preview: false,
   maxResults: 100,
   onSelect: async ([name, entry]) => {
     await installPackage(entry.repository, name, "plugin");
-  }
+  },
 });
 
 // =============================================================================
@@ -2037,14 +2319,18 @@ const registryFinder = new Finder<[string, RegistryEntry]>(editor, {
 /**
  * Browse and install plugins from registry
  */
-globalThis.pkg_install_plugin = async function(): Promise<void> {
+globalThis.pkg_install_plugin = async function (): Promise<void> {
   editor.debug("[pkg] pkg_install_plugin called");
   try {
     // Always sync registry to ensure latest plugins are available
     await syncRegistry();
 
     const registry = loadRegistry("plugins");
-    editor.debug(`[pkg] loaded registry with ${Object.keys(registry.packages).length} packages`);
+    editor.debug(
+      `[pkg] loaded registry with ${
+        Object.keys(registry.packages).length
+      } packages`,
+    );
     const entries = Object.entries(registry.packages);
     editor.debug(`[pkg] entries.length = ${entries.length}`);
 
@@ -2060,8 +2346,8 @@ globalThis.pkg_install_plugin = async function(): Promise<void> {
       title: "Install Plugin:",
       source: {
         mode: "filter",
-        load: async () => entries
-      }
+        load: async () => entries,
+      },
     });
   } catch (e) {
     editor.debug(`[pkg] Error in pkg_install_plugin: ${e}`);
@@ -2072,14 +2358,18 @@ globalThis.pkg_install_plugin = async function(): Promise<void> {
 /**
  * Browse and install themes from registry
  */
-globalThis.pkg_install_theme = async function(): Promise<void> {
+globalThis.pkg_install_theme = async function (): Promise<void> {
   editor.debug("[pkg] pkg_install_theme called");
   try {
     // Always sync registry to ensure latest themes are available
     await syncRegistry();
 
     const registry = loadRegistry("themes");
-    editor.debug(`[pkg] loaded registry with ${Object.keys(registry.packages).length} themes`);
+    editor.debug(
+      `[pkg] loaded registry with ${
+        Object.keys(registry.packages).length
+      } themes`,
+    );
     const entries = Object.entries(registry.packages);
 
     if (entries.length === 0) {
@@ -2091,8 +2381,8 @@ globalThis.pkg_install_theme = async function(): Promise<void> {
       title: "Install Theme:",
       source: {
         mode: "filter",
-        load: async () => entries
-      }
+        load: async () => entries,
+      },
     });
   } catch (e) {
     editor.debug(`[pkg] Error in pkg_install_theme: ${e}`);
@@ -2103,11 +2393,11 @@ globalThis.pkg_install_theme = async function(): Promise<void> {
 /**
  * Install from git URL
  */
-globalThis.pkg_install_url = function(): void {
+globalThis.pkg_install_url = function (): void {
   editor.startPrompt("Git URL:", "pkg-install-url");
 };
 
-globalThis.onPkgInstallUrlConfirmed = async function(args: {
+globalThis.onPkgInstallUrlConfirmed = async function (args: {
   prompt_type: string;
   selected_index: number | null;
   input: string;
@@ -2129,21 +2419,21 @@ editor.on("prompt_confirmed", "onPkgInstallUrlConfirmed");
 /**
  * Open the package manager UI
  */
-globalThis.pkg_list = async function(): Promise<void> {
+globalThis.pkg_list = async function (): Promise<void> {
   await openPackageManager();
 };
 
 /**
  * Update all packages
  */
-globalThis.pkg_update_all = async function(): Promise<void> {
+globalThis.pkg_update_all = async function (): Promise<void> {
   await updateAllPackages();
 };
 
 /**
  * Update a specific package
  */
-globalThis.pkg_update = function(): void {
+globalThis.pkg_update = function (): void {
   const plugins = getInstalledPackages("plugin");
   const themes = getInstalledPackages("theme");
   const all = [...plugins, ...themes];
@@ -2158,27 +2448,27 @@ globalThis.pkg_update = function(): void {
     format: (pkg) => ({
       label: pkg.name,
       description: `${pkg.type} | ${pkg.version}`,
-      metadata: pkg
+      metadata: pkg,
     }),
     preview: false,
     onSelect: async (pkg) => {
       await updatePackage(pkg);
-    }
+    },
   });
 
   finder.prompt({
     title: "Update Package:",
     source: {
       mode: "filter",
-      load: async () => all
-    }
+      load: async () => all,
+    },
   });
 };
 
 /**
  * Remove a package
  */
-globalThis.pkg_remove = function(): void {
+globalThis.pkg_remove = function (): void {
   const plugins = getInstalledPackages("plugin");
   const themes = getInstalledPackages("theme");
   const all = [...plugins, ...themes];
@@ -2193,34 +2483,34 @@ globalThis.pkg_remove = function(): void {
     format: (pkg) => ({
       label: pkg.name,
       description: `${pkg.type} | ${pkg.version}`,
-      metadata: pkg
+      metadata: pkg,
     }),
     preview: false,
     onSelect: async (pkg) => {
       await removePackage(pkg);
-    }
+    },
   });
 
   finder.prompt({
     title: "Remove Package:",
     source: {
       mode: "filter",
-      load: async () => all
-    }
+      load: async () => all,
+    },
   });
 };
 
 /**
  * Sync registry
  */
-globalThis.pkg_sync = async function(): Promise<void> {
+globalThis.pkg_sync = async function (): Promise<void> {
   await syncRegistry();
 };
 
 /**
  * Show outdated packages
  */
-globalThis.pkg_outdated = async function(): Promise<void> {
+globalThis.pkg_outdated = async function (): Promise<void> {
   const plugins = getInstalledPackages("plugin");
   const themes = getInstalledPackages("theme");
   const all = [...plugins, ...themes];
@@ -2240,7 +2530,11 @@ globalThis.pkg_outdated = async function(): Promise<void> {
 
     // Check how many commits behind
     const result = await gitCommand([
-      "-C", `${pkg.path}`, "rev-list", "--count", "HEAD..origin/HEAD"
+      "-C",
+      `${pkg.path}`,
+      "rev-list",
+      "--count",
+      "HEAD..origin/HEAD",
     ]);
 
     const behind = parseInt(result.stdout.trim(), 10);
@@ -2259,34 +2553,34 @@ globalThis.pkg_outdated = async function(): Promise<void> {
     format: (item) => ({
       label: item.pkg.name,
       description: `${item.behind} commits behind`,
-      metadata: item
+      metadata: item,
     }),
     preview: false,
     onSelect: async (item) => {
       await updatePackage(item.pkg);
-    }
+    },
   });
 
   finder.prompt({
     title: `Outdated Packages (${outdated.length}):`,
     source: {
       mode: "filter",
-      load: async () => outdated
-    }
+      load: async () => outdated,
+    },
   });
 };
 
 /**
  * Generate lockfile
  */
-globalThis.pkg_lock = async function(): Promise<void> {
+globalThis.pkg_lock = async function (): Promise<void> {
   await generateLockfile();
 };
 
 /**
  * Install from lockfile
  */
-globalThis.pkg_install_lock = async function(): Promise<void> {
+globalThis.pkg_install_lock = async function (): Promise<void> {
   await installFromLockfile();
 };
 
@@ -2298,7 +2592,12 @@ globalThis.pkg_install_lock = async function(): Promise<void> {
 editor.registerCommand("%cmd.list", "%cmd.list_desc", "pkg_list", null);
 
 // Install from URL - for packages not in registry
-editor.registerCommand("%cmd.install_url", "%cmd.install_url_desc", "pkg_install_url", null);
+editor.registerCommand(
+  "%cmd.install_url",
+  "%cmd.install_url_desc",
+  "pkg_install_url",
+  null,
+);
 
 // Note: Other commands (install_plugin, install_theme, update, remove, sync, etc.)
 // are available via the package manager UI and don't need global command palette entries.

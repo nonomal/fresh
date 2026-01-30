@@ -194,7 +194,11 @@ export class ToggleButton {
 /**
  * List item renderer function type
  */
-export type ItemRenderer<T> = (item: T, selected: boolean, index: number) => string;
+export type ItemRenderer<T> = (
+  item: T,
+  selected: boolean,
+  index: number,
+) => string;
 
 /**
  * Selectable list control - mirrors Settings item list behavior
@@ -243,7 +247,7 @@ export class ListControl<T> {
       selectedFg?: string | RGB;
       /** Selected item background color */
       selectedBg?: string | RGB;
-    } = {}
+    } = {},
   ) {
     this._maxVisible = options.maxVisible ?? 10;
     this._selectionPrefix = options.selectionPrefix ?? "▸ ";
@@ -257,7 +261,10 @@ export class ListControl<T> {
    */
   selectNext(): void {
     if (this.items.length === 0) return;
-    this.selectedIndex = Math.min(this.selectedIndex + 1, this.items.length - 1);
+    this.selectedIndex = Math.min(
+      this.selectedIndex + 1,
+      this.items.length - 1,
+    );
     this.ensureVisible();
   }
 
@@ -326,14 +333,15 @@ export class ListControl<T> {
 
     const visibleItems = this.items.slice(
       this.scrollOffset,
-      this.scrollOffset + this._maxVisible
+      this.scrollOffset + this._maxVisible,
     );
 
     for (let i = 0; i < visibleItems.length; i++) {
       const actualIndex = this.scrollOffset + i;
       const selected = actualIndex === this.selectedIndex;
       const prefix = selected ? this._selectionPrefix : this._emptyPrefix;
-      const line = prefix + this.renderItem(visibleItems[i], selected, actualIndex);
+      const line = prefix +
+        this.renderItem(visibleItems[i], selected, actualIndex);
       lines.push(line);
 
       if (selected) {
@@ -440,7 +448,7 @@ export class GroupedListControl<T> {
       selectedBg?: string | RGB;
       /** Normal item foreground (optional) */
       itemFg?: string | RGB;
-    } = {}
+    } = {},
   ) {
     this._maxVisible = options.maxVisible ?? 10;
     this._selectionPrefix = options.selectionPrefix ?? "▸ ";
@@ -455,7 +463,7 @@ export class GroupedListControl<T> {
    * Get all items flattened
    */
   private get allItems(): T[] {
-    return this.groups.flatMap(g => g.items);
+    return this.groups.flatMap((g) => g.items);
   }
 
   /**
@@ -540,8 +548,12 @@ export class GroupedListControl<T> {
    * Render to individual lines - useful for split-view layouts
    * Returns array of line objects with text and optional styling
    */
-  renderLines(): Array<{ text: string; fg?: string | RGB; bg?: string | RGB; isTitle?: boolean }> {
-    const result: Array<{ text: string; fg?: string | RGB; bg?: string | RGB; isTitle?: boolean }> = [];
+  renderLines(): Array<
+    { text: string; fg?: string | RGB; bg?: string | RGB; isTitle?: boolean }
+  > {
+    const result: Array<
+      { text: string; fg?: string | RGB; bg?: string | RGB; isTitle?: boolean }
+    > = [];
     let itemIndex = 0;
 
     for (const group of this.groups) {
@@ -564,7 +576,11 @@ export class GroupedListControl<T> {
         const line = prefix + this.renderItem(item, selected, itemIndex);
 
         if (selected) {
-          result.push({ text: line, fg: this._selectedFg, bg: this._selectedBg });
+          result.push({
+            text: line,
+            fg: this._selectedFg,
+            bg: this._selectedBg,
+          });
         } else {
           result.push({ text: line, fg: this._itemFg });
         }
@@ -602,7 +618,7 @@ export class FocusManager<T> {
 
   constructor(
     /** Ordered list of focusable elements */
-    public elements: T[]
+    public elements: T[],
   ) {}
 
   /**
@@ -633,7 +649,8 @@ export class FocusManager<T> {
    */
   focusPrev(): T | undefined {
     if (this.elements.length === 0) return undefined;
-    this.currentIndex = (this.currentIndex + this.elements.length - 1) % this.elements.length;
+    this.currentIndex = (this.currentIndex + this.elements.length - 1) %
+      this.elements.length;
     return this.current();
   }
 
@@ -716,7 +733,8 @@ export class TextInputControl {
    * Insert text at cursor position
    */
   insert(text: string): void {
-    this.value = this.value.slice(0, this.cursor) + text + this.value.slice(this.cursor);
+    this.value = this.value.slice(0, this.cursor) + text +
+      this.value.slice(this.cursor);
     this.cursor += text.length;
   }
 
@@ -725,7 +743,8 @@ export class TextInputControl {
    */
   backspace(): void {
     if (this.cursor > 0) {
-      this.value = this.value.slice(0, this.cursor - 1) + this.value.slice(this.cursor);
+      this.value = this.value.slice(0, this.cursor - 1) +
+        this.value.slice(this.cursor);
       this.cursor--;
     }
   }
@@ -735,7 +754,8 @@ export class TextInputControl {
    */
   delete(): void {
     if (this.cursor < this.value.length) {
-      this.value = this.value.slice(0, this.cursor) + this.value.slice(this.cursor + 1);
+      this.value = this.value.slice(0, this.cursor) +
+        this.value.slice(this.cursor + 1);
     }
   }
 
@@ -842,5 +862,274 @@ export class Label {
       });
     }
     return { text: this.text, styles };
+  }
+}
+
+// =============================================================================
+// Panel Line (for split views)
+// =============================================================================
+
+/**
+ * A line in a panel with optional styling
+ */
+export interface PanelLine {
+  text: string;
+  fg?: string | RGB;
+  bg?: string | RGB;
+}
+
+// =============================================================================
+// Split View
+// =============================================================================
+
+/**
+ * Renders two panels side-by-side with a divider
+ *
+ * @example
+ * ```typescript
+ * const split = new SplitView(leftLines, rightLines, {
+ *   leftWidth: 40,
+ *   divider: "│",
+ *   dividerFg: "ui.border",
+ *   minRows: 8,
+ * });
+ * const { text, styles } = split.render();
+ * ```
+ */
+export class SplitView {
+  constructor(
+    public leftLines: PanelLine[],
+    public rightLines: PanelLine[],
+    public options: {
+      /** Width of left panel (right panel takes remaining space) */
+      leftWidth: number;
+      /** Divider character (default: "│") */
+      divider?: string;
+      /** Divider foreground color */
+      dividerFg?: string | RGB;
+      /** Minimum number of rows to render */
+      minRows?: number;
+      /** Left padding for left panel */
+      leftPadding?: string;
+      /** Left padding for right panel */
+      rightPadding?: string;
+    },
+  ) {}
+
+  render(): ControlOutput {
+    const {
+      leftWidth,
+      divider = "│",
+      dividerFg = "ui.border",
+      minRows = 0,
+      leftPadding = " ",
+      rightPadding = " ",
+    } = this.options;
+
+    const lines: string[] = [];
+    const styles: StyleRange[] = [];
+    let charOffset = 0;
+
+    const maxRows = Math.max(
+      this.leftLines.length,
+      this.rightLines.length,
+      minRows,
+    );
+
+    for (let i = 0; i < maxRows; i++) {
+      const leftItem = this.leftLines[i];
+      const rightItem = this.rightLines[i];
+
+      // Left side (padded to fixed width)
+      const leftContent = leftItem ? (leftPadding + leftItem.text) : "";
+      const leftText = leftContent.padEnd(leftWidth);
+
+      if (leftItem?.fg || leftItem?.bg) {
+        styles.push({
+          start: charOffset,
+          end: charOffset + leftText.length,
+          fg: leftItem.fg,
+          bg: leftItem.bg,
+        });
+      }
+      charOffset += leftText.length;
+
+      // Divider
+      styles.push({
+        start: charOffset,
+        end: charOffset + divider.length,
+        fg: dividerFg,
+      });
+      charOffset += divider.length;
+
+      // Right side
+      const rightText = rightItem ? (rightPadding + rightItem.text) : "";
+
+      if (rightItem?.fg || rightItem?.bg) {
+        styles.push({
+          start: charOffset,
+          end: charOffset + rightText.length,
+          fg: rightItem.fg,
+          bg: rightItem.bg,
+        });
+      }
+      charOffset += rightText.length;
+
+      lines.push(leftText + divider + rightText);
+      charOffset += 1; // newline
+    }
+
+    return {
+      text: lines.join("\n"),
+      styles,
+    };
+  }
+}
+
+// =============================================================================
+// Filter Bar
+// =============================================================================
+
+/**
+ * Filter option for FilterBar
+ */
+export interface FilterOption {
+  id: string;
+  label: string;
+}
+
+/**
+ * Renders a row of toggle filter buttons
+ *
+ * @example
+ * ```typescript
+ * const filterBar = new FilterBar(
+ *   [{ id: "all", label: "All" }, { id: "active", label: "Active" }],
+ *   "all",  // active filter
+ *   1,      // focused index (or -1 for none)
+ * );
+ * const { text, styles } = filterBar.render();
+ * ```
+ */
+export class FilterBar {
+  constructor(
+    public filters: FilterOption[],
+    public activeId: string,
+    public focusedIndex: number = -1,
+    public options: {
+      activeFg?: string | RGB;
+      activeBg?: string | RGB;
+      inactiveFg?: string | RGB;
+      focusedFg?: string | RGB;
+      focusedBg?: string | RGB;
+    } = {},
+  ) {}
+
+  render(): ControlOutput {
+    const {
+      activeFg = [255, 255, 255],
+      activeBg = "syntax.keyword",
+      inactiveFg = [160, 160, 170],
+      focusedFg = [255, 255, 255],
+      focusedBg = [80, 80, 90],
+    } = this.options;
+
+    let text = "";
+    const styles: StyleRange[] = [];
+
+    for (let i = 0; i < this.filters.length; i++) {
+      const f = this.filters[i];
+      const isActive = f.id === this.activeId;
+      const isFocused = i === this.focusedIndex;
+
+      const btn = new ButtonControl(
+        f.label,
+        isFocused ? FocusState.Focused : FocusState.Normal,
+      );
+      const btnText = btn.render().text;
+
+      const start = text.length;
+
+      if (isFocused) {
+        styles.push({
+          start,
+          end: start + btnText.length,
+          fg: isActive ? activeFg : focusedFg,
+          bg: isActive ? activeBg : focusedBg,
+        });
+      } else if (isActive) {
+        styles.push({
+          start,
+          end: start + btnText.length,
+          fg: activeFg,
+          bg: activeBg,
+        });
+      } else {
+        styles.push({
+          start,
+          end: start + btnText.length,
+          fg: inactiveFg,
+        });
+      }
+
+      text += btnText;
+    }
+
+    return { text, styles };
+  }
+}
+
+// =============================================================================
+// Help Bar
+// =============================================================================
+
+/**
+ * Key binding for HelpBar
+ */
+export interface KeyBinding {
+  key: string;
+  action: string;
+}
+
+/**
+ * Renders a help bar with key bindings
+ *
+ * @example
+ * ```typescript
+ * const help = new HelpBar([
+ *   { key: "↑↓", action: "Navigate" },
+ *   { key: "Tab", action: "Next" },
+ *   { key: "Enter", action: "Select" },
+ *   { key: "Esc", action: "Close" },
+ * ]);
+ * const { text, styles } = help.render();
+ * // text: " ↑↓ Navigate  Tab Next  Enter Select  Esc Close"
+ * ```
+ */
+export class HelpBar {
+  constructor(
+    public bindings: KeyBinding[],
+    public options: {
+      fg?: string | RGB;
+      separator?: string;
+      prefix?: string;
+    } = {},
+  ) {}
+
+  render(): ControlOutput {
+    const { fg = "syntax.comment", separator = "  ", prefix = " " } =
+      this.options;
+
+    const text = prefix +
+      this.bindings.map((b) => `${b.key} ${b.action}`).join(separator);
+
+    return {
+      text,
+      styles: [{
+        start: 0,
+        end: text.length,
+        fg,
+      }],
+    };
   }
 }

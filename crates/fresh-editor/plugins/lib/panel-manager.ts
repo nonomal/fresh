@@ -47,7 +47,7 @@ export class PanelManager {
   constructor(
     private readonly editor: EditorAPI,
     private readonly panelName: string,
-    private readonly modeName: string
+    private readonly modeName: string,
   ) {}
 
   /**
@@ -94,7 +94,12 @@ export class PanelManager {
    * @returns The buffer ID of the panel
    */
   async open(options: PanelOptions): Promise<number> {
-    const { entries, ratio = 0.3, showLineNumbers = false, editingDisabled = true } = options;
+    const {
+      entries,
+      ratio = 0.3,
+      showLineNumbers = false,
+      editingDisabled = true,
+    } = options;
 
     if (this.state.isOpen && this.state.bufferId !== null) {
       // Panel already open - just update content
@@ -199,7 +204,11 @@ export class PanelManager {
    * @param line - Line number to jump to (1-indexed)
    * @param column - Column number to jump to (1-indexed)
    */
-  async openInSource(filePath: string, line: number, column: number): Promise<void> {
+  async openInSource(
+    filePath: string,
+    line: number,
+    column: number,
+  ): Promise<void> {
     if (this.state.sourceSplitId === null) {
       return;
     }

@@ -37,7 +37,12 @@ export interface DebouncedSearchOptions {
 // Editor interface (subset of what we need)
 interface EditorApi {
   readFile(path: string): Promise<string>;
-  defineMode(name: string, parent: string, bindings: [string, string][], readOnly: boolean): void;
+  defineMode(
+    name: string,
+    parent: string,
+    bindings: [string, string][],
+    readOnly: boolean,
+  ): void;
   createVirtualBufferInSplit(options: {
     name: string;
     mode: string;
@@ -131,7 +136,10 @@ export class SearchPreview {
 
       if (this.bufferId === null) {
         // Create preview mode if not exists
-        this.editor.defineMode(this.modeName, "special", [["q", "close_buffer"]], true);
+        this.editor.defineMode(this.modeName, "special", [[
+          "q",
+          "close_buffer",
+        ]], true);
 
         // Create preview in a split on the right
         const result = await this.editor.createVirtualBufferInSplit({
@@ -217,7 +225,7 @@ export class DebouncedSearch {
   async search(
     query: string,
     executor: () => ProcessHandle<SpawnResult>,
-    onResults: (result: SpawnResult) => void
+    onResults: (result: SpawnResult) => void,
   ): Promise<void> {
     const thisVersion = ++this.searchVersion;
 
@@ -320,16 +328,15 @@ export function parseGrepLine(line: string): SearchMatch | null {
  */
 export function matchesToSuggestions(
   matches: SearchMatch[],
-  maxResults: number = 100
+  maxResults: number = 100,
 ): PromptSuggestion[] {
   const suggestions: PromptSuggestion[] = [];
 
   for (let i = 0; i < Math.min(matches.length, maxResults); i++) {
     const match = matches[i];
-    const displayContent =
-      match.content.length > 60
-        ? match.content.substring(0, 57) + "..."
-        : match.content;
+    const displayContent = match.content.length > 60
+      ? match.content.substring(0, 57) + "..."
+      : match.content;
 
     suggestions.push({
       text: `${match.file}:${match.line}`,

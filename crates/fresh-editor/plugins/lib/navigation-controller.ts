@@ -33,7 +33,10 @@ export class NavigationController<T> {
   private currentIndex: number = 0;
   private options: NavigationOptions<T>;
 
-  constructor(private readonly editor: EditorAPI, options: NavigationOptions<T> = {}) {
+  constructor(
+    private readonly editor: EditorAPI,
+    options: NavigationOptions<T> = {},
+  ) {
     this.options = {
       itemLabel: "Item",
       wrap: false,
@@ -53,7 +56,10 @@ export class NavigationController<T> {
       this.currentIndex = 0;
     } else {
       // Clamp to valid range
-      this.currentIndex = Math.min(this.currentIndex, Math.max(0, items.length - 1));
+      this.currentIndex = Math.min(
+        this.currentIndex,
+        Math.max(0, items.length - 1),
+      );
     }
   }
 
@@ -113,7 +119,10 @@ export class NavigationController<T> {
     if (this.options.wrap) {
       this.currentIndex = (this.currentIndex + 1) % this.items.length;
     } else {
-      this.currentIndex = Math.min(this.currentIndex + 1, this.items.length - 1);
+      this.currentIndex = Math.min(
+        this.currentIndex + 1,
+        this.items.length - 1,
+      );
     }
     this.notifyChange();
   }
@@ -125,7 +134,8 @@ export class NavigationController<T> {
     if (this.items.length === 0) return;
 
     if (this.options.wrap) {
-      this.currentIndex = (this.currentIndex - 1 + this.items.length) % this.items.length;
+      this.currentIndex = (this.currentIndex - 1 + this.items.length) %
+        this.items.length;
     } else {
       this.currentIndex = Math.max(this.currentIndex - 1, 0);
     }

@@ -28,7 +28,7 @@
  * ```
  */
 
-import type { StyleRange, ControlOutput } from "./controls.ts";
+import type { ControlOutput, StyleRange } from "./controls.ts";
 import type { RGB } from "./types.ts";
 
 const editor = getEditor();
@@ -54,7 +54,7 @@ export class VirtualBufferBuilder {
     /** Buffer ID to write to */
     private bufferId: number,
     /** Namespace for overlays (used in clearNamespace) */
-    private namespace: string = "ui"
+    private namespace: string = "ui",
   ) {}
 
   /**
@@ -148,7 +148,11 @@ export class VirtualBufferBuilder {
    * @param content - Content control output
    * @param labelFg - Label foreground color
    */
-  labeledRow(label: string, content: ControlOutput, labelFg?: string | RGB): this {
+  labeledRow(
+    label: string,
+    content: ControlOutput,
+    labelFg?: string | RGB,
+  ): this {
     const labelOutput: ControlOutput = {
       text: label,
       styles: labelFg ? [{ start: 0, end: label.length, fg: labelFg }] : [],
@@ -179,7 +183,12 @@ export class VirtualBufferBuilder {
    * @param bg - Background color
    * @param bold - Bold text
    */
-  styled(content: string, fg?: string | RGB, bg?: string | RGB, bold?: boolean): this {
+  styled(
+    content: string,
+    fg?: string | RGB,
+    bg?: string | RGB,
+    bold?: boolean,
+  ): this {
     const styles: StyleRange[] = [];
     if (fg || bg || bold) {
       styles.push({ start: 0, end: content.length, fg, bg, bold });
@@ -213,7 +222,7 @@ export class VirtualBufferBuilder {
     left: ControlOutput,
     right: ControlOutput,
     leftWidth: number,
-    divider: string = " | "
+    divider: string = " | ",
   ): this {
     // Pad/truncate left column
     let leftText = left.text;
@@ -225,7 +234,7 @@ export class VirtualBufferBuilder {
 
     const paddedLeft: ControlOutput = {
       text: leftText,
-      styles: left.styles.map(s => ({
+      styles: left.styles.map((s) => ({
         ...s,
         end: Math.min(s.end, leftText.length),
       })),
@@ -258,7 +267,10 @@ export class VirtualBufferBuilder {
    * @param items - Items to iterate
    * @param fn - Function to add content for each item
    */
-  forEach<T>(items: T[], fn: (builder: this, item: T, index: number) => void): this {
+  forEach<T>(
+    items: T[],
+    fn: (builder: this, item: T, index: number) => void,
+  ): this {
     items.forEach((item, index) => fn(this, item, index));
     return this;
   }
@@ -300,7 +312,10 @@ export class VirtualBufferBuilder {
     }
 
     // Convert to TextPropertyEntry format
-    const textEntries: TextPropertyEntry[] = [{ text: fullText, properties: {} }];
+    const textEntries: TextPropertyEntry[] = [{
+      text: fullText,
+      properties: {},
+    }];
     editor.setVirtualBufferContent(this.bufferId, textEntries);
 
     // Clear existing overlays and apply new ones
@@ -319,7 +334,13 @@ export class VirtualBufferBuilder {
       if (style.underline) options.underline = true;
 
       if (Object.keys(options).length > 0) {
-        editor.addOverlay(this.bufferId, this.namespace, byteStart, byteEnd, options);
+        editor.addOverlay(
+          this.bufferId,
+          this.namespace,
+          byteStart,
+          byteEnd,
+          options,
+        );
       }
     }
   }
@@ -328,7 +349,7 @@ export class VirtualBufferBuilder {
    * Get the combined text without building (useful for debugging)
    */
   getText(): string {
-    return this.entries.map(e => e.text).join("");
+    return this.entries.map((e) => e.text).join("");
   }
 
   /**
@@ -369,6 +390,9 @@ export class VirtualBufferBuilder {
  * @param bufferId - Buffer ID to write to
  * @param namespace - Namespace for overlays
  */
-export function createBuilder(bufferId: number, namespace: string = "ui"): VirtualBufferBuilder {
+export function createBuilder(
+  bufferId: number,
+  namespace: string = "ui",
+): VirtualBufferBuilder {
   return new VirtualBufferBuilder(bufferId, namespace);
 }

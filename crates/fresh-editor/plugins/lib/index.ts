@@ -34,13 +34,13 @@
 
 // Types
 export type {
-  RGB,
+  FileExplorerDecoration,
+  HighlightPattern,
   Location,
+  NavigationOptions,
   PanelOptions,
   PanelState,
-  NavigationOptions,
-  HighlightPattern,
-  FileExplorerDecoration,
+  RGB,
 } from "./types.ts";
 
 // Panel Management
@@ -51,40 +51,56 @@ export { NavigationController } from "./navigation-controller.ts";
 
 // Buffer Creation
 export { createVirtualBufferFactory } from "./virtual-buffer-factory.ts";
-export type { VirtualBufferOptions, SplitBufferOptions } from "./virtual-buffer-factory.ts";
+export type {
+  SplitBufferOptions,
+  VirtualBufferOptions,
+} from "./virtual-buffer-factory.ts";
 
 // Finder Abstraction
-export { Finder, defaultFuzzyFilter, parseGrepLine, parseGrepOutput, getRelativePath, createLiveProvider } from "./finder.ts";
+export {
+  createLiveProvider,
+  defaultFuzzyFilter,
+  Finder,
+  getRelativePath,
+  parseGrepLine,
+  parseGrepOutput,
+} from "./finder.ts";
 export type {
   DisplayEntry,
-  SearchSource,
   FilterSource,
-  PreviewConfig,
   FinderConfig,
-  PromptOptions,
-  PanelOptions as FinderPanelOptions,
   FinderProvider,
   LivePanelOptions,
+  PanelOptions as FinderPanelOptions,
+  PreviewConfig,
+  PromptOptions,
+  SearchSource,
 } from "./finder.ts";
 
 // UI Controls Library
 export {
-  FocusState,
   ButtonControl,
-  ToggleButton,
-  ListControl,
-  GroupedListControl,
+  FilterBar,
   FocusManager,
-  TextInputControl,
-  Separator,
+  FocusState,
+  GroupedListControl,
+  HelpBar,
   Label,
+  ListControl,
+  Separator,
+  SplitView,
+  TextInputControl,
+  ToggleButton,
 } from "./controls.ts";
 export type {
-  StyleRange,
   ControlOutput,
+  FilterOption,
   ItemRenderer,
+  KeyBinding,
   ListGroup,
+  PanelLine,
+  StyleRange,
 } from "./controls.ts";
 
 // Virtual Buffer Builder
-export { VirtualBufferBuilder, createBuilder } from "./vbuffer.ts";
+export { createBuilder, VirtualBufferBuilder } from "./vbuffer.ts";

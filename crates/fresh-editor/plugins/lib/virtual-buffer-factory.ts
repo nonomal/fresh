@@ -73,7 +73,10 @@ export function createVirtualBufferFactory(editor: EditorAPI) {
     /**
      * Create a virtual buffer in an existing split
      */
-    async createInSplit(splitId: number, options: VirtualBufferOptions): Promise<number> {
+    async createInSplit(
+      splitId: number,
+      options: VirtualBufferOptions,
+    ): Promise<number> {
       const {
         name,
         mode,

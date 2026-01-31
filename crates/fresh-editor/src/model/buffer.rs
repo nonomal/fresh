@@ -650,6 +650,54 @@ impl TextBuffer {
         Ok((temp_path, file))
     }
 
+    /// Get the path for in-place write recovery metadata.
+    /// Uses the same recovery directory as temp files.
+    fn inplace_recovery_meta_path(&self, dest_path: &Path) -> PathBuf {
+        let recovery_dir = crate::input::input_history::get_data_dir()
+            .map(|d| d.join("recovery"))
+            .unwrap_or_else(|_| std::env::temp_dir());
+
+        let hash = crate::services::recovery::path_hash(dest_path);
+        recovery_dir.join(format!("{}.inplace.json", hash))
+    }
+
+    /// Write in-place recovery metadata using self.fs.
+    /// This is called before the dangerous streaming step so we can recover on crash.
+    fn write_inplace_recovery_meta(
+        &self,
+        meta_path: &Path,
+        dest_path: &Path,
+        temp_path: &Path,
+        original_metadata: &Option<FileMetadata>,
+    ) -> io::Result<()> {
+        #[cfg(unix)]
+        let (uid, gid, mode) = original_metadata
+            .as_ref()
+            .map(|m| {
+                (
+                    m.uid.unwrap_or(0),
+                    m.gid.unwrap_or(0),
+                    m.permissions.as_ref().map(|p| p.mode()).unwrap_or(0o644),
+                )
+            })
+            .unwrap_or((0, 0, 0o644));
+        #[cfg(not(unix))]
+        let (uid, gid, mode) = (0u32, 0u32, 0o644u32);
+
+        let recovery = crate::services::recovery::InplaceWriteRecovery::new(
+            dest_path.to_path_buf(),
+            temp_path.to_path_buf(),
+            uid,
+            gid,
+            mode,
+        );
+
+        let json = serde_json::to_string_pretty(&recovery)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        self.fs.write_file(meta_path, json.as_bytes())
+    }
+
     /// Save the buffer to a specific file
     ///
     /// Uses the write recipe approach for both local and remote filesystems:
@@ -760,25 +808,39 @@ impl TextBuffer {
         temp_file.sync_all()?;
         drop(temp_file);
 
+        // Step 1.5: Save recovery metadata before the dangerous step
+        // If we crash during step 2, this metadata + temp file allows recovery
+        let recovery_meta_path = self.inplace_recovery_meta_path(dest_path);
+        // Best effort - don't fail the save if we can't write recovery metadata
+        let _ = self.write_inplace_recovery_meta(
+            &recovery_meta_path,
+            dest_path,
+            &temp_path,
+            &original_metadata,
+        );
+
         // Step 2: Stream temp file content to destination
         // Now it's safe to truncate the destination since all data is in temp
         match self.fs.open_file_for_write(dest_path) {
             Ok(mut out_file) => {
                 if let Err(e) = self.stream_file_to_writer(&temp_path, &mut out_file) {
-                    let _ = self.fs.remove_file(&temp_path);
+                    // Don't delete temp file or recovery metadata - allow recovery
                     return Err(e.into());
                 }
                 out_file.sync_all()?;
+                // Success! Clean up temp file and recovery metadata
                 let _ = self.fs.remove_file(&temp_path);
+                let _ = self.fs.remove_file(&recovery_meta_path);
                 Ok(())
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 // Can't write to destination - trigger sudo fallback
-                // Keep temp file for sudo to use
+                // Keep temp file for sudo to use, clean up recovery metadata
+                let _ = self.fs.remove_file(&recovery_meta_path);
                 Err(self.make_sudo_error(temp_path, dest_path, original_metadata))
             }
             Err(e) => {
-                let _ = self.fs.remove_file(&temp_path);
+                // Don't delete temp file or recovery metadata - allow recovery
                 Err(e.into())
             }
         }

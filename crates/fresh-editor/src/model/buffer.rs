@@ -48,6 +48,38 @@ impl std::fmt::Display for SudoSaveRequired {
 
 impl std::error::Error for SudoSaveRequired {}
 
+/// Error returned when a large file has a non-resynchronizable encoding
+/// and requires user confirmation before loading the entire file into memory.
+///
+/// Non-resynchronizable encodings (like Shift-JIS, GB18030, GBK, EUC-KR) cannot
+/// determine character boundaries when jumping into the middle of a file.
+/// This means the entire file must be loaded and decoded sequentially.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LargeFileEncodingConfirmation {
+    /// Path to the file
+    pub path: PathBuf,
+    /// Size of the file in bytes
+    pub file_size: usize,
+    /// The detected encoding that requires full loading
+    pub encoding: Encoding,
+}
+
+impl std::fmt::Display for LargeFileEncodingConfirmation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let size_mb = self.file_size as f64 / (1024.0 * 1024.0);
+        write!(
+            f,
+            "Large file ({:.1} MB) uses {} encoding which requires loading the entire file into memory. \
+             This encoding cannot be streamed because character boundaries cannot be determined \
+             from the middle of the file. Continue?",
+            size_mb,
+            self.encoding.display_name()
+        )
+    }
+}
+
+impl std::error::Error for LargeFileEncodingConfirmation {}
+
 // Large file support configuration
 /// Default threshold for considering a file "large" (100 MB)
 pub const DEFAULT_LARGE_FILE_THRESHOLD: usize = 100 * 1024 * 1024;
@@ -474,11 +506,81 @@ impl TextBuffer {
         Ok(buffer)
     }
 
+    /// Check if loading a large file requires user confirmation due to encoding.
+    ///
+    /// Some encodings (like Shift-JIS, GB18030, GBK, EUC-KR) cannot be "resynchronized" -
+    /// meaning you cannot determine character boundaries when jumping into the middle
+    /// of a file. These encodings require loading the entire file into memory.
+    ///
+    /// Returns `Some(confirmation)` if user confirmation is needed, `None` if the file
+    /// can be loaded with lazy/streaming loading.
+    pub fn check_large_file_encoding(
+        path: impl AsRef<Path>,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Option<LargeFileEncodingConfirmation>> {
+        let path = path.as_ref();
+        let metadata = fs.metadata(path)?;
+        let file_size = metadata.size as usize;
+
+        // Only check for large files
+        if file_size < DEFAULT_LARGE_FILE_THRESHOLD {
+            return Ok(None);
+        }
+
+        // Read a sample to detect encoding
+        let sample_size = file_size.min(8 * 1024);
+        let sample = fs.read_range(path, 0, sample_size)?;
+        let (encoding, is_binary) = Self::detect_encoding_or_binary(&sample);
+
+        // Binary files don't need confirmation (loaded as-is)
+        if is_binary {
+            return Ok(None);
+        }
+
+        // Check if the encoding requires full file loading
+        if encoding.requires_full_file_load() {
+            return Ok(Some(LargeFileEncodingConfirmation {
+                path: path.to_path_buf(),
+                file_size,
+                encoding,
+            }));
+        }
+
+        Ok(None)
+    }
+
     /// Load a large file with unloaded buffer (no line indexing, lazy loading)
+    ///
+    /// If `force_full_load` is true, loads the entire file regardless of encoding.
+    /// This should be set to true after user confirms loading a non-resynchronizable encoding.
     fn load_large_file(
         path: &Path,
         file_size: usize,
         fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::load_large_file_internal(path, file_size, fs, false)
+    }
+
+    /// Load a large file, optionally forcing full load for non-resynchronizable encodings.
+    ///
+    /// Called with `force_full_load=true` after user confirms the warning about
+    /// non-resynchronizable encodings requiring full file loading.
+    pub fn load_large_file_confirmed(
+        path: impl AsRef<Path>,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let metadata = fs.metadata(path)?;
+        let file_size = metadata.size as usize;
+        Self::load_large_file_internal(path, file_size, fs, true)
+    }
+
+    /// Internal implementation for loading large files.
+    fn load_large_file_internal(
+        path: &Path,
+        file_size: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        force_full_load: bool,
     ) -> anyhow::Result<Self> {
         use crate::model::piece_tree::{BufferData, BufferLocation};
 
@@ -503,8 +605,20 @@ impl TextBuffer {
             return Ok(buffer);
         }
 
-        // For non-UTF-8 encodings, we need to load the entire file and convert
-        // This is because lazy loading would require on-demand transcoding which is complex
+        // Check if encoding requires full file loading
+        let requires_full_load = encoding.requires_full_file_load();
+
+        // For non-resynchronizable encodings, require confirmation unless forced
+        if requires_full_load && !force_full_load {
+            anyhow::bail!(LargeFileEncodingConfirmation {
+                path: path.to_path_buf(),
+                file_size,
+                encoding,
+            });
+        }
+
+        // For encodings that require full load (non-resynchronizable or non-UTF-8),
+        // load the entire file and convert
         if !matches!(encoding, Encoding::Utf8 | Encoding::Ascii) {
             tracing::info!(
                 "Large file with non-UTF-8 encoding ({:?}), loading fully for conversion",

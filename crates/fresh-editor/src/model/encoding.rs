@@ -134,6 +134,67 @@ impl Encoding {
             Self::EucKr,
         ]
     }
+
+    /// Returns true if this encoding supports "resynchronization" - the ability to
+    /// find character boundaries when jumping into the middle of a file.
+    ///
+    /// Resynchronizable encodings can be safely used with lazy/streaming file loading
+    /// because you can determine character boundaries from any position.
+    ///
+    /// - **UTF-8**: Excellent - unique bit patterns distinguish lead/continuation bytes
+    /// - **ASCII/Latin-1/Windows-1252**: Trivial - every byte is a character
+    /// - **UTF-16**: Good with 2-byte alignment - can detect surrogate pairs
+    /// - **UTF-32**: Good with 4-byte alignment
+    ///
+    /// Non-resynchronizable encodings (legacy CJK like Shift-JIS, GB18030, GBK, Big5)
+    /// have ambiguous byte sequences where a byte could be either a standalone character
+    /// or part of a multi-byte sequence. You must scan from the beginning to be certain.
+    pub fn is_resynchronizable(&self) -> bool {
+        match self {
+            // Fixed-width single byte - every byte is a character
+            Self::Ascii | Self::Latin1 | Self::Windows1252 => true,
+
+            // UTF-8 has unique bit patterns for lead vs continuation bytes
+            Self::Utf8 | Self::Utf8Bom => true,
+
+            // UTF-16 is resynchronizable with 2-byte alignment
+            // (can detect surrogate pairs by checking 0xD800-0xDFFF range)
+            Self::Utf16Le | Self::Utf16Be => true,
+
+            // Legacy CJK encodings are NOT resynchronizable
+            // The second byte of a double-byte char can equal a valid single-byte char
+            Self::Gb18030 | Self::Gbk | Self::ShiftJis | Self::EucKr => false,
+        }
+    }
+
+    /// Returns the byte alignment required for this encoding when doing random access.
+    ///
+    /// For lazy loading of large files, reads must be aligned to this boundary.
+    /// Returns None if the encoding is not resynchronizable (requires full file scan).
+    pub fn alignment(&self) -> Option<usize> {
+        match self {
+            // Single-byte encodings - no alignment needed
+            Self::Ascii | Self::Latin1 | Self::Windows1252 => Some(1),
+
+            // UTF-8 - no alignment needed (self-synchronizing)
+            Self::Utf8 | Self::Utf8Bom => Some(1),
+
+            // UTF-16 - must be 2-byte aligned
+            Self::Utf16Le | Self::Utf16Be => Some(2),
+
+            // Legacy CJK - not resynchronizable, no valid alignment
+            Self::Gb18030 | Self::Gbk | Self::ShiftJis | Self::EucKr => None,
+        }
+    }
+
+    /// Returns true if this encoding requires the entire file to be loaded
+    /// for correct decoding (cannot use lazy/streaming loading).
+    ///
+    /// This is the inverse of `is_resynchronizable()` and indicates that
+    /// the user should be warned before loading large files in this encoding.
+    pub fn requires_full_file_load(&self) -> bool {
+        !self.is_resynchronizable()
+    }
 }
 
 // ============================================================================
@@ -552,5 +613,61 @@ mod tests {
         // Note: convert_from_utf8 doesn't add BOM, so result won't have BOM
         let back = convert_from_utf8(&utf8_content, encoding);
         assert_eq!(back, [b'H', 0x00, b'i', 0x00]);
+    }
+
+    #[test]
+    fn test_encoding_resynchronizable() {
+        // Self-synchronizing encodings (can find char boundaries from middle of file)
+        assert!(Encoding::Utf8.is_resynchronizable());
+        assert!(Encoding::Utf8Bom.is_resynchronizable());
+        assert!(Encoding::Ascii.is_resynchronizable());
+        assert!(Encoding::Latin1.is_resynchronizable());
+        assert!(Encoding::Windows1252.is_resynchronizable());
+
+        // UTF-16 is resynchronizable with proper alignment
+        assert!(Encoding::Utf16Le.is_resynchronizable());
+        assert!(Encoding::Utf16Be.is_resynchronizable());
+
+        // Legacy CJK encodings are NOT resynchronizable
+        // (second byte of double-byte char can equal a valid single-byte char)
+        assert!(!Encoding::Gb18030.is_resynchronizable());
+        assert!(!Encoding::Gbk.is_resynchronizable());
+        assert!(!Encoding::ShiftJis.is_resynchronizable());
+        assert!(!Encoding::EucKr.is_resynchronizable());
+    }
+
+    #[test]
+    fn test_encoding_alignment() {
+        // Single-byte encodings have alignment of 1
+        assert_eq!(Encoding::Ascii.alignment(), Some(1));
+        assert_eq!(Encoding::Latin1.alignment(), Some(1));
+        assert_eq!(Encoding::Windows1252.alignment(), Some(1));
+        assert_eq!(Encoding::Utf8.alignment(), Some(1));
+        assert_eq!(Encoding::Utf8Bom.alignment(), Some(1));
+
+        // UTF-16 requires 2-byte alignment
+        assert_eq!(Encoding::Utf16Le.alignment(), Some(2));
+        assert_eq!(Encoding::Utf16Be.alignment(), Some(2));
+
+        // Non-resynchronizable encodings have no valid alignment
+        assert_eq!(Encoding::Gb18030.alignment(), None);
+        assert_eq!(Encoding::Gbk.alignment(), None);
+        assert_eq!(Encoding::ShiftJis.alignment(), None);
+        assert_eq!(Encoding::EucKr.alignment(), None);
+    }
+
+    #[test]
+    fn test_requires_full_file_load() {
+        // Encodings that can be streamed
+        assert!(!Encoding::Utf8.requires_full_file_load());
+        assert!(!Encoding::Ascii.requires_full_file_load());
+        assert!(!Encoding::Latin1.requires_full_file_load());
+        assert!(!Encoding::Utf16Le.requires_full_file_load());
+
+        // Encodings that require full loading
+        assert!(Encoding::Gb18030.requires_full_file_load());
+        assert!(Encoding::Gbk.requires_full_file_load());
+        assert!(Encoding::ShiftJis.requires_full_file_load());
+        assert!(Encoding::EucKr.requires_full_file_load());
     }
 }

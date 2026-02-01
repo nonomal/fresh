@@ -1285,6 +1285,15 @@ impl Editor {
                     }
                 }
 
+                // Check encoding indicator - click opens encoding selector
+                if let Some((enc_row, enc_start, enc_end)) =
+                    self.cached_layout.status_bar_encoding_area
+                {
+                    if row == enc_row && col >= enc_start && col < enc_end {
+                        return self.handle_action(Action::SetEncoding);
+                    }
+                }
+
                 // Check language indicator - click opens language selector
                 if let Some((lang_row, lang_start, lang_end)) =
                     self.cached_layout.status_bar_language_area

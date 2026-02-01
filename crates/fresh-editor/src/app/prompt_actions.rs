@@ -597,15 +597,22 @@ impl Editor {
     fn handle_set_encoding(&mut self, input: &str) {
         use crate::model::buffer::Encoding;
 
-        // Extract the encoding code from the input (e.g., "UTF-8" from "UTF-8 (Unicode)")
         let trimmed = input.trim();
-        let code = trimmed.split_whitespace().next().unwrap_or(trimmed);
 
-        // Match against all known encodings
+        // First try to match the full input against encoding display names
+        // This handles multi-word names like "UTF-16 LE" and "UTF-8 BOM"
         let encoding = Encoding::all()
             .iter()
-            .find(|enc| enc.display_name().eq_ignore_ascii_case(code))
-            .copied();
+            .find(|enc| enc.display_name().eq_ignore_ascii_case(trimmed))
+            .copied()
+            .or_else(|| {
+                // If no match, try extracting before the parenthesis (e.g., "UTF-8" from "UTF-8 (Unicode)")
+                let before_paren = trimmed.split('(').next().unwrap_or(trimmed).trim();
+                Encoding::all()
+                    .iter()
+                    .find(|enc| enc.display_name().eq_ignore_ascii_case(before_paren))
+                    .copied()
+            });
 
         match encoding {
             Some(enc) => {

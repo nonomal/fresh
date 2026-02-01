@@ -588,11 +588,10 @@ fn test_detect_encoding_utf8() {
     assert!(screen.contains('世'), "Screen should contain '世'");
     assert!(screen.contains('界'), "Screen should contain '界'");
 
-    // UTF-8 encoding is NOT shown in status bar (hidden as it's the default)
-    // This is by design to save status bar space
+    // UTF-8 encoding IS now shown in status bar (always visible)
     assert!(
-        !screen.contains("UTF-8"),
-        "UTF-8 should not be shown in status bar (hidden as default)"
+        screen.contains("UTF-8"),
+        "UTF-8 should be shown in status bar"
     );
 }
 
@@ -967,7 +966,8 @@ fn test_utf16_encoding_indicator_click_and_change() {
     // After clicking, the encoding selector prompt should open
     harness.assert_screen_contains("Encoding:");
 
-    // Clear the prompt input first (Ctrl+A to select all, then type to replace)
+    // Type "UTF-8" to filter and select UTF-8 encoding
+    // Ctrl+A selects all existing text, then typing replaces it
     harness
         .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
         .unwrap();
@@ -1010,5 +1010,113 @@ fn test_utf16_encoding_indicator_click_and_change() {
     assert!(
         saved_text.contains("Line 2"),
         "Saved file should contain all lines"
+    );
+}
+
+/// Test changing encoding from UTF-8 to UTF-16 LE via click on status bar indicator.
+/// This tests the opposite direction: UTF-8 → UTF-16 LE.
+#[test]
+fn test_utf8_to_utf16_encoding_change() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test_utf8.txt");
+
+    // Create a UTF-8 file with non-ASCII content (to ensure it's detected as UTF-8, not ASCII)
+    let text = "Hello World! こんにちは\nLine 2\n";
+    std::fs::write(&file_path, text).unwrap();
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    // Verify UTF-8 encoding is shown in status bar
+    harness.assert_screen_contains("UTF-8");
+
+    // Find the position of "UTF-8" on screen - should be in the status bar (last lines)
+    let (col, row) = harness
+        .find_text_on_screen("UTF-8")
+        .expect("UTF-8 encoding indicator should be visible in status bar");
+
+    // Verify we found it in the status bar area (bottom of screen)
+    assert!(
+        row >= 20,
+        "UTF-8 should be in status bar (bottom of screen), found at row {}",
+        row
+    );
+
+    // Click on the encoding indicator to open encoding selector
+    harness.mouse_click(col, row).unwrap();
+
+    // After clicking, the encoding selector prompt should open
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Encoding:"),
+        "Encoding selector should open after clicking. Screen:\n{}",
+        screen
+    );
+
+    // Navigate to UTF-16 LE using arrow keys
+    // The encoding list order is: UTF-8, UTF-8 BOM, UTF-16 LE, UTF-16 BE, ASCII, ...
+    // Current selection is UTF-8 (index 0), UTF-16 LE is at index 2
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Move to UTF-8 BOM
+    harness.render().unwrap();
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Move to UTF-16 LE
+    harness.render().unwrap();
+
+    // Check what's shown after navigation
+    let screen_after_nav = harness.screen_to_string();
+    assert!(
+        screen_after_nav.contains("UTF-16 LE"),
+        "UTF-16 LE should be visible after navigating. Screen:\n{}",
+        screen_after_nav
+    );
+
+    // Press Enter to confirm the selection
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify encoding changed to UTF-16 LE in status bar
+    let final_screen = harness.screen_to_string();
+    assert!(
+        final_screen.contains("UTF-16 LE"),
+        "Encoding should be UTF-16 LE after confirmation. Screen:\n{}",
+        final_screen
+    );
+    // Content should still be visible
+    harness.assert_screen_contains("Hello World!");
+
+    // Save the file (Ctrl+S)
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Read the saved file and verify it's now UTF-16 LE
+    let saved_content = std::fs::read(&file_path).unwrap();
+
+    // UTF-16 LE file should start with BOM
+    assert!(
+        saved_content.starts_with(UTF16_LE_BOM),
+        "Saved file should have UTF-16 LE BOM. Got first bytes: {:?}",
+        &saved_content[..saved_content.len().min(10)]
+    );
+
+    // Decode UTF-16 LE content (skip BOM)
+    let utf16_bytes = &saved_content[2..];
+    let utf16_units: Vec<u16> = utf16_bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    let decoded = String::from_utf16(&utf16_units).expect("Should be valid UTF-16 LE");
+
+    assert!(
+        decoded.contains("Hello World!"),
+        "Saved file should contain the original text. Got: {}",
+        decoded
+    );
+    assert!(
+        decoded.contains("こんにちは"),
+        "Saved file should preserve Japanese characters"
     );
 }

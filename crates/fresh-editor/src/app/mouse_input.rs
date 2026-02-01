@@ -807,6 +807,15 @@ impl Editor {
                     }
                 }
 
+                // Check encoding indicator area
+                if let Some((enc_row, enc_start, enc_end)) =
+                    self.cached_layout.status_bar_encoding_area
+                {
+                    if row == enc_row && col >= enc_start && col < enc_end {
+                        return Some(HoverTarget::StatusBarEncodingIndicator);
+                    }
+                }
+
                 // Check language indicator area
                 if let Some((lang_row, lang_start, lang_end)) =
                     self.cached_layout.status_bar_language_area

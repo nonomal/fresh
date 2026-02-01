@@ -370,6 +370,9 @@ impl Editor {
             PromptType::SetLineEnding => {
                 self.handle_set_line_ending(&input);
             }
+            PromptType::SetEncoding => {
+                self.handle_set_encoding(&input);
+            }
             PromptType::SetLanguage => {
                 self.handle_set_language(&input);
             }
@@ -586,6 +589,31 @@ impl Editor {
             }
             None => {
                 self.set_status_message(t!("error.unknown_line_ending", input = input).to_string());
+            }
+        }
+    }
+
+    /// Handle SetEncoding prompt confirmation.
+    fn handle_set_encoding(&mut self, input: &str) {
+        use crate::model::buffer::Encoding;
+
+        // Extract the encoding code from the input (e.g., "UTF-8" from "UTF-8 (Unicode)")
+        let trimmed = input.trim();
+        let code = trimmed.split_whitespace().next().unwrap_or(trimmed);
+
+        // Match against all known encodings
+        let encoding = Encoding::all()
+            .iter()
+            .find(|enc| enc.display_name().eq_ignore_ascii_case(code))
+            .copied();
+
+        match encoding {
+            Some(enc) => {
+                self.active_state_mut().buffer.set_encoding(enc);
+                self.set_status_message(format!("Encoding set to {}", enc.display_name()));
+            }
+            None => {
+                self.set_status_message(format!("Unknown encoding: {}", input));
             }
         }
     }

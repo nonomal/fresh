@@ -695,33 +695,14 @@ mod tests {
 
         // The UTF-8 content should contain the Polish characters
         let utf8_str = std::str::from_utf8(utf8_content).unwrap();
-        assert!(
-            utf8_str.contains('ż'),
-            "Should contain ż: {}",
-            utf8_str
-        );
-        assert!(
-            utf8_str.contains('ó'),
-            "Should contain ó: {}",
-            utf8_str
-        );
-        assert!(
-            utf8_str.contains('ł'),
-            "Should contain ł: {}",
-            utf8_str
-        );
-        assert!(
-            utf8_str.contains('ć'),
-            "Should contain ć: {}",
-            utf8_str
-        );
+        assert!(utf8_str.contains('ż'), "Should contain ż: {}", utf8_str);
+        assert!(utf8_str.contains('ó'), "Should contain ó: {}", utf8_str);
+        assert!(utf8_str.contains('ł'), "Should contain ł: {}", utf8_str);
+        assert!(utf8_str.contains('ć'), "Should contain ć: {}", utf8_str);
 
         // Convert back to Windows-1250
         let back = convert_from_utf8(utf8_content, Encoding::Windows1250);
-        assert_eq!(
-            back, windows1250_bytes,
-            "Round-trip should preserve bytes"
-        );
+        assert_eq!(back, windows1250_bytes, "Round-trip should preserve bytes");
     }
 
     #[test]

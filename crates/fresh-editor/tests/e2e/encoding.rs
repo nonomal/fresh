@@ -302,6 +302,11 @@ fn ascii_text_strategy() -> impl Strategy<Value = String> {
 ///
 /// IMPORTANT: The ASCII prefix is mandatory (never empty) to create "space + high byte"
 /// patterns that distinguish Latin-1 from CJK encodings.
+///
+/// IMPORTANT: We only use Latin-1 characters in the 0xC0-0xFF range, NOT 0x80-0xBF.
+/// Characters in 0x80-0xBF are valid UTF-8 continuation bytes, so sequences like
+/// "é££" (0xE9 0xA3 0xA3) would be valid UTF-8 and detected as such, causing test failures.
+/// By using only 0xC0-0xFF characters, sequences like "éé" (0xE9 0xE9) are NOT valid UTF-8.
 fn latin1_text_strategy() -> impl Strategy<Value = String> {
     // Generate a prefix with at least one ASCII word (NEVER empty!)
     // The trailing space creates "space + high byte" pattern that signals Latin-1
@@ -310,10 +315,12 @@ fn latin1_text_strategy() -> impl Strategy<Value = String> {
     ]);
 
     // Generate middle content with Latin-1 extended characters
+    // NOTE: Only use characters in 0xC0-0xFF range to avoid generating valid UTF-8 sequences.
+    // Excluded (0xA0-0xBF range, valid UTF-8 continuation bytes): £, ¥, ©, ®, ±, µ, ¶
     let latin1_chars = prop::collection::vec(
         prop::sample::select(vec![
             'é', 'è', 'ê', 'ë', 'à', 'â', 'ä', 'ç', 'ô', 'ö', 'ù', 'û', 'ü', 'ñ', 'ß', 'æ', 'ø',
-            'å', '£', '¥', '©', '®', '±', 'µ', '¶', ' ', ' ', ' ',
+            'å', 'ÿ', 'þ', 'ý', 'ü', 'û', 'ú', ' ', ' ', ' ',
         ]),
         3..30,
     );

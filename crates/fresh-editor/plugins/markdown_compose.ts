@@ -599,14 +599,14 @@ editor.registerCommand(
   "%cmd.toggle_compose",
   "%cmd.toggle_compose_desc",
   "markdownToggleCompose",
-  "normal"
+  null
 );
 
 editor.registerCommand(
   "%cmd.set_compose_width",
   "%cmd.set_compose_width_desc",
   "markdownSetComposeWidth",
-  "normal"
+  null
 );
 
 // Initialization

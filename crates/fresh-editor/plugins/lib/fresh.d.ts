@@ -664,8 +664,34 @@ interface EditorAPI {
 	copyToClipboard(text: string): void;
 	setClipboard(text: string): void;
 	/**
-	* Register a command - reads plugin name from __pluginName__ global
-	* context is optional - can be omitted, null, undefined, or a string
+	* Register a command that will appear in the command palette.
+	* 
+	* # Arguments
+	* 
+	* * `name` - Command name displayed in the palette. Prefix with `%` for i18n
+	* lookup (e.g., `"%cmd.my_command"` looks up `"cmd.my_command"` in the
+	* plugin's i18n strings).
+	* * `description` - Command description. Also supports `%` prefix for i18n.
+	* * `handler_name` - Name of a global JavaScript function to call when the
+	* command is executed.
+	* * `context` - Optional visibility filter. Controls when the command appears
+	* in the command palette:
+	* - `null`, `undefined`, or omitted: Command is **always visible** in the
+	* palette (recommended for most commands).
+	* - A string (e.g., `"vi-normal"`): Command is only visible when this
+	* context is active. Contexts are activated via `setContext()` or by
+	* the buffer's mode. Use this for mode-specific commands (e.g., vim
+	* normal mode commands).
+	* 
+	* # Example
+	* 
+	* ```javascript
+	* // Always-visible command (recommended)
+	* editor.registerCommand("%cmd.my_action", "%cmd.my_action_desc", "myHandler", null);
+	* 
+	* // Context-restricted command (only visible when "vi-normal" context is active)
+	* editor.registerCommand("Vi: Join Lines", "Join current line with next", "viJoinLines", "vi-normal");
+	* ```
 	*/
 	registerCommand(name: string, description: string, handlerName: string, context?: unknown): boolean;
 	/**

@@ -627,24 +627,24 @@ mod integration_tests {
         let mut read_buf = [0u8; 8192];
 
         loop {
-            match conn.data.try_read(&mut read_buf) {
-                Ok(0) => {
-                    // EOF - shouldn't happen, but don't spin
-                    thread::sleep(Duration::from_millis(10));
-                }
+            let no_data = match conn.data.try_read(&mut read_buf) {
+                Ok(0) => true,
                 Ok(n) => {
                     output_buf.extend_from_slice(&read_buf[..n]);
-                    // Check if we have the expected output (ANSI sequences or substantial content)
-                    let output_str = String::from_utf8_lossy(&output_buf);
-                    if output_str.contains("\x1b[") || output_buf.len() > 100 {
-                        break; // Got expected output
-                    }
+                    false
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No data yet, wait a bit and retry
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                 Err(e) => panic!("Read error: {}", e),
+            };
+
+            // Check condition after every read attempt (whether we got data or not)
+            let output_str = String::from_utf8_lossy(&output_buf);
+            if output_str.contains("\x1b[") || output_buf.len() > 100 {
+                break; // Got expected output
+            }
+
+            if no_data {
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
@@ -656,33 +656,30 @@ mod integration_tests {
         // No fixed timeout - nextest will handle external timeout
         output_buf.clear();
         loop {
-            match conn.data.try_read(&mut read_buf) {
-                Ok(0) => {
-                    // EOF - shouldn't happen, but don't spin
-                    thread::sleep(Duration::from_millis(10));
-                }
+            let no_data = match conn.data.try_read(&mut read_buf) {
+                Ok(0) => true,
                 Ok(n) => {
                     output_buf.extend_from_slice(&read_buf[..n]);
-                    // Check if we have the expected output
-                    let output_str = String::from_utf8_lossy(&output_buf);
-                    if output_str.contains('h') || output_buf.len() > 50 {
-                        break; // Got expected output
-                    }
+                    false
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No data yet, wait a bit and retry
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                 Err(e) => panic!("Read error: {}", e),
+            };
+
+            // Check condition after every read attempt
+            let output_str = String::from_utf8_lossy(&output_buf);
+            if output_str.contains('h') || output_buf.len() > 50 {
+                break; // Got expected output
+            }
+
+            if no_data {
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
         // Test detach command
         conn.write_control(&serde_json::to_string(&ClientControl::Detach).unwrap())
             .unwrap();
-
-        // Give server time to process detach
-        thread::sleep(Duration::from_millis(100));
 
         // Server should still be running after detach (just client disconnected)
         // Connect again to verify
@@ -794,18 +791,23 @@ mod integration_tests {
         let mut buf = [0u8; 8192];
         let mut client1_initial = Vec::new();
         loop {
-            match conn1.data.try_read(&mut buf) {
-                Ok(0) => thread::sleep(Duration::from_millis(10)),
+            let no_data = match conn1.data.try_read(&mut buf) {
+                Ok(0) => true,
                 Ok(n) => {
                     client1_initial.extend_from_slice(&buf[..n]);
-                    if !client1_initial.is_empty() {
-                        break;
-                    }
+                    false
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                 Err(e) => panic!("Read error: {}", e),
+            };
+
+            // Check condition after every read attempt
+            if !client1_initial.is_empty() {
+                break;
+            }
+
+            if no_data {
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
@@ -815,19 +817,24 @@ mod integration_tests {
         // Semantic wait: read until we see HELLO_WORLD in client1's output
         let mut client1_typed = Vec::new();
         loop {
-            match conn1.data.try_read(&mut buf) {
-                Ok(0) => thread::sleep(Duration::from_millis(10)),
+            let no_data = match conn1.data.try_read(&mut buf) {
+                Ok(0) => true,
                 Ok(n) => {
                     client1_typed.extend_from_slice(&buf[..n]);
-                    let output_str = String::from_utf8_lossy(&client1_typed);
-                    if output_str.contains("HELLO_WORLD") {
-                        break;
-                    }
+                    false
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                 Err(e) => panic!("Read error: {}", e),
+            };
+
+            // Check condition after every read attempt
+            let output_str = String::from_utf8_lossy(&client1_typed);
+            if output_str.contains("HELLO_WORLD") {
+                break;
+            }
+
+            if no_data {
+                thread::sleep(Duration::from_millis(10));
             }
         }
 
@@ -853,19 +860,24 @@ mod integration_tests {
         // This verifies it got a full screen render with the typed content
         let mut client2_output = Vec::new();
         loop {
-            match conn2.data.try_read(&mut buf) {
-                Ok(0) => thread::sleep(Duration::from_millis(10)),
+            let no_data = match conn2.data.try_read(&mut buf) {
+                Ok(0) => true,
                 Ok(n) => {
                     client2_output.extend_from_slice(&buf[..n]);
-                    let output_str = String::from_utf8_lossy(&client2_output);
-                    if output_str.contains("HELLO_WORLD") && client2_output.len() > 500 {
-                        break;
-                    }
+                    false
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                 Err(e) => panic!("Read error: {}", e),
+            };
+
+            // Check condition after every read attempt
+            let output_str = String::from_utf8_lossy(&client2_output);
+            if output_str.contains("HELLO_WORLD") && client2_output.len() > 500 {
+                break;
+            }
+
+            if no_data {
+                thread::sleep(Duration::from_millis(10));
             }
         }
 

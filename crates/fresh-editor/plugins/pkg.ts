@@ -1409,7 +1409,7 @@ async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
 
   // Confirm with user before reinstalling
   const response = await editor.prompt(
-    `Reinstall ${pkg.name} from ${pkg.source}? (yes/no)`,
+    `Reinstall ${pkg.name} from ${pkg.source}? (yes/no) `,
     "no"
   );
 

@@ -47,7 +47,7 @@ const EXIT_NEW_SESSION: i32 = 2;
     "  session attach [NAME]     Attach to a session (NAME or current dir)\n",
     "  session new NAME          Start a new named session\n",
     "  session kill [NAME]       Terminate a session\n",
-    "  session open-file NAME FILES   Open files in session (starts if needed, exit 2 = new)\n",
+    "  session open-file [--wait] NAME FILES   Open files in session (exit 2 = new session)\n",
     "\n",
     "Examples:\n",
     "  fresh file.txt                               Open a file\n",
@@ -55,7 +55,7 @@ const EXIT_NEW_SESSION: i32 = 2;
     "  fresh -a mysession                           Attach to named session\n",
     "  fresh --cmd session new proj                 Start session named 'proj'\n",
     "  fresh --cmd session open-file . main.rs     Open file in current dir session\n",
-    "  fresh --cmd session open-file proj a.rs     Open file in 'proj' session\n",
+    "  fresh --cmd session open-file --wait main f Use as $EDITOR (blocks until closed)\n",
     "\n",
     "Documentation: https://getfresh.dev/docs"
 ))]

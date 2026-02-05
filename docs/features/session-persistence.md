@@ -51,7 +51,8 @@ Detaching exits only the client; the server keeps running.
 | `fresh -a <name>` | Attach to named session |
 | `fresh --cmd session list` | List running sessions |
 | `fresh --cmd session new <name>` | Start a new named session |
-| `fresh --cmd session open-file <name> <files>` | Open files in a running session |
+| `fresh --cmd session open-file <name> <files>` | Open files in a running session (starts server if needed) |
+| `fresh --cmd session open-file --wait <name> <file>` | Open file and block until closed (for `$EDITOR`) |
 | `fresh --cmd session kill` | Kill session for current directory |
 | `fresh --cmd session kill <name>` | Kill named session |
 | `fresh --cmd session kill --all` | Kill all sessions |
@@ -68,7 +69,7 @@ fresh -a feature-work
 
 ### Opening Files in a Running Session
 
-Open files in an existing session without attaching to it:
+Open files in a session without attaching to it. If no session exists, one is started automatically.
 
 ```bash
 # Open file in current directory session (use "." for session name)
@@ -81,7 +82,28 @@ fresh --cmd session open-file myproject src/lib.rs:42:10
 fresh --cmd session open-file . file1.rs file2.rs
 ```
 
+**Exit codes:**
+- `0` - Files opened in existing session
+- `2` - New session started (useful for scripts that need to spawn a terminal)
+
 This is useful for integrating Fresh with file managers or other tools—files open in the existing editor without starting a new terminal session.
+
+### Using Fresh as `$EDITOR`
+
+The `--wait` flag blocks until the file is closed, making Fresh suitable for `$EDITOR`:
+
+```bash
+export EDITOR='fresh --cmd session open-file --wait main'
+export VISUAL='fresh --cmd session open-file --wait main'
+
+# Now git commit, crontab -e, etc. will use Fresh
+git commit  # Opens editor, waits for you to close the buffer
+```
+
+When used with `--wait`:
+1. The file opens in the specified session
+2. The command blocks until you close that buffer (Command Palette → "Close Buffer")
+3. Control returns to the calling program (git, crontab, etc.)
 
 ### Detaching
 

@@ -483,6 +483,8 @@ pub struct JsEditorApi {
     callback_contexts: Rc<RefCell<HashMap<u64, String>>>,
     #[qjs(skip_trace)]
     services: Arc<dyn fresh_core::services::PluginServiceBridge>,
+    #[qjs(skip_trace)]
+    plugin_path: Option<PathBuf>,
     pub plugin_name: String,
 }
 
@@ -1252,6 +1254,16 @@ impl JsEditorApi {
             .join("themes")
             .to_string_lossy()
             .to_string()
+    }
+
+    /// Get the directory containing the currently executing plugin
+    /// Returns empty string if plugin path is not available
+    pub fn get_plugin_dir(&self) -> String {
+        self.plugin_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     /// Apply a theme by name
@@ -2846,6 +2858,8 @@ pub struct QuickJsBackend {
     main_context: Context,
     /// Plugin-specific contexts: plugin_name -> Context
     plugin_contexts: Rc<RefCell<HashMap<String, Context>>>,
+    /// Plugin paths: plugin_name -> PathBuf to plugin file
+    plugin_paths: Rc<RefCell<HashMap<String, PathBuf>>>,
     /// Event handlers: event_name -> list of PluginHandler
     event_handlers: Rc<RefCell<HashMap<String, Vec<PluginHandler>>>>,
     /// Registered actions: action_name -> PluginHandler
@@ -2927,6 +2941,7 @@ impl QuickJsBackend {
             .map_err(|e| anyhow!("Failed to create QuickJS context: {}", e))?;
 
         let plugin_contexts = Rc::new(RefCell::new(HashMap::new()));
+        let plugin_paths = Rc::new(RefCell::new(HashMap::new()));
         let event_handlers = Rc::new(RefCell::new(HashMap::new()));
         let registered_actions = Rc::new(RefCell::new(HashMap::new()));
         let next_request_id = Rc::new(RefCell::new(1u64));
@@ -2936,6 +2951,7 @@ impl QuickJsBackend {
             runtime,
             main_context,
             plugin_contexts,
+            plugin_paths,
             event_handlers,
             registered_actions,
             state_snapshot,
@@ -2961,6 +2977,9 @@ impl QuickJsBackend {
         let registered_actions = Rc::clone(&self.registered_actions);
         let next_request_id = Rc::clone(&self.next_request_id);
 
+        // Get plugin path from the map
+        let plugin_path = self.plugin_paths.borrow().get(plugin_name).cloned();
+
         context.with(|ctx| {
             let globals = ctx.globals();
 
@@ -2977,6 +2996,7 @@ impl QuickJsBackend {
                 next_request_id: Rc::clone(&next_request_id),
                 callback_contexts: Rc::clone(&self.callback_contexts),
                 services: self.services.clone(),
+                plugin_path,
                 plugin_name: plugin_name.to_string(),
             };
             let editor = rquickjs::Class::<JsEditorApi>::instance(ctx.clone(), js_api)?;
@@ -3129,12 +3149,14 @@ impl QuickJsBackend {
     }
 
     /// Load and execute a TypeScript/JavaScript plugin from a file path
-    pub async fn load_module_with_source(
-        &mut self,
-        path: &str,
-        _plugin_source: &str,
-    ) -> Result<()> {
+    pub async fn load_module_with_source(&mut self, path: &str, plugin_name: &str) -> Result<()> {
         let path_buf = PathBuf::from(path);
+
+        // Store plugin path for getPluginDir() API
+        self.plugin_paths
+            .borrow_mut()
+            .insert(plugin_name.to_string(), path_buf.clone());
+
         let source = std::fs::read_to_string(&path_buf)
             .map_err(|e| anyhow!("Failed to read plugin {}: {}", path, e))?;
 

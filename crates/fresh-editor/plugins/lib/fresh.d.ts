@@ -884,6 +884,11 @@ interface EditorAPI {
 	*/
 	getThemesDir(): string;
 	/**
+	* Get the directory containing the currently executing plugin
+	* Returns empty string if plugin path is not available
+	*/
+	getPluginDir(): string;
+	/**
 	* Apply a theme by name
 	*/
 	applyTheme(themeName: string): boolean;

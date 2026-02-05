@@ -155,24 +155,36 @@ struct Args {
     list_sessions: bool,
     session_name: Option<String>,
     kill: Option<Option<String>>,
-    /// Open files in a session without attaching (session_name, files)
-    open_files_in_session: Option<(Option<String>, Vec<String>)>,
+    /// Open files in a session without attaching
+    open_files_in_session: Option<OpenFilesCommand>,
+}
+
+/// Command to open files in a session
+#[derive(Debug, Clone)]
+struct OpenFilesCommand {
+    session_name: Option<String>,
+    files: Vec<String>,
+    wait: bool,
+}
+
+/// Parsed command result from CLI arguments
+#[derive(Debug, Clone, Default)]
+struct ParsedCommand {
+    list_sessions: bool,
+    kill: Option<Option<String>>,
+    attach: bool,
+    session_name: Option<String>,
+    dump_config: bool,
+    show_paths: bool,
+    init: Option<Option<String>>,
+    files: Vec<String>,
+    open_files_in_session: Option<OpenFilesCommand>,
 }
 
 impl From<Cli> for Args {
     fn from(cli: Cli) -> Self {
         // Parse --cmd arguments to determine command
-        let (
-            list_sessions,
-            kill,
-            attach,
-            session_name,
-            dump_config,
-            show_paths,
-            init,
-            files,
-            open_files_in_session,
-        ) = if !cli.cmd.is_empty() {
+        let parsed = if !cli.cmd.is_empty() {
             // Parse command from --cmd arguments
             let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
             match cmd_args.as_slice() {
@@ -180,139 +192,136 @@ impl From<Cli> for Args {
                 ["session", "list", ..]
                 | ["s", "list", ..]
                 | ["session", "ls", ..]
-                | ["s", "ls", ..] => (true, None, false, None, false, false, None, cli.files, None),
-                // Open file in session: fresh --cmd session open-file <name> <files...>
-                ["session", "open-file", name, files @ ..]
-                | ["s", "open-file", name, files @ ..] => {
-                    let session = if *name == "." {
-                        None
+                | ["s", "ls", ..] => ParsedCommand {
+                    list_sessions: true,
+                    files: cli.files,
+                    ..Default::default()
+                },
+                // Open file in session: fresh --cmd session open-file [--wait] <name> <files...>
+                ["session", "open-file", rest @ ..] | ["s", "open-file", rest @ ..] => {
+                    // Parse --wait flag and extract name and files
+                    let mut wait = false;
+                    let mut remaining: Vec<&str> = Vec::new();
+                    for arg in rest {
+                        if *arg == "--wait" || *arg == "-w" {
+                            wait = true;
+                        } else {
+                            remaining.push(arg);
+                        }
+                    }
+
+                    if remaining.is_empty() {
+                        eprintln!("Missing session name for open-file command");
+                        ParsedCommand {
+                            files: cli.files,
+                            ..Default::default()
+                        }
                     } else {
-                        Some((*name).to_string())
-                    };
-                    let file_list: Vec<String> = files.iter().map(|s| (*s).to_string()).collect();
-                    (
-                        false,
-                        None,
-                        false,
-                        None,
-                        false,
-                        false,
-                        None,
-                        vec![],
-                        Some((session, file_list)),
-                    )
+                        let name = remaining[0];
+                        let session = if name == "." {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        };
+                        let file_list: Vec<String> =
+                            remaining[1..].iter().map(|s| (*s).to_string()).collect();
+                        ParsedCommand {
+                            open_files_in_session: Some(OpenFilesCommand {
+                                session_name: session,
+                                files: file_list,
+                                wait,
+                            }),
+                            ..Default::default()
+                        }
+                    }
                 }
                 ["session", "attach", name, ..]
                 | ["s", "attach", name, ..]
                 | ["session", "a", name, ..]
-                | ["s", "a", name, ..] => (
-                    false,
-                    None,
-                    true,
-                    Some((*name).to_string()),
-                    false,
-                    false,
-                    None,
-                    cli.files,
-                    None,
-                ),
+                | ["s", "a", name, ..] => ParsedCommand {
+                    attach: true,
+                    session_name: Some((*name).to_string()),
+                    files: cli.files,
+                    ..Default::default()
+                },
                 ["session", "attach"] | ["s", "attach"] | ["session", "a"] | ["s", "a"] => {
-                    (false, None, true, None, false, false, None, cli.files, None)
+                    ParsedCommand {
+                        attach: true,
+                        files: cli.files,
+                        ..Default::default()
+                    }
                 }
                 ["session", "new", name, rest @ ..]
                 | ["s", "new", name, rest @ ..]
                 | ["session", "n", name, rest @ ..]
                 | ["s", "n", name, rest @ ..] => {
                     let files: Vec<String> = rest.iter().map(|s| (*s).to_string()).collect();
-                    (
-                        false,
-                        None,
-                        true,
-                        Some((*name).to_string()),
-                        false,
-                        false,
-                        None,
+                    ParsedCommand {
+                        attach: true,
+                        session_name: Some((*name).to_string()),
                         files,
-                        None,
-                    )
+                        ..Default::default()
+                    }
                 }
                 ["session", "kill", "--all"]
                 | ["s", "kill", "--all"]
                 | ["session", "k", "--all"]
-                | ["s", "k", "--all"] => (
-                    false,
-                    Some(Some("--all".to_string())),
-                    false,
-                    None,
-                    false,
-                    false,
-                    None,
-                    cli.files,
-                    None,
-                ),
+                | ["s", "k", "--all"] => ParsedCommand {
+                    kill: Some(Some("--all".to_string())),
+                    files: cli.files,
+                    ..Default::default()
+                },
                 ["session", "kill", name, ..]
                 | ["s", "kill", name, ..]
                 | ["session", "k", name, ..]
-                | ["s", "k", name, ..] => (
-                    false,
-                    Some(Some((*name).to_string())),
-                    false,
-                    None,
-                    false,
-                    false,
-                    None,
-                    cli.files,
-                    None,
-                ),
-                ["session", "kill"] | ["s", "kill"] | ["session", "k"] | ["s", "k"] => (
-                    false,
-                    Some(None),
-                    false,
-                    None,
-                    false,
-                    false,
-                    None,
-                    cli.files,
-                    None,
-                ),
+                | ["s", "k", name, ..] => ParsedCommand {
+                    kill: Some(Some((*name).to_string())),
+                    files: cli.files,
+                    ..Default::default()
+                },
+                ["session", "kill"] | ["s", "kill"] | ["session", "k"] | ["s", "k"] => {
+                    ParsedCommand {
+                        kill: Some(None),
+                        files: cli.files,
+                        ..Default::default()
+                    }
+                }
                 ["session", "info", name, ..] | ["s", "info", name, ..] => {
                     // Info not fully implemented, treat as list for now
                     let _ = name;
-                    (true, None, false, None, false, false, None, cli.files, None)
+                    ParsedCommand {
+                        list_sessions: true,
+                        files: cli.files,
+                        ..Default::default()
+                    }
                 }
-                ["session", "info"] | ["s", "info"] => {
-                    (true, None, false, None, false, false, None, cli.files, None)
-                }
+                ["session", "info"] | ["s", "info"] => ParsedCommand {
+                    list_sessions: true,
+                    files: cli.files,
+                    ..Default::default()
+                },
                 // Config commands
-                ["config", "show"] | ["config", "dump"] => {
-                    (false, None, false, None, true, false, None, cli.files, None)
-                }
-                ["config", "paths"] => {
-                    (false, None, false, None, false, true, None, cli.files, None)
-                }
+                ["config", "show"] | ["config", "dump"] => ParsedCommand {
+                    dump_config: true,
+                    files: cli.files,
+                    ..Default::default()
+                },
+                ["config", "paths"] => ParsedCommand {
+                    show_paths: true,
+                    files: cli.files,
+                    ..Default::default()
+                },
                 // Init command
-                ["init", pkg_type, ..] => (
-                    false,
-                    None,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(Some((*pkg_type).to_string())),
-                    cli.files,
-                    None,
-                ),
-                ["init"] => (
-                    false,
-                    None,
-                    false,
-                    None,
-                    false,
-                    false,
-                    Some(None),
-                    cli.files,
-                    None,
-                ),
+                ["init", pkg_type, ..] => ParsedCommand {
+                    init: Some(Some((*pkg_type).to_string())),
+                    files: cli.files,
+                    ..Default::default()
+                },
+                ["init"] => ParsedCommand {
+                    init: Some(None),
+                    files: cli.files,
+                    ..Default::default()
+                },
                 // Unknown command
                 _ => {
                     eprintln!("Unknown command: {}", cli.cmd.join(" "));
@@ -335,21 +344,19 @@ impl From<Cli> for Args {
                 cli.session_name
             };
 
-            (
-                false,
-                None,
+            ParsedCommand {
                 attach,
                 session_name,
-                cli.dump_config,
-                cli.show_paths,
-                cli.init,
-                cli.files,
-                None,
-            )
+                dump_config: cli.dump_config,
+                show_paths: cli.show_paths,
+                init: cli.init,
+                files: cli.files,
+                ..Default::default()
+            }
         };
 
         Args {
-            files,
+            files: parsed.files,
             stdin: cli.stdin,
             no_plugins: cli.no_plugins,
             config: cli.config,
@@ -357,17 +364,17 @@ impl From<Cli> for Args {
             event_log: cli.event_log,
             no_session: cli.no_restore,
             no_upgrade_check: cli.no_upgrade_check,
-            dump_config,
-            show_paths,
+            dump_config: parsed.dump_config,
+            show_paths: parsed.show_paths,
             locale: cli.locale,
             check_plugin: cli.check_plugin,
-            init,
+            init: parsed.init,
             server: cli.server,
-            attach,
-            list_sessions,
-            session_name,
-            kill,
-            open_files_in_session,
+            attach: parsed.attach,
+            list_sessions: parsed.list_sessions,
+            session_name: parsed.session_name,
+            kill: parsed.kill,
+            open_files_in_session: parsed.open_files_in_session,
         }
     }
 }
@@ -2085,12 +2092,16 @@ fn run_server_command(args: &Args) -> AnyhowResult<()> {
 }
 
 /// Open files in a running session without attaching
-fn run_open_files_command(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> {
+fn run_open_files_command(cmd: &OpenFilesCommand) -> AnyhowResult<()> {
     use fresh::server::daemon::is_process_running;
     use fresh::server::protocol::{
         ClientControl, ClientHello, FileRequest, ServerControl, TermSize, PROTOCOL_VERSION,
     };
     use fresh::server::spawn_server_detached;
+
+    let session_name = cmd.session_name.as_deref();
+    let files = &cmd.files;
+    let wait = cmd.wait;
 
     if files.is_empty() {
         eprintln!("No files specified.");
@@ -2203,18 +2214,46 @@ fn run_open_files_command(session_name: Option<&str>, files: &[String]) -> Anyho
     // Send OpenFiles command
     let msg = serde_json::to_string(&ClientControl::OpenFiles {
         files: file_requests.clone(),
+        wait,
     })?;
     conn.write_control(&msg)?;
 
-    if server_was_started {
-        eprintln!(
-            "Started new session and opened {} file(s).",
-            file_requests.len()
-        );
+    let file_count = file_requests.len();
+
+    if wait {
+        // Wait mode: block until all files are closed
+        eprintln!("Opened {} file(s), waiting for close...", file_count);
+
+        // Track how many files we're waiting for
+        let mut remaining = file_count;
+
+        while remaining > 0 {
+            if let Some(response) = conn.read_control()? {
+                let msg: ServerControl = serde_json::from_str(&response)?;
+                match msg {
+                    ServerControl::BufferClosed { path } => {
+                        tracing::debug!("Buffer closed: {}", path);
+                        remaining -= 1;
+                    }
+                    ServerControl::Quit { .. } => {
+                        // Server is shutting down
+                        break;
+                    }
+                    _ => {}
+                }
+            } else {
+                // Connection closed
+                break;
+            }
+        }
+
+        eprintln!("All files closed.");
+    } else if server_was_started {
+        eprintln!("Started new session and opened {} file(s).", file_count);
         // Exit code 2 signals caller to spawn a terminal with attached client
         std::process::exit(EXIT_NEW_SESSION);
     } else {
-        eprintln!("Opened {} file(s) in session.", file_requests.len());
+        eprintln!("Opened {} file(s) in session.", file_count);
     }
     Ok(())
 }
@@ -2494,8 +2533,8 @@ fn real_main() -> AnyhowResult<()> {
     }
 
     // Handle open-file in session: send files to running session without attaching
-    if let Some((session_name, files)) = &args.open_files_in_session {
-        return run_open_files_command(session_name.as_deref(), files);
+    if let Some(ref cmd) = args.open_files_in_session {
+        return run_open_files_command(cmd);
     }
 
     // Handle --attach: connect to existing session

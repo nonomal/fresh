@@ -116,7 +116,12 @@ pub enum ClientControl {
     /// Request to quit (shutdown server if last client)
     Quit,
     /// Request to open files in the editor
-    OpenFiles { files: Vec<FileRequest> },
+    OpenFiles {
+        files: Vec<FileRequest>,
+        /// If true, server will send BufferClosed when all files are closed
+        #[serde(default)]
+        wait: bool,
+    },
 }
 
 /// A file to open with optional line/column position
@@ -145,6 +150,8 @@ pub enum ServerControl {
     Quit { reason: String },
     /// Error message
     Error { message: String },
+    /// Buffer was closed (sent to waiting clients)
+    BufferClosed { path: String },
 }
 
 /// Wrapper for control channel messages (used for JSON serialization)

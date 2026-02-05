@@ -1322,6 +1322,13 @@ impl Editor {
 
     /// Internal helper to close a buffer (shared by close_buffer and force_close_buffer)
     fn close_buffer_internal(&mut self, id: BufferId) -> anyhow::Result<()> {
+        // Get file path before closing (for FILE_CLOSED event)
+        let file_path = self
+            .buffer_metadata
+            .get(&id)
+            .and_then(|m| m.file_path())
+            .map(|p| p.to_path_buf());
+
         // Save file state before closing (for per-file session persistence)
         self.save_file_state_on_close(id);
 
@@ -1438,6 +1445,16 @@ impl Editor {
         // If this was the last visible buffer, focus file explorer
         if is_last_visible_buffer {
             self.focus_file_explorer();
+        }
+
+        // Emit FILE_CLOSED event for waiting clients
+        if let Some(path) = file_path {
+            self.emit_event(
+                crate::model::control_event::events::FILE_CLOSED.name,
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                }),
+            );
         }
 
         Ok(())

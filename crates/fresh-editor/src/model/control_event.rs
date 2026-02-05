@@ -41,6 +41,12 @@ pub mod events {
         data_schema_fn: || json!({"path": "string"}),
     };
 
+    pub const FILE_CLOSED: EventDef = EventDef {
+        name: "editor:file_closed",
+        description: "File buffer closed",
+        data_schema_fn: || json!({"path": "string"}),
+    };
+
     // ===== LSP Events =====
 
     pub const LSP_STATUS_CHANGED: EventDef = EventDef {
@@ -51,7 +57,7 @@ pub mod events {
 
     /// Get all registered events (for schema generation)
     pub fn all_events() -> Vec<&'static EventDef> {
-        vec![&FILE_OPENED, &FILE_SAVED, &LSP_STATUS_CHANGED]
+        vec![&FILE_OPENED, &FILE_SAVED, &FILE_CLOSED, &LSP_STATUS_CHANGED]
     }
 
     /// Get schema for all events as JSON

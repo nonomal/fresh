@@ -58,6 +58,8 @@ pub struct EditorServer {
     term_size: TermSize,
     /// Index of the client that most recently provided input (for per-client detach)
     last_input_client: Option<usize>,
+    /// Clients waiting for specific files to be closed (client_id -> paths)
+    waiting_clients: std::collections::HashMap<u64, Vec<String>>,
 }
 
 /// A connected client with its own input parser
@@ -98,6 +100,7 @@ impl EditorServer {
             shutdown: Arc::new(AtomicBool::new(false)),
             term_size: TermSize::new(80, 24), // Default until first client connects
             last_input_client: None,
+            waiting_clients: std::collections::HashMap::new(),
         })
     }
 
@@ -261,6 +264,9 @@ impl EditorServer {
                     needs_render = true;
                 }
             }
+
+            // Check for FILE_CLOSED events and notify waiting clients
+            self.notify_waiting_clients();
 
             // Render and broadcast if needed
             if needs_render && last_render.elapsed() >= FRAME_DURATION {
@@ -566,19 +572,31 @@ impl EditorServer {
                     tracing::info!("Client {} detached", idx);
                     disconnected.push(idx);
                 }
-                ClientControl::OpenFiles { files } => {
+                ClientControl::OpenFiles { files, wait } => {
                     if let Some(ref mut editor) = self.editor {
+                        let mut paths_to_wait: Vec<String> = Vec::new();
                         for file_req in &files {
                             let path = std::path::PathBuf::from(&file_req.path);
                             tracing::debug!(
-                                "Queuing file open: {:?} line={:?} col={:?}",
+                                "Queuing file open: {:?} line={:?} col={:?} wait={:?}",
                                 path,
                                 file_req.line,
-                                file_req.column
+                                file_req.column,
+                                wait
                             );
                             editor.queue_file_open(path, file_req.line, file_req.column);
+                            if wait {
+                                paths_to_wait.push(file_req.path.clone());
+                            }
                         }
                         resize_occurred = true; // Force re-render
+
+                        // Track waiting client
+                        if wait && !paths_to_wait.is_empty() {
+                            if let Some(client) = self.clients.get(idx) {
+                                self.waiting_clients.insert(client.id, paths_to_wait);
+                            }
+                        }
                     }
                 }
                 ClientControl::Quit => unreachable!(), // Handled above
@@ -613,6 +631,63 @@ impl EditorServer {
         }
 
         Ok(())
+    }
+
+    /// Check for FILE_CLOSED events and notify waiting clients
+    fn notify_waiting_clients(&mut self) {
+        use serde_json::json;
+
+        // Get closed files from event broadcaster
+        let closed_paths: Vec<String> = if let Some(ref editor) = self.editor {
+            let mut paths = Vec::new();
+            // Drain FILE_CLOSED events
+            loop {
+                if let Some(event) = editor
+                    .event_broadcaster()
+                    .take_match("editor:file_closed", &json!(null))
+                {
+                    if let Some(path) = event.data.get("path").and_then(|p| p.as_str()) {
+                        paths.push(path.to_string());
+                    }
+                } else {
+                    break;
+                }
+            }
+            paths
+        } else {
+            return;
+        };
+
+        if closed_paths.is_empty() {
+            return;
+        }
+
+        // Notify waiting clients
+        let mut clients_to_notify: Vec<(u64, String)> = Vec::new();
+
+        for closed_path in &closed_paths {
+            // Find clients waiting for this path
+            for (client_id, paths) in self.waiting_clients.iter_mut() {
+                if let Some(pos) = paths.iter().position(|p| p == closed_path) {
+                    paths.remove(pos);
+                    clients_to_notify.push((*client_id, closed_path.clone()));
+                }
+            }
+        }
+
+        // Remove clients with no more paths to wait for
+        self.waiting_clients.retain(|_, paths| !paths.is_empty());
+
+        // Send BufferClosed messages
+        for (client_id, path) in clients_to_notify {
+            if let Some(client) = self.clients.iter().find(|c| c.id == client_id) {
+                let msg = ServerControl::BufferClosed { path: path.clone() };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = client.conn.write_control(&json);
+                    tracing::debug!("Sent BufferClosed to client {} for {}", client_id, path);
+                }
+            }
+        }
     }
 
     /// Handle an input event

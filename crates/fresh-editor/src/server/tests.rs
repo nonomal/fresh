@@ -678,21 +678,28 @@ mod integration_tests {
         }
 
         // Test detach command
+        eprintln!("[test] Sending Detach to first connection");
         conn.write_control(&serde_json::to_string(&ClientControl::Detach).unwrap())
             .unwrap();
+        eprintln!("[test] Detach sent");
 
         // Server should still be running after detach (just client disconnected)
         // Connect again to verify
+        eprintln!("[test] Attempting second connection after detach");
         let conn2 =
             ClientConnection::connect(&socket_paths).expect("Should reconnect after detach");
+        eprintln!("[test] Second connection established");
 
         // Handshake again
         let hello2 = ClientHello::new(TermSize::new(80, 24));
+        eprintln!("[test] Sending Hello on second connection");
         conn2
             .write_control(&serde_json::to_string(&ClientControl::Hello(hello2)).unwrap())
             .unwrap();
+        eprintln!("[test] Hello sent, waiting for response");
 
         let response2 = conn2.read_control().unwrap().unwrap();
+        eprintln!("[test] Received response from server");
         let server_msg2: ServerControl = serde_json::from_str(&response2).unwrap();
         assert!(
             matches!(server_msg2, ServerControl::Hello(_)),
@@ -839,15 +846,20 @@ mod integration_tests {
         }
 
         // === Second client connects while first is still connected ===
+        eprintln!("[test] Connecting second client while first is active");
         let conn2 =
             ClientConnection::connect(&socket_paths).expect("Second client failed to connect");
+        eprintln!("[test] Second client connected");
 
         let hello2 = ClientHello::new(TermSize::new(80, 24));
+        eprintln!("[test] Sending Hello from second client");
         conn2
             .write_control(&serde_json::to_string(&ClientControl::Hello(hello2)).unwrap())
             .unwrap();
+        eprintln!("[test] Hello sent from second client, waiting for response");
 
         let response2 = conn2.read_control().unwrap().unwrap();
+        eprintln!("[test] Second client received Hello response");
         assert!(
             matches!(
                 serde_json::from_str::<ServerControl>(&response2).unwrap(),

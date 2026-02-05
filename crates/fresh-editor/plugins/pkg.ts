@@ -2552,10 +2552,12 @@ globalThis.pkg_nav_down = function(): void {
 };
 
 globalThis.pkg_next_button = function(): void {
+  editor.debug("[pkg] pkg_next_button called, isOpen=" + pkgState.isOpen);
   if (!pkgState.isOpen) return;
 
   const actions = getActionButtons();
   const hasActions = actions.length > 0;
+  editor.debug("[pkg] hasActions=" + hasActions + ", focus.type=" + pkgState.focus.type);
 
   // Special handling: from list with actions, go to first action button
   if (hasActions && pkgState.focus.type === "list") {

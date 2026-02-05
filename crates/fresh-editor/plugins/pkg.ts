@@ -1365,6 +1365,17 @@ async function updatePackage(pkg: InstalledPackage): Promise<boolean> {
  * Remove a package
  */
 async function removePackage(pkg: InstalledPackage): Promise<boolean> {
+  // Confirm with user before uninstalling
+  const response = await editor.prompt(
+    `Uninstall ${pkg.name}? (yes/no) `,
+    "no"
+  );
+
+  if (response?.toLowerCase() !== "yes") {
+    editor.setStatus("Uninstall cancelled");
+    return false;
+  }
+
   editor.setStatus(`Removing ${pkg.name}...`);
 
   // Unload the plugin first (ignore errors - plugin might not be loaded)

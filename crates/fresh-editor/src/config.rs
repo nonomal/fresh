@@ -2233,6 +2233,30 @@ impl Config {
         );
 
         languages.insert(
+            "html".to_string(),
+            LanguageConfig {
+                extensions: vec!["html".to_string(), "htm".to_string()],
+                filenames: vec![],
+                grammar: "html".to_string(),
+                comment_prefix: Some("<!--".to_string()),
+                auto_indent: true,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                use_tabs: false,
+                tab_size: None,
+                formatter: Some(FormatterConfig {
+                    command: "prettier".to_string(),
+                    args: vec!["--stdin-filepath".to_string(), "$FILE".to_string()],
+                    stdin: true,
+                    timeout_ms: 10000,
+                }),
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
             "python".to_string(),
             LanguageConfig {
                 extensions: vec!["py".to_string(), "pyi".to_string()],

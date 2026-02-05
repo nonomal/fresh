@@ -621,71 +621,61 @@ mod integration_tests {
             other => panic!("Expected Hello, got {:?}", other),
         }
 
-        // Give server time to initialize editor after handshake
-        thread::sleep(Duration::from_millis(100));
-
         // Read initial render output (alternate screen setup + initial frame)
+        // Semantic wait: keep reading until we see ANSI sequences or substantial content
         let mut output_buf = Vec::new();
         let mut read_buf = [0u8; 8192];
 
-        // Non-blocking read of initial output
-        for _ in 0..50 {
+        loop {
             match conn.data.try_read(&mut read_buf) {
-                Ok(0) => break,
-                Ok(n) => output_buf.extend_from_slice(&read_buf[..n]),
+                Ok(0) => {
+                    // EOF - shouldn't happen, but don't spin
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(n) => {
+                    output_buf.extend_from_slice(&read_buf[..n]);
+                    // Check if we have the expected output (ANSI sequences or substantial content)
+                    let output_str = String::from_utf8_lossy(&output_buf);
+                    if output_str.contains("\x1b[") || output_buf.len() > 100 {
+                        break; // Got expected output
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
+                    // No data yet, wait a bit and retry
+                    thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => panic!("Read error: {}", e),
             }
         }
-
-        // Verify we received some output (terminal setup sequences)
-        assert!(
-            !output_buf.is_empty(),
-            "Should receive initial render output from server"
-        );
-
-        // Verify output contains terminal setup (alternate screen, cursor, etc.)
-        let output_str = String::from_utf8_lossy(&output_buf);
-        assert!(
-            output_str.contains("\x1b[") || output_buf.len() > 100,
-            "Output should contain ANSI escape sequences or substantial content"
-        );
 
         // Send some keystrokes through data pipe (simulating user typing)
         // Type "hello" - these are raw bytes that the input parser will process
         conn.write_data(b"hello").unwrap();
 
-        // Give server time to process input and render
-        thread::sleep(Duration::from_millis(200));
-
-        // Read updated output
+        // Semantic wait: keep reading until we see 'h' in output or sufficient data
+        // No fixed timeout - nextest will handle external timeout
         output_buf.clear();
-        for _ in 0..50 {
+        loop {
             match conn.data.try_read(&mut read_buf) {
-                Ok(0) => break,
-                Ok(n) => output_buf.extend_from_slice(&read_buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if output_buf.is_empty() {
-                        thread::sleep(Duration::from_millis(20));
-                    } else {
-                        break; // Got some data, stop reading
+                Ok(0) => {
+                    // EOF - shouldn't happen, but don't spin
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(n) => {
+                    output_buf.extend_from_slice(&read_buf[..n]);
+                    // Check if we have the expected output
+                    let output_str = String::from_utf8_lossy(&output_buf);
+                    if output_str.contains('h') || output_buf.len() > 50 {
+                        break; // Got expected output
                     }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data yet, wait a bit and retry
+                    thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => panic!("Read error: {}", e),
             }
         }
-
-        // The output should contain the typed text "hello" somewhere
-        // (Note: it may be spread across escape sequences for cursor positioning)
-        let output_str = String::from_utf8_lossy(&output_buf);
-        // We typed into an empty buffer, so "hello" should appear in the render
-        // Either as literal text or we should at least see cursor movement
-        assert!(
-            output_str.contains('h') || output_buf.len() > 50,
-            "Should receive render updates after typing"
-        );
 
         // Test detach command
         conn.write_control(&serde_json::to_string(&ClientControl::Detach).unwrap())

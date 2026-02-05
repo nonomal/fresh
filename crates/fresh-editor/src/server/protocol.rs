@@ -275,6 +275,7 @@ mod tests {
                     line: Some(10),
                     column: Some(5),
                 }],
+                wait: false,
             },
         ];
 

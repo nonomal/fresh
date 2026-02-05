@@ -2444,6 +2444,9 @@ async function openPackageManager(): Promise<void> {
   pkgState.bufferId = result.bufferId;
   pkgState.isOpen = true;
 
+  // Ensure pkg-manager mode is active for keybindings
+  editor.setEditorMode("pkg-manager");
+
   // Apply initial highlighting
   applyPkgManagerHighlighting();
 

@@ -551,15 +551,28 @@ function getInstalledPackages(type: "plugin" | "theme" | "language" | "bundle"):
         const manifestPath = editor.pathJoin(pkgPath, "package.json");
         const manifest = readJsonFile<PackageManifest>(manifestPath);
 
-        // Try to get git remote
-        const gitConfigPath = editor.pathJoin(pkgPath, ".git", "config");
+        // Try to get source - check both git remote and .fresh-source.json
         let source = "";
-        if (editor.fileExists(gitConfigPath)) {
-          const gitConfig = editor.readFile(gitConfigPath);
-          if (gitConfig) {
-            const match = gitConfig.match(/url\s*=\s*(.+)/);
-            if (match) {
-              source = match[1].trim();
+
+        // First try .fresh-source.json (for local path installations)
+        const freshSourcePath = editor.pathJoin(pkgPath, ".fresh-source.json");
+        if (editor.fileExists(freshSourcePath)) {
+          const sourceInfo = readJsonFile<{local_path?: string, original_url?: string}>(freshSourcePath);
+          if (sourceInfo?.original_url) {
+            source = sourceInfo.original_url;
+          }
+        }
+
+        // Fall back to git remote if no .fresh-source.json
+        if (!source) {
+          const gitConfigPath = editor.pathJoin(pkgPath, ".git", "config");
+          if (editor.fileExists(gitConfigPath)) {
+            const gitConfig = editor.readFile(gitConfigPath);
+            if (gitConfig) {
+              const match = gitConfig.match(/url\s*=\s*(.+)/);
+              if (match) {
+                source = match[1].trim();
+              }
             }
           }
         }
@@ -570,7 +583,7 @@ function getInstalledPackages(type: "plugin" | "theme" | "language" | "bundle"):
           type,
           source,
           version: manifest?.version || "unknown",
-          manifest
+          manifest: manifest || undefined
         });
       }
     }
@@ -1390,6 +1403,7 @@ async function removePackage(pkg: InstalledPackage): Promise<boolean> {
 async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
   if (!pkg.source) {
     editor.setStatus(`Cannot reinstall ${pkg.name}: no source URL found`);
+    editor.warn(`[pkg] Cannot reinstall ${pkg.name}: no source URL found`);
     return false;
   }
 
@@ -1405,26 +1419,38 @@ async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
   }
 
   editor.setStatus(`Reinstalling ${pkg.name}...`);
+  editor.debug(`[pkg] Reinstalling ${pkg.name} from ${pkg.source}`);
 
   // Step 1: Remove the package
   const removed = await removePackage(pkg);
   if (!removed) {
-    editor.setStatus(`Failed to reinstall ${pkg.name}: could not uninstall`);
+    const msg = `Failed to reinstall ${pkg.name}: could not uninstall`;
+    editor.setStatus(msg);
+    editor.warn(`[pkg] ${msg}`);
     return false;
   }
 
-  // Step 2: Reinstall from source
+  // Step 2: Reinstall from source using installPackage which handles both local and remote sources
   editor.setStatus(`Installing ${pkg.name} from ${pkg.source}...`);
+  editor.debug(`[pkg] Installing from source: ${pkg.source}, type: ${pkg.type}`);
 
-  // Parse the URL to extract package name
-  const parsed = parsePackageUrl(pkg.source);
-  const result = await installFromRepo(parsed.repoUrl, parsed.name);
+  try {
+    const result = await installPackage(pkg.source, pkg.name, pkg.type);
 
-  if (result) {
-    editor.setStatus(`Reinstalled ${pkg.name} successfully`);
-    return true;
-  } else {
-    editor.setStatus(`Failed to reinstall ${pkg.name} from ${pkg.source}`);
+    if (result) {
+      editor.setStatus(`Reinstalled ${pkg.name} successfully`);
+      editor.debug(`[pkg] Reinstalled ${pkg.name} successfully`);
+      return true;
+    } else {
+      const msg = `Failed to reinstall ${pkg.name} from ${pkg.source}`;
+      editor.setStatus(msg);
+      editor.warn(`[pkg] ${msg}`);
+      return false;
+    }
+  } catch (e) {
+    const msg = `Failed to reinstall ${pkg.name}: ${e}`;
+    editor.setStatus(msg);
+    editor.warn(`[pkg] ${msg}`);
     return false;
   }
 }

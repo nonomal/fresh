@@ -2030,19 +2030,24 @@ fn kill_session_command(session: Option<&str>, args: &Args) -> AnyhowResult<()> 
 /// Run as a daemon server
 fn run_server_command(args: &Args) -> AnyhowResult<()> {
     use fresh::server::{EditorServer, EditorServerConfig};
+    use fresh::services::log_dirs;
 
-    // Initialize tracing to stderr (will go to log file when spawned detached)
+    // Initialize tracing to a log file
     use tracing_subscriber::{fmt, EnvFilter};
+    let log_path = log_dirs::server_log_path(std::process::id());
+    let log_file = std::fs::File::create(&log_path)?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+
     fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(log_file))
         .with_ansi(false)
         .init();
 
-    eprintln!(
-        "[server] Starting server process for session {:?}",
-        args.session_name
+    tracing::info!(
+        "[server] Starting server process for session {:?}, log: {:?}",
+        args.session_name,
+        log_path
     );
 
     let working_dir = std::env::current_dir()?;

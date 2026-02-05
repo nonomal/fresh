@@ -38,19 +38,31 @@ pub fn log_dir() -> &'static PathBuf {
     })
 }
 
-/// Get the XDG state home log directory
+/// Get the platform-appropriate log directory
 fn get_xdg_log_dir() -> Option<PathBuf> {
-    // First try XDG_STATE_HOME
-    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        let path = PathBuf::from(state_home);
-        if path.is_absolute() {
-            return Some(path.join("fresh").join("logs"));
+    // On Windows, use LOCALAPPDATA
+    #[cfg(windows)]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            return Some(PathBuf::from(local_app_data).join("fresh").join("logs"));
         }
     }
 
-    // Fall back to ~/.local/state
-    if let Some(home) = home_dir() {
-        return Some(home.join(".local").join("state").join("fresh").join("logs"));
+    // On Unix, use XDG_STATE_HOME or fallback
+    #[cfg(not(windows))]
+    {
+        // First try XDG_STATE_HOME
+        if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+            let path = PathBuf::from(state_home);
+            if path.is_absolute() {
+                return Some(path.join("fresh").join("logs"));
+            }
+        }
+
+        // Fall back to ~/.local/state
+        if let Some(home) = home_dir() {
+            return Some(home.join(".local").join("state").join("fresh").join("logs"));
+        }
     }
 
     None
@@ -91,6 +103,13 @@ pub fn warnings_log_path() -> PathBuf {
 /// Returns `{log_dir}/status-{PID}.log`
 pub fn status_log_path() -> PathBuf {
     log_dir().join(format!("status-{}.log", std::process::id()))
+}
+
+/// Get the path for the server log file for a given PID.
+///
+/// Returns `{log_dir}/fresh-server-{PID}.log`
+pub fn server_log_path(pid: u32) -> PathBuf {
+    log_dir().join(format!("fresh-server-{}.log", pid))
 }
 
 /// Get the directory for LSP-related logs.

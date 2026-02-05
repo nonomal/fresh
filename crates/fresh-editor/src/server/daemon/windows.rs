@@ -2,12 +2,13 @@
 
 use std::io;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+
+use crate::services::log_dirs;
 
 const DETACHED_PROCESS: u32 = 0x00000008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
@@ -42,22 +43,17 @@ pub fn spawn_server_detached(session_name: Option<&str>) -> io::Result<u32> {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
 
-    // Redirect stderr to a log file for debugging
-    let log_dir = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("fresh")
-        .join("logs");
-    std::fs::create_dir_all(&log_dir)?;
-
-    let log_file = log_dir.join(format!("server-{}.log", session_name.unwrap_or("default")));
-    let stderr_file = std::fs::File::create(&log_file)?;
-    cmd.stderr(std::process::Stdio::from(stderr_file));
-
-    tracing::debug!("Server log file: {:?}", log_file);
-
+    // Spawn first to get the child PID
     let child = cmd.spawn()?;
-    Ok(child.id())
+    let pid = child.id();
+
+    // Redirect stderr to a PID-based log file
+    // Note: This creates the file after spawn, so early stderr output may be lost.
+    // The server will set up tracing to this file when it initializes.
+    let log_path = log_dirs::server_log_path(pid);
+    tracing::debug!("Server log file: {:?}", log_path);
+
+    Ok(pid)
 }
 
 /// Check if a process with the given PID is still running

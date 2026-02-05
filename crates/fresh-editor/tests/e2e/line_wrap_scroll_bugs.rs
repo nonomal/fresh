@@ -12,6 +12,7 @@
 
 use crate::common::harness::EditorTestHarness;
 use fresh::config::Config;
+use tempfile::TempDir;
 
 /// Helper to create a config with line wrapping enabled
 fn config_with_line_wrap() -> Config {
@@ -349,10 +350,6 @@ fn test_mouse_wheel_with_multiline_file_one_long_line() {
     const TERMINAL_WIDTH: u16 = 80;
     const TERMINAL_HEIGHT: u16 = 24;
 
-    let mut harness =
-        EditorTestHarness::with_config(TERMINAL_WIDTH, TERMINAL_HEIGHT, config_with_line_wrap())
-            .unwrap();
-
     // Create a file with structure similar to zz.txt:
     // - A few short lines at the start
     // - One very long line that wraps to many visual rows
@@ -370,26 +367,15 @@ fn test_mouse_wheel_with_multiline_file_one_long_line() {
         short_line1, short_line2, short_line3, long_line, short_line4, short_line5
     );
 
-    for ch in content.chars() {
-        if ch == '\n' {
-            harness
-                .send_key(
-                    crossterm::event::KeyCode::Enter,
-                    crossterm::event::KeyModifiers::NONE,
-                )
-                .unwrap();
-        } else {
-            harness.type_text(&ch.to_string()).unwrap();
-        }
-    }
+    // Write to temp file and open it (much faster than typing 2000+ chars)
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("long_line_test.txt");
+    std::fs::write(&file_path, &content).unwrap();
 
-    // Move cursor to the beginning
-    harness
-        .send_key(
-            crossterm::event::KeyCode::Home,
-            crossterm::event::KeyModifiers::CONTROL,
-        )
-        .unwrap();
+    let mut harness =
+        EditorTestHarness::with_config(TERMINAL_WIDTH, TERMINAL_HEIGHT, config_with_line_wrap())
+            .unwrap();
+    harness.open_file(&file_path).unwrap();
     harness.render().unwrap();
 
     let screen_before = harness.screen_to_string();
@@ -440,10 +426,6 @@ fn test_scrollbar_click_with_multiline_file_one_long_line() {
     const TERMINAL_WIDTH: u16 = 80;
     const TERMINAL_HEIGHT: u16 = 24;
 
-    let mut harness =
-        EditorTestHarness::with_config(TERMINAL_WIDTH, TERMINAL_HEIGHT, config_with_line_wrap())
-            .unwrap();
-
     // Create a file structure similar to zz.txt:
     // - Line 1: short
     // - Line 2: short
@@ -467,27 +449,15 @@ fn test_scrollbar_click_with_multiline_file_one_long_line() {
         short_line1, short_line2, short_line3, long_line, short_line5, short_line6
     );
 
-    // Type the content
-    for ch in content.chars() {
-        if ch == '\n' {
-            harness
-                .send_key(
-                    crossterm::event::KeyCode::Enter,
-                    crossterm::event::KeyModifiers::NONE,
-                )
-                .unwrap();
-        } else {
-            harness.type_text(&ch.to_string()).unwrap();
-        }
-    }
+    // Write to temp file and open it (much faster than typing 2000+ chars)
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("scrollbar_click_test.txt");
+    std::fs::write(&file_path, &content).unwrap();
 
-    // Move cursor to the beginning
-    harness
-        .send_key(
-            crossterm::event::KeyCode::Home,
-            crossterm::event::KeyModifiers::CONTROL,
-        )
-        .unwrap();
+    let mut harness =
+        EditorTestHarness::with_config(TERMINAL_WIDTH, TERMINAL_HEIGHT, config_with_line_wrap())
+            .unwrap();
+    harness.open_file(&file_path).unwrap();
     harness.render().unwrap();
 
     let screen_before = harness.screen_to_string();
@@ -539,10 +509,6 @@ fn test_scrollbar_drag_with_multiline_file_one_long_line() {
     const TERMINAL_WIDTH: u16 = 80;
     const TERMINAL_HEIGHT: u16 = 24;
 
-    let mut harness =
-        EditorTestHarness::with_config(TERMINAL_WIDTH, TERMINAL_HEIGHT, config_with_line_wrap())
-            .unwrap();
-
     // Same file structure as above
     let short_line1 = "<p>Short line 1</p>";
     let short_line2 = "</p>";
@@ -556,25 +522,15 @@ fn test_scrollbar_drag_with_multiline_file_one_long_line() {
         short_line1, short_line2, short_line3, long_line, short_line5, short_line6
     );
 
-    for ch in content.chars() {
-        if ch == '\n' {
-            harness
-                .send_key(
-                    crossterm::event::KeyCode::Enter,
-                    crossterm::event::KeyModifiers::NONE,
-                )
-                .unwrap();
-        } else {
-            harness.type_text(&ch.to_string()).unwrap();
-        }
-    }
+    // Write to temp file and open it (much faster than typing 2000+ chars)
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("scrollbar_drag_test.txt");
+    std::fs::write(&file_path, &content).unwrap();
 
-    harness
-        .send_key(
-            crossterm::event::KeyCode::Home,
-            crossterm::event::KeyModifiers::CONTROL,
-        )
-        .unwrap();
+    let mut harness =
+        EditorTestHarness::with_config(TERMINAL_WIDTH, TERMINAL_HEIGHT, config_with_line_wrap())
+            .unwrap();
+    harness.open_file(&file_path).unwrap();
     harness.render().unwrap();
 
     let screen_before = harness.screen_to_string();

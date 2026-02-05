@@ -790,38 +790,44 @@ mod integration_tests {
             "First client should get Hello"
         );
 
-        // Wait for initial render and read it
-        thread::sleep(Duration::from_millis(100));
+        // Semantic wait: read initial render until we get non-empty output
         let mut buf = [0u8; 8192];
         let mut client1_initial = Vec::new();
-        for _ in 0..20 {
+        loop {
             match conn1.data.try_read(&mut buf) {
-                Ok(n) if n > 0 => client1_initial.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if client1_initial.is_empty() {
-                        thread::sleep(Duration::from_millis(20));
-                    } else {
+                Ok(0) => thread::sleep(Duration::from_millis(10)),
+                Ok(n) => {
+                    client1_initial.extend_from_slice(&buf[..n]);
+                    if !client1_initial.is_empty() {
                         break;
                     }
                 }
-                _ => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("Read error: {}", e),
             }
         }
 
-        assert!(
-            !client1_initial.is_empty(),
-            "First client should receive initial render"
-        );
-
         // First client types something to create content
         conn1.write_data(b"HELLO_WORLD").unwrap();
-        thread::sleep(Duration::from_millis(200));
 
-        // Drain first client's output (the typed text render)
-        for _ in 0..20 {
+        // Semantic wait: read until we see HELLO_WORLD in client1's output
+        let mut client1_typed = Vec::new();
+        loop {
             match conn1.data.try_read(&mut buf) {
-                Ok(n) if n > 0 => {} // discard
-                _ => break,
+                Ok(0) => thread::sleep(Duration::from_millis(10)),
+                Ok(n) => {
+                    client1_typed.extend_from_slice(&buf[..n]);
+                    let output_str = String::from_utf8_lossy(&client1_typed);
+                    if output_str.contains("HELLO_WORLD") {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("Read error: {}", e),
             }
         }
 
@@ -843,22 +849,23 @@ mod integration_tests {
             "Second client should get Hello"
         );
 
-        // Wait for render to second client
-        thread::sleep(Duration::from_millis(200));
-
-        // Read second client's output - it should contain a FULL screen render
+        // Semantic wait: read second client's output until we see HELLO_WORLD
+        // This verifies it got a full screen render with the typed content
         let mut client2_output = Vec::new();
-        for _ in 0..50 {
+        loop {
             match conn2.data.try_read(&mut buf) {
-                Ok(n) if n > 0 => client2_output.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if client2_output.is_empty() {
-                        thread::sleep(Duration::from_millis(20));
-                    } else {
+                Ok(0) => thread::sleep(Duration::from_millis(10)),
+                Ok(n) => {
+                    client2_output.extend_from_slice(&buf[..n]);
+                    let output_str = String::from_utf8_lossy(&client2_output);
+                    if output_str.contains("HELLO_WORLD") && client2_output.len() > 500 {
                         break;
                     }
                 }
-                _ => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("Read error: {}", e),
             }
         }
 
@@ -869,23 +876,6 @@ mod integration_tests {
             "Second client received {} bytes, contains HELLO_WORLD: {}",
             client2_output.len(),
             client2_str.contains("HELLO_WORLD")
-        );
-
-        // A full 80x24 render should be substantial (at least 1000 bytes with escape sequences)
-        // If only diffs are sent, it would be much smaller
-        assert!(
-            client2_output.len() > 500,
-            "Second client should receive substantial output (full render), but only got {} bytes",
-            client2_output.len()
-        );
-
-        // The second client MUST see "HELLO_WORLD" that was typed by the first client
-        // This verifies it got a full screen render, not just diffs
-        assert!(
-            client2_str.contains("HELLO_WORLD"),
-            "Second client should see full screen with typed content 'HELLO_WORLD', but got: {} bytes, content sample: {:?}",
-            client2_output.len(),
-            &client2_str[..client2_str.len().min(500)]
         );
 
         // Cleanup

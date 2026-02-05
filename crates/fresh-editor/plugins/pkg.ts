@@ -2487,6 +2487,9 @@ function closePackageManager(): void {
     editor.showBuffer(pkgState.sourceBufferId);
   }
 
+  // Reset editor mode to normal
+  editor.setEditorMode("normal");
+
   // Reset state
   pkgState.isOpen = false;
   pkgState.bufferId = null;

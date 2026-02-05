@@ -2613,8 +2613,23 @@ globalThis.pkg_activate = async function(): Promise<void> {
       pkgState.focus = { type: "list" };
       updatePkgManagerView();
     } else if (actionName === "Install" && item.registryEntry) {
-      await installPackage(item.registryEntry.repository, item.name, item.packageType);
+      const packageName = item.name;
+      await installPackage(item.registryEntry.repository, packageName, item.packageType);
       pkgState.items = buildPackageList();
+
+      // Find the newly installed package in the rebuilt list
+      const newItems = getFilteredItems();
+      const newIndex = newItems.findIndex(i => i.name === packageName && i.installed);
+
+      // Update selection to point to the newly installed package, or stay at current position
+      if (newIndex >= 0) {
+        pkgState.selectedIndex = newIndex;
+      } else {
+        // Package might be filtered out - reset to first item
+        pkgState.selectedIndex = 0;
+      }
+
+      pkgState.focus = { type: "list" };
       updatePkgManagerView();
     }
   }

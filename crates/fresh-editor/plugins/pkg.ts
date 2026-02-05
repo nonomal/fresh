@@ -2554,32 +2554,36 @@ globalThis.pkg_next_button = function(): void {
   const actions = getActionButtons();
   const hasActions = actions.length > 0;
 
-  // Special handling when package selected: cycle between list and action buttons only
+  // Special handling: from list with actions, go to first action button
   if (hasActions && pkgState.focus.type === "list") {
-    // From list, go to first action button
     pkgState.focus = { type: "action", index: 0 };
     updatePkgManagerView();
     return;
   }
 
+  // From action button, go to next action button or continue to next element
   if (hasActions && pkgState.focus.type === "action") {
     const nextActionIdx = pkgState.focus.index + 1;
     if (nextActionIdx < actions.length) {
       // Go to next action button
       pkgState.focus = { type: "action", index: nextActionIdx };
-    } else {
-      // Wrap back to list
-      pkgState.focus = { type: "list" };
+      updatePkgManagerView();
+      return;
     }
-    updatePkgManagerView();
-    return;
+    // After last action button, fall through to continue to next UI element
   }
 
-  // Default behavior: cycle through all elements
+  // Default behavior: cycle through all elements, but wrap to list if actions available
   const order = getFocusOrder();
   const currentIdx = getCurrentFocusIndex();
-  const nextIdx = (currentIdx + 1) % order.length;
-  pkgState.focus = order[nextIdx];
+  let nextIdx = (currentIdx + 1) % order.length;
+
+  // If we wrapped around and action buttons are available, go to list instead of first element
+  if (hasActions && nextIdx === 0) {
+    pkgState.focus = { type: "list" };
+  } else {
+    pkgState.focus = order[nextIdx];
+  }
   updatePkgManagerView();
 };
 
@@ -2589,25 +2593,31 @@ globalThis.pkg_prev_button = function(): void {
   const actions = getActionButtons();
   const hasActions = actions.length > 0;
 
-  // Special handling when package selected: cycle between list and action buttons only
-  if (hasActions && pkgState.focus.type === "list") {
-    // From list, go to last action button
-    pkgState.focus = { type: "action", index: actions.length - 1 };
+  // Special handling: from first action button, go back to list
+  if (hasActions && pkgState.focus.type === "action" && pkgState.focus.index === 0) {
+    pkgState.focus = { type: "list" };
     updatePkgManagerView();
     return;
   }
 
+  // From other action buttons, go to previous action button
   if (hasActions && pkgState.focus.type === "action") {
-    const prevActionIdx = pkgState.focus.index - 1;
-    if (prevActionIdx >= 0) {
-      // Go to previous action button
-      pkgState.focus = { type: "action", index: prevActionIdx };
-    } else {
-      // Wrap back to list
-      pkgState.focus = { type: "list" };
-    }
+    pkgState.focus = { type: "action", index: pkgState.focus.index - 1 };
     updatePkgManagerView();
     return;
+  }
+
+  // From list with actions, go to last element in order (wrapping backward)
+  if (hasActions && pkgState.focus.type === "list") {
+    const order = getFocusOrder();
+    // Go to last non-action element (sync button)
+    for (let i = order.length - 1; i >= 0; i--) {
+      if (order[i].type !== "action" && order[i].type !== "list") {
+        pkgState.focus = order[i];
+        updatePkgManagerView();
+        return;
+      }
+    }
   }
 
   // Default behavior: cycle through all elements

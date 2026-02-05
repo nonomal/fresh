@@ -1384,6 +1384,52 @@ async function removePackage(pkg: InstalledPackage): Promise<boolean> {
 }
 
 /**
+ * Reinstall a package from its source (uninstall + install latest)
+ * This performs a clean reinstall to get the latest version from the git repository.
+ */
+async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
+  if (!pkg.source) {
+    editor.setStatus(`Cannot reinstall ${pkg.name}: no source URL found`);
+    return false;
+  }
+
+  // Confirm with user before reinstalling
+  const response = await editor.prompt(
+    `Reinstall ${pkg.name} from ${pkg.source}? (yes/no)`,
+    "no"
+  );
+
+  if (response?.toLowerCase() !== "yes") {
+    editor.setStatus("Reinstall cancelled");
+    return false;
+  }
+
+  editor.setStatus(`Reinstalling ${pkg.name}...`);
+
+  // Step 1: Remove the package
+  const removed = await removePackage(pkg);
+  if (!removed) {
+    editor.setStatus(`Failed to reinstall ${pkg.name}: could not uninstall`);
+    return false;
+  }
+
+  // Step 2: Reinstall from source
+  editor.setStatus(`Installing ${pkg.name} from ${pkg.source}...`);
+
+  // Parse the URL to extract package name
+  const parsed = parsePackageUrl(pkg.source);
+  const result = await installFromRepo(parsed.repoUrl, parsed.name);
+
+  if (result) {
+    editor.setStatus(`Reinstalled ${pkg.name} successfully`);
+    return true;
+  } else {
+    editor.setStatus(`Failed to reinstall ${pkg.name} from ${pkg.source}`);
+    return false;
+  }
+}
+
+/**
  * Update all packages
  */
 async function updateAllPackages(): Promise<void> {
@@ -1519,6 +1565,7 @@ interface PackageListItem {
   author?: string;
   license?: string;
   repository?: string;
+  source?: string;
   stars?: number;
   downloads?: number;
   keywords?: string[];
@@ -1851,7 +1898,18 @@ function getActionButtons(): string[] {
   const item = items[pkgState.selectedIndex];
 
   if (item.installed) {
-    return item.updateAvailable ? ["Update", "Uninstall"] : ["Uninstall"];
+    // Check if package has a source URL for reinstall
+    const hasSource = item.installedPackage?.source;
+
+    if (item.updateAvailable && hasSource) {
+      return ["Update", "Reinstall", "Uninstall"];
+    } else if (item.updateAvailable) {
+      return ["Update", "Uninstall"];
+    } else if (hasSource) {
+      return ["Reinstall", "Uninstall"];
+    } else {
+      return ["Uninstall"];
+    }
   } else {
     return ["Install"];
   }
@@ -2541,6 +2599,10 @@ globalThis.pkg_activate = async function(): Promise<void> {
 
     if (actionName === "Update" && item.installedPackage) {
       await updatePackage(item.installedPackage);
+      pkgState.items = buildPackageList();
+      updatePkgManagerView();
+    } else if (actionName === "Reinstall" && item.installedPackage) {
+      await reinstallPackage(item.installedPackage);
       pkgState.items = buildPackageList();
       updatePkgManagerView();
     } else if (actionName === "Uninstall" && item.installedPackage) {

@@ -2551,6 +2551,31 @@ globalThis.pkg_nav_down = function(): void {
 globalThis.pkg_next_button = function(): void {
   if (!pkgState.isOpen) return;
 
+  const actions = getActionButtons();
+  const hasActions = actions.length > 0;
+
+  // Special handling when package selected: cycle between list and action buttons only
+  if (hasActions && pkgState.focus.type === "list") {
+    // From list, go to first action button
+    pkgState.focus = { type: "action", index: 0 };
+    updatePkgManagerView();
+    return;
+  }
+
+  if (hasActions && pkgState.focus.type === "action") {
+    const nextActionIdx = pkgState.focus.index + 1;
+    if (nextActionIdx < actions.length) {
+      // Go to next action button
+      pkgState.focus = { type: "action", index: nextActionIdx };
+    } else {
+      // Wrap back to list
+      pkgState.focus = { type: "list" };
+    }
+    updatePkgManagerView();
+    return;
+  }
+
+  // Default behavior: cycle through all elements
   const order = getFocusOrder();
   const currentIdx = getCurrentFocusIndex();
   const nextIdx = (currentIdx + 1) % order.length;
@@ -2561,6 +2586,31 @@ globalThis.pkg_next_button = function(): void {
 globalThis.pkg_prev_button = function(): void {
   if (!pkgState.isOpen) return;
 
+  const actions = getActionButtons();
+  const hasActions = actions.length > 0;
+
+  // Special handling when package selected: cycle between list and action buttons only
+  if (hasActions && pkgState.focus.type === "list") {
+    // From list, go to last action button
+    pkgState.focus = { type: "action", index: actions.length - 1 };
+    updatePkgManagerView();
+    return;
+  }
+
+  if (hasActions && pkgState.focus.type === "action") {
+    const prevActionIdx = pkgState.focus.index - 1;
+    if (prevActionIdx >= 0) {
+      // Go to previous action button
+      pkgState.focus = { type: "action", index: prevActionIdx };
+    } else {
+      // Wrap back to list
+      pkgState.focus = { type: "list" };
+    }
+    updatePkgManagerView();
+    return;
+  }
+
+  // Default behavior: cycle through all elements
   const order = getFocusOrder();
   const currentIdx = getCurrentFocusIndex();
   const prevIdx = (currentIdx - 1 + order.length) % order.length;

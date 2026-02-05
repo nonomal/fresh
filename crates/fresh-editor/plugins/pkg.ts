@@ -2647,7 +2647,7 @@ globalThis.pkg_activate = async function(): Promise<void> {
     return;
   }
 
-  // Handle list selection - move focus to action buttons
+  // Handle list selection - execute primary action
   if (focus.type === "list") {
     const items = getFilteredItems();
     if (items.length === 0) {
@@ -2658,9 +2658,40 @@ globalThis.pkg_activate = async function(): Promise<void> {
       }
       return;
     }
-    // Move focus to action button
-    pkgState.focus = { type: "action", index: 0 };
-    updatePkgManagerView();
+    // Execute the primary (first) action button
+    const item = items[pkgState.selectedIndex];
+    const actions = getActionButtons();
+    if (actions.length === 0) return;
+
+    const actionName = actions[0]; // Primary action
+
+    if (actionName === "Update" && item.installedPackage) {
+      await updatePackage(item.installedPackage);
+      pkgState.items = buildPackageList();
+      updatePkgManagerView();
+    } else if (actionName === "Reinstall" && item.installedPackage) {
+      await reinstallPackage(item.installedPackage);
+      pkgState.items = buildPackageList();
+      updatePkgManagerView();
+    } else if (actionName === "Uninstall" && item.installedPackage) {
+      await removePackage(item.installedPackage);
+      pkgState.items = buildPackageList();
+      const newItems = getFilteredItems();
+      pkgState.selectedIndex = Math.min(pkgState.selectedIndex, Math.max(0, newItems.length - 1));
+      updatePkgManagerView();
+    } else if (actionName === "Install" && item.registryEntry) {
+      const packageName = item.name;
+      await installPackage(item.registryEntry.repository, packageName, item.packageType);
+      pkgState.items = buildPackageList();
+
+      // Find the newly installed package in the rebuilt list
+      const newItems = getFilteredItems();
+      const newIndex = newItems.findIndex(i => i.name === packageName && i.installed);
+      if (newIndex !== -1) {
+        pkgState.selectedIndex = newIndex;
+      }
+      updatePkgManagerView();
+    }
     return;
   }
 

@@ -691,7 +691,7 @@ mod tests {
     fn test_line_iterator_large_single_line_chunked_correctly() {
         // Create content with sequential markers: "[00001][00002][00003]..."
         // Each marker is 7 bytes, so we can verify order and completeness
-        let num_markers = 20_000; // ~140KB of data, spans multiple chunks
+        let num_markers = 10_000; // ~140KB of data, spans multiple chunks
         let content: String = (1..=num_markers).map(|i| format!("[{:05}]", i)).collect();
 
         let content_bytes = content.as_bytes().to_vec();

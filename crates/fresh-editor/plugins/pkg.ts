@@ -1364,16 +1364,18 @@ async function updatePackage(pkg: InstalledPackage): Promise<boolean> {
 /**
  * Remove a package
  */
-async function removePackage(pkg: InstalledPackage): Promise<boolean> {
-  // Confirm with user before uninstalling
-  const response = await editor.prompt(
-    `Uninstall ${pkg.name}? (yes/no) `,
-    "no"
-  );
+async function removePackage(pkg: InstalledPackage, skipConfirmation = false): Promise<boolean> {
+  // Confirm with user before uninstalling (unless called from reinstall)
+  if (!skipConfirmation) {
+    const response = await editor.prompt(
+      `Uninstall ${pkg.name}? (yes/no) `,
+      "no"
+    );
 
-  if (response?.toLowerCase() !== "yes") {
-    editor.setStatus("Uninstall cancelled");
-    return false;
+    if (response?.toLowerCase() !== "yes") {
+      editor.setStatus("Uninstall cancelled");
+      return false;
+    }
   }
 
   editor.setStatus(`Removing ${pkg.name}...`);
@@ -1432,8 +1434,8 @@ async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
   editor.setStatus(`Reinstalling ${pkg.name}...`);
   editor.debug(`[pkg] Reinstalling ${pkg.name} from ${pkg.source}`);
 
-  // Step 1: Remove the package
-  const removed = await removePackage(pkg);
+  // Step 1: Remove the package (skip confirmation since reinstall already confirmed)
+  const removed = await removePackage(pkg, true);
   if (!removed) {
     const msg = `Failed to reinstall ${pkg.name}: could not uninstall`;
     editor.setStatus(msg);

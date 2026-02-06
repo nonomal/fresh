@@ -3147,6 +3147,8 @@ impl Editor {
                 | Action::DeleteWordBackward
                 | Action::DeleteWordForward
                 | Action::DeleteLine
+                | Action::MoveLineUp
+                | Action::MoveLineDown
                 | Action::DedentSelection
                 | Action::ToggleComment
         );

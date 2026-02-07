@@ -43,10 +43,7 @@ pub fn render_keybinding_editor(
     frame.render_widget(Clear, modal_area);
 
     // Border
-    let title = format!(
-        " Keybinding Editor \u{2500} [{}] ",
-        editor.active_keymap
-    );
+    let title = format!(" Keybinding Editor \u{2500} [{}] ", editor.active_keymap);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -59,7 +56,7 @@ pub fn render_keybinding_editor(
     // Layout: header (3-4 lines) | table | footer (1 line)
     let chunks = Layout::vertical([
         Constraint::Length(3), // Header: config path + search + filters
-        Constraint::Min(5),   // Table
+        Constraint::Min(5),    // Table
         Constraint::Length(1), // Footer hints
     ])
     .split(inner);
@@ -122,10 +119,7 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
                             .fg(theme.help_key_fg)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        &editor.search_query,
-                        Style::default().fg(theme.editor_fg),
-                    ),
+                    Span::styled(&editor.search_query, Style::default().fg(theme.editor_fg)),
                     Span::styled("_", Style::default().fg(theme.cursor)),
                     Span::styled(
                         "  (Esc to cancel, Tab to switch to Record Key)",
@@ -199,7 +193,11 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
             Style::default().fg(theme.line_number_fg),
         ),
         Span::styled(
-            if editor.has_changes { "  [modified]" } else { "" },
+            if editor.has_changes {
+                "  [modified]"
+            } else {
+                ""
+            },
             Style::default().fg(theme.diagnostic_warning_fg),
         ),
     ];
@@ -207,12 +205,7 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
 }
 
 /// Render the keybinding table
-fn render_table(
-    frame: &mut Frame,
-    area: Rect,
-    editor: &KeybindingEditor,
-    theme: &Theme,
-) {
+fn render_table(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme: &Theme) {
     if area.height < 2 {
         return;
     }
@@ -222,7 +215,8 @@ fn render_table(
     // Column widths (adaptive)
     let key_col_width = (inner_width as f32 * 0.22).min(22.0) as u16;
     let action_col_width = (inner_width as f32 * 0.38).min(40.0) as u16;
-    let context_col_width = 14u16.min(inner_width.saturating_sub(key_col_width + action_col_width + 8));
+    let context_col_width =
+        14u16.min(inner_width.saturating_sub(key_col_width + action_col_width + 8));
     let source_col_width = 8u16;
 
     // Header line
@@ -378,8 +372,8 @@ fn render_table(
 
     // Scrollbar
     if editor.filtered_indices.len() > visible_rows {
-        let mut scrollbar_state = ScrollbarState::new(editor.filtered_indices.len())
-            .position(editor.scroll_offset);
+        let mut scrollbar_state =
+            ScrollbarState::new(editor.filtered_indices.len()).position(editor.scroll_offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, table_area, &mut scrollbar_state);
     }
@@ -577,7 +571,9 @@ fn render_edit_dialog(
         Style::default().fg(theme.line_number_fg)
     };
     let key_value_style = if key_focused {
-        Style::default().fg(theme.editor_fg).add_modifier(Modifier::UNDERLINED)
+        Style::default()
+            .fg(theme.editor_fg)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
         Style::default().fg(theme.editor_fg)
     };
@@ -598,7 +594,8 @@ fn render_edit_dialog(
     } else {
         Style::default().fg(theme.line_number_fg)
     };
-    let action_display = if dialog.action_text.is_empty() && dialog.mode != EditMode::EditingAction {
+    let action_display = if dialog.action_text.is_empty() && dialog.mode != EditMode::EditingAction
+    {
         "(type action name)"
     } else {
         &dialog.action_text
@@ -629,7 +626,10 @@ fn render_edit_dialog(
                 Style::default().fg(theme.editor_fg),
             ),
             if ctx_focused {
-                Span::styled("  \u{2190}/\u{2192} to change", Style::default().fg(theme.line_number_fg))
+                Span::styled(
+                    "  \u{2190}/\u{2192} to change",
+                    Style::default().fg(theme.line_number_fg),
+                )
             } else {
                 Span::raw("")
             },
@@ -684,12 +684,7 @@ fn render_edit_dialog(
 }
 
 /// Render the unsaved changes confirm dialog
-fn render_confirm_dialog(
-    frame: &mut Frame,
-    area: Rect,
-    editor: &KeybindingEditor,
-    theme: &Theme,
-) {
+fn render_confirm_dialog(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme: &Theme) {
     let width = 44u16.min(area.width.saturating_sub(4));
     let height = 7u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -802,10 +797,7 @@ pub enum KeybindingEditorAction {
     StatusMessage(String),
 }
 
-fn handle_main_input(
-    editor: &mut KeybindingEditor,
-    event: &KeyEvent,
-) -> KeybindingEditorAction {
+fn handle_main_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> KeybindingEditorAction {
     match (event.code, event.modifiers) {
         // Close
         (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -886,9 +878,7 @@ fn handle_main_input(
             if editor.delete_selected() {
                 KeybindingEditorAction::StatusMessage("Custom binding removed".to_string())
             } else {
-                KeybindingEditorAction::StatusMessage(
-                    "Can only delete custom bindings".to_string(),
-                )
+                KeybindingEditorAction::StatusMessage("Can only delete custom bindings".to_string())
             }
         }
 
@@ -908,10 +898,7 @@ fn handle_main_input(
     }
 }
 
-fn handle_search_input(
-    editor: &mut KeybindingEditor,
-    event: &KeyEvent,
-) -> KeybindingEditorAction {
+fn handle_search_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> KeybindingEditorAction {
     match editor.search_mode {
         SearchMode::Text => match (event.code, event.modifiers) {
             (KeyCode::Esc, _) => {
@@ -1002,8 +989,7 @@ fn handle_edit_dialog_input(
                         _ => {
                             dialog.key_code = Some(event.code);
                             dialog.modifiers = event.modifiers;
-                            dialog.key_display =
-                                format_keybinding(&event.code, &event.modifiers);
+                            dialog.key_display = format_keybinding(&event.code, &event.modifiers);
                             // Check conflicts
                             dialog.conflicts =
                                 editor.find_conflicts(event.code, event.modifiers, &dialog.context);
@@ -1053,7 +1039,8 @@ fn handle_edit_dialog_input(
                 (KeyCode::Left, _) => {
                     if dialog.context_option_index > 0 {
                         dialog.context_option_index -= 1;
-                        dialog.context = dialog.context_options[dialog.context_option_index].clone();
+                        dialog.context =
+                            dialog.context_options[dialog.context_option_index].clone();
                         // Update conflicts
                         if let Some(key_code) = dialog.key_code {
                             dialog.conflicts =
@@ -1064,7 +1051,8 @@ fn handle_edit_dialog_input(
                 (KeyCode::Right, _) => {
                     if dialog.context_option_index + 1 < dialog.context_options.len() {
                         dialog.context_option_index += 1;
-                        dialog.context = dialog.context_options[dialog.context_option_index].clone();
+                        dialog.context =
+                            dialog.context_options[dialog.context_option_index].clone();
                         if let Some(key_code) = dialog.key_code {
                             dialog.conflicts =
                                 editor.find_conflicts(key_code, dialog.modifiers, &dialog.context);
@@ -1120,10 +1108,7 @@ fn handle_edit_dialog_input(
     KeybindingEditorAction::Consumed
 }
 
-fn handle_confirm_input(
-    editor: &mut KeybindingEditor,
-    event: &KeyEvent,
-) -> KeybindingEditorAction {
+fn handle_confirm_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> KeybindingEditorAction {
     match (event.code, event.modifiers) {
         (KeyCode::Left, _) => {
             if editor.confirm_selection > 0 {

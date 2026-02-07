@@ -4,7 +4,7 @@
 //! Provides a table view of all resolved bindings with search, filter,
 //! key recording, conflict detection, and keymap management.
 
-use crate::config::{Config, Keybinding, KeyPress};
+use crate::config::{Config, KeyPress, Keybinding};
 use crate::input::keybindings::{format_keybinding, KeybindingResolver};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
@@ -276,16 +276,17 @@ impl KeybindingEditor {
     }
 
     /// Resolve all bindings from the active keymap + custom overrides
-    fn resolve_all_bindings(config: &Config, resolver: &KeybindingResolver) -> Vec<ResolvedBinding> {
+    fn resolve_all_bindings(
+        config: &Config,
+        resolver: &KeybindingResolver,
+    ) -> Vec<ResolvedBinding> {
         let mut bindings = Vec::new();
         let mut seen: HashMap<(String, String), usize> = HashMap::new(); // (key_display, context) -> index
 
         // First, load bindings from the active keymap
         let map_bindings = config.resolve_keymap(&config.active_keybinding_map);
         for kb in &map_bindings {
-            if let Some(entry) =
-                Self::keybinding_to_resolved(kb, BindingSource::Keymap, resolver)
-            {
+            if let Some(entry) = Self::keybinding_to_resolved(kb, BindingSource::Keymap, resolver) {
                 let key = (entry.key_display.clone(), entry.context.clone());
                 let idx = bindings.len();
                 seen.insert(key, idx);
@@ -295,9 +296,7 @@ impl KeybindingEditor {
 
         // Then, load custom bindings (these override keymap bindings)
         for kb in &config.keybindings {
-            if let Some(entry) =
-                Self::keybinding_to_resolved(kb, BindingSource::Custom, resolver)
-            {
+            if let Some(entry) = Self::keybinding_to_resolved(kb, BindingSource::Custom, resolver) {
                 let key = (entry.key_display.clone(), entry.context.clone());
                 if let Some(&existing_idx) = seen.get(&key) {
                     // Override the existing binding
@@ -326,11 +325,7 @@ impl KeybindingEditor {
         source: BindingSource,
         resolver: &KeybindingResolver,
     ) -> Option<ResolvedBinding> {
-        let context = kb
-            .when
-            .as_deref()
-            .unwrap_or("normal")
-            .to_string();
+        let context = kb.when.as_deref().unwrap_or("normal").to_string();
 
         if !kb.keys.is_empty() {
             // Chord binding
@@ -481,8 +476,8 @@ impl KeybindingEditor {
 
     /// Page down
     pub fn page_down(&mut self) {
-        self.selected = (self.selected + self.visible_rows)
-            .min(self.filtered_indices.len().saturating_sub(1));
+        self.selected =
+            (self.selected + self.visible_rows).min(self.filtered_indices.len().saturating_sub(1));
         self.ensure_visible();
     }
 
@@ -631,8 +626,7 @@ impl KeybindingEditor {
 
         // Update display
         let key_display = format_keybinding(&key_code, &modifiers);
-        let action_display =
-            KeybindingResolver::format_action_from_str(&dialog.action_text);
+        let action_display = KeybindingResolver::format_action_from_str(&dialog.action_text);
 
         let resolved = ResolvedBinding {
             key_display,
@@ -659,7 +653,12 @@ impl KeybindingEditor {
     }
 
     /// Check for conflicts with the given key combination
-    pub fn find_conflicts(&self, key_code: KeyCode, modifiers: KeyModifiers, context: &str) -> Vec<String> {
+    pub fn find_conflicts(
+        &self,
+        key_code: KeyCode,
+        modifiers: KeyModifiers,
+        context: &str,
+    ) -> Vec<String> {
         let mut conflicts = Vec::new();
         let key_display = format_keybinding(&key_code, &modifiers);
 
@@ -667,12 +666,19 @@ impl KeybindingEditor {
             if !binding.is_chord
                 && binding.key_code == key_code
                 && binding.modifiers == modifiers
-                && (binding.context == context || binding.context == "global" || context == "global")
+                && (binding.context == context
+                    || binding.context == "global"
+                    || context == "global")
             {
                 conflicts.push(format!(
                     "{} ({}, {})",
-                    binding.action_display, binding.context,
-                    if binding.source == BindingSource::Custom { "custom" } else { "keymap" }
+                    binding.action_display,
+                    binding.context,
+                    if binding.source == BindingSource::Custom {
+                        "custom"
+                    } else {
+                        "keymap"
+                    }
                 ));
             }
         }

@@ -80,8 +80,10 @@ impl Editor {
         let mut changes = std::collections::HashMap::new();
         changes.insert("/keybindings".to_string(), config_value);
 
-        let resolver =
-            crate::config_io::ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
+        let resolver = crate::config_io::ConfigResolver::new(
+            self.dir_context.clone(),
+            self.working_dir.clone(),
+        );
 
         match resolver.save_changes_to_layer(
             &changes,

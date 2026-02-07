@@ -860,7 +860,10 @@ impl Editor {
         if let Some(ref kb_editor) = self.keybinding_editor {
             crate::view::dimming::apply_dimming(frame, size);
             crate::view::keybinding_editor::render_keybinding_editor(
-                frame, size, kb_editor, &self.theme,
+                frame,
+                size,
+                kb_editor,
+                &self.theme,
             );
         }
 

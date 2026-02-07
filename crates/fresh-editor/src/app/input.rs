@@ -1126,6 +1126,9 @@ impl Editor {
             Action::EventDebug => {
                 self.open_event_debug();
             }
+            Action::OpenKeybindingEditor => {
+                self.open_keybinding_editor();
+            }
             Action::PromptConfirm => {
                 if let Some((input, prompt_type, selected_index)) = self.confirm_prompt() {
                     use super::prompt_actions::PromptResult;

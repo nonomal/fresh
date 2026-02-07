@@ -69,6 +69,12 @@ impl Editor {
             }
         }
 
+        // Keybinding editor is next
+        if self.keybinding_editor.is_some() {
+            let result = self.handle_keybinding_editor_input(event);
+            return Some(result);
+        }
+
         // Calibration wizard is next (modal, blocks all other input)
         if self.calibration_wizard.is_some() {
             let result = self.handle_calibration_input(event);

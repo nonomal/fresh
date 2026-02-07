@@ -592,6 +592,9 @@ pub enum Action {
     // Event debug
     EventDebug, // Open the event debug dialog
 
+    // Keybinding editor
+    OpenKeybindingEditor, // Open the keybinding editor modal
+
     // No-op
     None,
 }
@@ -909,6 +912,9 @@ impl Action {
 
             // Event debug
             "event_debug" => Self::EventDebug,
+
+            // Keybinding editor
+            "open_keybinding_editor" => Self::OpenKeybindingEditor,
 
             // Settings actions
             "open_settings" => Self::OpenSettings,
@@ -1965,9 +1971,46 @@ impl KeybindingResolver {
             Action::SortLines => t!("action.sort_lines"),
             Action::CalibrateInput => t!("action.calibrate_input"),
             Action::EventDebug => t!("action.event_debug"),
+            Action::OpenKeybindingEditor => "Keybinding Editor".into(),
             Action::None => t!("action.none"),
         }
         .to_string()
+    }
+
+    /// Public wrapper for parse_key (for keybinding editor)
+    pub fn parse_key_public(key: &str) -> Option<KeyCode> {
+        Self::parse_key(key)
+    }
+
+    /// Public wrapper for parse_modifiers (for keybinding editor)
+    pub fn parse_modifiers_public(modifiers: &[String]) -> KeyModifiers {
+        Self::parse_modifiers(modifiers)
+    }
+
+    /// Format an action name string as a human-readable description.
+    /// Used by the keybinding editor to display action names without needing
+    /// a full Action enum parse.
+    pub fn format_action_from_str(action_name: &str) -> String {
+        // Try to parse as Action enum first
+        if let Some(action) = Action::from_str(action_name, &std::collections::HashMap::new()) {
+            Self::format_action(&action)
+        } else {
+            // Fallback: convert snake_case to Title Case
+            action_name
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        Some(c) => {
+                            let upper: String = c.to_uppercase().collect();
+                            format!("{}{}", upper, chars.as_str())
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
     }
 
     /// Get the keybinding string for an action in a specific context

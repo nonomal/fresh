@@ -45,6 +45,8 @@ pub mod calibration_wizard;
 #[cfg(feature = "runtime")]
 pub mod event_debug;
 #[cfg(feature = "runtime")]
+pub mod keybinding_editor;
+#[cfg(feature = "runtime")]
 pub mod file_browser_input;
 #[cfg(feature = "runtime")]
 pub mod file_tree;

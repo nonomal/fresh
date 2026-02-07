@@ -2722,7 +2722,8 @@ pub fn action_to_events(
         | Action::ShellCommand
         | Action::ShellCommandReplace
         | Action::CalibrateInput
-        | Action::EventDebug => return None,
+        | Action::EventDebug
+        | Action::OpenKeybindingEditor => return None,
 
         // Block/rectangular selection actions
         Action::BlockSelectLeft => {

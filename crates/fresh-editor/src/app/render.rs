@@ -856,6 +856,14 @@ impl Editor {
             );
         }
 
+        // Render keybinding editor if active
+        if let Some(ref kb_editor) = self.keybinding_editor {
+            crate::view::dimming::apply_dimming(frame, size);
+            crate::view::keybinding_editor::render_keybinding_editor(
+                frame, size, kb_editor, &self.theme,
+            );
+        }
+
         // Render event debug dialog if active
         if let Some(ref debug) = self.event_debug {
             // Dim the editor content behind the dialog modal

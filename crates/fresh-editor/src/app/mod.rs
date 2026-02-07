@@ -6,6 +6,8 @@ mod clipboard;
 mod composite_buffer_actions;
 pub mod event_debug;
 mod event_debug_actions;
+pub mod keybinding_editor;
+mod keybinding_editor_actions;
 mod file_explorer;
 pub mod file_open;
 mod file_open_input;
@@ -675,6 +677,9 @@ pub struct Editor {
     /// Event debug dialog state (when event debug modal is open)
     pub(crate) event_debug: Option<event_debug::EventDebug>,
 
+    /// Keybinding editor state (when keybinding editor modal is open)
+    pub(crate) keybinding_editor: Option<keybinding_editor::KeybindingEditor>,
+
     /// Key translator for input calibration (loaded from config)
     pub(crate) key_translator: crate::input::key_translator::KeyTranslator,
 
@@ -1261,6 +1266,7 @@ impl Editor {
             settings_state: None,
             calibration_wizard: None,
             event_debug: None,
+            keybinding_editor: None,
             key_translator: crate::input::key_translator::KeyTranslator::load_from_config_dir(
                 &dir_context.config_dir,
             )

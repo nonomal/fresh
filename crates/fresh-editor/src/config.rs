@@ -2052,6 +2052,13 @@ impl MenuConfig {
                         when: None,
                         checkbox: None,
                     },
+                    MenuItem::Action {
+                        label: "Keybinding Editor...".to_string(),
+                        action: "open_keybinding_editor".to_string(),
+                        args: HashMap::new(),
+                        when: None,
+                        checkbox: None,
+                    },
                     MenuItem::Separator { separator: true },
                     MenuItem::Action {
                         label: t!("menu.help.event_debug").to_string(),

@@ -491,15 +491,18 @@ fn help_line<'a>(key: &'a str, desc: &'a str, theme: &Theme, is_header: bool) ->
     }
 }
 
+/// Maximum number of autocomplete suggestions to display
+const MAX_AUTOCOMPLETE_VISIBLE: usize = 8;
+
 /// Render the edit/add binding dialog
 fn render_edit_dialog(
     frame: &mut Frame,
     area: Rect,
     dialog: &crate::app::keybinding_editor::EditBindingState,
-    editor: &KeybindingEditor,
+    _editor: &KeybindingEditor,
     theme: &Theme,
 ) {
-    let width = 50u16.min(area.width.saturating_sub(4));
+    let width = 56u16.min(area.width.saturating_sub(4));
     let height = 16u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -533,7 +536,7 @@ fn render_edit_dialog(
         Constraint::Length(1), // Action field
         Constraint::Length(1), // Context field
         Constraint::Length(1), // Spacer
-        Constraint::Min(3),    // Conflicts
+        Constraint::Min(3),    // Conflicts / error
         Constraint::Length(1), // Buttons
     ])
     .split(inner);
@@ -541,7 +544,7 @@ fn render_edit_dialog(
     // Instructions
     let instr = match dialog.mode {
         EditMode::RecordingKey => "Press the desired key combination...",
-        EditMode::EditingAction => "Type the action name...",
+        EditMode::EditingAction => "Type action name (Tab/Enter to accept)",
         EditMode::EditingContext => "Select context...",
     };
     frame.render_widget(
@@ -594,6 +597,12 @@ fn render_edit_dialog(
     } else {
         Style::default().fg(theme.line_number_fg)
     };
+    let has_error = dialog.action_error.is_some();
+    let action_value_style = if has_error {
+        Style::default().fg(theme.diagnostic_error_fg)
+    } else {
+        Style::default().fg(theme.editor_fg)
+    };
     let action_display = if dialog.action_text.is_empty() && dialog.mode != EditMode::EditingAction
     {
         "(type action name)"
@@ -602,7 +611,7 @@ fn render_edit_dialog(
     };
     let mut action_spans = vec![
         Span::styled("   Action:  ", action_label_style),
-        Span::styled(action_display, Style::default().fg(theme.editor_fg)),
+        Span::styled(action_display, action_value_style),
     ];
     if action_focused && dialog.mode == EditMode::EditingAction {
         action_spans.push(Span::styled("_", Style::default().fg(theme.cursor)));
@@ -637,21 +646,32 @@ fn render_edit_dialog(
         chunks[4],
     );
 
-    // Conflicts
+    // Conflicts or error in the info area
+    let mut info_lines: Vec<Line> = Vec::new();
+    if let Some(ref err) = dialog.action_error {
+        info_lines.push(Line::from(Span::styled(
+            format!("   \u{2717} {}", err),
+            Style::default()
+                .fg(theme.diagnostic_error_fg)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     if !dialog.conflicts.is_empty() {
-        let mut conflict_lines = vec![Line::from(Span::styled(
+        info_lines.push(Line::from(Span::styled(
             "   \u{26a0} Conflicts:",
             Style::default()
                 .fg(theme.diagnostic_warning_fg)
                 .add_modifier(Modifier::BOLD),
-        ))];
+        )));
         for conflict in &dialog.conflicts {
-            conflict_lines.push(Line::from(Span::styled(
+            info_lines.push(Line::from(Span::styled(
                 format!("     {}", conflict),
                 Style::default().fg(theme.diagnostic_warning_fg),
             )));
         }
-        frame.render_widget(Paragraph::new(conflict_lines), chunks[6]);
+    }
+    if !info_lines.is_empty() {
+        frame.render_widget(Paragraph::new(info_lines), chunks[6]);
     }
 
     // Buttons
@@ -681,6 +701,84 @@ fn render_edit_dialog(
         ])),
         chunks[7],
     );
+
+    // Render autocomplete popup on top of everything if visible
+    if dialog.autocomplete_visible && !dialog.autocomplete_suggestions.is_empty() {
+        render_autocomplete_popup(frame, chunks[3], dialog, theme);
+    }
+}
+
+/// Render the autocomplete suggestions popup below the action field
+fn render_autocomplete_popup(
+    frame: &mut Frame,
+    action_field_area: Rect,
+    dialog: &crate::app::keybinding_editor::EditBindingState,
+    theme: &Theme,
+) {
+    let suggestion_count = dialog
+        .autocomplete_suggestions
+        .len()
+        .min(MAX_AUTOCOMPLETE_VISIBLE);
+    if suggestion_count == 0 {
+        return;
+    }
+
+    // Position: below the action field, offset to align with text
+    let popup_x = action_field_area.x + 12; // offset past "   Action:  "
+    let popup_y = action_field_area.y + 1;
+    let popup_width = 36u16.min(action_field_area.width.saturating_sub(12));
+    let popup_height = (suggestion_count as u16) + 2; // +2 for border
+
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.popup_border_fg))
+        .style(Style::default().bg(theme.popup_bg).fg(theme.editor_fg));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    // Determine scroll offset for autocomplete list
+    let selected = dialog.autocomplete_selected.unwrap_or(0);
+    let scroll_offset = if selected >= MAX_AUTOCOMPLETE_VISIBLE {
+        selected - MAX_AUTOCOMPLETE_VISIBLE + 1
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, suggestion) in dialog
+        .autocomplete_suggestions
+        .iter()
+        .skip(scroll_offset)
+        .take(MAX_AUTOCOMPLETE_VISIBLE)
+        .enumerate()
+    {
+        let actual_idx = i + scroll_offset;
+        let is_selected = Some(actual_idx) == dialog.autocomplete_selected;
+
+        let style = if is_selected {
+            Style::default()
+                .fg(theme.popup_bg)
+                .bg(theme.help_key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.editor_fg).bg(theme.popup_bg)
+        };
+
+        // Pad the suggestion to fill the width
+        let display = pad_right(suggestion, inner.width as usize);
+        lines.push(Line::from(Span::styled(display, style)));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render the unsaved changes confirm dialog
@@ -999,29 +1097,93 @@ fn handle_edit_dialog_input(
             }
         }
         1 => {
-            // Action editing area
+            // Action editing area with autocomplete
             match (event.code, event.modifiers) {
                 (KeyCode::Tab, KeyModifiers::NONE) => {
-                    dialog.focus_area = 2;
-                    dialog.mode = EditMode::EditingContext;
+                    // Accept selected autocomplete suggestion, or move to next field
+                    if dialog.autocomplete_visible {
+                        if let Some(sel) = dialog.autocomplete_selected {
+                            if sel < dialog.autocomplete_suggestions.len() {
+                                let suggestion = dialog.autocomplete_suggestions[sel].clone();
+                                dialog.action_text = suggestion;
+                                dialog.action_cursor = dialog.action_text.len();
+                                dialog.autocomplete_visible = false;
+                                dialog.autocomplete_selected = None;
+                                dialog.action_error = None;
+                            }
+                        }
+                    } else {
+                        dialog.focus_area = 2;
+                        dialog.mode = EditMode::EditingContext;
+                    }
                 }
                 (KeyCode::BackTab, _) => {
+                    dialog.autocomplete_visible = false;
                     dialog.focus_area = 0;
                     dialog.mode = EditMode::RecordingKey;
                 }
                 (KeyCode::Enter, KeyModifiers::NONE) => {
-                    dialog.focus_area = 3;
-                    dialog.mode = EditMode::EditingContext;
+                    // Accept selected autocomplete suggestion, or move to buttons
+                    if dialog.autocomplete_visible {
+                        if let Some(sel) = dialog.autocomplete_selected {
+                            if sel < dialog.autocomplete_suggestions.len() {
+                                let suggestion = dialog.autocomplete_suggestions[sel].clone();
+                                dialog.action_text = suggestion;
+                                dialog.action_cursor = dialog.action_text.len();
+                                dialog.autocomplete_visible = false;
+                                dialog.autocomplete_selected = None;
+                                dialog.action_error = None;
+                            }
+                        }
+                    } else {
+                        dialog.focus_area = 3;
+                        dialog.mode = EditMode::EditingContext;
+                    }
+                }
+                (KeyCode::Up, _) if dialog.autocomplete_visible => {
+                    // Navigate autocomplete up
+                    if let Some(sel) = dialog.autocomplete_selected {
+                        if sel > 0 {
+                            dialog.autocomplete_selected = Some(sel - 1);
+                        }
+                    }
+                }
+                (KeyCode::Down, _) if dialog.autocomplete_visible => {
+                    // Navigate autocomplete down
+                    if let Some(sel) = dialog.autocomplete_selected {
+                        let max = dialog.autocomplete_suggestions.len().saturating_sub(1);
+                        if sel < max {
+                            dialog.autocomplete_selected = Some(sel + 1);
+                        }
+                    }
+                }
+                (KeyCode::Esc, _) if dialog.autocomplete_visible => {
+                    // Close autocomplete without closing dialog
+                    dialog.autocomplete_visible = false;
+                    dialog.autocomplete_selected = None;
+                    // Put dialog back and return early (don't let outer Esc handler close dialog)
+                    editor.edit_dialog = Some(dialog);
+                    return KeybindingEditorAction::Consumed;
                 }
                 (KeyCode::Backspace, _) => {
                     if dialog.action_cursor > 0 {
                         dialog.action_cursor -= 1;
                         dialog.action_text.remove(dialog.action_cursor);
+                        dialog.action_error = None;
                     }
+                    // Put dialog back and update autocomplete
+                    editor.edit_dialog = Some(dialog);
+                    editor.update_autocomplete();
+                    return KeybindingEditorAction::Consumed;
                 }
                 (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
                     dialog.action_text.insert(dialog.action_cursor, c);
                     dialog.action_cursor += 1;
+                    dialog.action_error = None;
+                    // Put dialog back and update autocomplete
+                    editor.edit_dialog = Some(dialog);
+                    editor.update_autocomplete();
+                    return KeybindingEditorAction::Consumed;
                 }
                 _ => {}
             }
@@ -1090,7 +1252,10 @@ fn handle_edit_dialog_input(
                     if dialog.selected_button == 0 {
                         // Save - put the dialog back first so apply_edit_dialog can take it
                         editor.edit_dialog = Some(dialog);
-                        editor.apply_edit_dialog();
+                        if let Some(err) = editor.apply_edit_dialog() {
+                            // Validation failed - dialog is still open with error
+                            return KeybindingEditorAction::StatusMessage(err);
+                        }
                         return KeybindingEditorAction::Consumed;
                     } else {
                         // Cancel - don't put dialog back

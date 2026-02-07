@@ -81,6 +81,14 @@ pub struct EditBindingState {
     pub selected_button: usize,
     /// Focus area (0=key, 1=action, 2=context, 3=buttons)
     pub focus_area: usize,
+    /// Filtered autocomplete suggestions for action name
+    pub autocomplete_suggestions: Vec<String>,
+    /// Selected index in autocomplete suggestions (-1 = none)
+    pub autocomplete_selected: Option<usize>,
+    /// Whether the autocomplete popup is visible
+    pub autocomplete_visible: bool,
+    /// Error message for invalid action name (shown when trying to save)
+    pub action_error: Option<String>,
 }
 
 impl EditBindingState {
@@ -108,6 +116,10 @@ impl EditBindingState {
             context_dropdown_open: false,
             selected_button: 0,
             focus_area: 0,
+            autocomplete_suggestions: Vec::new(),
+            autocomplete_selected: None,
+            autocomplete_visible: false,
+            action_error: None,
         }
     }
 
@@ -141,6 +153,10 @@ impl EditBindingState {
             context_dropdown_open: false,
             selected_button: 0,
             focus_area: 0,
+            autocomplete_suggestions: Vec::new(),
+            autocomplete_selected: None,
+            autocomplete_visible: false,
+            action_error: None,
         }
     }
 }
@@ -362,23 +378,56 @@ impl KeybindingEditor {
         }
     }
 
-    /// Collect all available action names from the resolver
-    fn collect_action_names(resolver: &KeybindingResolver) -> Vec<String> {
-        let bindings = resolver.get_all_bindings();
-        let mut actions: Vec<String> = bindings
-            .into_iter()
-            .map(|(_, action)| {
-                // Strip context prefix if present
-                if let Some(bracket_end) = action.find("] ") {
-                    action[bracket_end + 2..].to_string()
-                } else {
-                    action
+    /// Collect all available action names
+    fn collect_action_names(#[allow(unused)] _resolver: &KeybindingResolver) -> Vec<String> {
+        KeybindingResolver::all_action_names()
+    }
+
+    /// Update autocomplete suggestions based on current action text
+    pub fn update_autocomplete(&mut self) {
+        if let Some(ref mut dialog) = self.edit_dialog {
+            let query = dialog.action_text.to_lowercase();
+            if query.is_empty() {
+                dialog.autocomplete_suggestions.clear();
+                dialog.autocomplete_visible = false;
+                dialog.autocomplete_selected = None;
+                return;
+            }
+
+            dialog.autocomplete_suggestions = self
+                .available_actions
+                .iter()
+                .filter(|a| a.to_lowercase().contains(&query))
+                .cloned()
+                .collect();
+
+            // Sort: exact prefix matches first, then contains matches
+            let q = query.clone();
+            dialog.autocomplete_suggestions.sort_by(|a, b| {
+                let a_prefix = a.to_lowercase().starts_with(&q);
+                let b_prefix = b.to_lowercase().starts_with(&q);
+                match (a_prefix, b_prefix) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.cmp(b),
                 }
-            })
-            .collect();
-        actions.sort();
-        actions.dedup();
-        actions
+            });
+
+            dialog.autocomplete_visible = !dialog.autocomplete_suggestions.is_empty();
+            // Reset selection when text changes
+            dialog.autocomplete_selected = if dialog.autocomplete_visible {
+                Some(0)
+            } else {
+                None
+            };
+            // Clear any previous error
+            dialog.action_error = None;
+        }
+    }
+
+    /// Check if the given action name is valid
+    pub fn is_valid_action(&self, action_name: &str) -> bool {
+        self.available_actions.iter().any(|a| a == action_name)
     }
 
     /// Apply current search and filter criteria
@@ -595,15 +644,29 @@ impl KeybindingEditor {
         false
     }
 
-    /// Apply the edit dialog to create/update a binding
-    pub fn apply_edit_dialog(&mut self) {
+    /// Apply the edit dialog to create/update a binding.
+    /// Returns an error message if validation fails.
+    pub fn apply_edit_dialog(&mut self) -> Option<String> {
         let dialog = match self.edit_dialog.take() {
             Some(d) => d,
-            None => return,
+            None => return None,
         };
 
         if dialog.key_code.is_none() || dialog.action_text.is_empty() {
-            return;
+            self.edit_dialog = Some(dialog);
+            return Some("Key and action are required".to_string());
+        }
+
+        // Validate the action name
+        if !self.is_valid_action(&dialog.action_text) {
+            let err_msg = format!(
+                "Unknown action: '{}'. Use autocomplete to select a valid action.",
+                dialog.action_text
+            );
+            let mut dialog = dialog;
+            dialog.action_error = Some(format!("Unknown action: '{}'", dialog.action_text));
+            self.edit_dialog = Some(dialog);
+            return Some(err_msg);
         }
 
         let key_code = dialog.key_code.unwrap();
@@ -650,6 +713,7 @@ impl KeybindingEditor {
         }
 
         self.apply_filters();
+        None
     }
 
     /// Check for conflicts with the given key combination

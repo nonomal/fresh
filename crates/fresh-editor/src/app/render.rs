@@ -333,7 +333,8 @@ impl Editor {
         let hide_cursor = self.menu_state.active_menu.is_some()
             || self.key_context == KeyContext::FileExplorer
             || self.terminal_mode
-            || settings_visible;
+            || settings_visible
+            || self.keybinding_editor.is_some();
 
         // Convert HoverTarget to tab hover info for rendering
         let hovered_tab = match &self.mouse_state.hover_target {

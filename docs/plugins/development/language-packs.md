@@ -94,6 +94,36 @@ Before writing a grammar from scratch, search online for existing Sublime Text o
 2. **Check VS Code extensions** - many use TextMate/Sublime grammars
 3. **Browse [Package Control](https://packagecontrol.io/)** - Sublime Text's package repository
 
+### ⚠️ Grammar Compatibility
+
+**Important:** Fresh supports a subset of sublime-syntax features. Before using a grammar, check that it:
+
+**Will NOT work:**
+- Uses `extends: Packages/...` directive (grammar inheritance)
+- References external grammars or packages
+- Has dependencies on other grammar files
+
+**Will work:**
+- Standalone, self-contained grammars
+- Grammars using only `include` for internal contexts
+- No external dependencies
+
+**Examples of compatible grammars:**
+- See [fresh-plugins/languages](https://github.com/sinelaw/fresh-plugins/tree/main/languages) for working examples (templ, hare, solidity)
+- Standalone grammars from Package Control that don't use `extends`
+
+**To test compatibility:**
+```bash
+fresh --check-plugin /path/to/your-language-pack
+```
+
+If you find a grammar that uses `extends`, you'll need to either:
+1. Find an alternative standalone grammar
+2. Manually merge the base grammar into your grammar file
+3. Create a new standalone grammar from scratch
+
+### Attribution
+
 When using an existing grammar:
 
 1. **Check the license** - ensure it allows redistribution (MIT, Apache, BSD are common)
@@ -199,29 +229,62 @@ languages/solidity/
 └── README.md
 ```
 
-### Grammar with Embedded Languages
+### Complete Working Example
 
-See the [Templ language pack](https://github.com/sinelaw/fresh-plugins/tree/main/languages/templ) for an example that extends Go syntax:
+See the [Templ language pack](https://github.com/sinelaw/fresh-plugins/tree/main/languages/templ) for a complete, self-contained grammar example:
 
 ```yaml
 %YAML 1.2
 ---
 name: Templ
-scope: source.go.templ
-extends: Packages/Go/Go.sublime-syntax
+scope: source.templ
+version: 2
 
 file_extensions:
   - templ
 
+variables:
+  ident: '[a-zA-Z_][a-zA-Z0-9_]*'
+
 contexts:
-  # Custom rules that extend the base Go grammar
+  main:
+    # All grammar rules defined inline
+    # No external dependencies
 ```
 
-## Testing
+## Testing and Local Development
 
-1. **Local testing**: Copy your language pack to `~/.config/fresh/grammars/`
+### Testing with Local Path (Recommended)
+
+The fastest way to test your language pack during development:
+
+1. **Open Fresh** with a test file
+2. **Open command palette**: Press `Ctrl+P` then type `>`
+3. **Install from local path**:
+   - Type `package` and select "Package: Install from URL"
+   - Enter the full path to your language pack directory: `/path/to/your-language-pack`
+4. **Check for errors**:
+   - Open command palette and run "Show Warnings"
+   - Check for grammar parse errors or missing files
+5. **Iterate**: Edit your grammar, then reinstall from the same local path to reload
+
+### Alternative: Manual Installation
+
+1. **Copy** your language pack to `~/.config/fresh/grammars/<package-name>/`
 2. **Validate manifest**: Run `./validate.sh` in your package directory
 3. **Restart Fresh** to load the new grammar
+
+### Validation
+
+Always validate your package before publishing:
+
+```bash
+# Validate package.json schema
+./validate.sh
+
+# Check grammar compatibility
+fresh --check-plugin /path/to/your-language-pack
+```
 
 ## Publishing
 
@@ -229,7 +292,14 @@ contexts:
 2. Submit a PR to [fresh-plugins-registry](https://github.com/sinelaw/fresh-plugins-registry)
 3. Add your package to `languages.json`
 
-After approval, users can install with:
-```
-:pkg install your-language
+After approval, users can install via the command palette:
+1. Press `Ctrl+P` then type `>`
+2. Type `package` and select "Package: Install from URL"
+3. Enter your package name or git URL
+
+Users can also install directly from your git repository:
+```bash
+# In Fresh command palette
+Package: Install from URL
+# Then enter: https://github.com/username/your-language-pack
 ```

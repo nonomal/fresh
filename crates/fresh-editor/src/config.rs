@@ -2053,7 +2053,7 @@ impl MenuConfig {
                         checkbox: None,
                     },
                     MenuItem::Action {
-                        label: "Keybinding Editor...".to_string(),
+                        label: t!("menu.help.keybinding_editor").to_string(),
                         action: "open_keybinding_editor".to_string(),
                         args: HashMap::new(),
                         when: None,

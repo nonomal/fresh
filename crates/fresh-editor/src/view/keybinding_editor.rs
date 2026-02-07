@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+use rust_i18n::t;
 
 /// Render the keybinding editor modal
 pub fn render_keybinding_editor(
@@ -43,7 +44,11 @@ pub fn render_keybinding_editor(
     frame.render_widget(Clear, modal_area);
 
     // Border
-    let title = format!(" Keybinding Editor \u{2500} [{}] ", editor.active_keymap);
+    let title = format!(
+        " {} \u{2500} [{}] ",
+        t!("keybinding_editor.title"),
+        editor.active_keymap
+    );
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -90,7 +95,10 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
 
     // Line 1: Config file path and keymap names
     let mut path_spans = vec![
-        Span::styled(" Config: ", Style::default().fg(theme.line_number_fg)),
+        Span::styled(
+            format!(" {} ", t!("keybinding_editor.label_config")),
+            Style::default().fg(theme.line_number_fg),
+        ),
         Span::styled(
             &editor.config_file_path,
             Style::default().fg(theme.diagnostic_info_fg),
@@ -98,7 +106,7 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
     ];
     if !editor.keymap_names.is_empty() {
         path_spans.push(Span::styled(
-            "  Maps: ",
+            format!("  {} ", t!("keybinding_editor.label_maps")),
             Style::default().fg(theme.line_number_fg),
         ));
         path_spans.push(Span::styled(
@@ -114,7 +122,7 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
             SearchMode::Text => {
                 vec![
                     Span::styled(
-                        " Search: ",
+                        format!(" {} ", t!("keybinding_editor.label_search")),
                         Style::default()
                             .fg(theme.help_key_fg)
                             .add_modifier(Modifier::BOLD),
@@ -122,27 +130,27 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
                     Span::styled(&editor.search_query, Style::default().fg(theme.editor_fg)),
                     Span::styled("_", Style::default().fg(theme.cursor)),
                     Span::styled(
-                        "  (Esc to cancel, Tab to switch to Record Key)",
+                        format!("  {}", t!("keybinding_editor.search_text_hint")),
                         Style::default().fg(theme.line_number_fg),
                     ),
                 ]
             }
             SearchMode::RecordKey => {
                 let key_text = if editor.search_key_display.is_empty() {
-                    "Press a key...".to_string()
+                    t!("keybinding_editor.press_a_key").to_string()
                 } else {
                     editor.search_key_display.clone()
                 };
                 vec![
                     Span::styled(
-                        " Record Key: ",
+                        format!(" {} ", t!("keybinding_editor.label_record_key")),
                         Style::default()
                             .fg(theme.diagnostic_warning_fg)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(key_text, Style::default().fg(theme.editor_fg)),
                     Span::styled(
-                        "  (Esc to cancel, Tab to switch to Text Search)",
+                        format!("  {}", t!("keybinding_editor.search_record_hint")),
                         Style::default().fg(theme.line_number_fg),
                     ),
                 ]
@@ -153,7 +161,7 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
         let hint = Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(
-                "Press / to search, r to record key search",
+                t!("keybinding_editor.search_hint").to_string(),
                 Style::default().fg(theme.line_number_fg),
             ),
         ]);
@@ -164,13 +172,21 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
     let total = editor.bindings.len();
     let filtered = editor.filtered_indices.len();
     let count_str = if filtered == total {
-        format!("{} bindings", total)
+        t!("keybinding_editor.bindings_count", count = total).to_string()
     } else {
-        format!("{}/{} shown", filtered, total)
+        t!(
+            "keybinding_editor.bindings_filtered",
+            filtered = filtered,
+            total = total
+        )
+        .to_string()
     };
 
     let filter_spans = vec![
-        Span::styled(" Context: ", Style::default().fg(theme.line_number_fg)),
+        Span::styled(
+            format!(" {} ", t!("keybinding_editor.label_context")),
+            Style::default().fg(theme.line_number_fg),
+        ),
         Span::styled(
             format!("[{}]", editor.context_filter_display()),
             Style::default().fg(if editor.context_filter == ContextFilter::All {
@@ -179,7 +195,10 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
                 theme.diagnostic_info_fg
             }),
         ),
-        Span::styled("  Source: ", Style::default().fg(theme.line_number_fg)),
+        Span::styled(
+            format!("  {} ", t!("keybinding_editor.label_source")),
+            Style::default().fg(theme.line_number_fg),
+        ),
         Span::styled(
             format!("[{}]", editor.source_filter_display()),
             Style::default().fg(if editor.source_filter == SourceFilter::All {
@@ -194,9 +213,9 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
         ),
         Span::styled(
             if editor.has_changes {
-                "  [modified]"
+                format!("  {}", t!("keybinding_editor.modified"))
             } else {
-                ""
+                String::new()
             },
             Style::default().fg(theme.diagnostic_warning_fg),
         ),
@@ -225,35 +244,47 @@ fn render_table(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme:
     let header = Line::from(vec![
         Span::styled(" ", Style::default()),
         Span::styled(
-            pad_right("Key", key_col_width as usize),
+            pad_right(&t!("keybinding_editor.header_key"), key_col_width as usize),
             Style::default()
                 .fg(theme.help_key_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default()),
         Span::styled(
-            pad_right("Action", action_name_col_width as usize),
+            pad_right(
+                &t!("keybinding_editor.header_action"),
+                action_name_col_width as usize,
+            ),
             Style::default()
                 .fg(theme.help_key_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default()),
         Span::styled(
-            pad_right("Description", description_col_width as usize),
+            pad_right(
+                &t!("keybinding_editor.header_description"),
+                description_col_width as usize,
+            ),
             Style::default()
                 .fg(theme.help_key_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default()),
         Span::styled(
-            pad_right("Context", context_col_width as usize),
+            pad_right(
+                &t!("keybinding_editor.header_context"),
+                context_col_width as usize,
+            ),
             Style::default()
                 .fg(theme.help_key_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default()),
         Span::styled(
-            pad_right("Source", source_col_width as usize),
+            pad_right(
+                &t!("keybinding_editor.header_source"),
+                source_col_width as usize,
+            ),
             Style::default()
                 .fg(theme.help_key_fg)
                 .add_modifier(Modifier::BOLD),
@@ -367,10 +398,10 @@ fn render_table(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme:
             Span::styled(" ", source_style),
             Span::styled(
                 pad_right(
-                    if binding.source == BindingSource::Custom {
-                        "custom"
+                    &if binding.source == BindingSource::Custom {
+                        t!("keybinding_editor.source_custom").to_string()
                     } else {
-                        "keymap"
+                        t!("keybinding_editor.source_keymap").to_string()
                     },
                     source_col_width as usize,
                 ),
@@ -405,34 +436,73 @@ fn render_footer(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
     let hints = if editor.search_active {
         vec![
             Span::styled(" Esc", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Cancel  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_cancel")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("Tab", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Toggle Mode  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_toggle_mode")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("Enter", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Confirm", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}", t!("keybinding_editor.footer_confirm")),
+                Style::default().fg(theme.line_number_fg),
+            ),
         ]
     } else {
         vec![
             Span::styled(" Enter", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Edit  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_edit")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("a", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Add  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_add")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("d", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Delete  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_delete")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("/", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Search  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_search")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("r", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Record Key  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_record_key")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("c", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Context  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_context")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("s", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Source  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_source")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("?", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Help  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_help")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("Ctrl+S", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Save  ", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}  ", t!("keybinding_editor.footer_save")),
+                Style::default().fg(theme.line_number_fg),
+            ),
             Span::styled("Esc", Style::default().fg(theme.help_key_fg)),
-            Span::styled(":Close", Style::default().fg(theme.line_number_fg)),
+            Span::styled(
+                format!(":{}", t!("keybinding_editor.footer_close")),
+                Style::default().fg(theme.line_number_fg),
+            ),
         ]
     };
 
@@ -455,36 +525,55 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(Clear, dialog_area);
 
     let block = Block::default()
-        .title(" Keyboard Shortcuts ")
+        .title(format!(" {} ", t!("keybinding_editor.help_title")))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.popup_border_fg))
         .style(Style::default().bg(theme.popup_bg).fg(theme.editor_fg));
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
+    let h_nav = t!("keybinding_editor.help_navigation").to_string();
+    let h_move = t!("keybinding_editor.help_move_up_down").to_string();
+    let h_page = t!("keybinding_editor.help_page_up_down").to_string();
+    let h_first = t!("keybinding_editor.help_first_last").to_string();
+    let h_search = t!("keybinding_editor.help_search").to_string();
+    let h_by_name = t!("keybinding_editor.help_search_by_name").to_string();
+    let h_by_key = t!("keybinding_editor.help_search_by_key").to_string();
+    let h_toggle = t!("keybinding_editor.help_toggle_search").to_string();
+    let h_cancel = t!("keybinding_editor.help_cancel_search").to_string();
+    let h_editing = t!("keybinding_editor.help_editing").to_string();
+    let h_edit = t!("keybinding_editor.help_edit_binding").to_string();
+    let h_add = t!("keybinding_editor.help_add_binding").to_string();
+    let h_del = t!("keybinding_editor.help_delete_binding").to_string();
+    let h_filters = t!("keybinding_editor.help_filters").to_string();
+    let h_ctx = t!("keybinding_editor.help_cycle_context").to_string();
+    let h_src = t!("keybinding_editor.help_cycle_source").to_string();
+    let h_save = t!("keybinding_editor.help_save_changes").to_string();
+    let h_close = t!("keybinding_editor.help_close_help").to_string();
+
     let help_lines = vec![
-        help_line("Navigation", "", theme, true),
-        help_line("  \u{2191} / \u{2193}", "Move up/down", theme, false),
-        help_line("  PgUp / PgDn", "Page up/down", theme, false),
-        help_line("  Home / End", "First/last binding", theme, false),
+        help_line(&h_nav, "", theme, true),
+        help_line("  \u{2191} / \u{2193}", &h_move, theme, false),
+        help_line("  PgUp / PgDn", &h_page, theme, false),
+        help_line("  Home / End", &h_first, theme, false),
         help_line("", "", theme, false),
-        help_line("Search", "", theme, true),
-        help_line("  /", "Search by name", theme, false),
-        help_line("  r", "Search by recording key", theme, false),
-        help_line("  Tab", "Toggle search mode", theme, false),
-        help_line("  Esc", "Cancel search", theme, false),
+        help_line(&h_search, "", theme, true),
+        help_line("  /", &h_by_name, theme, false),
+        help_line("  r", &h_by_key, theme, false),
+        help_line("  Tab", &h_toggle, theme, false),
+        help_line("  Esc", &h_cancel, theme, false),
         help_line("", "", theme, false),
-        help_line("Editing", "", theme, true),
-        help_line("  Enter", "Edit selected binding", theme, false),
-        help_line("  a", "Add new binding", theme, false),
-        help_line("  d / Delete", "Delete custom binding", theme, false),
+        help_line(&h_editing, "", theme, true),
+        help_line("  Enter", &h_edit, theme, false),
+        help_line("  a", &h_add, theme, false),
+        help_line("  d / Delete", &h_del, theme, false),
         help_line("", "", theme, false),
-        help_line("Filters", "", theme, true),
-        help_line("  c", "Cycle context filter", theme, false),
-        help_line("  s", "Cycle source filter", theme, false),
+        help_line(&h_filters, "", theme, true),
+        help_line("  c", &h_ctx, theme, false),
+        help_line("  s", &h_src, theme, false),
         help_line("", "", theme, false),
-        help_line("  Ctrl+S", "Save changes", theme, false),
-        help_line("  Esc / ?", "Close help / Toggle help", theme, false),
+        help_line("  Ctrl+S", &h_save, theme, false),
+        help_line("  Esc / ?", &h_close, theme, false),
     ];
 
     let para = Paragraph::new(help_lines);
@@ -537,9 +626,9 @@ fn render_edit_dialog(
     frame.render_widget(Clear, dialog_area);
 
     let title = if dialog.editing_index.is_some() {
-        " Edit Keybinding "
+        format!(" {} ", t!("keybinding_editor.dialog_edit_title"))
     } else {
-        " Add Keybinding "
+        format!(" {} ", t!("keybinding_editor.dialog_add_title"))
     };
 
     let block = Block::default()
@@ -565,9 +654,9 @@ fn render_edit_dialog(
 
     // Instructions
     let instr = match dialog.mode {
-        EditMode::RecordingKey => "Press the desired key combination...",
-        EditMode::EditingAction => "Type action name (Tab/Enter to accept)",
-        EditMode::EditingContext => "Select context...",
+        EditMode::RecordingKey => t!("keybinding_editor.instr_recording_key").to_string(),
+        EditMode::EditingAction => t!("keybinding_editor.instr_editing_action").to_string(),
+        EditMode::EditingContext => t!("keybinding_editor.instr_editing_context").to_string(),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -579,11 +668,15 @@ fn render_edit_dialog(
 
     // Key field
     let key_focused = dialog.focus_area == 0;
+    let key_none_text;
+    let key_recording_text;
     let key_text = if dialog.key_display.is_empty() {
         if dialog.mode == EditMode::RecordingKey {
-            "..."
+            key_recording_text = t!("keybinding_editor.key_recording").to_string();
+            &key_recording_text
         } else {
-            "(none)"
+            key_none_text = t!("keybinding_editor.key_none").to_string();
+            &key_none_text
         }
     } else {
         &dialog.key_display
@@ -604,7 +697,10 @@ fn render_edit_dialog(
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("   Key:     ", key_label_style),
+            Span::styled(
+                format!("   {:9}", t!("keybinding_editor.label_key")),
+                key_label_style,
+            ),
             Span::styled(key_text, key_value_style),
         ])),
         chunks[2],
@@ -625,14 +721,19 @@ fn render_edit_dialog(
     } else {
         Style::default().fg(theme.editor_fg)
     };
+    let action_placeholder;
     let action_display = if dialog.action_text.is_empty() && dialog.mode != EditMode::EditingAction
     {
-        "(type action name)"
+        action_placeholder = t!("keybinding_editor.action_placeholder").to_string();
+        &action_placeholder
     } else {
         &dialog.action_text
     };
     let mut action_spans = vec![
-        Span::styled("   Action:  ", action_label_style),
+        Span::styled(
+            format!("   {:9}", t!("keybinding_editor.label_action")),
+            action_label_style,
+        ),
         Span::styled(action_display, action_value_style),
     ];
     if action_focused && dialog.mode == EditMode::EditingAction {
@@ -671,14 +772,17 @@ fn render_edit_dialog(
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("   Context: ", ctx_label_style),
+            Span::styled(
+                format!("   {:9}", t!("keybinding_editor.label_context")),
+                ctx_label_style,
+            ),
             Span::styled(
                 format!("[{}]", dialog.context),
                 Style::default().fg(theme.editor_fg),
             ),
             if ctx_focused {
                 Span::styled(
-                    "  \u{2190}/\u{2192} to change",
+                    format!("  {}", t!("keybinding_editor.context_change_hint")),
                     Style::default().fg(theme.line_number_fg),
                 )
             } else {
@@ -700,7 +804,7 @@ fn render_edit_dialog(
     }
     if !dialog.conflicts.is_empty() {
         info_lines.push(Line::from(Span::styled(
-            "   \u{26a0} Conflicts:",
+            format!("   {}", t!("keybinding_editor.conflicts_label")),
             Style::default()
                 .fg(theme.diagnostic_warning_fg)
                 .add_modifier(Modifier::BOLD),
@@ -737,9 +841,15 @@ fn render_edit_dialog(
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw("   "),
-            Span::styled(" Save ", save_style),
+            Span::styled(
+                format!(" {} ", t!("keybinding_editor.btn_save")),
+                save_style,
+            ),
             Span::raw("  "),
-            Span::styled(" Cancel ", cancel_style),
+            Span::styled(
+                format!(" {} ", t!("keybinding_editor.btn_cancel")),
+                cancel_style,
+            ),
         ])),
         chunks[8],
     );
@@ -839,7 +949,7 @@ fn render_confirm_dialog(frame: &mut Frame, area: Rect, editor: &KeybindingEdito
     frame.render_widget(Clear, dialog_area);
 
     let block = Block::default()
-        .title(" Unsaved Changes ")
+        .title(format!(" {} ", t!("keybinding_editor.confirm_title")))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.diagnostic_warning_fg))
         .style(Style::default().bg(theme.popup_bg).fg(theme.editor_fg));
@@ -855,13 +965,17 @@ fn render_confirm_dialog(frame: &mut Frame, area: Rect, editor: &KeybindingEdito
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " You have unsaved keybinding changes.",
+            format!(" {}", t!("keybinding_editor.confirm_message")),
             Style::default().fg(theme.editor_fg),
         ))),
         chunks[0],
     );
 
-    let options = ["Save", "Discard", "Cancel"];
+    let options = [
+        t!("keybinding_editor.btn_save").to_string(),
+        t!("keybinding_editor.btn_discard").to_string(),
+        t!("keybinding_editor.btn_cancel").to_string(),
+    ];
     let mut spans = vec![Span::raw(" ")];
     for (i, opt) in options.iter().enumerate() {
         let style = if i == editor.confirm_selection {
@@ -1016,9 +1130,13 @@ fn handle_main_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> Keybind
         // Delete binding
         (KeyCode::Char('d'), KeyModifiers::NONE) | (KeyCode::Delete, _) => {
             if editor.delete_selected() {
-                KeybindingEditorAction::StatusMessage("Custom binding removed".to_string())
+                KeybindingEditorAction::StatusMessage(
+                    t!("keybinding_editor.status_binding_removed").to_string(),
+                )
             } else {
-                KeybindingEditorAction::StatusMessage("Can only delete custom bindings".to_string())
+                KeybindingEditorAction::StatusMessage(
+                    t!("keybinding_editor.status_cannot_delete").to_string(),
+                )
             }
         }
 

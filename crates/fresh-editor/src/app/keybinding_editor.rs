@@ -7,6 +7,7 @@
 use crate::config::{Config, KeyPress, Keybinding};
 use crate::input::keybindings::{format_keybinding, Action, KeybindingResolver};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rust_i18n::t;
 use std::collections::HashMap;
 
 /// Where a binding comes from
@@ -654,17 +655,24 @@ impl KeybindingEditor {
 
         if dialog.key_code.is_none() || dialog.action_text.is_empty() {
             self.edit_dialog = Some(dialog);
-            return Some("Key and action are required".to_string());
+            return Some(t!("keybinding_editor.error_key_action_required").to_string());
         }
 
         // Validate the action name
         if !self.is_valid_action(&dialog.action_text) {
-            let err_msg = format!(
-                "Unknown action: '{}'. Use autocomplete to select a valid action.",
-                dialog.action_text
-            );
+            let err_msg = t!(
+                "keybinding_editor.error_unknown_action",
+                action = &dialog.action_text
+            )
+            .to_string();
             let mut dialog = dialog;
-            dialog.action_error = Some(format!("Unknown action: '{}'", dialog.action_text));
+            dialog.action_error = Some(
+                t!(
+                    "keybinding_editor.error_unknown_action_short",
+                    action = &dialog.action_text
+                )
+                .to_string(),
+            );
             self.edit_dialog = Some(dialog);
             return Some(err_msg);
         }

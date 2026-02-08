@@ -129,17 +129,13 @@ impl Editor {
 
         match mouse_event.kind {
             MouseEventKind::ScrollUp => {
-                // Scroll the table or edit dialog
+                // Scroll the table
                 if editor.edit_dialog.is_none() && !editor.showing_confirm_dialog {
-                    editor.select_prev();
-                    editor.select_prev();
                     editor.select_prev();
                 }
             }
             MouseEventKind::ScrollDown => {
                 if editor.edit_dialog.is_none() && !editor.showing_confirm_dialog {
-                    editor.select_next();
-                    editor.select_next();
                     editor.select_next();
                 }
             }

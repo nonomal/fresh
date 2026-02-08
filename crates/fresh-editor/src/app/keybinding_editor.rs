@@ -200,8 +200,10 @@ pub struct KeybindingEditor {
     /// Number of visible rows (set during render)
     pub visible_rows: usize,
 
-    /// Whether search is active
+    /// Whether search is active (search bar visible)
     pub search_active: bool,
+    /// Whether search input is focused (accepting keystrokes)
+    pub search_focused: bool,
     /// Search query string
     pub search_query: String,
     /// Search mode (text or record key)
@@ -268,6 +270,7 @@ impl KeybindingEditor {
             scroll_offset: 0,
             visible_rows: 20,
             search_active: false,
+            search_focused: false,
             search_query: String::new(),
             search_mode: SearchMode::Text,
             search_key_display: String::new(),
@@ -548,25 +551,33 @@ impl KeybindingEditor {
         }
     }
 
-    /// Start text search
+    /// Start text search (preserves existing query when re-focusing)
     pub fn start_search(&mut self) {
+        if !self.search_active || self.search_mode != SearchMode::Text {
+            // Starting fresh or switching from record mode
+            self.search_mode = SearchMode::Text;
+            if !self.search_active {
+                self.search_query.clear();
+            }
+        }
         self.search_active = true;
-        self.search_mode = SearchMode::Text;
-        self.search_query.clear();
+        self.search_focused = true;
     }
 
     /// Start record-key search
     pub fn start_record_key_search(&mut self) {
         self.search_active = true;
+        self.search_focused = true;
         self.search_mode = SearchMode::RecordKey;
         self.search_key_display.clear();
         self.search_key_code = None;
         self.search_modifiers = KeyModifiers::NONE;
     }
 
-    /// Cancel search
+    /// Cancel search (clear everything)
     pub fn cancel_search(&mut self) {
         self.search_active = false;
+        self.search_focused = false;
         self.search_query.clear();
         self.search_key_code = None;
         self.search_key_display.clear();

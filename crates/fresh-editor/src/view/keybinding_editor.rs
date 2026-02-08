@@ -120,7 +120,7 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
     if editor.search_active {
         let search_spans = match editor.search_mode {
             SearchMode::Text => {
-                vec![
+                let mut spans = vec![
                     Span::styled(
                         format!(" {} ", t!("keybinding_editor.label_search")),
                         Style::default()
@@ -128,12 +128,15 @@ fn render_header(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(&editor.search_query, Style::default().fg(theme.editor_fg)),
-                    Span::styled("_", Style::default().fg(theme.cursor)),
-                    Span::styled(
+                ];
+                if editor.search_focused {
+                    spans.push(Span::styled("_", Style::default().fg(theme.cursor)));
+                    spans.push(Span::styled(
                         format!("  {}", t!("keybinding_editor.search_text_hint")),
                         Style::default().fg(theme.line_number_fg),
-                    ),
-                ]
+                    ));
+                }
+                spans
             }
             SearchMode::RecordKey => {
                 let key_text = if editor.search_key_display.is_empty() {
@@ -433,7 +436,7 @@ fn render_table(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme:
 
 /// Render the footer with key hints
 fn render_footer(frame: &mut Frame, area: Rect, editor: &KeybindingEditor, theme: &Theme) {
-    let hints = if editor.search_active {
+    let hints = if editor.search_active && editor.search_focused {
         vec![
             Span::styled(" Esc", Style::default().fg(theme.help_key_fg)),
             Span::styled(
@@ -1030,8 +1033,8 @@ pub fn handle_keybinding_editor_input(
         return handle_edit_dialog_input(editor, event);
     }
 
-    // Search mode
-    if editor.search_active {
+    // Search mode (only when focused/accepting input)
+    if editor.search_active && editor.search_focused {
         return handle_search_input(editor, event);
     }
 
@@ -1053,9 +1056,13 @@ pub enum KeybindingEditorAction {
 
 fn handle_main_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> KeybindingEditorAction {
     match (event.code, event.modifiers) {
-        // Close
+        // Close / clear search
         (KeyCode::Esc, KeyModifiers::NONE) => {
-            if editor.has_changes {
+            if editor.search_active {
+                // Search is visible but unfocused — clear it
+                editor.cancel_search();
+                KeybindingEditorAction::Consumed
+            } else if editor.has_changes {
                 editor.showing_confirm_dialog = true;
                 editor.confirm_selection = 0;
                 KeybindingEditorAction::Consumed
@@ -1097,7 +1104,7 @@ fn handle_main_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> Keybind
             KeybindingEditorAction::Consumed
         }
 
-        // Search
+        // Search (re-focuses existing search if visible)
         (KeyCode::Char('/'), KeyModifiers::NONE) => {
             editor.start_search();
             KeybindingEditorAction::Consumed
@@ -1163,9 +1170,16 @@ fn handle_search_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> Keybi
                 editor.cancel_search();
                 KeybindingEditorAction::Consumed
             }
-            (KeyCode::Enter, _) => {
-                editor.search_active = false;
-                // Keep the filter results
+            (KeyCode::Enter, _) | (KeyCode::Down, _) => {
+                // Unfocus search, keep results visible, move to list
+                editor.search_focused = false;
+                KeybindingEditorAction::Consumed
+            }
+            (KeyCode::Up, _) => {
+                // Unfocus search, move to list, select last item
+                editor.search_focused = false;
+                editor.selected = editor.filtered_indices.len().saturating_sub(1);
+                editor.ensure_visible_public();
                 KeybindingEditorAction::Consumed
             }
             (KeyCode::Tab, _) => {
@@ -1193,14 +1207,14 @@ fn handle_search_input(editor: &mut KeybindingEditor, event: &KeyEvent) -> Keybi
                 KeybindingEditorAction::Consumed
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
-                // Switch to text mode
+                // Switch to text mode, preserve query
                 editor.search_mode = SearchMode::Text;
-                editor.search_query.clear();
                 editor.apply_filters();
                 KeybindingEditorAction::Consumed
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                editor.search_active = false;
+                // Unfocus search, keep results visible
+                editor.search_focused = false;
                 KeybindingEditorAction::Consumed
             }
             _ => {

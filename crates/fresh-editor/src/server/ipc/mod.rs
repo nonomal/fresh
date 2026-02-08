@@ -300,12 +300,20 @@ impl StreamWrapper {
         Write::flush(&mut *guard)
     }
 
-    /// Try to read without blocking (returns WouldBlock if no data)
+    /// Try to read without blocking (returns WouldBlock if no data or if mutex is contended)
     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut guard = self
-            .0
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mutex poisoned"))?;
+        let mut guard = match self.0.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "stream busy (mutex contended)",
+                ));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::new(io::ErrorKind::Other, "mutex poisoned"));
+            }
+        };
 
         platform::try_read_nonblocking(&mut *guard, buf)
     }

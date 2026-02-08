@@ -8,6 +8,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ use crate::server::capture_backend::{
     terminal_setup_sequences, terminal_teardown_sequences, CaptureBackend,
 };
 use crate::server::input_parser::InputParser;
-use crate::server::ipc::{ServerConnection, ServerListener, SocketPaths};
+use crate::server::ipc::{ServerConnection, ServerListener, SocketPaths, StreamWrapper};
 use crate::server::protocol::{
     ClientControl, ServerControl, ServerHello, TermSize, VersionMismatch, PROTOCOL_VERSION,
 };
@@ -60,9 +61,67 @@ pub struct EditorServer {
     last_input_client: Option<usize>,
 }
 
+/// Buffered writer for sending data to a client without blocking the server loop.
+///
+/// Spawns a background thread that receives data via a bounded channel and
+/// writes it to the client's data pipe. If the channel fills up (client is
+/// too slow to read), frames are dropped. If the pipe breaks, the `pipe_broken`
+/// flag is set so the main loop can disconnect the client.
+struct ClientDataWriter {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    pipe_broken: Arc<AtomicBool>,
+}
+
+impl ClientDataWriter {
+    /// Create a new writer that spawns a background thread to write to the data stream.
+    fn new(data: StreamWrapper, client_id: u64) -> Self {
+        // 16 frames of buffer (~270ms at 60fps before dropping frames)
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
+        let pipe_broken = Arc::new(AtomicBool::new(false));
+        let pipe_broken_clone = pipe_broken.clone();
+
+        std::thread::Builder::new()
+            .name(format!("client-{}-writer", client_id))
+            .spawn(move || {
+                while let Ok(buf) = rx.recv() {
+                    if let Err(e) = data.write_all(&buf) {
+                        tracing::debug!("Client {} writer pipe error: {}", client_id, e);
+                        pipe_broken_clone.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if let Err(e) = data.flush() {
+                        tracing::debug!("Client {} writer flush error: {}", client_id, e);
+                        pipe_broken_clone.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                tracing::debug!("Client {} writer thread exiting", client_id);
+            })
+            .expect("Failed to spawn client writer thread");
+
+        Self {
+            sender: tx,
+            pipe_broken,
+        }
+    }
+
+    /// Try to send data without blocking. Returns false if the channel is full
+    /// (client too slow) or the writer thread has exited.
+    fn try_write(&self, data: &[u8]) -> bool {
+        self.sender.try_send(data.to_vec()).is_ok()
+    }
+
+    /// Check if the writer thread detected a broken pipe.
+    fn is_broken(&self) -> bool {
+        self.pipe_broken.load(Ordering::Relaxed)
+    }
+}
+
 /// A connected client with its own input parser
 struct ConnectedClient {
     conn: ServerConnection,
+    /// Background writer for non-blocking data output
+    data_writer: ClientDataWriter,
     term_size: TermSize,
     env: std::collections::HashMap<String, Option<String>>,
     id: u64,
@@ -214,7 +273,7 @@ impl EditorServer {
                         tracing::info!("Client {} requested detach", self.clients[idx].id);
                         let client = self.clients.remove(idx);
                         let teardown = terminal_teardown_sequences();
-                        let _ = client.conn.write_data(&teardown);
+                        let _ = client.data_writer.try_write(&teardown);
                         let quit_msg = serde_json::to_string(&ServerControl::Quit {
                             reason: "Detached".to_string(),
                         })
@@ -406,8 +465,12 @@ impl EditorServer {
             hello.term()
         );
 
+        // Create background writer for non-blocking render output
+        let data_writer = ClientDataWriter::new(conn.data.clone(), client_id);
+
         Ok(ConnectedClient {
             conn,
+            data_writer,
             term_size: hello.term_size,
             env: hello.env,
             id: client_id,
@@ -585,12 +648,24 @@ impl EditorServer {
             }
         }
 
+        // Check for clients with broken write pipes
+        for (idx, client) in self.clients.iter().enumerate() {
+            if client.data_writer.is_broken() && !disconnected.contains(&idx) {
+                tracing::info!("Client {} write pipe broken, disconnecting", client.id);
+                disconnected.push(idx);
+            }
+        }
+
+        // Deduplicate and sort for safe reverse removal
+        disconnected.sort_unstable();
+        disconnected.dedup();
+
         // Remove disconnected clients
         for idx in disconnected.into_iter().rev() {
             let client = self.clients.remove(idx);
-            // Send teardown sequences
+            // Best-effort teardown via the non-blocking writer
             let teardown = terminal_teardown_sequences();
-            let _ = client.conn.write_data(&teardown);
+            let _ = client.data_writer.try_write(&teardown);
             tracing::info!("Client {} disconnected", client.id);
             // Invalidate input source if that client disconnected
             if input_source_client == Some(idx) {
@@ -684,21 +759,22 @@ impl EditorServer {
             return Ok(());
         }
 
-        // Broadcast to all clients (pending sequences first, then rendered output)
+        // Broadcast to all clients via non-blocking writer threads
         for client in &mut self.clients {
-            if !pending_sequences.is_empty() {
-                if let Err(e) = client.conn.write_data(&pending_sequences) {
-                    tracing::warn!(
-                        "Failed to send pending sequences to client {}: {}",
-                        client.id,
-                        e
-                    );
-                }
-            }
-            if !output.is_empty() {
-                if let Err(e) = client.conn.write_data(&output) {
-                    tracing::warn!("Failed to send to client {}: {}", client.id, e);
-                }
+            // Combine pending sequences and output into a single frame
+            let frame = if !pending_sequences.is_empty() && !output.is_empty() {
+                let mut combined = Vec::with_capacity(pending_sequences.len() + output.len());
+                combined.extend_from_slice(&pending_sequences);
+                combined.extend_from_slice(&output);
+                combined
+            } else if !pending_sequences.is_empty() {
+                pending_sequences.clone()
+            } else {
+                output.clone()
+            };
+
+            if !frame.is_empty() && !client.data_writer.try_write(&frame) {
+                tracing::warn!("Client {} output buffer full, dropping frame", client.id);
             }
             // Clear full render flag after sending
             client.needs_full_render = false;
@@ -711,7 +787,7 @@ impl EditorServer {
     fn disconnect_all_clients(&mut self, reason: &str) -> io::Result<()> {
         let teardown = terminal_teardown_sequences();
         for client in &mut self.clients {
-            let _ = client.conn.write_data(&teardown);
+            let _ = client.data_writer.try_write(&teardown);
             let quit_msg = serde_json::to_string(&ServerControl::Quit {
                 reason: reason.to_string(),
             })

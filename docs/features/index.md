@@ -12,3 +12,4 @@ Fresh provides a comprehensive set of features to help you be productive.
 - [Session Persistence](./session-persistence.md) - Detach and reattach to sessions (Experimental)
 - [Themes](./themes.md) - Customizable color themes
 - [Encoding](./encoding.md) - Text encoding detection and conversion
+- [Keybinding Editor](./keybinding-editor.md) - Visual keybinding browser and editor

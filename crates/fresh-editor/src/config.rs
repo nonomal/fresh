@@ -1556,6 +1556,13 @@ impl MenuConfig {
                         when: None,
                         checkbox: None,
                     },
+                    MenuItem::Action {
+                        label: t!("menu.edit.keybinding_editor").to_string(),
+                        action: "open_keybinding_editor".to_string(),
+                        args: HashMap::new(),
+                        when: None,
+                        checkbox: None,
+                    },
                 ],
             },
             // View menu
@@ -2048,13 +2055,6 @@ impl MenuConfig {
                     MenuItem::Action {
                         label: t!("menu.help.keyboard_shortcuts").to_string(),
                         action: "keyboard_shortcuts".to_string(),
-                        args: HashMap::new(),
-                        when: None,
-                        checkbox: None,
-                    },
-                    MenuItem::Action {
-                        label: t!("menu.help.keybinding_editor").to_string(),
-                        action: "open_keybinding_editor".to_string(),
                         args: HashMap::new(),
                         when: None,
                         checkbox: None,

@@ -830,6 +830,7 @@
   "keybinding_editor.source_keymap": "키맵",
   "keybinding_editor.status_binding_removed": "사용자 정의 키 바인딩 삭제됨",
   "keybinding_editor.status_cannot_delete": "사용자 정의 키 바인딩만 삭제할 수 있습니다",
+  "keybinding_editor.status_keymap_overridden": "Keymap binding disabled (noop override added)",
   "keybinding_editor.title": "키 바인딩 편집기",
   "line_ending.cr": "CR",
   "line_ending.crlf": "CRLF",

@@ -830,6 +830,7 @@
   "keybinding_editor.source_keymap": "mapa kláves",
   "keybinding_editor.status_binding_removed": "Vlastní vazba odstraněna",
   "keybinding_editor.status_cannot_delete": "Lze smazat pouze vlastní vazby",
+  "keybinding_editor.status_keymap_overridden": "Keymap binding disabled (noop override added)",
   "keybinding_editor.title": "Editor klávesových zkratek",
   "line_ending.cr": "CR",
   "line_ending.crlf": "CRLF",

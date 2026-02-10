@@ -830,6 +830,7 @@
   "keybinding_editor.source_keymap": "键映射",
   "keybinding_editor.status_binding_removed": "已删除自定义快捷键",
   "keybinding_editor.status_cannot_delete": "只能删除自定义快捷键",
+  "keybinding_editor.status_keymap_overridden": "Keymap binding disabled (noop override added)",
   "keybinding_editor.title": "快捷键编辑器",
   "line_ending.cr": "CR",
   "line_ending.crlf": "CRLF",

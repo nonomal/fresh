@@ -830,6 +830,7 @@
   "keybinding_editor.source_keymap": "розкладка",
   "keybinding_editor.status_binding_removed": "Користувацьку прив'язку видалено",
   "keybinding_editor.status_cannot_delete": "Можна видаляти лише користувацькі прив'язки",
+  "keybinding_editor.status_keymap_overridden": "Keymap binding disabled (noop override added)",
   "keybinding_editor.title": "Редактор прив'язок клавіш",
   "line_ending.cr": "CR",
   "line_ending.crlf": "CRLF",

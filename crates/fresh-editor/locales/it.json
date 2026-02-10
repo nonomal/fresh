@@ -830,6 +830,7 @@
   "keybinding_editor.source_keymap": "keymap",
   "keybinding_editor.status_binding_removed": "Scorciatoia personalizzata rimossa",
   "keybinding_editor.status_cannot_delete": "Si possono eliminare solo scorciatoie personalizzate",
+  "keybinding_editor.status_keymap_overridden": "Keymap binding disabled (noop override added)",
   "keybinding_editor.title": "Editor scorciatoie da tastiera",
   "line_ending.cr": "CR",
   "line_ending.crlf": "CRLF",

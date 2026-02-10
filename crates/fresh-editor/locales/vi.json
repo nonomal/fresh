@@ -830,6 +830,7 @@
   "keybinding_editor.source_keymap": "bản đồ phím",
   "keybinding_editor.status_binding_removed": "Đã xóa phím tắt tùy chỉnh",
   "keybinding_editor.status_cannot_delete": "Chỉ có thể xóa phím tắt tùy chỉnh",
+  "keybinding_editor.status_keymap_overridden": "Keymap binding disabled (noop override added)",
   "keybinding_editor.title": "Trình chỉnh sửa phím tắt",
   "line_ending.cr": "CR",
   "line_ending.crlf": "CRLF",

@@ -3,6 +3,7 @@ name = "fresh-editor"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 default-run = "fresh"
 description = "A lightweight, fast terminal-based text editor with LSP support and TypeScript plugins"
 license.workspace = true

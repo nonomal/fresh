@@ -2557,8 +2557,11 @@ impl Editor {
                 // Set terminal cursor color to match theme
                 self.theme.set_terminal_cursor_color();
 
-                // Update the config in memory
-                self.config.theme = self.theme.name.clone().into();
+                // Update the config in memory using the normalized registry key,
+                // not the JSON name field, so that the config value can be looked
+                // up in the registry on restart (fixes #1001).
+                let normalized = crate::view::theme::normalize_theme_name(theme_name);
+                self.config.theme = normalized.into();
 
                 // Persist to config file
                 self.save_theme_to_config();

@@ -1160,6 +1160,13 @@ impl StatusBarRenderer {
         current_col += regex_full_width as u16;
         layout.regex = Some((regex_start, current_col));
 
+        // Show capture group hint when regex is enabled in replace mode
+        if use_regex && confirm_each.is_some() {
+            let hint = " \u{2502} $1,$2,…";
+            spans.push(Span::styled(hint, shortcut_style));
+            current_col += str_width(hint) as u16;
+        }
+
         // Confirm Each option (only shown in replace mode)
         if let Some(confirm_value) = confirm_each {
             let confirm_shortcut =

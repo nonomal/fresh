@@ -1980,6 +1980,49 @@ impl JsEditorApi {
             .is_ok()
     }
 
+    /// Set a label on a split (e.g., "sidebar")
+    pub fn set_split_label(&self, split_id: u32, label: String) -> bool {
+        self.command_sender
+            .send(PluginCommand::SetSplitLabel {
+                split_id: SplitId(split_id as usize),
+                label,
+            })
+            .is_ok()
+    }
+
+    /// Remove a label from a split
+    pub fn clear_split_label(&self, split_id: u32) -> bool {
+        self.command_sender
+            .send(PluginCommand::ClearSplitLabel {
+                split_id: SplitId(split_id as usize),
+            })
+            .is_ok()
+    }
+
+    /// Find a split by label (async)
+    #[plugin_api(
+        async_promise,
+        js_name = "getSplitByLabel",
+        ts_return = "number | null"
+    )]
+    #[qjs(rename = "_getSplitByLabelStart")]
+    pub fn get_split_by_label_start(&self, _ctx: rquickjs::Ctx<'_>, label: String) -> u64 {
+        let id = {
+            let mut id_ref = self.next_request_id.borrow_mut();
+            let id = *id_ref;
+            *id_ref += 1;
+            self.callback_contexts
+                .borrow_mut()
+                .insert(id, self.plugin_name.clone());
+            id
+        };
+        let _ = self.command_sender.send(PluginCommand::GetSplitByLabel {
+            label,
+            request_id: id,
+        });
+        id
+    }
+
     /// Distribute all splits evenly
     pub fn distribute_splits_evenly(&self) -> bool {
         // Get all split IDs - for now send empty vec (app will handle)

@@ -378,6 +378,14 @@ impl PluginThreadHandle {
                 });
                 self.resolve_callback(JsCallbackId(request_id), result.to_string());
             }
+            PluginResponse::SplitByLabel {
+                request_id,
+                split_id,
+            } => {
+                let result = serde_json::to_string(&split_id.map(|s| s.0))
+                    .unwrap_or_else(|_| "null".to_string());
+                self.resolve_callback(JsCallbackId(request_id), result);
+            }
         }
     }
 
@@ -643,6 +651,7 @@ fn respond_to_pending(
         fresh_core::api::PluginResponse::LineEndPosition { request_id, .. } => *request_id,
         fresh_core::api::PluginResponse::BufferLineCount { request_id, .. } => *request_id,
         fresh_core::api::PluginResponse::TerminalCreated { request_id, .. } => *request_id,
+        fresh_core::api::PluginResponse::SplitByLabel { request_id, .. } => *request_id,
     };
 
     let sender = {

@@ -4560,6 +4560,19 @@ impl Editor {
             PluginCommand::SetSplitRatio { split_id, ratio } => {
                 self.handle_set_split_ratio(split_id, ratio);
             }
+            PluginCommand::SetSplitLabel { split_id, label } => {
+                self.split_manager.set_label(split_id, label);
+            }
+            PluginCommand::ClearSplitLabel { split_id } => {
+                self.split_manager.clear_label(split_id);
+            }
+            PluginCommand::GetSplitByLabel { label, request_id } => {
+                let split_id = self.split_manager.find_split_by_label(&label);
+                let callback_id = fresh_core::api::JsCallbackId::from(request_id);
+                let json = serde_json::to_string(&split_id.map(|s| s.0))
+                    .unwrap_or_else(|_| "null".to_string());
+                self.plugin_manager.resolve_callback(callback_id, json);
+            }
             PluginCommand::DistributeSplitsEvenly { split_ids: _ } => {
                 self.handle_distribute_splits_evenly();
             }

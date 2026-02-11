@@ -220,6 +220,11 @@ pub enum PluginResponse {
         request_id: u64,
         buffer_id: BufferId,
     },
+    /// Response to GetSplitByLabel with the found split ID (if any)
+    SplitByLabel {
+        request_id: u64,
+        split_id: Option<SplitId>,
+    },
 }
 
 /// Messages sent from async plugin tasks to the synchronous main loop
@@ -1236,6 +1241,15 @@ pub enum PluginCommand {
         /// Ratio between 0.0 and 1.0 (0.5 = equal split)
         ratio: f32,
     },
+
+    /// Set a label on a leaf split (e.g., "sidebar")
+    SetSplitLabel { split_id: SplitId, label: String },
+
+    /// Remove a label from a split
+    ClearSplitLabel { split_id: SplitId },
+
+    /// Find a split by its label (async)
+    GetSplitByLabel { label: String, request_id: u64 },
 
     /// Distribute splits evenly - make all given splits equal size
     DistributeSplitsEvenly {

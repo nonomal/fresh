@@ -30,6 +30,7 @@ use crate::view::viewport::Viewport;
 use crate::{services::plugins::api::ViewTransformPayload, state::ViewMode};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A node in the split tree
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -491,6 +492,9 @@ pub struct SplitManager {
 
     /// Currently maximized split (if any). When set, only this split is visible.
     maximized_split: Option<SplitId>,
+
+    /// Labels for leaf splits (e.g., "sidebar" to mark managed splits)
+    labels: HashMap<SplitId, String>,
 }
 
 impl SplitManager {
@@ -502,6 +506,7 @@ impl SplitManager {
             active_split: split_id,
             next_split_id: 1,
             maximized_split: None,
+            labels: HashMap::new(),
         }
     }
 
@@ -683,15 +688,29 @@ impl SplitManager {
             self.maximized_split = None;
         }
 
+        // Collect all split IDs that will be removed (the target and its children)
+        let removed_ids: Vec<SplitId> = self
+            .root
+            .find(split_id)
+            .map(|node| node.all_split_ids())
+            .unwrap_or_default();
+
         // Find the parent of the split to close
         // This requires a parent-tracking traversal
         let result = self.remove_split_node(split_id);
 
-        // If we closed the active split, update active_split to another split
-        if result.is_ok() && self.active_split == split_id {
-            let leaf_ids = self.root.leaf_split_ids();
-            if let Some(&first_leaf) = leaf_ids.first() {
-                self.active_split = first_leaf;
+        if result.is_ok() {
+            // Clean up labels for all removed splits
+            for id in &removed_ids {
+                self.labels.remove(id);
+            }
+
+            // If we closed the active split, update active_split to another split
+            if self.active_split == split_id {
+                let leaf_ids = self.root.leaf_split_ids();
+                if let Some(&first_leaf) = leaf_ids.first() {
+                    self.active_split = first_leaf;
+                }
             }
         }
 
@@ -957,6 +976,39 @@ impl SplitManager {
             })
             .collect()
     }
+
+    // === Split labels ===
+
+    /// Set a label on a leaf split (e.g., "sidebar")
+    pub fn set_label(&mut self, split_id: SplitId, label: String) {
+        self.labels.insert(split_id, label);
+    }
+
+    /// Remove a label from a split
+    pub fn clear_label(&mut self, split_id: SplitId) {
+        self.labels.remove(&split_id);
+    }
+
+    /// Get the label for a split (if any)
+    pub fn get_label(&self, split_id: SplitId) -> Option<&str> {
+        self.labels.get(&split_id).map(|s| s.as_str())
+    }
+
+    /// Find the first leaf split with the given label
+    pub fn find_split_by_label(&self, label: &str) -> Option<SplitId> {
+        self.root
+            .leaf_split_ids()
+            .into_iter()
+            .find(|id| self.labels.get(id).is_some_and(|l| l == label))
+    }
+
+    /// Find the first leaf split without a label
+    pub fn find_unlabeled_leaf(&self) -> Option<SplitId> {
+        self.root
+            .leaf_split_ids()
+            .into_iter()
+            .find(|id| !self.labels.contains_key(id))
+    }
 }
 
 #[cfg(test)]
@@ -1082,5 +1134,121 @@ mod tests {
         assert_eq!(second.height, 100);
         assert_eq!(first.x, 0);
         assert_eq!(second.x, 51); // first.x + first.width + 1 (separator)
+    }
+
+    // === Split label tests ===
+
+    #[test]
+    fn test_set_and_get_label() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let split = manager.active_split();
+
+        assert_eq!(manager.get_label(split), None);
+
+        manager.set_label(split, "sidebar".to_string());
+        assert_eq!(manager.get_label(split), Some("sidebar"));
+    }
+
+    #[test]
+    fn test_clear_label() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let split = manager.active_split();
+
+        manager.set_label(split, "sidebar".to_string());
+        assert!(manager.get_label(split).is_some());
+
+        manager.clear_label(split);
+        assert_eq!(manager.get_label(split), None);
+    }
+
+    #[test]
+    fn test_find_split_by_label() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let first_split = manager.active_split();
+
+        let second_split = manager
+            .split_active(SplitDirection::Vertical, BufferId(1), 0.5)
+            .unwrap();
+
+        manager.set_label(first_split, "sidebar".to_string());
+
+        assert_eq!(manager.find_split_by_label("sidebar"), Some(first_split));
+        assert_eq!(manager.find_split_by_label("terminal"), None);
+
+        // The second split has no label
+        assert_ne!(
+            manager.find_split_by_label("sidebar"),
+            Some(second_split)
+        );
+    }
+
+    #[test]
+    fn test_find_unlabeled_leaf() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let first_split = manager.active_split();
+
+        let second_split = manager
+            .split_active(SplitDirection::Vertical, BufferId(1), 0.5)
+            .unwrap();
+
+        // No labels — first leaf returned
+        assert!(manager.find_unlabeled_leaf().is_some());
+
+        // Label the first split — unlabeled should return the second
+        manager.set_label(first_split, "sidebar".to_string());
+        assert_eq!(manager.find_unlabeled_leaf(), Some(second_split));
+
+        // Label both — no unlabeled leaf
+        manager.set_label(second_split, "terminal".to_string());
+        assert_eq!(manager.find_unlabeled_leaf(), None);
+    }
+
+    #[test]
+    fn test_close_split_cleans_up_label() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let _first_split = manager.active_split();
+
+        let second_split = manager
+            .split_active(SplitDirection::Vertical, BufferId(1), 0.5)
+            .unwrap();
+
+        manager.set_label(second_split, "sidebar".to_string());
+        assert_eq!(manager.find_split_by_label("sidebar"), Some(second_split));
+
+        manager.close_split(second_split).unwrap();
+
+        // Label should be cleaned up
+        assert_eq!(manager.find_split_by_label("sidebar"), None);
+        assert_eq!(manager.get_label(second_split), None);
+    }
+
+    #[test]
+    fn test_label_overwrite() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let split = manager.active_split();
+
+        manager.set_label(split, "sidebar".to_string());
+        assert_eq!(manager.get_label(split), Some("sidebar"));
+
+        manager.set_label(split, "terminal".to_string());
+        assert_eq!(manager.get_label(split), Some("terminal"));
+        assert_eq!(manager.find_split_by_label("sidebar"), None);
+        assert_eq!(manager.find_split_by_label("terminal"), Some(split));
+    }
+
+    #[test]
+    fn test_find_unlabeled_leaf_single_split_no_label() {
+        let manager = SplitManager::new(BufferId(0));
+        // Single unlabeled split — should return it
+        assert_eq!(manager.find_unlabeled_leaf(), Some(manager.active_split()));
+    }
+
+    #[test]
+    fn test_find_unlabeled_leaf_single_split_labeled() {
+        let mut manager = SplitManager::new(BufferId(0));
+        let split = manager.active_split();
+        manager.set_label(split, "only".to_string());
+        // Only split is labeled — returns None
+        assert_eq!(manager.find_unlabeled_leaf(), None);
     }
 }

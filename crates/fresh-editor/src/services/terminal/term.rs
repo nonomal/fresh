@@ -96,6 +96,11 @@ impl TerminalState {
         let size = TermSize::new(cols as usize, rows as usize);
         let config = TermConfig {
             scrolling_history: SCROLLBACK_LINES,
+            // Enable kitty keyboard protocol handling so alacritty_terminal
+            // responds to `\x1b[?u` queries. Without this, shells like nushell
+            // that probe for kitty keyboard support will block waiting for a
+            // response that never comes, causing the terminal to freeze (#884).
+            kitty_keyboard: true,
             ..Default::default()
         };
         let listener = PtyWriteListener::new();
@@ -956,5 +961,47 @@ mod tests {
         let response = &responses[0];
         // Should report position as row 5, col 10
         assert_eq!(response, "\x1b[5;10R", "Response should be \\x1b[5;10R");
+    }
+
+    #[test]
+    fn test_kitty_keyboard_query_response() {
+        // Test that sending a kitty keyboard protocol query generates a response.
+        // This is critical for shells like nushell that probe for kitty keyboard
+        // support on startup - without a response, they freeze (#884).
+        let mut state = TerminalState::new(80, 24);
+
+        // Send kitty keyboard query: ESC [ ? u
+        state.process_output(b"\x1b[?u");
+
+        let responses = state.drain_pty_write_queue();
+        assert_eq!(responses.len(), 1, "Should respond to kitty keyboard query");
+
+        let response = &responses[0];
+        // Response should indicate no keyboard enhancement active: \x1b[?0u
+        assert_eq!(
+            response, "\x1b[?0u",
+            "Should report no keyboard enhancement (mode 0)"
+        );
+    }
+
+    #[test]
+    fn test_da1_primary_device_attributes_response() {
+        // Test that DA1 (Primary Device Attributes) query generates a response.
+        // Shells send \x1b[c to identify the terminal type.
+        let mut state = TerminalState::new(80, 24);
+
+        // Send DA1 query: ESC [ c
+        state.process_output(b"\x1b[c");
+
+        let responses = state.drain_pty_write_queue();
+        assert_eq!(responses.len(), 1, "Should respond to DA1 query");
+
+        let response = &responses[0];
+        // alacritty_terminal responds with \x1b[?6c (VT102)
+        assert!(
+            response.starts_with("\x1b[?"),
+            "DA1 response should start with ESC[?"
+        );
+        assert!(response.ends_with('c'), "DA1 response should end with 'c'");
     }
 }

@@ -84,6 +84,7 @@ pub mod tab_indent_selection;
 pub mod tab_scrolling;
 pub mod terminal;
 pub mod terminal_close;
+pub mod terminal_nushell_freeze;
 pub mod terminal_resize;
 pub mod test_scrollbar_keybinds_cursor;
 pub mod theme;

@@ -185,6 +185,115 @@ fn test_undo_past_indent_after_save_does_not_corrupt_buffer() {
     );
 }
 
+/// Simplest reproduction: bulk edit -> save -> undo (no typing after save)
+///
+/// 1. Open a file
+/// 2. Bulk edit (toggle comment)
+/// 3. Save
+/// 4. Undo
+///
+/// Expected: undoes step 2 (content matches original)
+/// Actual: corrupts the text
+#[test]
+fn test_bulk_edit_save_undo_minimal() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    std::fs::write(
+        &file_path,
+        "fn main() {\n    println!(\"hello\");\n    println!(\"world\");\n}\n",
+    )
+    .unwrap();
+
+    let config = Config::default();
+    let mut harness =
+        EditorTestHarness::create(80, 24, HarnessOptions::new().with_config(config)).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    let original_content = harness.get_buffer_content().unwrap();
+
+    // Step 1: Toggle comment (BulkEdit)
+    run_command(&mut harness, "Toggle Comment");
+
+    let commented = harness.get_buffer_content().unwrap();
+    assert_ne!(
+        commented, original_content,
+        "Toggle comment should have changed the content"
+    );
+
+    // Step 2: Save -> consolidate_after_save() replaces buffers
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Step 3: Undo -> should restore original content
+    harness
+        .send_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let final_content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        final_content, original_content,
+        "Undo after save should restore original content.\n\
+         Expected: {:?}\n\
+         Got: {:?}\n\
+         The BulkEdit undo restored a piece tree referencing buffers that were \
+         destroyed by consolidate_after_save().",
+        original_content, final_content
+    );
+}
+
+/// Same minimal reproduction but using move-line-down (Alt+Down) as the bulk edit
+#[test]
+fn test_move_line_down_save_undo_minimal() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    std::fs::write(&file_path, "line A\nline B\nline C\nline D\n").unwrap();
+
+    let config = Config::default();
+    let mut harness =
+        EditorTestHarness::create(80, 24, HarnessOptions::new().with_config(config)).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    let original_content = harness.get_buffer_content().unwrap();
+
+    // Step 1: Move line down (Alt+Down) - this is a BulkEdit
+    harness
+        .send_key(KeyCode::Down, KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+
+    let moved = harness.get_buffer_content().unwrap();
+    assert_ne!(
+        moved, original_content,
+        "Move line down should have changed the content"
+    );
+
+    // Step 2: Save
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Step 3: Undo -> should restore original content
+    harness
+        .send_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let final_content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        final_content, original_content,
+        "Undo after save should restore original line order.\n\
+         Expected: {:?}\n\
+         Got: {:?}",
+        original_content, final_content
+    );
+}
+
 /// Test multiple save-edit-undo cycles to catch cumulative corruption
 #[test]
 fn test_multiple_save_cycles_with_bulk_edit_undo() {

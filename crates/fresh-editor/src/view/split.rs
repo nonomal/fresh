@@ -994,6 +994,11 @@ impl SplitManager {
         self.labels.get(&split_id).map(|s| s.as_str())
     }
 
+    /// Get all split labels (for workspace serialization)
+    pub fn labels(&self) -> &HashMap<SplitId, String> {
+        &self.labels
+    }
+
     /// Find the first leaf split with the given label
     pub fn find_split_by_label(&self, label: &str) -> Option<SplitId> {
         self.root

@@ -1368,13 +1368,110 @@ fn test_session_restores_buffer_to_split_mapping() {
     }
 }
 
-/// Test that split labels are preserved in the serialized workspace.
+/// Test that splits with different tab counts restore correctly.
+///
+/// Regression test: when one split has multiple tabs and another has a single tab,
+/// restore should preserve the exact tab-to-split assignment — not dump all files
+/// into all splits.
+#[test]
+fn test_session_restores_tabs_per_split() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+
+    let file_a = project_dir.join("a.txt");
+    let file_b = project_dir.join("b.txt");
+    let file_c = project_dir.join("c.txt");
+    std::fs::write(&file_a, "Content A").unwrap();
+    std::fs::write(&file_b, "Content B").unwrap();
+    std::fs::write(&file_c, "Content C").unwrap();
+
+    // First session: left split has 2 tabs (a, b), right split has 1 tab (c)
+    {
+        let mut harness = EditorTestHarness::with_config_and_working_dir(
+            120,
+            24,
+            Config::default(),
+            project_dir.clone(),
+        )
+        .unwrap();
+
+        // Open a.txt and b.txt in the initial (left) split
+        harness.open_file(&file_a).unwrap();
+        harness.open_file(&file_b).unwrap();
+        harness.render().unwrap();
+
+        // Both tabs should be visible in this split
+        harness.assert_screen_contains("a.txt");
+        harness.assert_screen_contains("b.txt");
+
+        // Create vertical split (new right split becomes active)
+        split_vertical(&mut harness);
+
+        // Open only c.txt in the right split
+        harness.open_file(&file_c).unwrap();
+        harness.assert_buffer_content("Content C");
+
+        harness.render().unwrap();
+        let screen = harness.screen_to_string();
+        eprintln!("Before save:\n{}", screen);
+
+        harness.editor_mut().save_workspace().unwrap();
+    }
+
+    // Second session: restore and verify tab assignment
+    {
+        let mut harness = EditorTestHarness::with_config_and_working_dir(
+            120,
+            24,
+            Config::default(),
+            project_dir.clone(),
+        )
+        .unwrap();
+
+        harness.editor_mut().try_restore_workspace().unwrap();
+        harness.render().unwrap();
+
+        let screen = harness.screen_to_string();
+        eprintln!("After restore:\n{}", screen);
+
+        // Right split (active) should show c.txt
+        harness.assert_buffer_content("Content C");
+
+        // Right split should NOT have a.txt or b.txt in its tabs
+        // Count occurrences: c.txt should appear in right split's tab bar,
+        // a.txt and b.txt should only appear in left split's tab bar
+        // We can't easily check per-split tabs from screen, but we can verify
+        // that switching to left split shows the right files.
+
+        // Switch to left split
+        prev_split(&mut harness);
+        harness.render().unwrap();
+
+        // Left split should have b.txt active (last opened there)
+        harness.assert_buffer_content("Content B");
+
+        // Left split's tab bar should show both a.txt and b.txt
+        let left_screen = harness.screen_to_string();
+        eprintln!("Left split after restore:\n{}", left_screen);
+        assert!(
+            left_screen.contains("a.txt") && left_screen.contains("b.txt"),
+            "Left split should have both a.txt and b.txt tabs.\nScreen:\n{}",
+            left_screen
+        );
+    }
+}
+
+/// Test that split labels survive a save → restore cycle.
 ///
 /// Plugins (like Claude Code) use split labels to identify splits by purpose
-/// (e.g., "claude-sidebar"). This test verifies that labels survive a
-/// capture_workspace() → JSON → load() round-trip.
+/// (e.g., "claude-sidebar"). After restoring a workspace, the plugin must be
+/// able to find its labeled split again.
 #[test]
-fn test_session_serializes_split_labels() {
+fn test_session_restores_split_labels() {
+    use fresh::model::event::SplitId;
+    use fresh::services::plugins::api::PluginCommand;
+
     let temp_dir = TempDir::new().unwrap();
     let project_dir = temp_dir.path().join("project");
     std::fs::create_dir(&project_dir).unwrap();
@@ -1384,46 +1481,56 @@ fn test_session_serializes_split_labels() {
     std::fs::write(&file1, "Main content").unwrap();
     std::fs::write(&file2, "Sidebar content").unwrap();
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
-        100,
-        24,
-        Config::default(),
-        project_dir.clone(),
-    )
-    .unwrap();
+    // First session: create labeled split, save workspace
+    {
+        let mut harness = EditorTestHarness::with_config_and_working_dir(
+            100,
+            24,
+            Config::default(),
+            project_dir.clone(),
+        )
+        .unwrap();
 
-    harness.open_file(&file1).unwrap();
-    split_vertical(&mut harness);
-    harness.open_file(&file2).unwrap();
+        harness.open_file(&file1).unwrap();
+        split_vertical(&mut harness);
+        harness.open_file(&file2).unwrap();
 
-    // Verify both files visible in splits
-    harness.render().unwrap();
-    let screen = harness.screen_to_string();
-    assert!(
-        screen.contains("Main content") && screen.contains("Sidebar content"),
-        "Both files should be visible.\nScreen:\n{}",
-        screen
-    );
+        // Label the active (right) split as "my-sidebar"
+        // Discover the actual split ID from the captured workspace
+        let active_split = harness.editor().capture_workspace().active_split_id;
+        harness
+            .editor_mut()
+            .handle_plugin_command(PluginCommand::SetSplitLabel {
+                split_id: SplitId(active_split),
+                label: "my-sidebar".to_string(),
+            })
+            .unwrap();
 
-    // Capture workspace and verify the serialized JSON contains the split label
-    // (This tests the serialization path; restore is tested by the split restore tests above)
-    let workspace = harness.editor().capture_workspace();
-    let json = serde_json::to_string_pretty(&workspace).unwrap();
+        harness.render().unwrap();
+        harness.editor_mut().save_workspace().unwrap();
+    }
 
-    // The JSON should contain both file names (proves split layout is serialized)
-    assert!(
-        json.contains("main.txt"),
-        "Serialized workspace should reference main.txt.\nJSON:\n{}",
-        json
-    );
-    assert!(
-        json.contains("sidebar.txt"),
-        "Serialized workspace should reference sidebar.txt.\nJSON:\n{}",
-        json
-    );
+    // Second session: restore and verify the label is present
+    {
+        let mut harness = EditorTestHarness::with_config_and_working_dir(
+            100,
+            24,
+            Config::default(),
+            project_dir.clone(),
+        )
+        .unwrap();
 
-    // Verify JSON round-trips correctly
-    let deserialized: fresh::workspace::Workspace = serde_json::from_str(&json).unwrap();
-    let rejson = serde_json::to_string_pretty(&deserialized).unwrap();
-    assert_eq!(json, rejson, "Workspace should survive JSON round-trip");
+        harness.editor_mut().try_restore_workspace().unwrap();
+        harness.render().unwrap();
+
+        // Capture the restored workspace — the label should be in the serialized JSON
+        let workspace = harness.editor().capture_workspace();
+        let json = serde_json::to_string_pretty(&workspace).unwrap();
+
+        assert!(
+            json.contains("my-sidebar"),
+            "Restored workspace should contain the split label 'my-sidebar'.\nJSON:\n{}",
+            json
+        );
+    }
 }

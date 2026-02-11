@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Fake shell that mimics nushell's terminal capability probing behavior.
 
-On startup, nushell's line editor (reedline) sends a kitty keyboard protocol
-query to the terminal and blocks until it gets a response:
+On startup, nushell's line editor (reedline) via crossterm sends a DA1
+(Primary Device Attributes) query to identify the terminal:
 
-  \\x1b[?u  →  expects  \\x1b[?{mode}u  back
+  \\x1b[c  →  expects  \\x1b[?...c  back
 
-Without a response, reedline blocks and the terminal appears frozen.
+Without a response, crossterm blocks and the terminal appears frozen.
+
+Before the fix (commit 62835565), fresh used a NullListener that silently
+discarded all PtyWrite events from alacritty_terminal, so NO terminal queries
+got responses — causing nushell (and other shells) to freeze on startup.
 
 This script replicates that behavior: it switches stdin to raw mode (as
-nushell does via reedline/crossterm), sends the kitty keyboard query, and
-waits for the response. If no response arrives within the timeout, it prints
+nushell does via reedline/crossterm), sends a DA1 query, and waits for the
+response. If no response arrives within the timeout, it prints
 FAKE_SHELL_STUCK_NO_RESPONSE and blocks — exactly like the bug in issue #884.
 
-Used by the e2e test for #884 to verify fresh's PTY responds to \\x1b[?u.
+Used by the e2e test for #884 to verify fresh's PTY responds to \\x1b[c.
 """
 
 import os
@@ -43,13 +47,14 @@ def main():
     try:
         tty.setraw(0)
 
-        # Send the kitty keyboard protocol query — the specific query that
-        # was broken before the fix (alacritty_terminal only responds when
-        # its config has kitty_keyboard=true).
-        os.write(1, b"\x1b[?u")
+        # Send DA1 (Primary Device Attributes) query — this is one of the
+        # queries that crossterm/reedline sends on startup. Before the
+        # PtyWriteListener fix, all PtyWrite responses (including DA1) were
+        # discarded by NullListener, causing shells to hang.
+        os.write(1, b"\x1b[c")
 
-        # Wait for the response: \x1b[?{mode}u
-        # nushell blocks here until it gets the response.
+        # Wait for the response: \x1b[?...c
+        # nushell/crossterm blocks here until it gets the response.
         response = read_with_timeout(0, TIMEOUT_SEC)
     finally:
         # Restore terminal settings for normal I/O
@@ -62,7 +67,7 @@ def main():
         signal.pause()
         sys.exit(1)
 
-    # Got response — terminal supports kitty keyboard protocol query.
+    # Got response — terminal answered the DA1 query.
     os.write(1, b"FAKE_SHELL_READY\r\n")
     os.write(1, b"$ ")
 

@@ -1,14 +1,19 @@
 //! Regression test for issue #884: nushell freezing on terminal entry
 //!
-//! When nushell starts inside a PTY, its line editor (reedline) sends a kitty
-//! keyboard protocol query (`\x1b[?u`) and blocks until it gets a response.
+//! When nushell starts inside a PTY, its line editor (reedline) via crossterm
+//! sends terminal capability queries like DA1 (`\x1b[c`) and blocks until it
+//! gets a response.
 //!
-//! The fix (setting `kitty_keyboard: true` in alacritty_terminal's TermConfig)
-//! ensures this query gets a response via the existing PtyWrite pipeline.
+//! The root cause was that fresh used a `NullListener` that silently discarded
+//! all `Event::PtyWrite` events from alacritty_terminal, so terminal query
+//! responses never reached the shell process. The fix (commit 62835565)
+//! replaced `NullListener` with `PtyWriteListener`, which captures responses
+//! and forwards them back through the PTY.
 //!
 //! This test uses a fake shell (`tests/fixtures/fake_nushell.py`) that mimics
-//! nushell's probing behavior: it sends `\x1b[?u` and only becomes interactive
-//! once it receives a response. Without the fix, the fake shell stays stuck.
+//! nushell's probing behavior: it sends `\x1b[c` (DA1) and only becomes
+//! interactive once it receives a response. Without the PtyWrite pipeline,
+//! the fake shell stays stuck.
 
 use crate::common::harness::EditorTestHarness;
 use portable_pty::{native_pty_system, PtySize};
@@ -49,10 +54,10 @@ fn fake_nushell_path() -> PathBuf {
 /// Regression test for #884: shells that probe terminal capabilities must get
 /// responses from fresh's PTY, otherwise they freeze.
 ///
-/// Uses a fake shell that sends `\x1b[?u` (kitty keyboard protocol query) on
+/// Uses a fake shell that sends `\x1b[c` (DA1 / Primary Device Attributes) on
 /// startup and only prints `FAKE_SHELL_READY` once a response arrives. Without
-/// the fix (`kitty_keyboard: true`), the query goes unanswered and the fake
-/// shell prints `FAKE_SHELL_STUCK_NO_RESPONSE` instead.
+/// the PtyWriteListener (the pre-fix state), the query goes unanswered and the
+/// fake shell prints `FAKE_SHELL_STUCK_NO_RESPONSE` instead.
 #[test]
 #[cfg_attr(target_os = "windows", ignore)] // Uses python3 / Unix PTY
 fn test_nushell_terminal_capability_queries_get_responses() {
@@ -72,10 +77,11 @@ fn test_nushell_terminal_capability_queries_get_responses() {
     harness.editor_mut().open_terminal();
     harness.render().unwrap();
 
-    // The fake shell sends \x1b[?u and waits for the kitty keyboard response.
-    // With the fix, alacritty_terminal responds with \x1b[?0u and the fake
-    // shell prints FAKE_SHELL_READY. Without the fix, it times out (5s) and
-    // prints FAKE_SHELL_STUCK_NO_RESPONSE.
+    // The fake shell sends \x1b[c (DA1) and waits for the terminal's response.
+    // With PtyWriteListener, alacritty_terminal's DA1 response (\x1b[?6c) is
+    // captured and forwarded back to the shell. The fake shell prints
+    // FAKE_SHELL_READY. Without it, the response is discarded and the fake
+    // shell times out (5s), printing FAKE_SHELL_STUCK_NO_RESPONSE.
     let got_output = harness
         .wait_for_async(
             |h| {
@@ -97,8 +103,8 @@ fn test_nushell_terminal_capability_queries_get_responses() {
 
     assert!(
         screen.contains("FAKE_SHELL_READY"),
-        "Expected FAKE_SHELL_READY (kitty keyboard query answered), \
-         but the fake shell is stuck because \\x1b[?u got no response. \
+        "Expected FAKE_SHELL_READY (DA1 query answered), \
+         but the fake shell is stuck because \\x1b[c got no response. \
          Screen:\n{}",
         screen
     );

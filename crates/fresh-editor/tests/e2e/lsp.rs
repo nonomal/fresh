@@ -5539,7 +5539,7 @@ fn test_completion_snippet_cursor_position() -> anyhow::Result<()> {
     assert_eq!(buffer, "println!()", "Snippet should expand without $0");
 
     // Verify cursor is positioned inside the parens (at position 9)
-    let cursor_pos = harness.editor().active_state().cursors.primary().position;
+    let cursor_pos = harness.editor().active_cursors().primary().position;
     assert_eq!(cursor_pos, 9, "Cursor should be inside the parentheses");
 
     Ok(())
@@ -5597,7 +5597,7 @@ fn test_completion_snippet_with_default() -> anyhow::Result<()> {
     );
 
     // Verify cursor is at $0 position (after the 4 spaces on line 2)
-    let cursor_pos = harness.editor().active_state().cursors.primary().position;
+    let cursor_pos = harness.editor().active_cursors().primary().position;
     assert_eq!(cursor_pos, 16, "Cursor should be at $0 position");
 
     Ok(())
@@ -5652,7 +5652,7 @@ fn test_completion_plain_text_no_snippet() -> anyhow::Result<()> {
     assert_eq!(buffer, "my_variable", "Plain text should be inserted as-is");
 
     // Cursor should be at end of inserted text
-    let cursor_pos = harness.editor().active_state().cursors.primary().position;
+    let cursor_pos = harness.editor().active_cursors().primary().position;
     assert_eq!(cursor_pos, 11, "Cursor should be at end of text");
 
     Ok(())

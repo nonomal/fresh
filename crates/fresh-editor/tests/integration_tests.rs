@@ -5,6 +5,7 @@ mod common;
 use fresh::model::filesystem::StdFileSystem;
 use fresh::{
     model::event::{CursorId, Event, EventLog},
+    model::cursor::Cursors,
     state::EditorState,
     view::overlay::OverlayNamespace,
     view::theme,
@@ -23,36 +24,37 @@ fn test_buffer_cursor_adjustment_on_insert() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Get the initial primary cursor ID (CursorId(0))
-    let original_primary = state.cursors.primary_id();
+    let original_primary = cursors.primary_id();
 
     // Insert some initial text with the original primary cursor
-    state.apply(&Event::Insert {
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "hello world".to_string(),
         cursor_id: original_primary,
     });
 
     // Original primary cursor should be at end of inserted text (position 11)
-    assert_eq!(state.cursors.get(original_primary).unwrap().position, 11);
+    assert_eq!(cursors.get(original_primary).unwrap().position, 11);
 
     // Add a second cursor at position 6 (start of "world")
     // Note: This will make CursorId(1) the new primary
-    state.apply(&Event::AddCursor {
+    state.apply(&mut cursors, &Event::AddCursor {
         cursor_id: CursorId(1),
         position: 6,
         anchor: None,
     });
 
     // Verify CursorId(1) is at position 6 and is now primary
-    assert_eq!(state.cursors.get(CursorId(1)).unwrap().position, 6);
-    assert_eq!(state.cursors.primary_id(), CursorId(1));
+    assert_eq!(cursors.get(CursorId(1)).unwrap().position, 6);
+    assert_eq!(cursors.primary_id(), CursorId(1));
 
     // Insert text at beginning with the ORIGINAL primary cursor (not the new one)
     // This tests that non-editing cursors get adjusted
     let insert_len = "INSERTED ".len();
-    state.apply(&Event::Insert {
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "INSERTED ".to_string(),
         cursor_id: original_primary, // Using original cursor, not the new primary
@@ -60,14 +62,14 @@ fn test_buffer_cursor_adjustment_on_insert() {
 
     // The cursor that made the edit (original_primary) should be at position 0 + insert_len = 9
     assert_eq!(
-        state.cursors.get(original_primary).unwrap().position,
+        cursors.get(original_primary).unwrap().position,
         insert_len,
         "Cursor that made the edit should be at end of insertion"
     );
 
     // CursorId(1) was at position 6, should have moved forward by insert_len to position 15
     assert_eq!(
-        state.cursors.get(CursorId(1)).unwrap().position,
+        cursors.get(CursorId(1)).unwrap().position,
         6 + insert_len,
         "Non-editing cursor should be adjusted by insertion length"
     );
@@ -85,30 +87,33 @@ fn test_buffer_cursor_adjustment_on_delete() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Insert initial text
-    state.apply(&Event::Insert {
+    let cursor_id = cursors.primary_id();
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "hello beautiful world".to_string(),
-        cursor_id: state.cursors.primary_id(),
+        cursor_id,
     });
 
     // Add cursor at position 16 (start of "world")
-    state.apply(&Event::AddCursor {
+    state.apply(&mut cursors, &Event::AddCursor {
         cursor_id: CursorId(1),
         position: 16,
         anchor: None,
     });
 
     // Delete "beautiful " (positions 6-16)
-    state.apply(&Event::Delete {
+    let cursor_id = cursors.primary_id();
+    state.apply(&mut cursors, &Event::Delete {
         range: 6..16,
         deleted_text: "beautiful ".to_string(),
-        cursor_id: state.cursors.primary_id(),
+        cursor_id,
     });
 
     // Second cursor should have moved back to position 6
-    if let Some(cursor) = state.cursors.get(CursorId(1)) {
+    if let Some(cursor) = cursors.get(CursorId(1)) {
         assert_eq!(cursor.position, 6);
     }
 
@@ -126,8 +131,9 @@ fn test_state_eventlog_undo_redo() {
         test_fs(),
     );
     let mut log = EventLog::new();
+    let mut cursors = Cursors::new();
 
-    let cursor_id = state.cursors.primary_id();
+    let cursor_id = cursors.primary_id();
 
     // Perform a series of edits - each insert at the END of the buffer
     let event1 = Event::Insert {
@@ -136,7 +142,7 @@ fn test_state_eventlog_undo_redo() {
         cursor_id,
     };
     log.append(event1.clone());
-    state.apply(&event1);
+    state.apply(&mut cursors, &event1);
 
     let event2 = Event::Insert {
         position: state.buffer.len(),
@@ -144,7 +150,7 @@ fn test_state_eventlog_undo_redo() {
         cursor_id,
     };
     log.append(event2.clone());
-    state.apply(&event2);
+    state.apply(&mut cursors, &event2);
 
     let event3 = Event::Insert {
         position: state.buffer.len(),
@@ -152,7 +158,7 @@ fn test_state_eventlog_undo_redo() {
         cursor_id,
     };
     log.append(event3.clone());
-    state.apply(&event3);
+    state.apply(&mut cursors, &event3);
 
     assert_eq!(state.buffer.to_string().unwrap(), "abc");
 
@@ -160,7 +166,7 @@ fn test_state_eventlog_undo_redo() {
     while log.can_undo() {
         let events = log.undo();
         for event in events {
-            state.apply(&event);
+            state.apply(&mut cursors, &event);
         }
     }
 
@@ -170,7 +176,7 @@ fn test_state_eventlog_undo_redo() {
     while log.can_redo() {
         let events = log.redo();
         for event in events {
-            state.apply(&event);
+            state.apply(&mut cursors, &event);
         }
     }
 
@@ -187,8 +193,9 @@ fn test_undo_redo_cursor_positions() {
         test_fs(),
     );
     let mut log = EventLog::new();
+    let mut cursors = Cursors::new();
 
-    let cursor_id = state.cursors.primary_id();
+    let cursor_id = cursors.primary_id();
 
     // Type "hello" - each character at the end of the buffer
     for ch in "hello".chars() {
@@ -199,34 +206,34 @@ fn test_undo_redo_cursor_positions() {
             cursor_id,
         };
         log.append(event.clone());
-        state.apply(&event);
+        state.apply(&mut cursors, &event);
     }
 
     assert_eq!(state.buffer.to_string().unwrap(), "hello");
-    let cursor_after_typing = state.cursors.primary().position;
+    let cursor_after_typing = cursors.primary().position;
     assert_eq!(cursor_after_typing, 5);
 
     // Undo twice (remove 'o' and 'l')
     for _ in 0..2 {
         let events = log.undo();
         for event in events {
-            state.apply(&event);
+            state.apply(&mut cursors, &event);
         }
     }
 
     assert_eq!(state.buffer.to_string().unwrap(), "hel");
-    assert_eq!(state.cursors.primary().position, 3);
+    assert_eq!(cursors.primary().position, 3);
 
     // Redo twice
     for _ in 0..2 {
         let events = log.redo();
         for event in events {
-            state.apply(&event);
+            state.apply(&mut cursors, &event);
         }
     }
 
     assert_eq!(state.buffer.to_string().unwrap(), "hello");
-    assert_eq!(state.cursors.primary().position, 5);
+    assert_eq!(cursors.primary().position, 5);
 }
 
 /// Test viewport ensures cursor stays visible after edits
@@ -238,8 +245,9 @@ fn test_viewport_tracks_cursor_through_edits() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     ); // Small viewport
+    let mut cursors = Cursors::new();
 
-    let cursor_id = state.cursors.primary_id();
+    let cursor_id = cursors.primary_id();
 
     // Insert many lines to make content scroll
     for i in 0..20 {
@@ -248,11 +256,11 @@ fn test_viewport_tracks_cursor_through_edits() {
             text: format!("Line {i}\n"),
             cursor_id,
         };
-        state.apply(&event);
+        state.apply(&mut cursors, &event);
     }
 
     // Cursor should be at the end
-    let cursor_pos = state.cursors.primary().position;
+    let cursor_pos = cursors.primary().position;
     assert!(cursor_pos > 0);
 
     // Cursor position should be within buffer bounds
@@ -271,34 +279,35 @@ fn test_multi_cursor_normalization() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Insert initial text
-    state.apply(&Event::Insert {
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "hello world".to_string(),
-        cursor_id: state.cursors.primary_id(),
+        cursor_id: cursors.primary_id(),
     });
 
     // Add overlapping cursors
-    state.apply(&Event::AddCursor {
+    state.apply(&mut cursors, &Event::AddCursor {
         cursor_id: CursorId(1),
         position: 5,
         anchor: None,
     });
 
-    state.apply(&Event::AddCursor {
+    state.apply(&mut cursors, &Event::AddCursor {
         cursor_id: CursorId(2),
         position: 6,
         anchor: None,
     });
 
     // Should have 3 cursors initially
-    assert_eq!(state.cursors.count(), 3);
+    assert_eq!(cursors.count(), 3);
 
     // After normalization (which happens in AddCursor), overlapping cursors might be merged
     // This depends on Cursors::normalize() implementation
     // For now, just verify they all exist and are in valid positions
-    for (_, cursor) in state.cursors.iter() {
+    for (_, cursor) in cursors.iter() {
         assert!(cursor.position <= state.buffer.len());
     }
 }
@@ -312,16 +321,17 @@ fn test_cursor_within_buffer_bounds() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Insert text and move cursor to middle
-    state.apply(&Event::Insert {
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "line1\nline2\nline3\nline4\nline5\n".to_string(),
-        cursor_id: state.cursors.primary_id(),
+        cursor_id: cursors.primary_id(),
     });
 
-    state.apply(&Event::MoveCursor {
-        cursor_id: state.cursors.primary_id(),
+    state.apply(&mut cursors, &Event::MoveCursor {
+        cursor_id: cursors.primary_id(),
         old_position: 0,
         new_position: 12, // Middle of line 2
         old_anchor: None,
@@ -331,7 +341,7 @@ fn test_cursor_within_buffer_bounds() {
     });
 
     // Cursor should be within buffer bounds
-    let cursor_pos = state.cursors.primary().position;
+    let cursor_pos = cursors.primary().position;
     assert!(
         cursor_pos <= state.buffer.len(),
         "Cursor should be within buffer bounds"
@@ -349,16 +359,17 @@ fn test_overlay_events() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Insert some text
-    state.apply(&Event::Insert {
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "hello world".to_string(),
         cursor_id: CursorId(0),
     });
 
     // Add an error overlay with namespace
-    state.apply(&Event::AddOverlay {
+    state.apply(&mut cursors, &Event::AddOverlay {
         namespace: Some(OverlayNamespace::from_string("error".to_string())),
         range: 0..5,
         face: OverlayFace::Underline {
@@ -380,7 +391,7 @@ fn test_overlay_events() {
     );
 
     // Add a warning overlay with lower priority
-    state.apply(&Event::AddOverlay {
+    state.apply(&mut cursors, &Event::AddOverlay {
         namespace: Some(OverlayNamespace::from_string("warning".to_string())),
         range: 3..8,
         face: OverlayFace::Underline {
@@ -400,7 +411,7 @@ fn test_overlay_events() {
     assert_eq!(overlays_at_4[1].priority, 100); // Error (higher priority) comes second
 
     // Remove error overlay using namespace
-    state.apply(&Event::ClearNamespace {
+    state.apply(&mut cursors, &Event::ClearNamespace {
         namespace: OverlayNamespace::from_string("error".to_string()),
     });
 
@@ -413,7 +424,7 @@ fn test_overlay_events() {
     );
 
     // Clear all overlays
-    state.apply(&Event::ClearOverlays);
+    state.apply(&mut cursors, &Event::ClearOverlays);
     let overlays_after_clear = state.overlays.at_position(4, &state.marker_list);
     assert_eq!(overlays_after_clear.len(), 0);
 }
@@ -431,6 +442,7 @@ fn test_popup_events() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Create a popup with list items
     let popup_data = PopupData {
@@ -468,7 +480,7 @@ fn test_popup_events() {
     };
 
     // Show the popup
-    state.apply(&Event::ShowPopup { popup: popup_data });
+    state.apply(&mut cursors, &Event::ShowPopup { popup: popup_data });
 
     // Check popup is visible
     assert!(state.popups.is_visible());
@@ -476,7 +488,7 @@ fn test_popup_events() {
     assert_eq!(popup.title, Some("Test Popup".to_string()));
 
     // Navigate down
-    state.apply(&Event::PopupSelectNext);
+    state.apply(&mut cursors, &Event::PopupSelectNext);
 
     // Check selection moved to item 1
     let popup = state.popups.top().unwrap();
@@ -484,19 +496,19 @@ fn test_popup_events() {
     assert_eq!(selected_item.text, "Item 2");
 
     // Navigate down again
-    state.apply(&Event::PopupSelectNext);
+    state.apply(&mut cursors, &Event::PopupSelectNext);
     let popup = state.popups.top().unwrap();
     let selected_item = popup.selected_item().unwrap();
     assert_eq!(selected_item.text, "Item 3");
 
     // Navigate up
-    state.apply(&Event::PopupSelectPrev);
+    state.apply(&mut cursors, &Event::PopupSelectPrev);
     let popup = state.popups.top().unwrap();
     let selected_item = popup.selected_item().unwrap();
     assert_eq!(selected_item.text, "Item 2");
 
     // Hide popup
-    state.apply(&Event::HidePopup);
+    state.apply(&mut cursors, &Event::HidePopup);
     assert!(!state.popups.is_visible());
 }
 
@@ -512,6 +524,7 @@ fn test_overlay_undo_redo() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Insert text and add overlay
     let event1 = Event::Insert {
@@ -520,7 +533,7 @@ fn test_overlay_undo_redo() {
         cursor_id: CursorId(0),
     };
     log.append(event1.clone());
-    state.apply(&event1);
+    state.apply(&mut cursors, &event1);
 
     let event2 = Event::AddOverlay {
         namespace: Some(OverlayNamespace::from_string("test".to_string())),
@@ -535,7 +548,7 @@ fn test_overlay_undo_redo() {
         url: None,
     };
     log.append(event2.clone());
-    state.apply(&event2);
+    state.apply(&mut cursors, &event2);
 
     // Verify overlay exists
     assert_eq!(state.overlays.at_position(2, &state.marker_list).len(), 1);
@@ -543,7 +556,7 @@ fn test_overlay_undo_redo() {
     // Undo - this should process AddOverlay (remove it) and undo the Insert
     let undo_events = log.undo();
     for event in &undo_events {
-        state.apply(event);
+        state.apply(&mut cursors, event);
     }
 
     // After undo: buffer should be empty, and overlay should be removed
@@ -557,7 +570,7 @@ fn test_overlay_undo_redo() {
     // Redo - should redo the Insert and re-add the overlay
     let redo_events = log.redo();
     for event in &redo_events {
-        state.apply(event);
+        state.apply(&mut cursors, event);
     }
 
     // After redo: buffer is back and overlay should be back
@@ -640,16 +653,17 @@ fn test_overlay_priority_layering() {
         fresh::config::LARGE_FILE_THRESHOLD_BYTES as usize,
         test_fs(),
     );
+    let mut cursors = Cursors::new();
 
     // Insert text
-    state.apply(&Event::Insert {
+    state.apply(&mut cursors, &Event::Insert {
         position: 0,
         text: "hello world".to_string(),
         cursor_id: CursorId(0),
     });
 
     // Add low priority overlay (hint)
-    state.apply(&Event::AddOverlay {
+    state.apply(&mut cursors, &Event::AddOverlay {
         namespace: Some(OverlayNamespace::from_string("hint".to_string())),
         range: 0..5,
         face: OverlayFace::Underline {
@@ -663,7 +677,7 @@ fn test_overlay_priority_layering() {
     });
 
     // Add high priority overlay (error) overlapping
-    state.apply(&Event::AddOverlay {
+    state.apply(&mut cursors, &Event::AddOverlay {
         namespace: Some(OverlayNamespace::from_string("error".to_string())),
         range: 2..7,
         face: OverlayFace::Underline {
@@ -711,7 +725,8 @@ fn test_diagnostic_overlay_visual_rendering() {
     // We use the overlay API directly, but convert the color to RGB format
     // since that's what OverlayFace uses (u8, u8, u8) tuples
     let state = harness.editor_mut().active_state_mut();
-    state.apply(&Event::AddOverlay {
+    let mut cursors = Cursors::new();
+    state.apply(&mut cursors, &Event::AddOverlay {
         namespace: Some(OverlayNamespace::from_string("lsp-diagnostic".to_string())),
         range: 4..5, // "x"
         face: OverlayFace::Underline {

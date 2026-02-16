@@ -2712,7 +2712,8 @@ impl JsEditorApi {
                 .map(|s| s.working_dir.to_string_lossy().to_string())
         });
         tracing::info!(
-            "spawn_process_start: command='{}', args={:?}, cwd={:?}, callback_id={}",
+            "spawn_process_start: plugin='{}', command='{}', args={:?}, cwd={:?}, callback_id={}",
+            self.plugin_name,
             command,
             args,
             effective_cwd,

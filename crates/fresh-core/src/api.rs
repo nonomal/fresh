@@ -1644,6 +1644,17 @@ pub enum PluginCommand {
     },
 }
 
+impl PluginCommand {
+    /// Extract the enum variant name from the Debug representation.
+    pub fn debug_variant_name(&self) -> String {
+        let dbg = format!("{:?}", self);
+        dbg.split(|ch: char| ch == ' ' || ch == '{' || ch == '(')
+            .next()
+            .unwrap_or("?")
+            .to_string()
+    }
+}
+
 // =============================================================================
 // Language Pack Configuration Types
 // =============================================================================

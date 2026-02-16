@@ -336,32 +336,7 @@ impl Editor {
             // ensures a follow-up render cycle picks up any missed commands.
             let commands = self.plugin_manager.process_commands();
             if !commands.is_empty() {
-                let cmd_names: Vec<&str> = commands
-                    .iter()
-                    .map(|c| match c {
-                        fresh_core::api::PluginCommand::AddOverlay { .. } => "AddOverlay",
-                        fresh_core::api::PluginCommand::AddConceal { .. } => "AddConceal",
-                        fresh_core::api::PluginCommand::ClearOverlaysInRange { .. } => {
-                            "ClearOverlaysInRange"
-                        }
-                        fresh_core::api::PluginCommand::ClearConcealsInRange { .. } => {
-                            "ClearConcealsInRange"
-                        }
-                        fresh_core::api::PluginCommand::ClearNamespace { .. } => "ClearNamespace",
-                        fresh_core::api::PluginCommand::ClearConcealNamespace { .. } => {
-                            "ClearConcealNamespace"
-                        }
-                        fresh_core::api::PluginCommand::AddSoftBreak { .. } => "AddSoftBreak",
-                        fresh_core::api::PluginCommand::ClearSoftBreakNamespace { .. } => {
-                            "ClearSoftBreakNamespace"
-                        }
-                        fresh_core::api::PluginCommand::ClearSoftBreaksInRange { .. } => {
-                            "ClearSoftBreaksInRange"
-                        }
-                        fresh_core::api::PluginCommand::RefreshLines { .. } => "RefreshLines",
-                        _ => "Other",
-                    })
-                    .collect();
+                let cmd_names: Vec<String> = commands.iter().map(|c| c.debug_variant_name()).collect();
                 tracing::info!(count = commands.len(), cmds = ?cmd_names, "process_commands during render");
             }
             for command in commands {

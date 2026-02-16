@@ -971,13 +971,14 @@ impl Editor {
             return false;
         }
 
+        let cmd_names: Vec<String> = commands.iter().map(|c| c.debug_variant_name()).collect();
         tracing::info!(
-            "[SYNTAX DEBUG] process_plugin_commands: processing {} commands",
-            commands.len()
+            count = commands.len(),
+            cmds = ?cmd_names,
+            "process_plugin_commands"
         );
 
         for command in &commands {
-            // Log RegisterGrammar and ReloadGrammars commands specifically
             match command {
                 fresh_core::api::PluginCommand::RegisterGrammar {
                     language,

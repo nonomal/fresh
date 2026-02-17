@@ -1356,16 +1356,11 @@ editor.setStatus("Uppercase plugin loaded");
 
     // Wait for plugin to load
     harness
-        .wait_until(|h| {
-            h.screen_to_string()
-                .contains("Uppercase plugin loaded")
-        })
+        .wait_until(|h| h.screen_to_string().contains("Uppercase plugin loaded"))
         .unwrap();
 
     // Move cursor to beginning of "hello" and select 5 characters ("hello")
-    harness
-        .send_key(KeyCode::Home, KeyModifiers::NONE)
-        .unwrap();
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
     for _ in 0..5 {
         harness
             .send_key(KeyCode::Right, KeyModifiers::SHIFT)
@@ -1387,10 +1382,7 @@ editor.setStatus("Uppercase plugin loaded");
 
     // Wait for the async plugin to finish
     harness
-        .wait_until(|h| {
-            h.screen_to_string()
-                .contains("Uppercased 1 selection(s)")
-        })
+        .wait_until(|h| h.screen_to_string().contains("Uppercased 1 selection(s)"))
         .unwrap();
 
     harness.render().unwrap();

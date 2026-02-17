@@ -86,12 +86,10 @@ Record and replay sequences of keystrokes:
 
 | Shortcut | Action |
 |----------|--------|
-| `Alt+Shift+0-9` | Toggle macro recording for slot 0-9 |
-| `Ctrl+0-9` | Play macro from slot 0-9 |
 | `F5` | Stop macro recording |
 | `F4` | Play last recorded macro |
 
-You can also use the command palette (`Ctrl+P`) to access **Record Macro**, **Play Macro**, **Play Last Macro**, and **List Macros** commands.
+Use the command palette (`Ctrl+P`) to access **Record Macro**, **Play Macro**, **Play Last Macro**, and **List Macros** commands.
 
 ## Bookmarks
 

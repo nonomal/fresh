@@ -463,9 +463,7 @@ fn rust_to_typescript(ty: &Type, attrs: &[Attribute]) -> String {
 
                 // Types renamed by ts-rs — map Rust name to TypeScript name
                 "CompositeHunk" => "TsCompositeHunk".to_string(),
-                "CreateCompositeBufferOptions" => {
-                    "TsCreateCompositeBufferOptions".to_string()
-                }
+                "CreateCompositeBufferOptions" => "TsCreateCompositeBufferOptions".to_string(),
                 "Suggestion" => "PromptSuggestion".to_string(),
 
                 // Default: use type name as-is
@@ -1223,10 +1221,7 @@ mod tests {
             extract_type_references("CursorInfo | null"),
             vec!["CursorInfo"]
         );
-        assert_eq!(
-            extract_type_references("CursorInfo[]"),
-            vec!["CursorInfo"]
-        );
+        assert_eq!(extract_type_references("CursorInfo[]"), vec!["CursorInfo"]);
     }
 
     #[test]
@@ -1307,8 +1302,9 @@ mod tests {
         };
 
         let ts = generate_ts_method(&method);
-        assert!(ts
-            .contains("createTerminal(opts?: CreateTerminalOptions): Promise<TerminalResult>;"));
+        assert!(
+            ts.contains("createTerminal(opts?: CreateTerminalOptions): Promise<TerminalResult>;")
+        );
     }
 
     #[test]
@@ -1400,7 +1396,10 @@ mod tests {
         // Renamed types
         let renamed = vec![
             ("CompositeHunk", "TsCompositeHunk"),
-            ("CreateCompositeBufferOptions", "TsCreateCompositeBufferOptions"),
+            (
+                "CreateCompositeBufferOptions",
+                "TsCreateCompositeBufferOptions",
+            ),
             ("Suggestion", "PromptSuggestion"),
         ];
 

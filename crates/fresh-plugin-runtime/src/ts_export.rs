@@ -20,9 +20,9 @@ use fresh_core::api::{
     CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
     CreateVirtualBufferInExistingSplitOptions, CreateVirtualBufferInSplitOptions,
     CreateVirtualBufferOptions, CursorInfo, DirEntry, FormatterPackConfig, JsDiagnostic,
-    JsPosition, JsRange, JsTextPropertyEntry, LanguagePackConfig, LayoutHints,
-    LspServerPackConfig, SpawnResult, TerminalResult, TextPropertiesAtCursor, TsHighlightSpan,
-    ViewTokenStyle, ViewTokenWire, ViewTokenWireKind, ViewportInfo, VirtualBufferResult,
+    JsPosition, JsRange, JsTextPropertyEntry, LanguagePackConfig, LayoutHints, LspServerPackConfig,
+    SpawnResult, TerminalResult, TextPropertiesAtCursor, TsHighlightSpan, ViewTokenStyle,
+    ViewTokenWire, ViewTokenWireKind, ViewportInfo, VirtualBufferResult,
 };
 use fresh_core::command::Suggestion;
 use fresh_core::file_explorer::FileExplorerDecoration;
@@ -387,7 +387,10 @@ mod tests {
             ("CompositeLayoutConfig", "TsCompositeLayoutConfig"),
             ("CompositeSourceConfig", "TsCompositeSourceConfig"),
             ("CompositePaneStyle", "TsCompositePaneStyle"),
-            ("CreateCompositeBufferOptions", "TsCreateCompositeBufferOptions"),
+            (
+                "CreateCompositeBufferOptions",
+                "TsCreateCompositeBufferOptions",
+            ),
             ("ActionPopupAction", "TsActionPopupAction"),
             ("Suggestion", "PromptSuggestion"),
             ("JsTextPropertyEntry", "TextPropertyEntry"),
@@ -412,7 +415,10 @@ mod tests {
     #[test]
     fn test_terminal_types_exist() {
         let terminal_result = get_type_decl("TerminalResult");
-        assert!(terminal_result.is_some(), "TerminalResult should be defined");
+        assert!(
+            terminal_result.is_some(),
+            "TerminalResult should be defined"
+        );
         let decl = terminal_result.unwrap();
         assert!(
             decl.contains("bufferId"),
@@ -503,9 +509,7 @@ mod tests {
 
     #[test]
     fn test_generated_dts_validates_as_typescript() {
-        use crate::backend::quickjs_backend::{
-            JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE,
-        };
+        use crate::backend::quickjs_backend::{JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE};
 
         let ts_types = collect_ts_types();
         let content = format!(
@@ -513,15 +517,12 @@ mod tests {
             JSEDITORAPI_TS_PREAMBLE, ts_types, JSEDITORAPI_TS_EDITOR_API
         );
 
-        validate_typescript(&content)
-            .expect("Generated TypeScript should be syntactically valid");
+        validate_typescript(&content).expect("Generated TypeScript should be syntactically valid");
     }
 
     #[test]
     fn test_generated_dts_no_undefined_type_references() {
-        use crate::backend::quickjs_backend::{
-            JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE,
-        };
+        use crate::backend::quickjs_backend::{JSEDITORAPI_TS_EDITOR_API, JSEDITORAPI_TS_PREAMBLE};
 
         let ts_types = collect_ts_types();
         let content = format!(
@@ -533,9 +534,21 @@ mod tests {
         let mut defined_types = std::collections::HashSet::new();
         // Built-in types
         for builtin in &[
-            "number", "string", "boolean", "void", "unknown", "null", "undefined",
-            "Record", "Array", "Promise", "ProcessHandle", "PromiseLike",
-            "BufferId", "SplitId", "EditorAPI",
+            "number",
+            "string",
+            "boolean",
+            "void",
+            "unknown",
+            "null",
+            "undefined",
+            "Record",
+            "Array",
+            "Promise",
+            "ProcessHandle",
+            "PromiseLike",
+            "BufferId",
+            "SplitId",
+            "EditorAPI",
         ] {
             defined_types.insert(builtin.to_string());
         }

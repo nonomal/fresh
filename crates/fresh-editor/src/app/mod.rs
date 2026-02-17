@@ -546,7 +546,7 @@ pub struct Editor {
     /// Macro recording state (Some(key) if recording, None otherwise)
     macro_recording: Option<MacroRecordingState>,
 
-    /// Last recorded macro register (for F12 to replay)
+    /// Last recorded macro register (for F4 to replay)
     last_macro_register: Option<char>,
 
     /// Flag to prevent recursive macro playback

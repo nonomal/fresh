@@ -3948,7 +3948,12 @@ impl Editor {
 
     /// Build a hint message for how to play a macro
     fn build_macro_play_hint(&self) -> String {
-        // Get command palette keybinding
+        // Check for play_last_macro keybinding (e.g. F4)
+        if let Some(play_key) = self.get_keybinding_for_action("play_last_macro") {
+            return format!("{} → Play Last Macro", play_key);
+        }
+
+        // Fall back to command palette hint
         let palette_key = self
             .get_keybinding_for_action("command_palette")
             .unwrap_or_else(|| "Ctrl+P".to_string());

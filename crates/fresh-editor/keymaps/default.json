@@ -907,6 +907,14 @@
       "when": "normal"
     },
     {
+      "comment": "Play last recorded macro (F4)",
+      "key": "F4",
+      "modifiers": [],
+      "action": "play_last_macro",
+      "args": {},
+      "when": "normal"
+    },
+    {
       "comment": "Normal context - Scrolling",
       "key": "Up",
       "modifiers": ["ctrl"],

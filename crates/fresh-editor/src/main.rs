@@ -2786,6 +2786,20 @@ where
             needs_render = false;
         }
 
+        // Drain queued macro actions one at a time, rendering between each
+        // so the cached layout stays fresh — matching interactive behaviour.
+        // Bypass FRAME_DURATION: the layout MUST be rebuilt before each action.
+        if editor.has_pending_macro_actions() {
+            if needs_render {
+                terminal.draw(|frame| editor.render(frame))?;
+                last_render = Instant::now();
+                needs_render = false;
+            }
+            editor.drain_one_macro_action();
+            needs_render = true;
+            continue;
+        }
+
         let event = if let Some(e) = pending_event.take() {
             Some(e)
         } else {

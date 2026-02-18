@@ -3961,10 +3961,14 @@ impl Editor {
         format!("{} → Play Macro", palette_key)
     }
 
-    /// Play back a recorded macro
+    /// Queue a recorded macro for playback.
+    ///
+    /// Actions are not executed immediately — they are queued and drained
+    /// one per render cycle by [`drain_one_macro_action`] so that the cached
+    /// visual layout stays in sync, exactly as during interactive use.
     pub(super) fn play_macro(&mut self, key: char) {
-        // Prevent recursive macro playback
-        if self.macro_playing {
+        // Prevent recursive / overlapping playback
+        if self.macro_playback.is_some() {
             return;
         }
 
@@ -3974,29 +3978,59 @@ impl Editor {
                 return;
             }
 
-            // Temporarily disable recording to avoid recording the playback
-            let was_recording = self.macro_recording.take();
-            self.macro_playing = true;
-
-            let action_count = actions.len();
-            for action in actions {
-                let _ = self.handle_action(action);
-            }
-
-            // Restore recording and playing state
-            self.macro_recording = was_recording;
-            self.macro_playing = false;
-
-            self.set_status_message(
-                t!("macro.played", key = key, count = action_count).to_string(),
-            );
+            self.macro_playback = Some(MacroPlaybackState {
+                actions: actions.into(),
+            });
         } else {
             self.set_status_message(t!("macro.not_found", key = key).to_string());
         }
     }
 
+    /// Execute the next queued macro action.
+    ///
+    /// Returns `true` if there are more actions remaining, `false` when
+    /// playback is complete (or was already idle).  The caller should
+    /// render between calls so that the cached layout stays fresh.
+    pub fn drain_one_macro_action(&mut self) -> bool {
+        let state = match &mut self.macro_playback {
+            Some(s) => s,
+            None => return false,
+        };
+
+        if let Some(action) = state.actions.pop_front() {
+            let _ = self.handle_action(action);
+            // Check if that was the last one
+            let done = self
+                .macro_playback
+                .as_ref()
+                .map_or(true, |s| s.actions.is_empty());
+            if done {
+                self.macro_playback = None;
+                if let Some(key) = self.last_macro_register {
+                    let count = self.macros.get(&key).map_or(0, |a| a.len());
+                    self.set_status_message(
+                        t!("macro.played", key = key, count = count).to_string(),
+                    );
+                }
+            }
+            !done
+        } else {
+            self.macro_playback = None;
+            false
+        }
+    }
+
+    /// Whether there are queued macro actions waiting to be played.
+    pub fn has_pending_macro_actions(&self) -> bool {
+        self.macro_playback.is_some()
+    }
+
     /// Record an action to the current macro (if recording)
     pub(super) fn record_macro_action(&mut self, action: &Action) {
+        // Don't record actions that are being played back from a macro
+        if self.macro_playback.is_some() {
+            return;
+        }
         if let Some(state) = &mut self.macro_recording {
             // Don't record macro control actions themselves
             match action {

@@ -743,6 +743,13 @@ impl EditorTestHarness {
         // Render to make state changes visible
         self.render()?;
 
+        // Drain queued macro playback actions, rendering between each
+        // so the cached layout stays fresh — matching interactive behaviour.
+        while self.editor.has_pending_macro_actions() {
+            self.editor.drain_one_macro_action();
+            self.render()?;
+        }
+
         Ok(())
     }
 

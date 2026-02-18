@@ -368,6 +368,13 @@ pub(super) struct MacroRecordingState {
     pub actions: Vec<Action>,
 }
 
+/// State for macro playback — actions queued for one-at-a-time execution
+/// so that a render happens between each action (keeping the cached layout fresh).
+#[derive(Debug)]
+pub(super) struct MacroPlaybackState {
+    pub actions: std::collections::VecDeque<Action>,
+}
+
 /// LSP progress information
 #[derive(Debug, Clone)]
 pub(super) struct LspProgressInfo {

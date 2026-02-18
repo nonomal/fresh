@@ -79,7 +79,8 @@ pub(crate) fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
 
 use self::types::{
     Bookmark, CachedLayout, EventLineInfo, InteractiveReplaceState, LspMessageEntry,
-    LspProgressInfo, MacroRecordingState, MouseState, SearchState, TabContextMenu,
+    LspProgressInfo, MacroPlaybackState, MacroRecordingState, MouseState, SearchState,
+    TabContextMenu,
     DEFAULT_BACKGROUND_FILE,
 };
 use crate::config::Config;
@@ -552,8 +553,8 @@ pub struct Editor {
     /// Last recorded macro register (for F4 to replay)
     last_macro_register: Option<char>,
 
-    /// Flag to prevent recursive macro playback
-    macro_playing: bool,
+    /// Macro playback state — when Some, actions are being drained one per render cycle
+    macro_playback: Option<MacroPlaybackState>,
 
     /// Pending plugin action receivers (for async action execution)
     #[cfg(feature = "plugins")]
@@ -1239,7 +1240,7 @@ impl Editor {
             macros: HashMap::new(),
             macro_recording: None,
             last_macro_register: None,
-            macro_playing: false,
+            macro_playback: None,
             #[cfg(feature = "plugins")]
             pending_plugin_actions: Vec::new(),
             #[cfg(feature = "plugins")]

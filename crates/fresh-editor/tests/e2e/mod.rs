@@ -13,6 +13,7 @@ pub mod command_palette;
 pub mod crash_repro;
 pub mod crlf_rendering;
 pub mod ctrl_end_wrapped;
+pub mod cursor_up_no_scroll;
 pub mod document_model;
 pub mod duplicate_line;
 pub mod emacs_actions;

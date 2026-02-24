@@ -52,13 +52,10 @@ pub enum PluginRequest {
         response: oneshot::Sender<Vec<String>>,
     },
 
-    /// Load all plugins from a directory with config support
-    /// Returns (errors, discovered_plugins) where discovered_plugins contains
-    /// all found plugins with their paths and enabled status
-    LoadPluginsFromDirWithConfig {
-        dir: PathBuf,
-        plugin_configs: HashMap<String, PluginConfig>,
-        response: oneshot::Sender<(Vec<String>, HashMap<String, PluginConfig>)>,
+    /// Load plugins from multiple directories with config support (fire-and-forget)
+    /// Errors are logged, not returned.
+    LoadPluginsFromDirs {
+        dirs: Vec<(PathBuf, HashMap<String, PluginConfig>)>,
     },
 
     /// Unload a plugin by name
@@ -424,34 +421,23 @@ impl PluginThreadHandle {
             .unwrap_or_else(|_| vec!["Plugin thread closed".to_string()])
     }
 
-    /// Load all plugins from a directory with config support (blocking)
-    /// Returns (errors, discovered_plugins) where discovered_plugins is a map of
-    /// plugin name -> PluginConfig with paths populated.
+    /// Load plugins from multiple directories with config support (fire-and-forget).
+    /// Sends all dirs to the plugin thread and returns immediately.
+    /// Errors are logged on the plugin thread, not returned.
     pub fn load_plugins_from_dir_with_config(
         &self,
-        dir: &Path,
-        plugin_configs: &HashMap<String, PluginConfig>,
-    ) -> (Vec<String>, HashMap<String, PluginConfig>) {
-        let (tx, rx) = oneshot::channel();
+        dirs: Vec<(PathBuf, HashMap<String, PluginConfig>)>,
+    ) {
         let Some(sender) = self.request_sender.as_ref() else {
-            return (vec!["Plugin thread shut down".to_string()], HashMap::new());
+            tracing::error!("Plugin thread shut down before loading plugins");
+            return;
         };
         if sender
-            .send(PluginRequest::LoadPluginsFromDirWithConfig {
-                dir: dir.to_path_buf(),
-                plugin_configs: plugin_configs.clone(),
-                response: tx,
-            })
+            .send(PluginRequest::LoadPluginsFromDirs { dirs })
             .is_err()
         {
-            return (
-                vec!["Plugin thread not responding".to_string()],
-                HashMap::new(),
-            );
+            tracing::error!("Plugin thread not responding during plugin load");
         }
-
-        rx.recv()
-            .unwrap_or_else(|_| (vec!["Plugin thread closed".to_string()], HashMap::new()))
     }
 
     /// Unload a plugin (blocking)
@@ -919,19 +905,60 @@ async fn handle_request(
             let _ = response.send(errors);
         }
 
-        PluginRequest::LoadPluginsFromDirWithConfig {
-            dir,
-            plugin_configs,
-            response,
-        } => {
-            let (errors, discovered) = load_plugins_from_dir_with_config_internal(
-                Rc::clone(&runtime),
-                plugins,
-                &dir,
-                &plugin_configs,
-            )
-            .await;
-            let _ = response.send((errors, discovered));
+        PluginRequest::LoadPluginsFromDirs { dirs } => {
+            // Pre-scan all dirs to count total enabled plugins for progress reporting
+            let mut total_enabled = 0usize;
+            for (dir, plugin_configs) in &dirs {
+                if !dir.exists() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let ext = path.extension().and_then(|s| s.to_str());
+                        if (ext == Some("ts") || ext == Some("js"))
+                            && !path.to_string_lossy().contains(".i18n.")
+                        {
+                            let name = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("unknown");
+                            let enabled =
+                                plugin_configs.get(name).map(|c| c.enabled).unwrap_or(true);
+                            if enabled {
+                                total_enabled += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Send initial status
+            if total_enabled > 0 {
+                runtime
+                    .borrow()
+                    .send_status(format!("Loading plugins (0/{total_enabled})"));
+            }
+
+            let mut loaded = 0usize;
+            for (dir, plugin_configs) in dirs {
+                tracing::info!("Loading TypeScript plugins from: {:?}", dir);
+                let (errors, _discovered) = load_plugins_from_dir_with_config_internal(
+                    Rc::clone(&runtime),
+                    plugins,
+                    &dir,
+                    &plugin_configs,
+                    &mut loaded,
+                    total_enabled,
+                )
+                .await;
+                for err in &errors {
+                    tracing::error!("TypeScript plugin load error: {}", err);
+                }
+            }
+
+            // Clear status when done
+            runtime.borrow().send_status(String::new());
         }
 
         PluginRequest::UnloadPlugin { name, response } => {
@@ -1178,6 +1205,8 @@ async fn load_plugins_from_dir_with_config_internal(
     plugins: &mut HashMap<String, TsPluginInfo>,
     dir: &Path,
     plugin_configs: &HashMap<String, PluginConfig>,
+    loaded_count: &mut usize,
+    total_count: usize,
 ) -> (Vec<String>, HashMap<String, PluginConfig>) {
     tracing::debug!(
         "load_plugins_from_dir_with_config_internal: scanning directory {:?}",
@@ -1248,6 +1277,13 @@ async fn load_plugins_from_dir_with_config_internal(
                 let err = format!("Failed to load {:?}: {}", path, e);
                 tracing::error!("{}", err);
                 errors.push(err);
+            }
+            *loaded_count += 1;
+            if total_count > 0 {
+                runtime.borrow().send_status(format!(
+                    "Loading plugins ({}/{})",
+                    *loaded_count, total_count
+                ));
             }
         } else {
             tracing::info!(

@@ -308,6 +308,16 @@ impl EditorServer {
                 for event in input_events {
                     if self.handle_event(event)? {
                         needs_render = true;
+                        // Update layout caches between events so subsequent
+                        // events see correct visual layout (same as the
+                        // terminal event loop and macro replay).
+                        // Skip if resize occurred — cached frame dimensions
+                        // are stale until the next real render.
+                        if !resize_occurred {
+                            if let Some(ref mut editor) = self.editor {
+                                editor.recompute_layout_cached();
+                            }
+                        }
                     }
                 }
             }

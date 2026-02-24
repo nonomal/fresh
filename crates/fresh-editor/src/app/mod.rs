@@ -933,7 +933,7 @@ impl Editor {
     /// to verify editor behavior under various I/O conditions
     #[allow(clippy::too_many_arguments)]
     fn with_options(
-        mut config: Config,
+        config: Config,
         width: u16,
         height: u16,
         working_dir: Option<PathBuf>,
@@ -1150,37 +1150,23 @@ impl Editor {
                 );
             }
 
-            // Load from all found plugin directories, respecting config
-            for plugin_dir in plugin_dirs {
-                tracing::info!("Loading TypeScript plugins from: {:?}", plugin_dir);
-                let (errors, discovered_plugins) =
-                    plugin_manager.load_plugins_from_dir_with_config(&plugin_dir, &config.plugins);
-
-                // Merge discovered plugins into config
-                // discovered_plugins already contains the merged config (saved enabled state + discovered path)
-                for (name, plugin_config) in discovered_plugins {
-                    config.plugins.insert(name, plugin_config);
-                }
-
-                if !errors.is_empty() {
-                    for err in &errors {
-                        tracing::error!("TypeScript plugin load error: {}", err);
-                    }
-                    // In debug/test builds, panic to surface plugin loading errors
-                    #[cfg(debug_assertions)]
-                    panic!(
-                        "TypeScript plugin loading failed with {} error(s): {}",
-                        errors.len(),
-                        errors.join("; ")
-                    );
-                }
+            // Fire-and-forget: send all plugin dirs to the plugin thread
+            if !plugin_dirs.is_empty() {
+                let dirs: Vec<(
+                    std::path::PathBuf,
+                    std::collections::HashMap<String, fresh_core::config::PluginConfig>,
+                )> = plugin_dirs
+                    .into_iter()
+                    .map(|dir| (dir, config.plugins.clone()))
+                    .collect();
+                plugin_manager.load_plugins_from_dir_with_config(dirs);
             }
         }
 
         // Spawn background thread to build the full grammar registry
         // (includes embedded grammars, user grammars, and language packs).
         // The defaults-only registry is used until this completes.
-        let grammar_build_in_progress = enable_plugins; // only needed when plugins may register grammars
+        let grammar_build_in_progress = true;
         {
             let grammar_sender = async_bridge.sender();
             let grammar_config_dir = dir_context.config_dir.clone();

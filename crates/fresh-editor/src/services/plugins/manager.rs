@@ -128,30 +128,25 @@ impl PluginManager {
         }
     }
 
-    /// Load plugins from a directory with config support.
-    /// Returns (errors, discovered_plugins) where discovered_plugins is a map of
-    /// plugin name -> PluginConfig with paths populated.
+    /// Load plugins from multiple directories with config support (fire-and-forget).
+    /// Sends all dirs to the plugin thread and returns immediately.
     #[cfg(feature = "plugins")]
     pub fn load_plugins_from_dir_with_config(
         &self,
-        dir: &Path,
-        plugin_configs: &HashMap<String, PluginConfig>,
-    ) -> (Vec<String>, HashMap<String, PluginConfig>) {
+        dirs: Vec<(std::path::PathBuf, HashMap<String, PluginConfig>)>,
+    ) {
         if let Some(ref manager) = self.inner {
-            return manager.load_plugins_from_dir_with_config(dir, plugin_configs);
+            manager.load_plugins_from_dir_with_config(dirs);
         }
-        (Vec::new(), HashMap::new())
     }
 
-    /// Load plugins from a directory with config support (no-op when plugins disabled).
+    /// Load plugins from multiple directories with config support (no-op when plugins disabled).
     #[cfg(not(feature = "plugins"))]
     pub fn load_plugins_from_dir_with_config(
         &self,
-        dir: &Path,
-        plugin_configs: &HashMap<String, PluginConfig>,
-    ) -> (Vec<String>, HashMap<String, PluginConfig>) {
-        let _ = (dir, plugin_configs);
-        (Vec::new(), HashMap::new())
+        dirs: Vec<(std::path::PathBuf, HashMap<String, PluginConfig>)>,
+    ) {
+        let _ = dirs;
     }
 
     /// Unload a plugin by name.

@@ -3203,9 +3203,8 @@ impl Editor {
 
     /// Update Quick Open suggestions based on current input
     fn update_quick_open_suggestions(&mut self, input: &str) {
-        let suggestions = if input.starts_with('>') {
+        let suggestions = if let Some(query) = input.strip_prefix('>') {
             // Command mode
-            let query = &input[1..];
             let active_buffer_mode = self
                 .buffer_metadata
                 .get(&self.active_buffer())
@@ -3218,13 +3217,11 @@ impl Editor {
                 &self.active_custom_contexts,
                 active_buffer_mode,
             )
-        } else if input.starts_with('#') {
+        } else if let Some(query) = input.strip_prefix('#') {
             // Buffer mode
-            let query = &input[1..];
             self.get_buffer_suggestions(query)
-        } else if input.starts_with(':') {
+        } else if let Some(line_str) = input.strip_prefix(':') {
             // Go to line mode
-            let line_str = &input[1..];
             self.get_goto_line_suggestions(line_str)
         } else {
             // File mode (default)

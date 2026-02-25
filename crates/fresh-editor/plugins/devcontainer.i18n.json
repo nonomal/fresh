@@ -12,6 +12,8 @@
     "cmd.show_ports_desc": "Show configured port forwards",
     "cmd.rebuild": "Dev Container: Rebuild",
     "cmd.rebuild_desc": "Rebuild the dev container using the devcontainer CLI",
+    "cmd.open_terminal": "Dev Container: Open Terminal",
+    "cmd.open_terminal_desc": "Open a terminal inside the running dev container",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features} features, %{ports} ports",
     "status.no_config": "No devcontainer.json found",
@@ -30,6 +32,8 @@
     "status.rebuilding": "Rebuilding dev container...",
     "status.rebuild_done": "Dev container rebuild complete",
     "status.rebuild_failed": "Rebuild failed: %{error}",
+    "status.container_not_running": "No running dev container found. Run 'Dev Container: Rebuild' first.",
+    "status.terminal_opened": "Terminal opened inside dev container",
 
     "popup.cli_title": "Dev Container CLI Not Found",
     "popup.cli_message": "The devcontainer CLI is needed for rebuild. Copy the install command below, or dismiss.",
@@ -70,6 +74,8 @@
     "cmd.show_ports_desc": "Zobrazit nakonfigurovane presmerovani portu",
     "cmd.rebuild": "Dev Container: Sestavit znovu",
     "cmd.rebuild_desc": "Znovu sestavit dev container pomoci devcontainer CLI",
+    "cmd.open_terminal": "Dev Container: Otevrit terminal",
+    "cmd.open_terminal_desc": "Otevrit terminal uvnitr beziciho dev containeru",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features} features, %{ports} portu",
     "status.no_config": "devcontainer.json nenalezen",
@@ -88,6 +94,8 @@
     "status.rebuilding": "Znovu sestavuji dev container...",
     "status.rebuild_done": "Sestaveni dev containeru dokonceno",
     "status.rebuild_failed": "Sestaveni selhalo: %{error}",
+    "status.container_not_running": "Zadny bezici dev container nenalezen. Nejprve spustte 'Dev Container: Sestavit znovu'.",
+    "status.terminal_opened": "Terminal otevren uvnitr dev containeru",
 
     "popup.cli_title": "Dev Container CLI nenalezeno",
     "popup.cli_message": "CLI devcontainer je potrebny pro znovu sestaveni. Zkopirujte instalacni prikaz nize, nebo zavrete.",
@@ -128,6 +136,8 @@
     "cmd.show_ports_desc": "Konfigurierte Portweiterleitungen anzeigen",
     "cmd.rebuild": "Dev Container: Neu erstellen",
     "cmd.rebuild_desc": "Dev Container mit devcontainer CLI neu erstellen",
+    "cmd.open_terminal": "Dev Container: Terminal oeffnen",
+    "cmd.open_terminal_desc": "Terminal im laufenden Dev Container oeffnen",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features} Features, %{ports} Ports",
     "status.no_config": "Keine devcontainer.json gefunden",
@@ -146,6 +156,8 @@
     "status.rebuilding": "Dev Container wird neu erstellt...",
     "status.rebuild_done": "Dev-Container-Neuerstellung abgeschlossen",
     "status.rebuild_failed": "Neuerstellung fehlgeschlagen: %{error}",
+    "status.container_not_running": "Kein laufender Dev Container gefunden. Fuehren Sie zuerst 'Dev Container: Neu erstellen' aus.",
+    "status.terminal_opened": "Terminal im Dev Container geoeffnet",
 
     "popup.cli_title": "Dev Container CLI nicht gefunden",
     "popup.cli_message": "Das devcontainer CLI wird fuer die Neuerstellung benoetigt. Kopieren Sie den Installationsbefehl oder schliessen Sie.",
@@ -186,6 +198,8 @@
     "cmd.show_ports_desc": "Mostrar redirecciones de puertos configuradas",
     "cmd.rebuild": "Dev Container: Reconstruir",
     "cmd.rebuild_desc": "Reconstruir el dev container usando el CLI devcontainer",
+    "cmd.open_terminal": "Dev Container: Abrir Terminal",
+    "cmd.open_terminal_desc": "Abrir un terminal dentro del dev container en ejecucion",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features} features, %{ports} puertos",
     "status.no_config": "No se encontro devcontainer.json",
@@ -204,6 +218,8 @@
     "status.rebuilding": "Reconstruyendo dev container...",
     "status.rebuild_done": "Reconstruccion del dev container completada",
     "status.rebuild_failed": "Reconstruccion fallida: %{error}",
+    "status.container_not_running": "No se encontro un dev container en ejecucion. Ejecute 'Dev Container: Reconstruir' primero.",
+    "status.terminal_opened": "Terminal abierto dentro del dev container",
 
     "popup.cli_title": "CLI Dev Container no encontrado",
     "popup.cli_message": "El CLI devcontainer es necesario para reconstruir. Copie el comando de instalacion o descarte.",
@@ -244,6 +260,8 @@
     "cmd.show_ports_desc": "Afficher les redirections de ports configurees",
     "cmd.rebuild": "Dev Container: Reconstruire",
     "cmd.rebuild_desc": "Reconstruire le dev container avec le CLI devcontainer",
+    "cmd.open_terminal": "Dev Container: Ouvrir un terminal",
+    "cmd.open_terminal_desc": "Ouvrir un terminal dans le dev container en cours d'execution",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features} features, %{ports} ports",
     "status.no_config": "Aucun devcontainer.json trouve",
@@ -262,6 +280,8 @@
     "status.rebuilding": "Reconstruction du dev container...",
     "status.rebuild_done": "Reconstruction du dev container terminee",
     "status.rebuild_failed": "Reconstruction echouee: %{error}",
+    "status.container_not_running": "Aucun dev container en cours d'execution. Executez d'abord 'Dev Container: Reconstruire'.",
+    "status.terminal_opened": "Terminal ouvert dans le dev container",
 
     "popup.cli_title": "CLI Dev Container introuvable",
     "popup.cli_message": "Le CLI devcontainer est necessaire pour la reconstruction. Copiez la commande d'installation ou fermez.",
@@ -302,6 +322,8 @@
     "cmd.show_ports_desc": "設定済みのポート転送を表示",
     "cmd.rebuild": "Dev Container: リビルド",
     "cmd.rebuild_desc": "devcontainer CLIを使用してDev Containerをリビルド",
+    "cmd.open_terminal": "Dev Container: ターミナルを開く",
+    "cmd.open_terminal_desc": "実行中のDev Containerにターミナルを開く",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features}個のfeature, %{ports}個のポート",
     "status.no_config": "devcontainer.jsonが見つかりません",
@@ -320,6 +342,8 @@
     "status.rebuilding": "Dev Containerをリビルド中...",
     "status.rebuild_done": "Dev Containerのリビルドが完了しました",
     "status.rebuild_failed": "リビルド失敗: %{error}",
+    "status.container_not_running": "実行中のDev Containerが見つかりません。まず「Dev Container: リビルド」を実行してください。",
+    "status.terminal_opened": "Dev Container内にターミナルを開きました",
 
     "popup.cli_title": "Dev Container CLIが見つかりません",
     "popup.cli_message": "リビルドにはdevcontainer CLIが必要です。インストールコマンドをコピーするか、閉じてください。",
@@ -360,6 +384,8 @@
     "cmd.show_ports_desc": "구성된 포트 포워딩 표시",
     "cmd.rebuild": "Dev Container: 재빌드",
     "cmd.rebuild_desc": "devcontainer CLI를 사용하여 Dev Container 재빌드",
+    "cmd.open_terminal": "Dev Container: 터미널 열기",
+    "cmd.open_terminal_desc": "실행 중인 Dev Container에서 터미널 열기",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features}개 feature, %{ports}개 포트",
     "status.no_config": "devcontainer.json을 찾을 수 없습니다",
@@ -378,6 +404,8 @@
     "status.rebuilding": "Dev Container 재빌드 중...",
     "status.rebuild_done": "Dev Container 재빌드 완료",
     "status.rebuild_failed": "재빌드 실패: %{error}",
+    "status.container_not_running": "실행 중인 Dev Container를 찾을 수 없습니다. 먼저 'Dev Container: 재빌드'를 실행하세요.",
+    "status.terminal_opened": "Dev Container 내에서 터미널이 열렸습니다",
 
     "popup.cli_title": "Dev Container CLI를 찾을 수 없습니다",
     "popup.cli_message": "재빌드에는 devcontainer CLI가 필요합니다. 설치 명령을 복사하거나 닫으세요.",
@@ -418,6 +446,8 @@
     "cmd.show_ports_desc": "显示已配置的端口转发",
     "cmd.rebuild": "Dev Container: 重建",
     "cmd.rebuild_desc": "使用devcontainer CLI重建Dev Container",
+    "cmd.open_terminal": "Dev Container: 打开终端",
+    "cmd.open_terminal_desc": "在运行中的Dev Container中打开终端",
 
     "status.detected": "Dev Container: %{name} (%{image}) - %{features}个feature, %{ports}个端口",
     "status.no_config": "未找到devcontainer.json",
@@ -436,6 +466,8 @@
     "status.rebuilding": "正在重建Dev Container...",
     "status.rebuild_done": "Dev Container重建完成",
     "status.rebuild_failed": "重建失败: %{error}",
+    "status.container_not_running": "未找到运行中的Dev Container。请先运行「Dev Container: 重建」。",
+    "status.terminal_opened": "已在Dev Container中打开终端",
 
     "popup.cli_title": "未找到Dev Container CLI",
     "popup.cli_message": "重建需要devcontainer CLI。复制下面的安装命令或关闭。",

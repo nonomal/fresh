@@ -738,6 +738,32 @@ globalThis.devcontainer_rebuild = async function (): Promise<void> {
   }
 };
 
+globalThis.devcontainer_open_terminal = async function (): Promise<void> {
+  const cliCheck = await editor.spawnProcess("which", ["devcontainer"]);
+  if (cliCheck.exit_code !== 0) {
+    showCliNotFoundPopup();
+    return;
+  }
+
+  // Check if a container is running for this workspace
+  const cwd = editor.getCwd();
+  const upCheck = await editor.spawnProcess(
+    "devcontainer",
+    ["exec", "--workspace-folder", cwd, "echo", "__devcontainer_ok__"],
+  );
+
+  if (upCheck.exit_code !== 0 || !upCheck.stdout.includes("__devcontainer_ok__")) {
+    editor.setStatus(editor.t("status.container_not_running"));
+    return;
+  }
+
+  // Open a terminal and send the exec command into it
+  const term = await editor.createTerminal({ direction: "vertical", ratio: 0.5, focus: true });
+  const execCmd = `devcontainer exec --workspace-folder ${JSON.stringify(cwd)} /bin/sh -c 'exec \${SHELL:-/bin/sh}'\n`;
+  editor.sendTerminalInput(term.terminalId, execCmd);
+  editor.setStatus(editor.t("status.terminal_opened"));
+};
+
 // =============================================================================
 // Event Handlers
 // =============================================================================
@@ -784,6 +810,12 @@ function registerCommands(): void {
     "%cmd.rebuild",
     "%cmd.rebuild_desc",
     "devcontainer_rebuild",
+    null,
+  );
+  editor.registerCommand(
+    "%cmd.open_terminal",
+    "%cmd.open_terminal_desc",
+    "devcontainer_open_terminal",
     null,
   );
 }

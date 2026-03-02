@@ -161,6 +161,9 @@ impl CommandRegistry {
     /// When query is not empty, commands are sorted by match quality (fzf-style scoring)
     /// with recency as tiebreaker for equal scores.
     /// Disabled commands always appear after enabled ones.
+    ///
+    /// `has_lsp_config` indicates whether the active buffer's language has an LSP server
+    /// configured. When false, LSP start/restart/toggle commands are disabled.
     pub fn filter(
         &self,
         query: &str,
@@ -169,6 +172,7 @@ impl CommandRegistry {
         selection_active: bool,
         active_custom_contexts: &std::collections::HashSet<String>,
         active_buffer_mode: Option<&str>,
+        has_lsp_config: bool,
     ) -> Vec<Suggestion> {
         let commands = self.get_all();
 
@@ -201,6 +205,12 @@ impl CommandRegistry {
             |cmd: &Command, score: i32, localized_name: String, localized_desc: String| {
                 let mut available = is_available(cmd);
                 if cmd.action == Action::FindInSelection && !selection_active {
+                    available = false;
+                }
+                // Disable LSP start/restart/toggle commands when no LSP is configured
+                if !has_lsp_config
+                    && matches!(cmd.action, Action::LspRestart | Action::LspToggleForBuffer)
+                {
                     available = false;
                 }
                 let keybinding =
@@ -482,6 +492,7 @@ mod tests {
             false,
             &empty_contexts,
             None,
+            true,
         );
         assert!(results.len() >= 2); // At least "Save File" + "Test Save"
 
@@ -526,6 +537,7 @@ mod tests {
             false,
             &empty_contexts,
             None,
+            true,
         );
         let popup_only = results.iter().find(|s| s.text == "Popup Only");
         assert!(popup_only.is_some());
@@ -539,6 +551,7 @@ mod tests {
             false,
             &empty_contexts,
             None,
+            true,
         );
         let normal_only = results.iter().find(|s| s.text == "Normal Only");
         assert!(normal_only.is_some());
@@ -637,6 +650,7 @@ mod tests {
             false,
             &empty_contexts,
             None,
+            true,
         );
 
         // Find positions of our test commands in results
@@ -713,6 +727,7 @@ mod tests {
             false,
             &empty_contexts,
             None,
+            true,
         );
 
         let save_pos = results.iter().position(|s| s.text == "Save File").unwrap();

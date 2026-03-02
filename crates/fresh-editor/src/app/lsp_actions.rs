@@ -22,6 +22,18 @@ impl Editor {
         };
         let language = state.language.clone();
 
+        // Check if LSP is configured for this language before attempting restart
+        let lsp_configured = self
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.get_config(&language))
+            .is_some();
+
+        if !lsp_configured {
+            self.set_status_message(t!("lsp.no_server_configured").to_string());
+            return;
+        }
+
         // Attempt restart
         let Some(lsp) = self.lsp.as_mut() else {
             self.set_status_message(t!("lsp.no_manager").to_string());

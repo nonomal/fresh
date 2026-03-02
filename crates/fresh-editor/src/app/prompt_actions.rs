@@ -1128,6 +1128,15 @@ impl Editor {
                 .buffer_metadata
                 .get(&self.active_buffer())
                 .and_then(|m| m.virtual_mode());
+            let has_lsp_config = {
+                let language = self
+                    .buffers
+                    .get(&self.active_buffer())
+                    .map(|s| s.language.as_str());
+                language
+                    .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
+                    .is_some()
+            };
 
             registry.filter(
                 query,
@@ -1136,6 +1145,7 @@ impl Editor {
                 selection_active,
                 &self.active_custom_contexts,
                 active_buffer_mode,
+                has_lsp_config,
             )
         };
 

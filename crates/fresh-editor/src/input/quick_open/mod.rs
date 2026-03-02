@@ -59,6 +59,8 @@ pub struct QuickOpenContext {
     pub custom_contexts: std::collections::HashSet<String>,
     /// Active buffer mode (e.g., "vi_normal")
     pub buffer_mode: Option<String>,
+    /// Whether the active buffer's language has an LSP server configured
+    pub has_lsp_config: bool,
 }
 
 /// Information about an open buffer

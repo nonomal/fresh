@@ -65,6 +65,7 @@ impl QuickOpenProvider for CommandProvider {
             context.has_selection,
             &context.custom_contexts,
             context.buffer_mode.as_deref(),
+            context.has_lsp_config,
         )
     }
 
@@ -84,6 +85,7 @@ impl QuickOpenProvider for CommandProvider {
             context.has_selection,
             &context.custom_contexts,
             context.buffer_mode.as_deref(),
+            context.has_lsp_config,
         );
 
         if let Some(idx) = selected_index {
@@ -662,6 +664,7 @@ mod tests {
             key_context: crate::input::keybindings::KeyContext::Normal,
             custom_contexts: std::collections::HashSet::new(),
             buffer_mode: None,
+            has_lsp_config: true,
         }
     }
 

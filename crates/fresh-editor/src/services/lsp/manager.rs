@@ -21,6 +21,8 @@ pub enum LspSpawnResult {
     /// Server is not configured for auto-start
     /// The server can still be started manually via command palette
     NotAutoStart,
+    /// No LSP server is configured for this language
+    NotConfigured,
     /// Server spawn failed or is disabled
     Failed,
 }
@@ -220,6 +222,7 @@ impl LspManager {
     /// It returns:
     /// - `LspSpawnResult::Spawned` if the server was spawned or already running
     /// - `LspSpawnResult::NotAutoStart` if auto_start is false and not manually allowed
+    /// - `LspSpawnResult::NotConfigured` if no LSP server is configured for the language
     /// - `LspSpawnResult::Failed` if spawn failed or language is disabled
     ///
     /// IMPORTANT: Callers should only call this when there is at least one buffer
@@ -234,7 +237,7 @@ impl LspManager {
         let config = match self.config.get(language) {
             Some(c) if c.enabled => c,
             Some(_) => return LspSpawnResult::Failed, // Disabled
-            None => return LspSpawnResult::Failed,    // Not configured
+            None => return LspSpawnResult::NotConfigured, // Not configured
         };
 
         // Check if we have runtime and bridge

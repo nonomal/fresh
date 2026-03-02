@@ -594,6 +594,9 @@ impl Editor {
                     language
                 );
             }
+            LspSpawnResult::NotConfigured => {
+                tracing::debug!("No LSP server configured for language: {}", language);
+            }
             LspSpawnResult::Failed => {
                 tracing::warn!("Failed to spawn LSP client for language: {}", language);
             }

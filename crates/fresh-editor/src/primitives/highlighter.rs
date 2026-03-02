@@ -230,6 +230,19 @@ impl Highlighter {
         self.cache = None;
     }
 
+    /// Get the highlight category at a byte position from the cache.
+    ///
+    /// Returns the category if the position falls within a cached highlight span.
+    /// The position must be within the last highlighted viewport range for a result.
+    pub fn category_at_position(&self, position: usize) -> Option<HighlightCategory> {
+        let cache = self.cache.as_ref()?;
+        cache
+            .spans
+            .iter()
+            .find(|span| span.range.start <= position && position < span.range.end)
+            .map(|span| span.category)
+    }
+
     /// Get the current language
     pub fn language(&self) -> &Language {
         &self.language

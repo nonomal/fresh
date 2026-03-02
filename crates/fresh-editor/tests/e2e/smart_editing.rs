@@ -1482,3 +1482,141 @@ fn test_auto_close_works_independently_from_auto_indent() {
         "Auto-close should work when auto_close is true, even if auto_indent is false"
     );
 }
+
+// =============================================================================
+// Surround Selection Tests
+// =============================================================================
+
+/// Test that typing ( with a selection wraps the selection in parentheses
+#[test]
+fn test_surround_selection_parenthesis() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    std::fs::write(&file_path, "hello").unwrap();
+
+    let mut harness = harness_with_auto_indent();
+    harness.open_file(&file_path).unwrap();
+
+    // Select the word "hello" (5 chars from start)
+    for _ in 0..5 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::SHIFT)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    // Verify selection
+    let cursor = harness.editor().active_cursors().primary();
+    let selection = cursor.selection_range();
+    assert!(selection.is_some(), "Should have a selection");
+    assert_eq!(selection.unwrap(), 0..5);
+
+    // Type opening paren - should surround, not replace
+    harness.type_text("(").unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        content, "(hello)",
+        "Typing ( with selection should wrap it in parentheses"
+    );
+}
+
+/// Test that typing [ with a selection wraps the selection in brackets
+#[test]
+fn test_surround_selection_square_bracket() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    std::fs::write(&file_path, "hello").unwrap();
+
+    let mut harness = harness_with_auto_indent();
+    harness.open_file(&file_path).unwrap();
+
+    // Select "hello"
+    for _ in 0..5 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::SHIFT)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    // Type opening bracket
+    harness.type_text("[").unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        content, "[hello]",
+        "Typing [ with selection should wrap it in brackets"
+    );
+}
+
+/// Test that typing " with a selection wraps the selection in quotes
+#[test]
+fn test_surround_selection_double_quote() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    std::fs::write(&file_path, "hello").unwrap();
+
+    let mut harness = harness_with_auto_indent();
+    harness.open_file(&file_path).unwrap();
+
+    // Select "hello"
+    for _ in 0..5 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::SHIFT)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    // Type double quote
+    harness.type_text("\"").unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        content, "\"hello\"",
+        "Typing \" with selection should wrap it in double quotes"
+    );
+}
+
+/// Test that surround does not happen when auto_surround is disabled
+#[test]
+fn test_surround_selection_disabled() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    std::fs::write(&file_path, "hello").unwrap();
+
+    let mut config = Config::default();
+    config.editor.auto_indent = true;
+    config.editor.auto_surround = false;
+
+    let mut harness = EditorTestHarness::create(
+        80,
+        24,
+        HarnessOptions::new()
+            .with_config(config)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    harness.enable_shadow_validation();
+    harness.open_file(&file_path).unwrap();
+
+    // Select "hello"
+    for _ in 0..5 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::SHIFT)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    // Type opening paren - should replace selection, not surround
+    harness.type_text("(").unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        content, "()",
+        "With auto_surround disabled, typing ( should replace selection and auto-close"
+    );
+}

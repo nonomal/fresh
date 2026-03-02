@@ -256,6 +256,7 @@ impl Editor {
         let mut whitespace =
             crate::config::WhitespaceVisibility::from_editor_config(&self.config.editor);
         state.buffer_settings.auto_close = self.config.editor.auto_close;
+        state.buffer_settings.auto_surround = self.config.editor.auto_surround;
         if let Some(lang_config) = self.config.languages.get(&state.language) {
             whitespace = whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
             state.buffer_settings.use_tabs = lang_config.use_tabs;
@@ -266,6 +267,12 @@ impl Editor {
             if state.buffer_settings.auto_close {
                 if let Some(lang_auto_close) = lang_config.auto_close {
                     state.buffer_settings.auto_close = lang_auto_close;
+                }
+            }
+            // Auto surround: language override (only if globally enabled)
+            if state.buffer_settings.auto_surround {
+                if let Some(lang_auto_surround) = lang_config.auto_surround {
+                    state.buffer_settings.auto_surround = lang_auto_surround;
                 }
             }
         } else {
@@ -1054,9 +1061,10 @@ impl Editor {
         // Clear modified flag - content is "fresh" from stdin (vim behavior)
         state.buffer.clear_modified();
 
-        // Set tab size and auto_close from config
+        // Set tab size, auto_close, and auto_surround from config
         state.buffer_settings.tab_size = self.config.editor.tab_size;
         state.buffer_settings.auto_close = self.config.editor.auto_close;
+        state.buffer_settings.auto_surround = self.config.editor.auto_surround;
 
         // Apply line_numbers default from config
         state

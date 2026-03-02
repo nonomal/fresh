@@ -491,6 +491,19 @@ impl TextMateEngine {
         self.cache = None;
     }
 
+    /// Get the highlight category at a byte position from the cache.
+    ///
+    /// Returns the category if the position falls within a cached highlight span.
+    /// The position must be within the last highlighted viewport range for a result.
+    pub fn category_at_position(&self, position: usize) -> Option<HighlightCategory> {
+        let cache = self.cache.as_ref()?;
+        cache
+            .spans
+            .iter()
+            .find(|span| span.range.start <= position && position < span.range.end)
+            .map(|span| span.category)
+    }
+
     /// Get syntax name
     pub fn syntax_name(&self) -> &str {
         &self.syntax_set.syntaxes()[self.syntax_index].name
@@ -757,6 +770,18 @@ impl HighlightEngine {
         match self {
             Self::TreeSitter(_) => None, // Tree-sitter doesn't expose name easily
             Self::TextMate(h) => Some(h.syntax_name()),
+            Self::None => None,
+        }
+    }
+
+    /// Get the highlight category at a byte position from the cache.
+    ///
+    /// Returns the category if the position falls within a cached highlight span.
+    /// Useful for detecting whether the cursor is inside a string, comment, etc.
+    pub fn category_at_position(&self, position: usize) -> Option<HighlightCategory> {
+        match self {
+            Self::TreeSitter(h) => h.category_at_position(position),
+            Self::TextMate(h) => h.category_at_position(position),
             Self::None => None,
         }
     }

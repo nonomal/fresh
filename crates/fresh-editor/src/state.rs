@@ -69,6 +69,10 @@ pub struct BufferSettings {
     /// Whether to auto-close brackets, parentheses, and quotes.
     /// Set based on global + language config.
     pub auto_close: bool,
+
+    /// Whether to surround selected text with matching pairs when typing a delimiter.
+    /// Set based on global + language config.
+    pub auto_surround: bool,
 }
 
 impl Default for BufferSettings {
@@ -78,6 +82,7 @@ impl Default for BufferSettings {
             use_tabs: false,
             tab_size: 4,
             auto_close: true,
+            auto_surround: true,
         }
     }
 }

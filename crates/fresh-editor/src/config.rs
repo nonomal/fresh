@@ -697,6 +697,14 @@ pub struct EditorConfig {
     #[schemars(extend("x-section" = "Editing"))]
     pub auto_close: bool,
 
+    /// Automatically surround selected text with matching pairs when typing
+    /// an opening delimiter. When enabled and text is selected, typing `(`, `[`,
+    /// `{`, `"`, `'`, or `` ` `` wraps the selection instead of replacing it.
+    /// Default: true
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-section" = "Editing"))]
+    pub auto_surround: bool,
+
     /// Minimum lines to keep visible above/below cursor when scrolling
     #[serde(default = "default_scroll_offset")]
     #[schemars(extend("x-section" = "Editing"))]
@@ -1027,6 +1035,7 @@ impl Default for EditorConfig {
             tab_size: default_tab_size(),
             auto_indent: true,
             auto_close: true,
+            auto_surround: true,
             line_numbers: true,
             relative_line_numbers: false,
             scroll_offset: default_scroll_offset(),
@@ -1356,6 +1365,11 @@ pub struct LanguageConfig {
     #[serde(default)]
     pub auto_close: Option<bool>,
 
+    /// Whether to auto-surround selected text with matching pairs for this language.
+    /// If not specified (`null`), falls back to the global `editor.auto_surround` setting.
+    #[serde(default)]
+    pub auto_surround: Option<bool>,
+
     /// Preferred highlighter backend (auto, tree-sitter, or textmate)
     #[serde(default)]
     pub highlighter: HighlighterPreference,
@@ -1416,6 +1430,9 @@ pub struct BufferConfig {
     /// Whether to auto-close brackets, parentheses, and quotes
     pub auto_close: bool,
 
+    /// Whether to surround selected text with matching pairs
+    pub auto_surround: bool,
+
     /// Resolved whitespace indicator visibility
     pub whitespace: WhitespaceVisibility,
 
@@ -1454,6 +1471,7 @@ impl BufferConfig {
             use_tabs: false, // Global default is spaces
             auto_indent: editor.auto_indent,
             auto_close: editor.auto_close,
+            auto_surround: editor.auto_surround,
             whitespace,
             formatter: None,
             format_on_save: false,
@@ -1480,6 +1498,13 @@ impl BufferConfig {
                 if config.auto_close {
                     if let Some(lang_auto_close) = lang_config.auto_close {
                         config.auto_close = lang_auto_close;
+                    }
+                }
+
+                // Auto surround: language override (only if globally enabled)
+                if config.auto_surround {
+                    if let Some(lang_auto_surround) = lang_config.auto_surround {
+                        config.auto_surround = lang_auto_surround;
                     }
                 }
 
@@ -2527,6 +2552,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2552,6 +2578,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2577,6 +2604,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2602,6 +2630,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2631,6 +2660,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2663,6 +2693,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2688,6 +2719,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2723,6 +2755,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2747,6 +2780,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: false,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2767,6 +2801,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2787,6 +2822,7 @@ impl Config {
                 comment_prefix: None,
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2812,6 +2848,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2832,6 +2869,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2857,6 +2895,7 @@ impl Config {
                 comment_prefix: None,
                 auto_indent: false,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2878,6 +2917,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: false,
@@ -2903,6 +2943,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: false,
@@ -2923,6 +2964,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2943,6 +2985,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2970,6 +3013,7 @@ impl Config {
                 comment_prefix: Some("%".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -2990,6 +3034,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3011,6 +3056,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: false,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3036,6 +3082,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: false,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3061,6 +3108,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: false,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3081,6 +3129,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3101,6 +3150,7 @@ impl Config {
                 comment_prefix: Some("#".to_string()),
                 auto_indent: false,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3121,6 +3171,7 @@ impl Config {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
@@ -3797,6 +3848,7 @@ mod tests {
                 comment_prefix: Some("//".to_string()),
                 auto_indent: true,
                 auto_close: None,
+                auto_surround: None,
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: false, // Go hides tab indicators

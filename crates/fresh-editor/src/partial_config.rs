@@ -139,6 +139,7 @@ pub struct PartialEditorConfig {
     pub tab_size: Option<usize>,
     pub auto_indent: Option<bool>,
     pub auto_close: Option<bool>,
+    pub auto_surround: Option<bool>,
     pub line_numbers: Option<bool>,
     pub relative_line_numbers: Option<bool>,
     pub scroll_offset: Option<usize>,
@@ -195,6 +196,7 @@ impl Merge for PartialEditorConfig {
         self.tab_size.merge_from(&other.tab_size);
         self.auto_indent.merge_from(&other.auto_indent);
         self.auto_close.merge_from(&other.auto_close);
+        self.auto_surround.merge_from(&other.auto_surround);
         self.line_numbers.merge_from(&other.line_numbers);
         self.relative_line_numbers
             .merge_from(&other.relative_line_numbers);
@@ -400,6 +402,7 @@ pub struct PartialLanguageConfig {
     pub comment_prefix: Option<String>,
     pub auto_indent: Option<bool>,
     pub auto_close: Option<bool>,
+    pub auto_surround: Option<bool>,
     pub highlighter: Option<HighlighterPreference>,
     pub textmate_grammar: Option<std::path::PathBuf>,
     pub show_whitespace_tabs: Option<bool>,
@@ -418,6 +421,7 @@ impl Merge for PartialLanguageConfig {
         self.comment_prefix.merge_from(&other.comment_prefix);
         self.auto_indent.merge_from(&other.auto_indent);
         self.auto_close.merge_from(&other.auto_close);
+        self.auto_surround.merge_from(&other.auto_surround);
         self.highlighter.merge_from(&other.highlighter);
         self.textmate_grammar.merge_from(&other.textmate_grammar);
         self.show_whitespace_tabs
@@ -457,6 +461,7 @@ impl From<&crate::config::EditorConfig> for PartialEditorConfig {
             tab_size: Some(cfg.tab_size),
             auto_indent: Some(cfg.auto_indent),
             auto_close: Some(cfg.auto_close),
+            auto_surround: Some(cfg.auto_surround),
             line_numbers: Some(cfg.line_numbers),
             relative_line_numbers: Some(cfg.relative_line_numbers),
             scroll_offset: Some(cfg.scroll_offset),
@@ -519,6 +524,7 @@ impl PartialEditorConfig {
             tab_size: self.tab_size.unwrap_or(defaults.tab_size),
             auto_indent: self.auto_indent.unwrap_or(defaults.auto_indent),
             auto_close: self.auto_close.unwrap_or(defaults.auto_close),
+            auto_surround: self.auto_surround.unwrap_or(defaults.auto_surround),
             line_numbers: self.line_numbers.unwrap_or(defaults.line_numbers),
             relative_line_numbers: self
                 .relative_line_numbers
@@ -784,6 +790,7 @@ impl From<&LanguageConfig> for PartialLanguageConfig {
             comment_prefix: cfg.comment_prefix.clone(),
             auto_indent: Some(cfg.auto_indent),
             auto_close: cfg.auto_close,
+            auto_surround: cfg.auto_surround,
             highlighter: Some(cfg.highlighter),
             textmate_grammar: cfg.textmate_grammar.clone(),
             show_whitespace_tabs: Some(cfg.show_whitespace_tabs),
@@ -809,6 +816,7 @@ impl PartialLanguageConfig {
                 .or_else(|| defaults.comment_prefix.clone()),
             auto_indent: self.auto_indent.unwrap_or(defaults.auto_indent),
             auto_close: self.auto_close.or(defaults.auto_close),
+            auto_surround: self.auto_surround.or(defaults.auto_surround),
             highlighter: self.highlighter.unwrap_or(defaults.highlighter),
             textmate_grammar: self
                 .textmate_grammar
@@ -996,6 +1004,7 @@ impl Default for LanguageConfig {
             comment_prefix: None,
             auto_indent: true,
             auto_close: None,
+            auto_surround: None,
             highlighter: HighlighterPreference::default(),
             textmate_grammar: None,
             show_whitespace_tabs: true,

@@ -248,3 +248,53 @@ fn test_ctrl_d_multicursor_e2e() {
         .collect();
     assert!(cursors.contains(&7));
 }
+
+/// Test that typing a single quote inside a string does NOT auto-close.
+/// When cursor is inside "hello|", typing ' should insert just ' (not '').
+#[test]
+fn test_no_auto_close_quote_inside_string() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    // Pre-fill with content containing a string. Cursor will start at 0.
+    std::fs::write(&file_path, "let x = \"hello\";").unwrap();
+
+    let mut config = Config::default();
+    config.editor.auto_indent = true;
+
+    let mut harness = EditorTestHarness::create(
+        80,
+        24,
+        HarnessOptions::new()
+            .without_empty_plugins_dir()
+            .with_config(config),
+    )
+    .unwrap();
+    harness.open_file(&file_path).unwrap();
+    // Render to trigger syntax highlighting (populates highlight cache)
+    harness.render().unwrap();
+
+    // Move cursor to position 14 (inside the string, before closing quote)
+    // Content: let x = "hello";
+    //          0123456789012345
+    // Position 14 is right after 'o', before the closing "
+    for _ in 0..14 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    let cursor = harness.editor().active_cursors().primary();
+    assert_eq!(cursor.position, 14, "Cursor should be at position 14");
+
+    // Type a single quote inside the string
+    harness.type_text("'").unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    // Should be just one apostrophe inserted, not auto-closed to ''
+    assert_eq!(
+        content, "let x = \"hello'\";",
+        "Quote inside a string should NOT auto-close"
+    );
+}

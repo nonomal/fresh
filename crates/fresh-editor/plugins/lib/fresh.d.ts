@@ -138,7 +138,7 @@ type ViewportInfo = {
 	*/
 	topByte: number;
 	/**
-	* Line number of the first visible line (null when line index unavailable, e.g. large file before scan)
+	* Line number of the first visible line (None when line index unavailable, e.g. large file before scan)
 	*/
 	topLine: number | null;
 	/**
@@ -1167,7 +1167,7 @@ interface EditorAPI {
 	*/
 	setLineIndicator(bufferId: number, line: number, namespace: string, symbol: string, r: number, g: number, b: number, priority: number): boolean;
 	/**
-	* Batch set line indicators in the gutter (all lines share the same namespace/symbol/color/priority)
+	* Batch set line indicators in the gutter
 	*/
 	setLineIndicators(bufferId: number, lines: number[], namespace: string, symbol: string, r: number, g: number, b: number, priority: number): boolean;
 	/**

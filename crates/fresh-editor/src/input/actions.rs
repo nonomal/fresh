@@ -6,6 +6,7 @@ use crate::model::buffer::{Buffer, LineEnding};
 use crate::model::cursor::{Cursors, Position2D, SelectionMode};
 use crate::model::event::{CursorId, Event};
 use crate::primitives::display_width::{byte_offset_at_visual_column, str_width};
+use crate::primitives::highlighter::HighlightCategory;
 use crate::primitives::word_navigation::{
     find_word_end, find_word_end_right, find_word_start, find_word_start_left,
     find_word_start_right,
@@ -694,12 +695,47 @@ fn insert_char_events(
     tab_size: usize,
     auto_indent: bool,
     auto_close: bool,
+    auto_surround: bool,
 ) {
     let is_closing_delimiter = matches!(ch, '}' | ')' | ']');
     let auto_close_char = get_auto_close_char(ch, auto_close, &state.language);
     let cursor_data = collect_insert_cursor_data(state, cursors);
 
     for data in cursor_data {
+        // Surround selection: when text is selected and the typed character has a
+        // matching close pair, wrap the selection instead of replacing it.
+        if auto_surround {
+            if let Some(close_char) = auto_close_char {
+                if let (Some(range), Some(_)) = (&data.selection, &data.deleted_text) {
+                    let sel_start = range.start;
+                    let sel_end = range.end;
+                    // Insert closing char at end of selection first (higher position)
+                    events.push(Event::Insert {
+                        position: sel_end,
+                        text: close_char.to_string(),
+                        cursor_id: data.cursor_id,
+                    });
+                    // Insert opening char at start of selection
+                    events.push(Event::Insert {
+                        position: sel_start,
+                        text: ch.to_string(),
+                        cursor_id: data.cursor_id,
+                    });
+                    // Place cursor after closing char (sel_end + 2: +1 for open, +1 for close)
+                    events.push(Event::MoveCursor {
+                        cursor_id: data.cursor_id,
+                        old_position: sel_end + 2,
+                        new_position: sel_end + 2,
+                        old_anchor: None,
+                        new_anchor: None,
+                        old_sticky_column: 0,
+                        new_sticky_column: 0,
+                    });
+                    continue;
+                }
+            }
+        }
+
         // Delete selection if present
         if let (Some(range), Some(text)) = (data.selection, data.deleted_text) {
             events.push(Event::Delete {
@@ -757,8 +793,12 @@ fn insert_char_events(
         }
 
         // Try auto-close
+        // Suppress auto-close for quotes when cursor is inside a string
         if let Some(close_char) = auto_close_char {
-            if should_auto_close(data.char_after) {
+            let suppress_quote_in_string = matches!(ch, '"' | '\'' | '`')
+                && state.highlighter.category_at_position(data.insert_position)
+                    == Some(HighlightCategory::String);
+            if !suppress_quote_in_string && should_auto_close(data.char_after) {
                 handle_auto_close(events, data.cursor_id, ch, close_char, data.insert_position);
                 continue;
             }
@@ -834,6 +874,7 @@ fn transform_case<F>(
 /// * `tab_size` - Number of spaces per tab
 /// * `auto_indent` - Whether auto-indent is enabled
 /// * `auto_close` - Whether auto-close brackets/quotes is enabled
+/// * `auto_surround` - Whether to surround selections with matching pairs
 /// * `estimated_line_length` - Estimated bytes per line for large files
 /// * `viewport_height` - Height of the viewport in lines (for PageUp/PageDown)
 ///
@@ -847,6 +888,7 @@ pub fn action_to_events(
     tab_size: usize,
     auto_indent: bool,
     auto_close: bool,
+    auto_surround: bool,
     estimated_line_length: usize,
     viewport_height: u16,
 ) -> Option<Vec<Event>> {
@@ -878,6 +920,7 @@ pub fn action_to_events(
                 tab_size,
                 auto_indent,
                 auto_close,
+                auto_surround,
             );
         }
 
@@ -2959,6 +3002,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3017,6 +3061,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3040,6 +3085,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3093,6 +3139,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3145,6 +3192,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3197,6 +3245,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3246,6 +3295,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3304,6 +3354,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3365,6 +3416,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3432,6 +3484,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3495,6 +3548,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3526,6 +3580,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3586,6 +3641,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3620,6 +3676,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3683,6 +3740,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3717,6 +3775,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3778,6 +3837,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3833,6 +3893,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3891,6 +3952,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3909,6 +3971,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3960,6 +4023,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -3978,6 +4042,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4110,6 +4175,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4171,6 +4237,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4249,6 +4316,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4331,6 +4399,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4391,6 +4460,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4408,6 +4478,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4429,6 +4500,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4446,6 +4518,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4468,6 +4541,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4515,6 +4589,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -4555,6 +4630,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -4590,6 +4666,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -4620,6 +4697,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar('"'),
             4,
+            true,
             true,
             true,
             80,
@@ -4653,6 +4731,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -4707,6 +4786,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar('('),
             4,
+            true,
             true,
             true,
             80,
@@ -4788,6 +4868,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -4854,6 +4935,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -4870,6 +4952,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -4884,6 +4967,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar('o'),
             4,
+            true,
             true,
             true,
             80,
@@ -4907,6 +4991,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar('('),
             4,
+            true,
             true,
             true,
             80,
@@ -4942,6 +5027,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar(')'),
             4,
+            true,
             true,
             true,
             80,
@@ -5025,6 +5111,7 @@ mod tests {
                 4,
                 true,
                 true,
+                true,
                 80,
                 24,
             )
@@ -5047,6 +5134,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar('('),
             4,
+            true,
             true,
             true,
             80,
@@ -5083,6 +5171,7 @@ mod tests {
             &mut cursors,
             Action::InsertChar(')'),
             4,
+            true,
             true,
             true,
             80,
@@ -5146,6 +5235,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -5199,6 +5289,7 @@ mod tests {
             &mut cursors,
             Action::DeleteBackward,
             4,
+            true,
             true,
             true,
             80,
@@ -5255,6 +5346,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -5309,6 +5401,7 @@ mod tests {
             4,
             false,
             false,
+            true,
             80,
             24,
         )
@@ -5364,6 +5457,7 @@ mod tests {
             4,
             true,
             true,
+            true,
             80,
             24,
         )
@@ -5417,6 +5511,7 @@ mod tests {
             &mut cursors,
             Action::DeleteBackward,
             4,
+            true,
             true,
             true,
             80,

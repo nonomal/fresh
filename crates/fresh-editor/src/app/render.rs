@@ -356,7 +356,7 @@ impl Editor {
             if !commands.is_empty() {
                 let cmd_names: Vec<String> =
                     commands.iter().map(|c| c.debug_variant_name()).collect();
-                tracing::info!(count = commands.len(), cmds = ?cmd_names, "process_commands during render");
+                tracing::trace!(count = commands.len(), cmds = ?cmd_names, "process_commands during render");
             }
             for command in commands {
                 if let Err(e) = self.handle_plugin_command(command) {

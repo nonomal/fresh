@@ -55,9 +55,15 @@ pub fn build_subscriber(
         .add_directive("swc_ecma_transforms_base=info".parse().unwrap())
         .add_directive("swc_common=info".parse().unwrap());
 
+    let span_events = if std::env::var("FRESH_LOG_SPANS").is_ok() {
+        fmt::format::FmtSpan::CLOSE
+    } else {
+        fmt::format::FmtSpan::NONE
+    };
+
     let fmt_layer = fmt::layer()
         .with_writer(Arc::new(log_file))
-        .with_span_events(fmt::format::FmtSpan::CLOSE);
+        .with_span_events(span_events);
 
     tracing_subscriber::registry()
         .with(fmt_layer)

@@ -506,7 +506,7 @@ impl EditorState {
                 extend_to_line_end,
                 url,
             } => {
-                tracing::debug!(
+                tracing::trace!(
                     "AddOverlay: namespace={:?}, range={:?}, face={:?}, priority={}",
                     namespace,
                     range,
@@ -529,7 +529,7 @@ impl EditorState {
                 overlay.url = url.clone();
 
                 let actual_range = overlay.range(&self.marker_list);
-                tracing::debug!(
+                tracing::trace!(
                     "Created overlay with markers - actual range: {:?}, handle={:?}",
                     actual_range,
                     overlay.handle
@@ -539,7 +539,7 @@ impl EditorState {
             }
 
             Event::RemoveOverlay { handle } => {
-                tracing::debug!("RemoveOverlay: handle={:?}", handle);
+                tracing::trace!("RemoveOverlay: handle={:?}", handle);
                 self.overlays
                     .remove_by_handle(handle, &mut self.marker_list);
             }
@@ -549,7 +549,7 @@ impl EditorState {
             }
 
             Event::ClearNamespace { namespace } => {
-                tracing::debug!("ClearNamespace: namespace={:?}", namespace);
+                tracing::trace!("ClearNamespace: namespace={:?}", namespace);
                 self.overlays
                     .clear_namespace(namespace, &mut self.marker_list);
             }

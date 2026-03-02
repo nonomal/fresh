@@ -1583,7 +1583,7 @@ impl TextBuffer {
         // has been restructured for non-edit reasons (viewport chunk loading,
         // line-scan preparation, search-scan splits).
         if !self.modified {
-            tracing::info!("diff_since_saved: not modified → equal");
+            tracing::trace!("diff_since_saved: not modified → equal");
             return PieceTreeDiff {
                 equal: true,
                 byte_ranges: Vec::new(),
@@ -1595,7 +1595,7 @@ impl TextBuffer {
         // Quick check: if tree roots are identical (Arc pointer equality),
         // the content is definitely the same.
         if Arc::ptr_eq(&self.saved_root, &self.piece_tree.root()) {
-            tracing::info!("diff_since_saved: Arc::ptr_eq fast path → equal");
+            tracing::trace!("diff_since_saved: Arc::ptr_eq fast path → equal");
             return PieceTreeDiff {
                 equal: true,
                 byte_ranges: Vec::new(),
@@ -1610,7 +1610,7 @@ impl TextBuffer {
 
         // If structure says trees are equal (same pieces in same order), we're done
         if structure_diff.equal {
-            tracing::info!(
+            tracing::trace!(
                 "diff_since_saved: structure equal, line_ranges={}",
                 structure_diff
                     .line_ranges
@@ -1636,7 +1636,7 @@ impl TextBuffer {
         if total_changed_bytes <= MAX_VERIFY_BYTES && !structure_diff.byte_ranges.is_empty() {
             // Check if content in the changed ranges is actually different
             if self.verify_content_differs_in_ranges(&structure_diff.byte_ranges) {
-                tracing::info!(
+                tracing::trace!(
                     "diff_since_saved: content differs, byte_ranges={}, line_ranges={}",
                     structure_diff.byte_ranges.len(),
                     structure_diff
@@ -2301,7 +2301,7 @@ impl TextBuffer {
         // Cap the estimate at the remaining bytes in the document
         let remaining_bytes = self.total_bytes().saturating_sub(start_offset);
         let bytes_to_load = estimated_bytes.min(remaining_bytes);
-        tracing::info!(
+        tracing::trace!(
             bytes_to_load,
             total_bytes = self.total_bytes(),
             "prepare_viewport loading"

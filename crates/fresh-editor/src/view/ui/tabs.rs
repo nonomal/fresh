@@ -454,7 +454,7 @@ impl TabsRenderer {
         // Only clamp to prevent negative or extreme values
         let max_offset = total_width.saturating_sub(max_width);
         let offset = tab_scroll_offset.min(total_width);
-        tracing::debug!(
+        tracing::trace!(
             "render_for_split: tab_scroll_offset={}, max_offset={}, offset={}, total={}, max_width={}",
             tab_scroll_offset, max_offset, offset, total_width, max_width
         );

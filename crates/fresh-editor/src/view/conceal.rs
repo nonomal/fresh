@@ -160,7 +160,7 @@ impl ConcealManager {
                 .iter()
                 .map(|(r, repl)| format!("{}..{}={}", r.start, r.end, repl.unwrap_or("hide")))
                 .collect();
-            tracing::info!(
+            tracing::trace!(
                 "[conceal] query_viewport({start}..{end}): {} ranges: {}",
                 results.len(),
                 summary.join(", ")

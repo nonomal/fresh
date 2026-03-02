@@ -4107,7 +4107,7 @@ impl Editor {
             bridge.try_recv_all()
         };
         let needs_render = !messages.is_empty();
-        tracing::info!(
+        tracing::trace!(
             async_message_count = messages.len(),
             "received async messages"
         );

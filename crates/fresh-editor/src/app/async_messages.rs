@@ -1031,7 +1031,7 @@ impl Editor {
             .any(|c| !matches!(c, fresh_core::api::PluginCommand::HookCompleted { .. }));
 
         let cmd_names: Vec<String> = commands.iter().map(|c| c.debug_variant_name()).collect();
-        tracing::info!(
+        tracing::trace!(
             count = commands.len(),
             cmds = ?cmd_names,
             "process_plugin_commands"

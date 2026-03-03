@@ -938,11 +938,12 @@ impl Editor {
             None => return,
         };
 
-        // Build the display content
-        let mut lines: Vec<String> = Vec::new();
+        // Build the display content as markdown
+        let mut content = String::new();
 
         // Add the signature label (function signature)
-        lines.push(signature.label.clone());
+        content.push_str(&signature.label);
+        content.push('\n');
 
         // Add parameter highlighting info
         let active_param = signature_help
@@ -969,7 +970,7 @@ impl Editor {
                 };
 
                 if !param_label.is_empty() {
-                    lines.push(format!("> {}", param_label));
+                    content.push_str(&format!("\n> {}\n", param_label));
                 }
 
                 // Add parameter documentation if available
@@ -979,8 +980,9 @@ impl Editor {
                         lsp_types::Documentation::MarkupContent(m) => m.value.clone(),
                     };
                     if !doc_text.is_empty() {
-                        lines.push(String::new());
-                        lines.push(doc_text);
+                        content.push('\n');
+                        content.push_str(&doc_text);
+                        content.push('\n');
                     }
                 }
             }
@@ -993,24 +995,23 @@ impl Editor {
                 lsp_types::Documentation::MarkupContent(m) => m.value.clone(),
             };
             if !doc_text.is_empty() {
-                if lines.len() > 1 {
-                    lines.push(String::new());
-                    lines.push("---".to_string());
-                }
-                lines.push(doc_text);
+                content.push_str("\n---\n\n");
+                content.push_str(&doc_text);
+                content.push('\n');
             }
         }
 
-        // Create a popup with the signature help
+        // Create a popup with markdown rendering (like hover popup)
         use crate::view::popup::{Popup, PopupPosition};
         use ratatui::style::Style;
 
-        let mut popup = Popup::text(lines, &self.theme);
+        let mut popup =
+            Popup::markdown(&content, &self.theme, Some(&self.grammar_registry));
         popup.title = Some(t!("lsp.popup_signature").to_string());
         popup.transient = true;
         popup.position = PopupPosition::BelowCursor;
         popup.width = 60;
-        popup.max_height = 10;
+        popup.max_height = 20;
         popup.border_style = Style::default().fg(self.theme.popup_border_fg);
         popup.background_style = Style::default().bg(self.theme.popup_bg);
 

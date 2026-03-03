@@ -60,12 +60,12 @@ const LSP_ERROR_SERVER_CANCELLED: i64 = -32802;
 /// Check if a document is already open and should skip didOpen.
 /// Returns true if the document is already open (should skip), false if it should proceed.
 fn should_skip_did_open(
-    document_versions: &HashMap<PathBuf, i64>,
+    document_versions: &Arc<std::sync::Mutex<HashMap<PathBuf, i64>>>,
     path: &PathBuf,
     language: &str,
     uri: &Uri,
 ) -> bool {
-    if document_versions.contains_key(path) {
+    if document_versions.lock().unwrap().contains_key(path) {
         tracing::debug!(
             "LSP ({}): skipping didOpen - document already open: {}",
             language,
@@ -559,8 +559,8 @@ struct LspState {
     /// Server capabilities
     capabilities: Option<ServerCapabilities>,
 
-    /// Document versions
-    document_versions: HashMap<PathBuf, i64>,
+    /// Document versions (shared with stdout reader for stale diagnostic filtering)
+    document_versions: Arc<std::sync::Mutex<HashMap<PathBuf, i64>>>,
 
     /// Track when didOpen was sent for each document to avoid race with didChange
     /// The LSP server needs time to process didOpen before it can handle didChange
@@ -906,7 +906,7 @@ impl LspState {
             },
         };
 
-        self.document_versions.insert(path.clone(), 0);
+        self.document_versions.lock().unwrap().insert(path.clone(), 0);
 
         // Record when we sent didOpen so didChange can wait if needed
         self.pending_opens.insert(path, Instant::now());
@@ -928,7 +928,7 @@ impl LspState {
 
         // If the document hasn't been opened yet (not in document_versions),
         // skip this change - the upcoming didOpen will have the current content
-        if !self.document_versions.contains_key(&path) {
+        if !self.document_versions.lock().unwrap().contains_key(&path) {
             tracing::debug!(
                 "LSP ({}): skipping didChange - document not yet opened",
                 self.language
@@ -955,13 +955,17 @@ impl LspState {
             self.pending_opens.remove(&path);
         }
 
-        let version = self.document_versions.entry(path).or_insert(0);
-        *version += 1;
+        let new_version = {
+            let mut versions = self.document_versions.lock().unwrap();
+            let version = versions.entry(path).or_insert(0);
+            *version += 1;
+            *version
+        };
 
         let params = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: uri.clone(),
-                version: *version as i32,
+                version: new_version as i32,
             },
             content_changes,
         };
@@ -987,7 +991,7 @@ impl LspState {
         let path = PathBuf::from(uri.path().as_str());
 
         // Remove from document_versions so that a subsequent didOpen will be accepted
-        if self.document_versions.remove(&path).is_some() {
+        if self.document_versions.lock().unwrap().remove(&path).is_some() {
             tracing::info!("LSP ({}): didClose for {}", self.language, uri.as_str());
         } else {
             tracing::debug!(
@@ -2106,8 +2110,8 @@ struct LspTask {
     /// Server capabilities
     capabilities: Option<ServerCapabilities>,
 
-    /// Document versions
-    document_versions: HashMap<PathBuf, i64>,
+    /// Document versions (shared with stdout reader for stale diagnostic filtering)
+    document_versions: Arc<std::sync::Mutex<HashMap<PathBuf, i64>>>,
 
     /// Track when didOpen was sent for each document to avoid race with didChange
     /// The LSP server needs time to process didOpen before it can handle didChange
@@ -2206,7 +2210,7 @@ impl LspTask {
             next_id: 0,
             pending: HashMap::new(),
             capabilities: None,
-            document_versions: HashMap::new(),
+            document_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_opens: HashMap::new(),
             initialized: false,
             async_tx,
@@ -2265,6 +2269,7 @@ impl LspTask {
         stdin_writer: Arc<tokio::sync::Mutex<ChildStdin>>,
         stderr_log_path: std::path::PathBuf,
         shutting_down: Arc<AtomicBool>,
+        document_versions: Arc<std::sync::Mutex<HashMap<PathBuf, i64>>>,
     ) {
         tokio::spawn(async move {
             tracing::info!("LSP stdout reader task started for {}", language);
@@ -2279,6 +2284,7 @@ impl LspTask {
                             &language,
                             &server_command,
                             &stdin_writer,
+                            &document_versions,
                         )
                         .await
                         {
@@ -2328,7 +2334,7 @@ impl LspTask {
             stdin: stdin_writer.clone(),
             next_id: self.next_id,
             capabilities: self.capabilities,
-            document_versions: self.document_versions,
+            document_versions: self.document_versions.clone(),
             pending_opens: self.pending_opens,
             initialized: self.initialized,
             async_tx: self.async_tx.clone(),
@@ -2353,6 +2359,7 @@ impl LspTask {
             stdin_writer.clone(),
             self.stderr_log_path,
             shutting_down.clone(),
+            self.document_versions.clone(),
         );
 
         // Sequential command processing loop
@@ -2893,6 +2900,7 @@ async fn handle_message_dispatch(
     language: &str,
     server_command: &str,
     stdin_writer: &Arc<tokio::sync::Mutex<ChildStdin>>,
+    document_versions: &Arc<std::sync::Mutex<HashMap<PathBuf, i64>>>,
 ) -> Result<(), String> {
     match message {
         JsonRpcMessage::Response(response) => {
@@ -2935,7 +2943,7 @@ async fn handle_message_dispatch(
         }
         JsonRpcMessage::Notification(notification) => {
             tracing::trace!("Received LSP notification: {}", notification.method);
-            handle_notification_dispatch(notification, async_tx, language).await?;
+            handle_notification_dispatch(notification, async_tx, language, document_versions).await?;
         }
         JsonRpcMessage::Request(request) => {
             // Handle server-to-client requests - MUST respond to avoid timeouts
@@ -3069,12 +3077,37 @@ async fn handle_notification_dispatch(
     notification: JsonRpcNotification,
     async_tx: &std_mpsc::Sender<AsyncMessage>,
     language: &str,
+    document_versions: &Arc<std::sync::Mutex<HashMap<PathBuf, i64>>>,
 ) -> Result<(), String> {
     match notification.method.as_str() {
         PublishDiagnostics::METHOD => {
             if let Some(params) = notification.params {
                 let params: PublishDiagnosticsParams = serde_json::from_value(params)
                     .map_err(|e| format!("Failed to deserialize diagnostics: {}", e))?;
+
+                // Drop stale diagnostics: if the server reports a version older than
+                // the document version we last sent via didOpen/didChange, the diagnostics
+                // are for an outdated snapshot and should be discarded.
+                if let Some(diag_version) = params.version {
+                    let path = PathBuf::from(params.uri.path().as_str());
+                    let current_version = document_versions
+                        .lock()
+                        .unwrap()
+                        .get(&path)
+                        .copied();
+                    if let Some(current) = current_version {
+                        if (diag_version as i64) < current {
+                            tracing::debug!(
+                                "LSP ({}): dropping stale diagnostics for {} (diag version {} < current {})",
+                                language,
+                                params.uri.as_str(),
+                                diag_version,
+                                current
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
 
                 tracing::trace!(
                     "Received {} diagnostics for {}",

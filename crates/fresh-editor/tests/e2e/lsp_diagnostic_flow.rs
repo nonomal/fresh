@@ -743,3 +743,230 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Create a fake LSP server that simulates delayed diagnostic responses during rapid typing.
+///
+/// This server deliberately sends stale diagnostics: when it receives didChange, it
+/// delays 500ms before sending publishDiagnostics with the *old* version number.
+/// Meanwhile, the editor continues sending didChange with newer versions.
+/// The editor should drop these stale diagnostics because the version is older
+/// than the current document version.
+fn create_stale_diagnostics_server_script() -> std::path::PathBuf {
+    let script = r##"#!/bin/bash
+
+# Fake LSP server that sends delayed, stale diagnostics
+# Simulates a slow LSP server responding to intermediate typing states
+LOG_FILE="${1:-/tmp/fake_stale_diag_log.txt}"
+> "$LOG_FILE"
+
+DID_OPEN_URI=""
+VERSION=0
+CHANGE_COUNT=0
+
+read_message() {
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: $length\r\n\r\n%s" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then break; fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    echo "RECV: method=$method id=$msg_id" >> "$LOG_FILE"
+
+    case "$method" in
+        "initialize")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":2,"save":{}},"diagnosticProvider":{"identifier":"test","interFileDependencies":false,"workspaceDiagnostics":false},"inlayHintProvider":{"resolveProvider":false}}}}'
+            echo "ACTION: initialized" >> "$LOG_FILE"
+            ;;
+        "initialized")
+            ;;
+        "textDocument/didOpen")
+            DID_OPEN_URI=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+            VERSION=1
+            echo "ACTION: didOpen uri=$DID_OPEN_URI version=$VERSION" >> "$LOG_FILE"
+            ;;
+        "textDocument/didChange")
+            CHANGE_COUNT=$((CHANGE_COUNT + 1))
+            VERSION=$((VERSION + 1))
+            echo "ACTION: didChange count=$CHANGE_COUNT version=$VERSION" >> "$LOG_FILE"
+
+            # On the first didChange (simulating "import " with no module name),
+            # delay and then send diagnostics with THIS version (which will be stale
+            # by the time they arrive because the editor keeps typing)
+            if [ $CHANGE_COUNT -eq 1 ]; then
+                STALE_VERSION=$VERSION
+                echo "QUEUED: stale diagnostics for version=$STALE_VERSION (will delay)" >> "$LOG_FILE"
+                # Send stale diagnostics after a delay (in background)
+                (
+                    sleep 0.5
+                    send_message '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$DID_OPEN_URI"'","diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":7}},"severity":1,"code":"E999","source":"test","message":"STALE: Expected module name after import"}],"version":'"$STALE_VERSION"'}}'
+                    echo "SENT: stale publishDiagnostics version=$STALE_VERSION (delayed)" >> "$LOG_FILE"
+                ) &
+            fi
+            ;;
+        "textDocument/diagnostic")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":{"kind":"full","resultId":"test","items":[]}}'
+            ;;
+        "textDocument/inlayHint")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":[]}'
+            ;;
+        "$/cancelRequest")
+            ;;
+        "shutdown")
+            echo "ACTION: shutdown" >> "$LOG_FILE"
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
+            break
+            ;;
+        *)
+            if [ -n "$msg_id" ]; then
+                send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
+            fi
+            ;;
+    esac
+done
+echo "SERVER: exiting" >> "$LOG_FILE"
+"##;
+
+    let script_path = std::env::temp_dir().join("fake_stale_diag_server.sh");
+    std::fs::write(&script_path, script).expect("Failed to write stale diagnostics server script");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("Failed to get script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("Failed to set script permissions");
+    }
+
+    script_path
+}
+
+/// Test that stale diagnostics are dropped during rapid typing.
+///
+/// Scenario: User types "import os" in a Python file. The LSP server is slow and
+/// sends diagnostics for "import " (version 2, missing module name) after the user
+/// has already typed "import os" (version 3+). The editor should drop the stale
+/// diagnostics because version 2 < current version 3+.
+///
+/// The fake server:
+/// 1. On first didChange: delays 500ms, then sends error diagnostics with version 2
+/// 2. Meanwhile the editor sends more didChange events (version 3, 4, ...)
+/// 3. When the delayed diagnostics arrive, they should be dropped (version 2 < current)
+/// 4. The screen should NOT show "E:1" because the stale diagnostics were filtered
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("fresh=debug")
+        .try_init();
+
+    let script_path = create_stale_diagnostics_server_script();
+
+    let temp_dir = tempfile::tempdir()?;
+    let log_file = temp_dir.path().join("stale_diag_log.txt");
+    let test_file = temp_dir.path().join("test.py");
+    std::fs::write(&test_file, "")?;
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "python".to_string(),
+        fresh::services::lsp::LspServerConfig {
+            command: script_path.to_string_lossy().to_string(),
+            args: vec![log_file.to_string_lossy().to_string()],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+        },
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    // Open the Python file (triggers initialize + didOpen)
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for didOpen to be processed
+    harness.wait_until(|_| {
+        let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log.contains("ACTION: didOpen")
+    })?;
+
+    // Type rapidly: "import os" — each character triggers a didChange.
+    // The first didChange (after "i") triggers the server to queue stale
+    // diagnostics with version 2, delayed by 500ms.
+    // By the time those arrive, we'll have typed more characters (version 3+).
+    harness.type_text("import os")?;
+    harness.render()?;
+
+    // Wait for the server to have sent the stale diagnostics
+    harness.wait_until(|_| {
+        let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log.contains("SENT: stale publishDiagnostics")
+    })?;
+
+    // Give the editor a moment to process all async messages
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    harness.process_async_and_render()?;
+
+    let screen = harness.screen_to_string();
+    eprintln!("[TEST] Screen after rapid typing:\n{}", screen);
+
+    let log = std::fs::read_to_string(&log_file)?;
+    eprintln!("[TEST] Server log:\n{}", log);
+
+    // Verify the server DID send stale diagnostics (so the test is meaningful)
+    assert!(
+        log.contains("SENT: stale publishDiagnostics"),
+        "Expected server to send stale diagnostics.\nLog:\n{}",
+        log
+    );
+
+    // Verify that multiple didChange events were received (rapid typing)
+    let change_count = log.matches("ACTION: didChange").count();
+    assert!(
+        change_count >= 2,
+        "Expected at least 2 didChange events for rapid typing, got {}.\nLog:\n{}",
+        change_count,
+        log
+    );
+
+    // The stale diagnostics should have been dropped — no error indicator on screen
+    assert!(
+        !screen.contains("E:1"),
+        "Stale diagnostics should have been dropped! Screen should NOT show E:1.\nScreen:\n{}",
+        screen
+    );
+
+    Ok(())
+}

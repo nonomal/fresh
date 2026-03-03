@@ -799,12 +799,16 @@ impl Editor {
                 .get(&active_split)
                 .map(|vs| vs.viewport.clone());
 
-            // Get file explorer width offset for popup positioning (Bug #898)
-            let file_explorer_offset = self
+            // Get the content_rect for the active split from the cached layout.
+            // This is the absolute screen rect (already accounts for file explorer,
+            // tab bar, scrollbars, etc.). The gutter is rendered inside this rect,
+            // so we add gutter_width to get the text content origin.
+            let content_rect = self
                 .cached_layout
-                .file_explorer_area
-                .map(|area| area.width)
-                .unwrap_or(0);
+                .split_areas
+                .iter()
+                .find(|(split_id, _, _, _, _, _)| *split_id == active_split)
+                .map(|(_, _, rect, _, _, _)| *rect);
 
             let primary_cursor = self
                 .split_view_states
@@ -815,16 +819,49 @@ impl Editor {
                 // Get the primary cursor position for popup positioning
                 let primary_cursor =
                     primary_cursor.unwrap_or_else(|| crate::model::cursor::Cursor::new(0));
+
+                // Compute gutter width so we know where text content starts
+                let gutter_width = viewport
+                    .as_ref()
+                    .map(|vp| vp.gutter_width(&state.buffer) as u16)
+                    .unwrap_or(0);
+
                 let cursor_screen_pos = viewport
                     .as_ref()
                     .map(|vp| vp.cursor_screen_position(&mut state.buffer, &primary_cursor))
                     .unwrap_or((0, 0));
 
-                // Adjust cursor position to account for tab bar (1 line offset)
-                // and file explorer width (Bug #898)
+                // For completion popups, compute the word-start screen position so
+                // the popup aligns with the beginning of the word being completed,
+                // not the current cursor position.
+                let word_start_screen_pos = {
+                    use crate::primitives::word_navigation::find_completion_word_start;
+                    let word_start = find_completion_word_start(
+                        &state.buffer,
+                        primary_cursor.position,
+                    );
+                    let word_start_cursor = crate::model::cursor::Cursor::new(word_start);
+                    viewport
+                        .as_ref()
+                        .map(|vp| vp.cursor_screen_position(&mut state.buffer, &word_start_cursor))
+                        .unwrap_or((0, 0))
+                };
+
+                // Use content_rect as the single source of truth for the text
+                // content area origin. content_rect.x is the split's left edge
+                // (already past the file explorer), content_rect.y is below the
+                // tab bar. Adding gutter_width gives us the text content start.
+                let (base_x, base_y) = content_rect
+                    .map(|r| (r.x + gutter_width, r.y))
+                    .unwrap_or((gutter_width, 1));
+
                 let cursor_screen_pos = (
-                    cursor_screen_pos.0 + file_explorer_offset,
-                    cursor_screen_pos.1 + 1,
+                    cursor_screen_pos.0 + base_x,
+                    cursor_screen_pos.1 + base_y,
+                );
+                let word_start_screen_pos = (
+                    word_start_screen_pos.0 + base_x,
+                    word_start_screen_pos.1 + base_y,
                 );
 
                 // Collect popup data
@@ -834,7 +871,13 @@ impl Editor {
                     .iter()
                     .enumerate()
                     .map(|(popup_idx, popup)| {
-                        let popup_area = popup.calculate_area(size, Some(cursor_screen_pos));
+                        // Use word-start x for completion popups, cursor x for others
+                        let popup_pos = if popup.kind == crate::view::popup::PopupKind::Completion {
+                            (word_start_screen_pos.0, cursor_screen_pos.1)
+                        } else {
+                            cursor_screen_pos
+                        };
+                        let popup_area = popup.calculate_area(size, Some(popup_pos));
 
                         // Track popup area for mouse hit testing
                         // Account for description height when calculating the list item area

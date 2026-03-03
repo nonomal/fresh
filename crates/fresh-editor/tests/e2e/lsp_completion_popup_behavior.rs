@@ -640,3 +640,256 @@ fn test_completion_underscore_filters() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Completion popup alignment and formatting consistency
+// ============================================================================
+
+/// Helper: set up an editor with a frameless completion popup (matching lsp_requests.rs behavior).
+/// This creates the popup the same way the initial LSP completion response does:
+/// bordered: false, title: None.
+fn setup_frameless_completion_popup(prefix: &str) -> anyhow::Result<EditorTestHarness> {
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    harness.type_text(prefix)?;
+    harness.render()?;
+
+    let completion_items = vec![
+        lsp_types::CompletionItem {
+            label: "calculate_difference".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fn(a: i32, b: i32) -> i32".to_string()),
+            insert_text: Some("calculate_difference".to_string()),
+            ..Default::default()
+        },
+        lsp_types::CompletionItem {
+            label: "calculate_product".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fn(a: i32, b: i32) -> i32".to_string()),
+            insert_text: Some("calculate_product".to_string()),
+            ..Default::default()
+        },
+        lsp_types::CompletionItem {
+            label: "calculate_sum".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            detail: Some("fn(a: i32, b: i32) -> i32".to_string()),
+            insert_text: Some("calculate_sum".to_string()),
+            ..Default::default()
+        },
+    ];
+    harness.editor_mut().set_completion_items(completion_items);
+
+    // Show popup exactly as lsp_requests.rs does: bordered: false, title: None
+    harness
+        .apply_event(Event::ShowPopup {
+            popup: PopupData {
+                kind: PopupKindHint::Completion,
+                title: None,
+                description: None,
+                transient: false,
+                content: PopupContentData::List {
+                    items: vec![
+                        PopupListItemData {
+                            text: "calculate_difference".to_string(),
+                            detail: Some("fn(a: i32, b: i32) -> i32".to_string()),
+                            icon: Some("λ".to_string()),
+                            data: Some("calculate_difference".to_string()),
+                        },
+                        PopupListItemData {
+                            text: "calculate_product".to_string(),
+                            detail: Some("fn(a: i32, b: i32) -> i32".to_string()),
+                            icon: Some("λ".to_string()),
+                            data: Some("calculate_product".to_string()),
+                        },
+                        PopupListItemData {
+                            text: "calculate_sum".to_string(),
+                            detail: Some("fn(a: i32, b: i32) -> i32".to_string()),
+                            icon: Some("λ".to_string()),
+                            data: Some("calculate_sum".to_string()),
+                        },
+                    ],
+                    selected: 0,
+                },
+                position: PopupPositionData::BelowCursor,
+                width: 50,
+                max_height: 15,
+                bordered: false,
+            },
+        })
+        .unwrap();
+
+    harness.render()?;
+    Ok(harness)
+}
+
+/// After typing a filter character, the re-filtered completion popup should remain
+/// frameless (bordered: false, title: None) — matching the initial popup format.
+///
+/// Bug: `refilter_completion_popup` in popup_actions.rs creates the replacement popup
+/// with `bordered: true` and `title: Some(...)`, producing a visually different popup
+/// format after typing one character.
+#[test]
+fn test_completion_popup_stays_frameless_after_filter() -> anyhow::Result<()> {
+    let mut harness = setup_frameless_completion_popup("calc")?;
+
+    // Verify the initial popup is frameless (no border characters)
+    let screen_before = harness.screen_to_string();
+    assert!(
+        screen_before.contains("calculate_difference"),
+        "Initial popup should show completions"
+    );
+
+    // Verify popup is frameless
+    let popup = harness
+        .editor()
+        .active_state()
+        .popups
+        .top()
+        .expect("popup should be visible");
+    assert!(
+        !popup.bordered,
+        "Initial popup should be frameless (bordered: false)"
+    );
+
+    // Type a filter character — this triggers refilter_completion_popup
+    harness.send_key(KeyCode::Char('u'), KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Popup should still be visible
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Popup should remain visible after typing filter char"
+    );
+
+    // The re-filtered popup MUST also be frameless
+    let popup = harness
+        .editor()
+        .active_state()
+        .popups
+        .top()
+        .expect("popup should still be visible");
+    assert!(
+        !popup.bordered,
+        "Re-filtered popup should remain frameless (bordered: false), but it switched to bordered: true"
+    );
+    assert!(
+        popup.title.is_none(),
+        "Re-filtered popup should have no title, but it has: {:?}",
+        popup.title
+    );
+
+    Ok(())
+}
+
+/// The completion popup's left edge should align with the start of the word being
+/// completed, not with the current cursor position.
+///
+/// Example: if the user types "foo.calc" and triggers completion at position 8,
+/// the popup should be aligned at column 4 (start of "calc"), not column 8 (cursor).
+///
+/// Bug: The popup x-coordinate is set to cursor_x, which means it's offset to the
+/// right by however many characters the user has typed of the word prefix.
+#[test]
+fn test_completion_popup_aligns_with_word_start() -> anyhow::Result<()> {
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    // Type "foo.calc" — the completion word starts at column 4 ("calc")
+    harness.type_text("foo.calc")?;
+    harness.render()?;
+
+    // Before showing the popup, find where "foo" appears to determine gutter width
+    let screen_before = harness.screen_to_string();
+    let foo_row = screen_before
+        .lines()
+        .find(|line| line.contains("foo"))
+        .expect("Should find 'foo' on screen");
+    let foo_col = foo_row.find("foo").unwrap();
+    // "calc" starts at foo_col + 4 (after "foo.")
+    let word_start_col = foo_col + 4;
+    // cursor is at foo_col + 8 (after "foo.calc")
+    let cursor_col = foo_col + 8;
+
+    let completion_items = vec![
+        lsp_types::CompletionItem {
+            label: "calculate".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            insert_text: Some("calculate".to_string()),
+            ..Default::default()
+        },
+        lsp_types::CompletionItem {
+            label: "calibrate".to_string(),
+            kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+            insert_text: Some("calibrate".to_string()),
+            ..Default::default()
+        },
+    ];
+    harness.editor_mut().set_completion_items(completion_items);
+
+    harness
+        .apply_event(Event::ShowPopup {
+            popup: PopupData {
+                kind: PopupKindHint::Completion,
+                title: None,
+                description: None,
+                transient: false,
+                content: PopupContentData::List {
+                    items: vec![
+                        PopupListItemData {
+                            text: "calculate".to_string(),
+                            detail: None,
+                            icon: Some("λ".to_string()),
+                            data: Some("calculate".to_string()),
+                        },
+                        PopupListItemData {
+                            text: "calibrate".to_string(),
+                            detail: None,
+                            icon: Some("λ".to_string()),
+                            data: Some("calibrate".to_string()),
+                        },
+                    ],
+                    selected: 0,
+                },
+                position: PopupPositionData::BelowCursor,
+                width: 50,
+                max_height: 15,
+                bordered: false,
+            },
+        })
+        .unwrap();
+
+    harness.render()?;
+
+    let screen = harness.screen_to_string();
+    eprintln!("[TEST] Screen:\n{}", screen);
+
+    // Find the row where "calculate" appears in the popup
+    let popup_row = screen
+        .lines()
+        .find(|line| line.contains("calculate"))
+        .expect("Should find popup row with 'calculate'");
+    let popup_text_col = popup_row
+        .find("calculate")
+        .expect("Should find 'calculate' in popup row");
+
+    eprintln!(
+        "[TEST] word_start_col={}, popup_text_col={}, cursor_col={}",
+        word_start_col, popup_text_col, cursor_col
+    );
+
+    // The popup's suggestion text should start near the word start column,
+    // NOT at the cursor column. Allow for icon column (2-3 chars for "λ ").
+    // The key assertion: popup_text_col should be closer to word_start_col
+    // than to cursor_col.
+    assert!(
+        popup_text_col <= word_start_col + 3,
+        "Popup 'calculate' starts at column {} but word 'calc' starts at column {}. \
+         The popup should align with the word start, not the cursor position (col {}).\n\
+         Popup row: {:?}",
+        popup_text_col,
+        word_start_col,
+        cursor_col,
+        popup_row,
+    );
+
+    Ok(())
+}

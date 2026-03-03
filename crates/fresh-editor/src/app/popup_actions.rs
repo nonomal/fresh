@@ -317,75 +317,16 @@ impl Editor {
             .and_then(|p| p.selected_item())
             .map(|item| item.text.clone());
 
-        // Convert to PopupListItem
-        use crate::view::popup::PopupListItem;
-
-        let popup_items: Vec<PopupListItem> = filtered_items
-            .iter()
-            .map(|item| {
-                let text = item.label.clone();
-                let detail = item.detail.clone();
-                let icon = match item.kind {
-                    Some(lsp_types::CompletionItemKind::FUNCTION)
-                    | Some(lsp_types::CompletionItemKind::METHOD) => Some("λ".to_string()),
-                    Some(lsp_types::CompletionItemKind::VARIABLE) => Some("v".to_string()),
-                    Some(lsp_types::CompletionItemKind::STRUCT)
-                    | Some(lsp_types::CompletionItemKind::CLASS) => Some("S".to_string()),
-                    Some(lsp_types::CompletionItemKind::CONSTANT) => Some("c".to_string()),
-                    Some(lsp_types::CompletionItemKind::KEYWORD) => Some("k".to_string()),
-                    _ => None,
-                };
-
-                let mut list_item = PopupListItem::new(text);
-                if let Some(detail) = detail {
-                    list_item = list_item.with_detail(detail);
-                }
-                if let Some(icon) = icon {
-                    list_item = list_item.with_icon(icon);
-                }
-                let data = item
-                    .insert_text
-                    .clone()
-                    .or_else(|| Some(item.label.clone()));
-                if let Some(data) = data {
-                    list_item = list_item.with_data(data);
-                }
-                list_item
-            })
-            .collect();
-
         // Try to preserve selection
         let selected = current_selection
-            .and_then(|sel| popup_items.iter().position(|item| item.text == sel))
+            .and_then(|sel| {
+                filtered_items
+                    .iter()
+                    .position(|item| item.label == sel)
+            })
             .unwrap_or(0);
 
-        // Update the popup with filtered items
-        use crate::model::event::{
-            PopupContentData, PopupData, PopupKindHint, PopupListItemData, PopupPositionData,
-        };
-
-        let popup_data = PopupData {
-            kind: PopupKindHint::Completion,
-            title: Some(t!("lsp.popup_completion").to_string()),
-            description: None,
-            transient: false,
-            content: PopupContentData::List {
-                items: popup_items
-                    .into_iter()
-                    .map(|item| PopupListItemData {
-                        text: item.text,
-                        detail: item.detail,
-                        icon: item.icon,
-                        data: item.data,
-                    })
-                    .collect(),
-                selected,
-            },
-            position: PopupPositionData::BelowCursor,
-            width: 50,
-            max_height: 15,
-            bordered: true,
-        };
+        let popup_data = build_completion_popup(&filtered_items, selected);
 
         // Close old popup and show new one
         self.hide_popup();
@@ -397,5 +338,59 @@ impl Editor {
             cursors,
             &crate::model::event::Event::ShowPopup { popup: popup_data },
         );
+    }
+}
+
+/// Build a completion `PopupData` from a list of LSP `CompletionItem`s.
+///
+/// This is the single code path for creating completion popups, used both for
+/// the initial LSP completion response and for re-filtering during type-to-filter.
+pub(crate) fn build_completion_popup(
+    items: &[&lsp_types::CompletionItem],
+    selected: usize,
+) -> crate::model::event::PopupData {
+    use crate::model::event::{
+        PopupContentData, PopupKindHint, PopupListItemData, PopupPositionData,
+    };
+
+    let list_items: Vec<PopupListItemData> = items
+        .iter()
+        .map(|item| {
+            let icon = match item.kind {
+                Some(lsp_types::CompletionItemKind::FUNCTION)
+                | Some(lsp_types::CompletionItemKind::METHOD) => Some("λ".to_string()),
+                Some(lsp_types::CompletionItemKind::VARIABLE) => Some("v".to_string()),
+                Some(lsp_types::CompletionItemKind::STRUCT)
+                | Some(lsp_types::CompletionItemKind::CLASS) => Some("S".to_string()),
+                Some(lsp_types::CompletionItemKind::CONSTANT) => Some("c".to_string()),
+                Some(lsp_types::CompletionItemKind::KEYWORD) => Some("k".to_string()),
+                _ => None,
+            };
+
+            PopupListItemData {
+                text: item.label.clone(),
+                detail: item.detail.clone(),
+                icon,
+                data: item
+                    .insert_text
+                    .clone()
+                    .or_else(|| Some(item.label.clone())),
+            }
+        })
+        .collect();
+
+    crate::model::event::PopupData {
+        kind: PopupKindHint::Completion,
+        title: None,
+        description: None,
+        transient: false,
+        content: PopupContentData::List {
+            items: list_items,
+            selected,
+        },
+        position: PopupPositionData::BelowCursor,
+        width: 50,
+        max_height: 15,
+        bordered: true,
     }
 }

@@ -1150,7 +1150,14 @@ globalThis.onThemeSaveAsPromptConfirmed = async function(args: {
 
   const name = args.input.trim();
   if (name) {
-    // Check if theme already exists
+    // Reject names that match a built-in theme
+    if (state.builtinThemes.includes(name)) {
+      editor.setStatus(editor.t("error.name_is_builtin", { name }));
+      globalThis.theme_editor_save_as();
+      return true;
+    }
+
+    // Check if a user theme already exists with this name
     const userThemesDir = getUserThemesDir();
     const targetPath = editor.pathJoin(userThemesDir, `${name}.json`);
 

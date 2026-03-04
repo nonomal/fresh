@@ -306,7 +306,6 @@ const SHORTCUTS = {
   save_as: "C-S-s",
   delete: "C-d",
   reload: "C-r",
-  close: "C-q",
   help: "F1",
 };
 
@@ -334,7 +333,6 @@ editor.defineMode(
     [SHORTCUTS.save_as, "theme_editor_save_as"],
     [SHORTCUTS.delete, "theme_editor_delete"],
     [SHORTCUTS.reload, "theme_editor_reload"],
-    [SHORTCUTS.close, "theme_editor_close"],
     ["C-h", "theme_editor_show_help"],  // Alternative help key
   ],
   true // read-only

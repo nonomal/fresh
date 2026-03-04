@@ -10,6 +10,11 @@ use crate::primitives::highlighter::HighlightSpan;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 
+/// Whether a character is a space-like separator (regular space or NBSP).
+fn is_space(ch: char) -> bool {
+    ch == ' ' || ch == '\u{00A0}'
+}
+
 /// Calculate hanging indent width from leading spaces, clamped so that
 /// at least 10 characters of content remain.
 fn hanging_indent_width(leading_spaces: usize, max_width: usize) -> usize {
@@ -22,9 +27,7 @@ fn hanging_indent_width(leading_spaces: usize, max_width: usize) -> usize {
 
 /// Count the number of leading space-like characters (space or NBSP) in a string.
 fn count_leading_spaces(text: &str) -> usize {
-    text.chars()
-        .take_while(|&ch| ch == ' ' || ch == '\u{00A0}')
-        .count()
+    text.chars().take_while(|&ch| is_space(ch)).count()
 }
 
 /// Word-wrap a single line of text to fit within a given width.
@@ -68,7 +71,7 @@ pub fn wrap_text_line(text: &str, max_width: usize) -> Vec<String> {
 
         // Start a new line with hanging indent
         result.push(current_line);
-        let trimmed = word.trim_start_matches(|ch: char| ch == ' ' || ch == '\u{00A0}');
+        let trimmed = word.trim_start_matches(is_space);
         current_line = format!("{}{}", indent, trimmed);
         current_width = indent_width + unicode_width::UnicodeWidthStr::width(trimmed);
     }
@@ -120,7 +123,7 @@ pub fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<StyledLi
             let mut count = 0usize;
             'outer: for span in &line.spans {
                 for ch in span.text.chars() {
-                    if ch == ' ' || ch == '\u{00A0}' {
+                    if is_space(ch) {
                         count += 1;
                     } else {
                         break 'outer;
@@ -172,7 +175,7 @@ pub fn wrap_styled_lines(lines: &[StyledLine], max_width: usize) -> Vec<StyledLi
             current_line = new_continuation_line(indent_width);
             // Trim leading space/NBSP — either replaced by hanging indent or
             // just a word separator that shouldn't start a new line.
-            let trimmed = segment.trim_start_matches(|ch: char| ch == ' ' || ch == '\u{00A0}');
+            let trimmed = segment.trim_start_matches(is_space);
             let trimmed_width = unicode_width::UnicodeWidthStr::width(trimmed);
             current_line.push_with_link(trimmed.to_string(), style, link_url);
             current_width = indent_width + trimmed_width;
@@ -254,7 +257,7 @@ impl<'a> Iterator for WordSplitter<'a> {
 
         // Collect leading spaces (regular or NBSP)
         while let Some(&ch) = self.chars.peek() {
-            if ch != ' ' && ch != '\u{00A0}' {
+            if !is_space(ch) {
                 break;
             }
             let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
@@ -265,7 +268,7 @@ impl<'a> Iterator for WordSplitter<'a> {
 
         // Collect non-space characters
         while let Some(&ch) = self.chars.peek() {
-            if ch == ' ' || ch == '\u{00A0}' {
+            if is_space(ch) {
                 break;
             }
             let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
@@ -363,19 +366,21 @@ fn highlight_code_to_styled_lines(
         // Add unhighlighted text before this span
         if span.range.start > pos {
             let text = String::from_utf8_lossy(&bytes[pos..span.range.start]);
-            add_code_text_to_lines(
+            add_text_to_lines(
                 &mut result,
                 &text,
                 Style::default().fg(default_fg).bg(code_bg),
+                None,
             );
         }
 
         // Add highlighted text
         let text = String::from_utf8_lossy(&bytes[span.range.start..span.range.end]);
-        add_code_text_to_lines(
+        add_text_to_lines(
             &mut result,
             &text,
             Style::default().fg(span.color).bg(code_bg),
+            None,
         );
 
         pos = span.range.end;
@@ -384,25 +389,33 @@ fn highlight_code_to_styled_lines(
     // Add remaining unhighlighted text
     if pos < bytes.len() {
         let text = String::from_utf8_lossy(&bytes[pos..]);
-        add_code_text_to_lines(
+        add_text_to_lines(
             &mut result,
             &text,
             Style::default().fg(default_fg).bg(code_bg),
+            None,
         );
     }
 
     result
 }
 
-/// Helper to add code text to styled lines, handling newlines
-fn add_code_text_to_lines(lines: &mut Vec<StyledLine>, text: &str, style: Style) {
+/// Add text to styled lines, splitting on newlines.
+/// Each `\n` starts a new `StyledLine`. Non-empty segments are pushed with
+/// the given style and optional link URL.
+fn add_text_to_lines(
+    lines: &mut Vec<StyledLine>,
+    text: &str,
+    style: Style,
+    link_url: Option<String>,
+) {
     for (i, part) in text.split('\n').enumerate() {
         if i > 0 {
             lines.push(StyledLine::new());
         }
         if !part.is_empty() {
             if let Some(line) = lines.last_mut() {
-                line.push(part.to_string(), style);
+                line.push_with_link(part.to_string(), style, link_url.clone());
             }
         }
     }
@@ -587,35 +600,11 @@ pub fn parse_markdown(
                         let code_style = Style::default()
                             .fg(theme.help_key_fg)
                             .bg(theme.inline_code_bg);
-                        for (i, part) in text.split('\n').enumerate() {
-                            if i > 0 {
-                                lines.push(StyledLine::new());
-                            }
-                            if !part.is_empty() {
-                                if let Some(line) = lines.last_mut() {
-                                    line.push(part.to_string(), code_style);
-                                }
-                            }
-                        }
+                        add_text_to_lines(&mut lines, &text, code_style, None);
                     }
                 } else {
                     let current_style = *style_stack.last().unwrap_or(&Style::default());
-                    // Split text by newlines and add to lines
-                    for (i, part) in text.split('\n').enumerate() {
-                        if i > 0 {
-                            lines.push(StyledLine::new());
-                        }
-                        if !part.is_empty() {
-                            if let Some(line) = lines.last_mut() {
-                                // Include link URL if we're inside a link
-                                line.push_with_link(
-                                    part.to_string(),
-                                    current_style,
-                                    current_link_url.clone(),
-                                );
-                            }
-                        }
-                    }
+                    add_text_to_lines(&mut lines, &text, current_style, current_link_url.clone());
                 }
             }
             Event::Code(code) => {
@@ -663,10 +652,6 @@ mod tests {
     use crate::view::theme;
     use crate::view::theme::Theme;
 
-    fn get_line_text(line: &StyledLine) -> String {
-        line.spans.iter().map(|s| s.text.as_str()).collect()
-    }
-
     fn has_modifier(line: &StyledLine, modifier: Modifier) -> bool {
         line.spans
             .iter()
@@ -679,7 +664,7 @@ mod tests {
         let lines = parse_markdown("Hello world", &theme, None);
 
         assert_eq!(lines.len(), 1);
-        assert_eq!(get_line_text(&lines[0]), "Hello world");
+        assert_eq!(lines[0].plain_text(), "Hello world");
     }
 
     #[test]
@@ -688,7 +673,7 @@ mod tests {
         let lines = parse_markdown("This is **bold** text", &theme, None);
 
         assert_eq!(lines.len(), 1);
-        assert_eq!(get_line_text(&lines[0]), "This is bold text");
+        assert_eq!(lines[0].plain_text(), "This is bold text");
 
         // Check that "bold" span has BOLD modifier
         let bold_span = lines[0].spans.iter().find(|s| s.text == "bold");
@@ -709,7 +694,7 @@ mod tests {
         let lines = parse_markdown("This is *italic* text", &theme, None);
 
         assert_eq!(lines.len(), 1);
-        assert_eq!(get_line_text(&lines[0]), "This is italic text");
+        assert_eq!(lines[0].plain_text(), "This is italic text");
 
         let italic_span = lines[0].spans.iter().find(|s| s.text == "italic");
         assert!(italic_span.is_some(), "Should have an 'italic' span");
@@ -729,7 +714,7 @@ mod tests {
         let lines = parse_markdown("This is ~~deleted~~ text", &theme, None);
 
         assert_eq!(lines.len(), 1);
-        assert_eq!(get_line_text(&lines[0]), "This is deleted text");
+        assert_eq!(lines[0].plain_text(), "This is deleted text");
 
         let strike_span = lines[0].spans.iter().find(|s| s.text == "deleted");
         assert!(strike_span.is_some(), "Should have a 'deleted' span");
@@ -750,7 +735,7 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         // Inline code is rendered without backticks (styling indicates it's code)
-        assert_eq!(get_line_text(&lines[0]), "Use println! to print");
+        assert_eq!(lines[0].plain_text(), "Use println! to print");
 
         // Inline code should have background color
         let code_span = lines[0].spans.iter().find(|s| s.text.contains("println"));
@@ -767,7 +752,7 @@ mod tests {
         let lines = parse_markdown("```rust\nfn main() {}\n```", &theme, None);
 
         // Code block should have content with background
-        let code_line = lines.iter().find(|l| get_line_text(l).contains("fn"));
+        let code_line = lines.iter().find(|l| l.plain_text().contains("fn"));
         assert!(code_line.is_some(), "Should have code block content");
 
         // With syntax highlighting, "fn" may be in its own span
@@ -811,7 +796,11 @@ mod tests {
         );
 
         // Verify the code content is preserved
-        let all_text: String = lines.iter().map(get_line_text).collect::<Vec<_>>().join("");
+        let all_text: String = lines
+            .iter()
+            .map(|l| l.plain_text())
+            .collect::<Vec<_>>()
+            .join("");
         assert!(all_text.contains("fn"), "Should contain 'fn' keyword");
         assert!(all_text.contains("main"), "Should contain 'main'");
         assert!(all_text.contains("println"), "Should contain 'println'");
@@ -828,16 +817,18 @@ mod tests {
         assert!(!lines.is_empty(), "Should have parsed lines");
 
         // Content should be preserved
-        let all_text: String = lines.iter().map(get_line_text).collect::<Vec<_>>().join("");
+        let all_text: String = lines
+            .iter()
+            .map(|l| l.plain_text())
+            .collect::<Vec<_>>()
+            .join("");
         assert!(
             all_text.contains("some code here"),
             "Should contain the code"
         );
 
         // All spans should have the fallback code style (uniform color)
-        let code_line = lines
-            .iter()
-            .find(|l| get_line_text(l).contains("some code"));
+        let code_line = lines.iter().find(|l| l.plain_text().contains("some code"));
         if let Some(line) = code_line {
             for span in &line.spans {
                 assert!(span.style.bg.is_some(), "Code should have background color");
@@ -856,7 +847,7 @@ mod tests {
             has_modifier(heading_line, Modifier::BOLD),
             "Heading should be bold"
         );
-        assert_eq!(get_line_text(heading_line), "Heading");
+        assert_eq!(heading_line.plain_text(), "Heading");
     }
 
     #[test]
@@ -865,7 +856,7 @@ mod tests {
         let lines = parse_markdown("Click [here](https://example.com) for more", &theme, None);
 
         assert_eq!(lines.len(), 1);
-        assert_eq!(get_line_text(&lines[0]), "Click here for more");
+        assert_eq!(lines[0].plain_text(), "Click here for more");
 
         // Link text should be underlined and cyan
         let link_span = lines[0].spans.iter().find(|s| s.text == "here");
@@ -953,7 +944,7 @@ mod tests {
         // Each item should be on its own line
         assert!(lines.len() >= 3, "Should have at least 3 lines for 3 items");
 
-        let all_text: String = lines.iter().map(get_line_text).collect();
+        let all_text: String = lines.iter().map(|l| l.plain_text()).collect();
         assert!(all_text.contains("Item 1"), "Should contain Item 1");
         assert!(all_text.contains("Item 2"), "Should contain Item 2");
         assert!(all_text.contains("Item 3"), "Should contain Item 3");
@@ -969,15 +960,15 @@ mod tests {
             lines.len(),
             3,
             "Should have 3 lines (para, blank, para), got: {:?}",
-            lines.iter().map(get_line_text).collect::<Vec<_>>()
+            lines.iter().map(|l| l.plain_text()).collect::<Vec<_>>()
         );
 
-        assert_eq!(get_line_text(&lines[0]), "First paragraph.");
+        assert_eq!(lines[0].plain_text(), "First paragraph.");
         assert!(
             lines[1].spans.is_empty(),
             "Second line should be empty (paragraph break)"
         );
-        assert_eq!(get_line_text(&lines[2]), "Second paragraph.");
+        assert_eq!(lines[2].plain_text(), "Second paragraph.");
     }
 
     #[test]
@@ -992,7 +983,7 @@ mod tests {
             "Soft break should create separate lines, got {} lines",
             lines.len()
         );
-        let all_text: String = lines.iter().map(get_line_text).collect();
+        let all_text: String = lines.iter().map(|l| l.plain_text()).collect();
         assert!(
             all_text.contains("one") && all_text.contains("two"),
             "Should contain both lines"
@@ -1015,7 +1006,7 @@ mod tests {
         let lines = parse_markdown("Above\n\n---\n\nBelow", &theme, None);
 
         // Should have a line with horizontal rule characters
-        let has_rule = lines.iter().any(|l| get_line_text(l).contains("─"));
+        let has_rule = lines.iter().any(|l| l.plain_text().contains("─"));
         assert!(has_rule, "Should contain horizontal rule character");
     }
 
@@ -1053,11 +1044,11 @@ mod tests {
         assert!(lines.len() >= 3, "Should have multiple sections");
 
         // Code block should have background
-        let code_line = lines.iter().find(|l| get_line_text(l).contains("Path"));
+        let code_line = lines.iter().find(|l| l.plain_text().contains("Path"));
         assert!(code_line.is_some(), "Should have code block with Path");
 
         // Documentation text should be present
-        let all_text: String = lines.iter().map(get_line_text).collect();
+        let all_text: String = lines.iter().map(|l| l.plain_text()).collect();
         assert!(
             all_text.contains("PurePath subclass"),
             "Should contain docstring"
@@ -1076,7 +1067,7 @@ mod tests {
             lines.len() >= 3,
             "Should have multiple lines for keyword args list, got {} lines: {:?}",
             lines.len(),
-            lines.iter().map(get_line_text).collect::<Vec<_>>()
+            lines.iter().map(|l| l.plain_text()).collect::<Vec<_>>()
         );
     }
 
@@ -1099,7 +1090,7 @@ mod tests {
 
         // Whitespace-only should produce empty or minimal output
         for line in &lines {
-            let text = get_line_text(line);
+            let text = line.plain_text();
             assert!(
                 text.trim().is_empty(),
                 "Whitespace-only input should not produce content"
@@ -1253,12 +1244,7 @@ mod tests {
             .collect();
         let wrapped_text: String = wrapped
             .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<String>()
-            })
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(
@@ -1320,7 +1306,7 @@ mod tests {
         let content = "(*values: object, sep: str) -> None\n\n> *values\n\n---\n\nPrints the values to a stream.\n\nsep\n\n  string inserted between values, default a space.\n\nend\n\n  string appended after the last value, default a newline.";
 
         let lines = parse_markdown(content, &theme, None);
-        let texts: Vec<String> = lines.iter().map(get_line_text).collect();
+        let texts: Vec<String> = lines.iter().map(|l| l.plain_text()).collect();
         eprintln!("[TEST] Parsed markdown lines:");
         for (i, t) in texts.iter().enumerate() {
             eprintln!("  [{}] {:?}", i, t);
@@ -1335,7 +1321,7 @@ mod tests {
 
         // Now test wrapping at width 40 (narrow popup to force wrapping)
         let wrapped = wrap_styled_lines(&lines, 40);
-        let wrapped_texts: Vec<String> = wrapped.iter().map(get_line_text).collect();
+        let wrapped_texts: Vec<String> = wrapped.iter().map(|l| l.plain_text()).collect();
         eprintln!("[TEST] Wrapped lines:");
         for (i, t) in wrapped_texts.iter().enumerate() {
             eprintln!("  [{}] {:?}", i, t);

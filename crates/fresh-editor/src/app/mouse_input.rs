@@ -137,24 +137,12 @@ impl Editor {
                                 .and_then(|p| p.info.fg_key.clone());
                             self.theme_info_popup = None;
                             if let Some(key) = fg_key {
-                                // Open theme editor at this key
-                                #[cfg(feature = "plugins")]
-                                {
-                                    let _ = self
-                                        .plugin_manager
-                                        .execute_action_async("open_theme_editor");
-                                    tracing::debug!(
-                                        "Theme inspect: opening theme editor at key '{}'",
-                                        key
-                                    );
-                                }
-                                #[cfg(not(feature = "plugins"))]
-                                {
-                                    let _ = key;
-                                    self.set_status_message(
-                                        "Theme editor requires plugins feature".to_string(),
-                                    );
-                                }
+                                // Fire hook so theme editor plugin can open at this key
+                                let theme_name = self.config.theme.0.clone();
+                                self.plugin_manager.run_hook(
+                                    "theme_inspect_key",
+                                    HookArgs::ThemeInspectKey { theme_name, key },
+                                );
                             }
                             return Ok(true);
                         }

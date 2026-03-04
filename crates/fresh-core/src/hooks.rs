@@ -266,6 +266,14 @@ pub enum HookArgs {
         /// The new language identifier (e.g., "markdown", "rust", "text")
         language: String,
     },
+
+    /// Request to inspect a theme key in the theme editor
+    ThemeInspectKey {
+        /// The name of the current theme
+        theme_name: String,
+        /// The theme key to inspect (e.g. "editor.bg")
+        key: String,
+    },
 }
 
 /// Information about a single line for the LinesChanged hook
@@ -704,6 +712,12 @@ pub fn hook_args_to_json(args: &HookArgs) -> Result<serde_json::Value> {
             serde_json::json!({
                 "buffer_id": buffer_id.0,
                 "language": language,
+            })
+        }
+        HookArgs::ThemeInspectKey { theme_name, key } => {
+            serde_json::json!({
+                "theme_name": theme_name,
+                "key": key,
             })
         }
     };

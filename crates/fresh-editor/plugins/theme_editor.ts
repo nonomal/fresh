@@ -711,7 +711,7 @@ function buildDisplayEntries(): TextPropertyEntry[] {
       const colorStr = formatColorValue(field.value);
 
       entries.push({
-        text: `${indent}  ${field.def.displayName}: X  ${colorStr}\n`,
+        text: `${indent}  ${field.path} - ${field.def.displayName}: X  ${colorStr}\n`,
         properties: {
           type: "field",
           path: field.path,
@@ -1454,6 +1454,64 @@ globalThis.onThemeEditorBufferClosed = function(data: {
 };
 
 editor.on("buffer_closed", "onThemeEditorBufferClosed");
+
+/**
+ * Handle theme_inspect_key hook: open the theme editor at a specific key
+ */
+globalThis.onThemeInspectKey = async function(data: {
+  theme_name: string;
+  key: string;
+}): Promise<void> {
+  // If already open, just navigate to the key
+  if (isThemeEditorOpen()) {
+    const section = data.key.split(".")[0];
+    if (!state.expandedSections.has(section)) {
+      state.expandedSections.add(section);
+    }
+    updateDisplay();
+    moveCursorToField(data.key);
+    return;
+  }
+
+  // Save context
+  state.sourceSplitId = editor.getActiveSplitId();
+  state.sourceBufferId = editor.getActiveBufferId();
+  state.builtinThemes = await loadBuiltinThemes();
+
+  // Auto-load the current theme (builtin or user)
+  const isBuiltin = state.builtinThemes.includes(data.theme_name);
+  if (isBuiltin) {
+    const themeData = await loadThemeFile(data.theme_name);
+    if (themeData) {
+      state.themeData = deepClone(themeData);
+      state.originalThemeData = deepClone(themeData);
+      state.themeName = data.theme_name;
+      state.themePath = null;
+      state.isBuiltin = true;
+      state.hasChanges = false;
+    }
+  } else {
+    const result = await loadUserThemeFile(data.theme_name);
+    if (result) {
+      state.themeData = deepClone(result.data);
+      state.originalThemeData = deepClone(result.data);
+      state.themeName = data.theme_name;
+      state.themePath = result.path;
+      state.isBuiltin = false;
+      state.hasChanges = false;
+    }
+  }
+
+  // Expand the target section
+  const section = data.key.split(".")[0];
+  state.expandedSections.add(section);
+
+  // Open editor and navigate
+  await doOpenThemeEditor();
+  moveCursorToField(data.key);
+};
+
+editor.on("theme_inspect_key", "onThemeInspectKey");
 
 // =============================================================================
 // Smart Navigation - Skip Non-Selectable Lines

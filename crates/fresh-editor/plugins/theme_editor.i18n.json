@@ -659,6 +659,7 @@
     "status.loaded": "Loaded theme: %{name}",
     "status.opened_builtin": "Opened built-in theme: %{name} (use Save As to create your own)",
     "status.builtin_requires_save_as": "Built-in themes cannot be modified in place. Use Save As.",
+    "error.name_is_builtin": "'%{name}' is a built-in theme. Please choose a different name.",
     "error.color_empty": "Please enter a color value",
     "error.color_hex_length": "Hex color must be 6 characters: #RRGGBB (e.g., #FF0000)",
     "error.color_hex_invalid": "Invalid hex characters in '%{input}': use only 0-9 and A-F",

@@ -538,76 +538,9 @@ impl Editor {
         // Render hover highlights for separators and scrollbars
         self.render_hover_highlights(frame);
 
-        // Render file browser popup for OpenFile prompt, or suggestions for other prompts
+        // Initialize popup/suggestion layout state (rendered after status bar below)
         self.cached_layout.suggestions_area = None;
         self.file_browser_layout = None;
-        if let Some(prompt) = &self.prompt {
-            // For OpenFile/SwitchProject/SaveFileAs prompt, render the file browser popup
-            if matches!(
-                prompt.prompt_type,
-                PromptType::OpenFile | PromptType::SwitchProject | PromptType::SaveFileAs
-            ) {
-                if let Some(file_open_state) = &self.file_open_state {
-                    // Calculate popup area: position above prompt line, covering status bar
-                    let max_height = main_chunks[prompt_line_idx].y.saturating_sub(1).min(20);
-                    let popup_area = ratatui::layout::Rect {
-                        x: 0,
-                        y: main_chunks[prompt_line_idx].y.saturating_sub(max_height),
-                        width: size.width,
-                        height: max_height,
-                    };
-
-                    self.file_browser_layout = crate::view::ui::FileBrowserRenderer::render(
-                        frame,
-                        popup_area,
-                        file_open_state,
-                        &self.theme,
-                        &self.mouse_state.hover_target,
-                        Some(&self.keybindings),
-                    );
-                }
-            } else if !prompt.suggestions.is_empty() {
-                // For other prompts, render suggestions as before
-                // Calculate overlay area: position above prompt line (which is below status bar)
-                let suggestion_count = prompt.suggestions.len().min(10);
-                let is_quick_open =
-                    prompt.prompt_type == crate::view::prompt::PromptType::QuickOpen;
-                let hints_height: u16 = if is_quick_open { 1 } else { 0 };
-                let height = suggestion_count as u16 + 2 + hints_height; // +2 for borders, +1 for hints if QuickOpen
-
-                // Position suggestions above the prompt line (and hints line if present)
-                // The prompt line is at main_chunks[prompt_line_idx], so suggestions go above it
-                let suggestions_area = ratatui::layout::Rect {
-                    x: 0,
-                    y: main_chunks[prompt_line_idx].y.saturating_sub(height),
-                    width: size.width,
-                    height: height - hints_height,
-                };
-
-                // Clear the area behind the suggestions to obscure underlying text
-                frame.render_widget(ratatui::widgets::Clear, suggestions_area);
-
-                self.cached_layout.suggestions_area = SuggestionsRenderer::render_with_hover(
-                    frame,
-                    suggestions_area,
-                    prompt,
-                    &self.theme,
-                    self.mouse_state.hover_target.as_ref(),
-                );
-
-                // Render hints line for QuickOpen between suggestions and prompt
-                if is_quick_open {
-                    let hints_area = ratatui::layout::Rect {
-                        x: 0,
-                        y: main_chunks[prompt_line_idx].y.saturating_sub(hints_height),
-                        width: size.width,
-                        height: hints_height,
-                    };
-                    frame.render_widget(ratatui::widgets::Clear, hints_area);
-                    Self::render_quick_open_hints(frame, hints_area, &self.theme);
-                }
-            }
-        }
 
         // Clone all immutable values before the mutable borrow
         let display_name = self
@@ -781,6 +714,10 @@ impl Editor {
                 );
             }
         }
+
+        // Render file browser popup or suggestions popup AFTER status bar + prompt,
+        // so they overlay on top of both (fixes bottom border being overwritten by status bar)
+        self.render_prompt_popups(frame, main_chunks[prompt_line_idx], size.width);
 
         // Render popups from the active buffer state
         // Clone theme to avoid borrow checker issues with active_state_mut()
@@ -1117,6 +1054,79 @@ impl Editor {
     ) {
         let size = frame.area();
         crate::view::dimming::apply_dimming_excluding(frame, size, Some(terminal_area));
+    }
+
+    /// Render file browser or suggestions popup as overlay above the prompt line.
+    /// Called after status bar + prompt so the popup draws on top of both.
+    fn render_prompt_popups(
+        &mut self,
+        frame: &mut Frame,
+        prompt_area: ratatui::layout::Rect,
+        width: u16,
+    ) {
+        let Some(prompt) = &self.prompt else { return };
+
+        if matches!(
+            prompt.prompt_type,
+            PromptType::OpenFile | PromptType::SwitchProject | PromptType::SaveFileAs
+        ) {
+            let Some(file_open_state) = &self.file_open_state else {
+                return;
+            };
+            let max_height = prompt_area.y.saturating_sub(1).min(20);
+            let popup_area = ratatui::layout::Rect {
+                x: 0,
+                y: prompt_area.y.saturating_sub(max_height),
+                width,
+                height: max_height,
+            };
+            self.file_browser_layout = crate::view::ui::FileBrowserRenderer::render(
+                frame,
+                popup_area,
+                file_open_state,
+                &self.theme,
+                &self.mouse_state.hover_target,
+                Some(&self.keybindings),
+            );
+            return;
+        }
+
+        if prompt.suggestions.is_empty() {
+            return;
+        }
+
+        let suggestion_count = prompt.suggestions.len().min(10);
+        let is_quick_open = prompt.prompt_type == crate::view::prompt::PromptType::QuickOpen;
+        let hints_height: u16 = if is_quick_open { 1 } else { 0 };
+        let height = suggestion_count as u16 + 2 + hints_height;
+
+        let suggestions_area = ratatui::layout::Rect {
+            x: 0,
+            y: prompt_area.y.saturating_sub(height),
+            width,
+            height: height - hints_height,
+        };
+
+        frame.render_widget(ratatui::widgets::Clear, suggestions_area);
+
+        self.cached_layout.suggestions_area = SuggestionsRenderer::render_with_hover(
+            frame,
+            suggestions_area,
+            prompt,
+            &self.theme,
+            self.mouse_state.hover_target.as_ref(),
+        );
+
+        if is_quick_open {
+            let hints_area = ratatui::layout::Rect {
+                x: 0,
+                y: prompt_area.y.saturating_sub(hints_height),
+                width,
+                height: hints_height,
+            };
+            frame.render_widget(ratatui::widgets::Clear, hints_area);
+            Self::render_quick_open_hints(frame, hints_area, &self.theme);
+        }
     }
 
     /// Render hover highlights for interactive elements (separators, scrollbars)

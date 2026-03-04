@@ -308,6 +308,7 @@ const SHORTCUTS = {
   save: "C-s",
   save_as: "C-S-s",
   delete: "C-d",
+  close: "Esc",
   reload: "C-r",
   help: "F1",
 };

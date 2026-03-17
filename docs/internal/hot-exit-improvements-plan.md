@@ -122,7 +122,7 @@ session restore rather than replacing the session state (fixes #1237).
 #### Flow E: Exit (clean shutdown)
 
 ```
-User quits (Ctrl+Q or :q)
+User quits (Ctrl+Q or via command palette "Quit")
             ↓
     1. Capture workspace state:
        - Tab order (explicit ordered list, not iteration order)
@@ -171,21 +171,28 @@ is preserved.
 
 ### 1.3 Configuration
 
-The two existing settings `persist_unnamed_buffers` and `hot_exit` are merged
-into a single setting:
+The two existing Rust config fields `persist_unnamed_buffers` and `hot_exit`
+(both in `EditorConfig`, `config.rs`) are merged into a single field:
 
-```toml
-[editor]
-# Controls whether the editor preserves unsaved state across sessions.
-# When enabled, all buffers (file-backed and unnamed) are preserved on exit
-# and restored on next launch. No "Save changes?" prompt on clean exit.
-#
-# Values: true (default), false
-hot_exit = true
+```rust
+/// Whether to preserve unsaved changes in all buffers (file-backed and unnamed)
+/// across editor sessions (VS Code "hot exit" behavior).
+/// When enabled, no "Save changes?" prompt on clean exit.
+///
+/// Default: true
+#[serde(default = "default_true")]
+#[schemars(extend("x-section" = "Recovery"))]
+pub hot_exit: bool,
 ```
 
-The old `persist_unnamed_buffers` key is accepted as an alias during config
-loading for backward compatibility but is not documented.
+The `persist_unnamed_buffers` field is removed from the struct. For backward
+compatibility in user JSON config files, a `#[serde(alias = "persist_unnamed_buffers")]`
+attribute is added to `hot_exit` so old configs still parse.
+
+After making this change, the JSON config schema must be regenerated:
+```sh
+./scripts/gen_schema.sh
+```
 
 ### 1.4 Status Messages
 
@@ -442,35 +449,66 @@ manually inspect them later.
 
 #### Task 4.3: Merge config settings
 
-**Files**: `config.rs`, `app/recovery_actions.rs`, `app/workspace.rs`,
-`app/prompt_actions.rs`
+**Files**: `config.rs`, `partial_config.rs`, `app/recovery_actions.rs`,
+`app/workspace.rs`, `app/prompt_actions.rs`, `app/buffer_management.rs`
 
-1. In config loading, treat `persist_unnamed_buffers` as an alias for
-   `hot_exit` (for backward compatibility).
-2. Remove all internal branching that checks them separately — use a single
-   `hot_exit` flag.
-3. Update config documentation / settings UI.
+1. Remove the `persist_unnamed_buffers` field from `EditorConfig` in
+   `config.rs`. Add `#[serde(alias = "persist_unnamed_buffers")]` to `hot_exit`
+   so existing user JSON configs that set `persist_unnamed_buffers` still parse.
+2. Update `Default` impl to no longer set `persist_unnamed_buffers`.
+3. Remove all internal branching that checks `persist_unnamed_buffers`
+   separately — use the single `hot_exit` flag everywhere.
+4. Update `partial_config.rs` if it mirrors the field.
+5. Regenerate JSON config schema: `./scripts/gen_schema.sh`
+6. Regenerate TypeScript definitions if the config is exposed to plugins:
+   `cargo test -p fresh-plugin-runtime write_fresh_dts_file -- --ignored`
 
 ### Phase 5: Testing
 
-#### Task 5.1: Integration tests for each flow
+Per CONTRIBUTING.md: bug fixes must first reproduce the issue in a failing
+test, then add the fix. New user flows must include e2e tests. E2e tests
+send keyboard/mouse events and examine rendered output, not internal state.
+Use semantic waiting (not timeouts). Tests must be isolated (temp dirs,
+internal clipboard).
 
-Add or extend integration tests for:
-- Workspace restore without CLI files → no extra unnamed buffer
-- Workspace restore with CLI files → workspace + CLI files, CLI focused
-- Tab order preserved across save/restore cycle
+#### Task 5.1: E2e tests for each flow (reproduce-first for bug fixes)
+
+For each bug fix (Tasks 1.1–1.3), write a failing e2e test first:
+- **#1231**: Launch with workspace file present, no CLI args → assert no
+  extra unnamed buffer tab in rendered output
+- **#1232**: Launch with workspace + CLI file → assert workspace tabs are
+  present AND CLI file is focused
+- **#1234**: Save workspace with known tab order, relaunch → assert tabs
+  render in same order
+
+New flow e2e tests:
 - Session-scoped recovery isolation (two sessions, each with own dirty buffers)
-- File mtime change → warning, recovery not deleted
-- `fresh -a session file.txt` → file opened in restored session
+- File mtime change → warning message appears in rendered output, recovery
+  file not deleted
+- `fresh -a session file.txt` → file tab appears in restored session
 
 #### Task 5.2: Migration test
 
 Test that existing flat-layout recovery files are correctly migrated into
-the new scoped directory structure on first launch.
+the new scoped directory structure on first launch. (Unit test, not e2e —
+this is filesystem logic.)
 
 ---
 
-## 4. Risk Assessment
+## 4. Build & Commit Requirements
+
+Per CONTRIBUTING.md, every commit must pass:
+- `cargo check --all-targets`
+- `cargo fmt`
+
+After config changes, regenerate schemas:
+- `./scripts/gen_schema.sh`
+- `cargo test -p fresh-plugin-runtime write_fresh_dts_file -- --ignored` (if plugin API types changed)
+- `crates/fresh-editor/plugins/check-types.sh` (TypeScript type check)
+
+---
+
+## 5. Risk Assessment
 
 | Risk | Mitigation |
 |---|---|

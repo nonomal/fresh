@@ -253,9 +253,10 @@ impl CommandRegistry {
                 (suggestion, history_pos, score)
             };
 
-        // First, try to match by name only
+        // Match by name or description
         // Commands with unmet custom contexts are completely hidden
-        let mut suggestions: Vec<(Suggestion, Option<usize>, i32)> = commands
+        // match_kind: 0 = name match, 1 = description match
+        let mut suggestions: Vec<(Suggestion, Option<usize>, i32, u8)> = commands
             .iter()
             .filter(|cmd| is_visible(cmd))
             .filter_map(|cmd| {
@@ -263,73 +264,65 @@ impl CommandRegistry {
                 let name_result = fuzzy_match(query, &localized_name);
                 if name_result.matched {
                     let localized_desc = cmd.get_localized_description();
-                    Some(make_suggestion(
-                        cmd,
-                        name_result.score,
-                        localized_name,
-                        localized_desc,
-                    ))
+                    let (suggestion, hist, score) =
+                        make_suggestion(cmd, name_result.score, localized_name, localized_desc);
+                    Some((suggestion, hist, score, 0))
+                } else if !query.is_empty() {
+                    let localized_desc = cmd.get_localized_description();
+                    let desc_result = fuzzy_match(query, &localized_desc);
+                    if desc_result.matched {
+                        let (suggestion, hist, score) =
+                            make_suggestion(cmd, desc_result.score, localized_name, localized_desc);
+                        Some((suggestion, hist, score, 1))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             })
             .collect();
 
-        // If no name matches found, try description matching as a fallback
-        if suggestions.is_empty() && !query.is_empty() {
-            suggestions = commands
-                .iter()
-                .filter(|cmd| is_visible(cmd))
-                .filter_map(|cmd| {
-                    let localized_desc = cmd.get_localized_description();
-                    let desc_result = fuzzy_match(query, &localized_desc);
-                    if desc_result.matched {
-                        let localized_name = cmd.get_localized_name();
-                        // Description matches get reduced score
-                        Some(make_suggestion(
-                            cmd,
-                            desc_result.score.saturating_sub(50),
-                            localized_name,
-                            localized_desc,
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
-
         // Sort by:
         // 1. Disabled status (enabled first)
-        // 2. Fuzzy match score (higher is better) - only when query is not empty
-        // 3. History position (recent first, then never-used alphabetically)
+        // 2. Match kind (name matches before description matches) - only when query is not empty
+        // 3. Fuzzy match score (higher is better) - only when query is not empty
+        // 4. History position (recent first, then never-used alphabetically)
         let has_query = !query.is_empty();
-        suggestions.sort_by(|(a, a_hist, a_score), (b, b_hist, b_score)| {
-            // First sort by disabled status
-            match a.disabled.cmp(&b.disabled) {
-                std::cmp::Ordering::Equal => {}
-                other => return other,
-            }
-
-            // When there's a query, sort by fuzzy score (higher is better)
-            if has_query {
-                match b_score.cmp(a_score) {
+        suggestions.sort_by(
+            |(a, a_hist, a_score, a_kind), (b, b_hist, b_score, b_kind)| {
+                // First sort by disabled status
+                match a.disabled.cmp(&b.disabled) {
                     std::cmp::Ordering::Equal => {}
                     other => return other,
                 }
-            }
 
-            // Then sort by history position (lower = more recent = better)
-            match (a_hist, b_hist) {
-                (Some(a_pos), Some(b_pos)) => a_pos.cmp(b_pos),
-                (Some(_), None) => std::cmp::Ordering::Less, // In history beats not in history
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.text.cmp(&b.text), // Alphabetical for never-used commands
-            }
-        });
+                if has_query {
+                    // Name matches before description matches
+                    match a_kind.cmp(b_kind) {
+                        std::cmp::Ordering::Equal => {}
+                        other => return other,
+                    }
+
+                    // Within the same kind, sort by fuzzy score (higher is better)
+                    match b_score.cmp(a_score) {
+                        std::cmp::Ordering::Equal => {}
+                        other => return other,
+                    }
+                }
+
+                // Then sort by history position (lower = more recent = better)
+                match (a_hist, b_hist) {
+                    (Some(a_pos), Some(b_pos)) => a_pos.cmp(b_pos),
+                    (Some(_), None) => std::cmp::Ordering::Less, // In history beats not in history
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.text.cmp(&b.text), // Alphabetical for never-used commands
+                }
+            },
+        );
 
         // Extract just the suggestions
-        suggestions.into_iter().map(|(s, _, _)| s).collect()
+        suggestions.into_iter().map(|(s, _, _, _)| s).collect()
     }
 
     /// Get count of registered plugin commands

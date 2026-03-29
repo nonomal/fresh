@@ -1047,3 +1047,24 @@ fn test_command_palette_select_cursor_style() {
         .wait_for_screen_contains("Cursor style changed")
         .unwrap();
 }
+
+/// Test that command palette searches descriptions, not just names
+#[test]
+fn test_command_palette_description_search() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+
+    // Trigger the command palette
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    // Type "narrow" which only appears in the description of page view commands,
+    // not in their names
+    harness.type_text("narrow").unwrap();
+    harness.render().unwrap();
+
+    // Should find commands whose descriptions match
+    harness.assert_screen_contains("Toggle Page View");
+    harness.assert_screen_contains("Set Page Width");
+}

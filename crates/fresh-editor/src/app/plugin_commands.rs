@@ -910,8 +910,7 @@ impl Editor {
 
             // Apply events
             for event in events {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
         }
     }
@@ -949,6 +948,11 @@ impl Editor {
         let buffer_len = state.buffer.len();
         let clamped_position = final_position.min(buffer_len);
 
+        // Update the cached line number so the status bar shows the correct
+        // position. Without this, the status bar reads a stale value from
+        // state.primary_cursor_line_number which was set before the jump.
+        state.primary_cursor_line_number = crate::model::buffer::LineNumber::Absolute(target_line);
+
         // Update cursors (now in SplitViewState)
         let cursors = self.active_cursors_mut();
         cursors.primary_mut().position = clamped_position;
@@ -970,7 +974,7 @@ impl Editor {
         line: Option<usize>,
         column: Option<usize>,
     ) -> AnyhowResult<()> {
-        // Open the file
+        // Open the file (may switch to an already-open buffer)
         if let Err(e) = self.open_file(&path) {
             tracing::error!("Failed to open file from plugin: {}", e);
             return Ok(());
@@ -1067,7 +1071,7 @@ impl Editor {
     pub(super) fn handle_set_view_mode(&mut self, buffer_id: BufferId, mode: &str) {
         use crate::state::ViewMode;
         let view_mode = match mode {
-            "compose" => ViewMode::Compose,
+            "page_view" | "compose" => ViewMode::PageView,
             _ => ViewMode::Source,
         };
         // Set on the specified buffer's per-split view state.
@@ -1553,7 +1557,7 @@ impl Editor {
                     if let Some(mode_bindings) =
                         self.keybindings.get_plugin_defaults().get(&mode_context)
                     {
-                        for ((key_code, modifiers), _action) in mode_bindings {
+                        for (key_code, modifiers) in mode_bindings.keys() {
                             let label =
                                 crate::input::keybindings::format_keybinding(key_code, modifiers);
                             if let Some((_key_str, cmd)) = bindings
@@ -1591,7 +1595,7 @@ impl Editor {
         let error = if let Some(lsp) = self.lsp.as_mut() {
             // Respect auto_start setting for plugin requests
             use crate::services::lsp::manager::LspSpawnResult;
-            if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
+            if lsp.try_spawn(&language, None) != LspSpawnResult::Spawned {
                 Some(format!(
                     "LSP server for '{}' is not running (auto_start disabled)",
                     language
@@ -1650,7 +1654,7 @@ impl Editor {
         let lang_config = crate::config::LanguageConfig {
             comment_prefix: config.comment_prefix,
             auto_indent: config.auto_indent.unwrap_or(true),
-            use_tabs: config.use_tabs.unwrap_or(false),
+            use_tabs: config.use_tabs,
             tab_size: config.tab_size,
             show_whitespace_tabs: config.show_whitespace_tabs.unwrap_or(true),
             formatter: config.formatter.map(|f| crate::config::FormatterConfig {
@@ -1697,7 +1701,10 @@ impl Editor {
             lsp.set_language_config(language.clone(), lsp_config.clone());
         }
         // Also update runtime config
-        self.config.lsp.insert(language.clone(), lsp_config);
+        self.config.lsp.insert(
+            language.clone(),
+            crate::types::LspLanguageConfig::Multi(vec![lsp_config]),
+        );
         tracing::info!("LSP server registered for '{}'", language);
     }
 
@@ -1721,7 +1728,48 @@ impl Editor {
     /// RegisterGrammar+ReloadGrammars pairs result in only one rebuild.
     /// The rebuild happens on a background thread; when complete, a
     /// `GrammarRegistryBuilt` message swaps in the new registry.
+    ///
+    /// On the first call, this triggers the deferred full grammar build
+    /// (user grammars + language packs + any plugin grammars accumulated so far).
     pub(super) fn flush_pending_grammars(&mut self) {
+        // On the first call, start the deferred full grammar build.
+        // This includes any plugin grammars that were registered during init,
+        // so we get everything in a single builder.build() pass.
+        if self.needs_full_grammar_build {
+            self.needs_full_grammar_build = false;
+            self.grammar_reload_pending = false;
+
+            // Drain all pending grammars to include in the initial build
+            let additional: Vec<_> = self
+                .pending_grammars
+                .drain(..)
+                .map(|g| crate::primitives::grammar::GrammarSpec {
+                    language: g.language.clone(),
+                    path: std::path::PathBuf::from(g.grammar_path),
+                    extensions: g.extensions.clone(),
+                })
+                .collect();
+
+            // Update config.languages with the extensions so detect_language() works
+            for crate::primitives::grammar::GrammarSpec {
+                language,
+                extensions,
+                ..
+            } in &additional
+            {
+                let lang_config = self.config.languages.entry(language.clone()).or_default();
+                for ext in extensions {
+                    if !lang_config.extensions.contains(ext) {
+                        lang_config.extensions.push(ext.clone());
+                    }
+                }
+            }
+
+            let callback_ids: Vec<_> = self.pending_grammar_callbacks.drain(..).collect();
+            self.start_background_grammar_build(additional, callback_ids);
+            return;
+        }
+
         if !self.grammar_reload_pending {
             return;
         }
@@ -1743,26 +1791,73 @@ impl Editor {
             return;
         }
 
+        // Deduplicate: skip grammars whose extensions are all already mapped
+        // in the current registry (meaning the grammar was already loaded by
+        // for_editor or a previous build).
+        let pending_before = self.pending_grammars.len();
+        self.pending_grammars.retain(|g| {
+            // Check if ALL extensions for this grammar are already mapped
+            let all_mapped = !g.extensions.is_empty()
+                && g.extensions
+                    .iter()
+                    .all(|ext| self.grammar_registry.user_extensions().contains_key(ext));
+            if all_mapped {
+                tracing::debug!(
+                    "Skipping already-loaded grammar '{}' (extensions {:?} already mapped)",
+                    g.language,
+                    g.extensions
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if pending_before != self.pending_grammars.len() {
+            tracing::info!(
+                "Deduplicated pending grammars: {} -> {}",
+                pending_before,
+                self.pending_grammars.len()
+            );
+        }
+
+        if self.pending_grammars.is_empty() {
+            tracing::info!(
+                "All pending grammars already loaded, resolving callbacks without rebuild"
+            );
+            // Resolve callbacks immediately — no rebuild needed
+            #[cfg(feature = "plugins")]
+            for cb_id in self.pending_grammar_callbacks.drain(..) {
+                self.plugin_manager
+                    .resolve_callback(cb_id, "null".to_string());
+            }
+            #[cfg(not(feature = "plugins"))]
+            self.pending_grammar_callbacks.clear();
+            return;
+        }
+
         tracing::info!(
             "Flushing {} pending grammars via background rebuild",
             self.pending_grammars.len()
         );
 
         // Collect pending grammars
-        let additional: Vec<_> = self
+        let additional: Vec<crate::primitives::grammar::GrammarSpec> = self
             .pending_grammars
             .drain(..)
-            .map(|g| {
-                (
-                    g.language.clone(),
-                    PathBuf::from(g.grammar_path),
-                    g.extensions.clone(),
-                )
+            .map(|g| crate::primitives::grammar::GrammarSpec {
+                language: g.language.clone(),
+                path: PathBuf::from(g.grammar_path),
+                extensions: g.extensions.clone(),
             })
             .collect();
 
         // Update config.languages with the extensions so detect_language() works
-        for (language, _path, extensions) in &additional {
+        for crate::primitives::grammar::GrammarSpec {
+            language,
+            extensions,
+            ..
+        } in &additional
+        {
             let lang_config = self.config.languages.entry(language.clone()).or_default();
             for ext in extensions {
                 if !lang_config.extensions.contains(ext) {

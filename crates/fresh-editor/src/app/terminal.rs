@@ -318,7 +318,13 @@ impl Editor {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
     ) {
-        if let Some(bytes) = crate::services::terminal::pty::key_to_pty_bytes(code, modifiers) {
+        let app_cursor = self
+            .get_active_terminal_state()
+            .map(|s| s.is_app_cursor())
+            .unwrap_or(false);
+        if let Some(bytes) =
+            crate::services::terminal::pty::key_to_pty_bytes(code, modifiers, app_cursor)
+        {
             self.send_terminal_input(&bytes);
         }
     }
@@ -704,7 +710,8 @@ impl Editor {
                 // Fallback: check active cursors
                 self.split_view_states
                     .values()
-                    .find_map(|vs| Some(vs.cursors.primary().position))
+                    .map(|vs| vs.cursors.primary().position)
+                    .next()
             })
     }
 

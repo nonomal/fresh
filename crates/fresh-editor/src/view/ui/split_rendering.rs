@@ -426,6 +426,8 @@ struct LineRenderInput<'a> {
     /// Whether the gutter shows byte offsets instead of line numbers
     /// (large file without line index scan)
     byte_offset_mode: bool,
+    /// Whether to show tilde (~) markers on lines past end-of-file
+    show_tilde: bool,
 }
 
 /// Context for computing the style of a single character
@@ -443,8 +445,10 @@ struct CharStyleContext<'a> {
     viewport_overlays: &'a [(crate::view::overlay::Overlay, Range<usize>)],
     primary_cursor_position: usize,
     is_active: bool,
-    /// Skip REVERSED style on the primary cursor cell (session mode or
-    /// non-block cursor styles like bar/underline).
+    /// Skip REVERSED style on the primary cursor cell.
+    /// True when a hardware cursor is available (not software_cursor_only),
+    /// or in session mode. Avoids double-inversion in terminal multiplexers
+    /// like zellij where the hardware block cursor inverts the cell too.
     skip_primary_cursor_reverse: bool,
 }
 
@@ -789,17 +793,18 @@ fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
     if ctx.is_active {
         if ctx.is_cursor {
             if ctx.skip_primary_cursor_reverse {
-                // Hardware cursor provides the primary cursor visual (session mode
-                // or non-block cursor styles like bar/underline where REVERSED
-                // would create a block highlight that hides the thin cursor shape).
+                // Hardware cursor provides the primary cursor visual.
+                // Skip REVERSED on primary to avoid double-inversion in
+                // terminal multiplexers (e.g. zellij) where the hardware
+                // cursor also inverts the cell.
                 // Secondary cursors still need REVERSED as their only indicator.
                 if is_secondary_cursor {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
             } else {
-                // Block cursor mode: apply REVERSED to all cursor positions
-                // (primary and secondary). The REVERSED block highlight is
-                // visually consistent with the block cursor shape.
+                // Software-cursor-only mode: apply REVERSED to all cursor
+                // positions (primary and secondary) since there is no
+                // hardware cursor to provide a visual indicator.
                 style = style.add_modifier(Modifier::REVERSED);
             }
         }
@@ -871,6 +876,7 @@ impl SplitRenderer {
         show_vertical_scrollbar: bool,
         show_horizontal_scrollbar: bool,
         diagnostics_inline_text: bool,
+        show_tilde: bool,
     ) -> (
         Vec<(LeafId, BufferId, Rect, Rect, usize, usize)>,
         HashMap<LeafId, crate::view::ui::tabs::TabLayout>, // tab layouts per split
@@ -1026,6 +1032,7 @@ impl SplitRenderer {
                             is_active,
                             view_state,
                             use_terminal_bg,
+                            show_tilde,
                         );
 
                         // Render scrollbar for composite buffer
@@ -1154,6 +1161,7 @@ impl SplitRenderer {
                     &view_prefs.rulers,
                     view_prefs.show_line_numbers,
                     diagnostics_inline_text,
+                    show_tilde,
                 );
 
                 drop(_render_buf_span);
@@ -1293,6 +1301,7 @@ impl SplitRenderer {
         show_vertical_scrollbar: bool,
         show_horizontal_scrollbar: bool,
         diagnostics_inline_text: bool,
+        show_tilde: bool,
     ) -> HashMap<LeafId, Vec<ViewLineMapping>> {
         let visible_buffers = split_manager.get_visible_buffers(area);
         let active_split_id = split_manager.active_split();
@@ -1385,6 +1394,7 @@ impl SplitRenderer {
                 software_cursor_only,
                 view_prefs.show_line_numbers,
                 diagnostics_inline_text,
+                show_tilde,
             );
 
             view_line_mappings.insert(split_id, layout_output.view_line_mappings);
@@ -1439,6 +1449,7 @@ impl SplitRenderer {
         _is_active: bool,
         view_state: &mut crate::view::composite_view::CompositeViewState,
         use_terminal_bg: bool,
+        show_tilde: bool,
     ) {
         use crate::model::composite_buffer::{CompositeLayout, RowType};
 
@@ -1626,14 +1637,16 @@ impl SplitRenderer {
         for view_row in 0..visible_rows {
             let display_row = scroll_row + view_row;
             if display_row >= total_rows {
-                // Fill with tildes for empty rows
-                let mut x = area.x;
-                for &width in &pane_widths {
-                    let tilde_area = Rect::new(x, content_y + view_row as u16, width, 1);
-                    let tilde =
-                        Paragraph::new("~").style(Style::default().fg(theme.line_number_fg));
-                    frame.render_widget(tilde, tilde_area);
-                    x += width + separator_width;
+                if show_tilde {
+                    // Fill with tildes for empty rows
+                    let mut x = area.x;
+                    for &width in &pane_widths {
+                        let tilde_area = Rect::new(x, content_y + view_row as u16, width, 1);
+                        let tilde =
+                            Paragraph::new("~").style(Style::default().fg(theme.line_number_fg));
+                        frame.render_widget(tilde, tilde_area);
+                        x += width + separator_width;
+                    }
                 }
                 continue;
             }
@@ -2559,7 +2572,7 @@ impl SplitRenderer {
 
         // Apply soft breaks — marker-based line wrapping that survives edits without flicker.
         // Only apply in Compose mode; Source mode shows the raw unwrapped text.
-        let is_compose = matches!(view_mode, ViewMode::Compose);
+        let is_compose = matches!(view_mode, ViewMode::PageView);
         if is_compose && !state.soft_breaks.is_empty() {
             let viewport_end = tokens
                 .iter()
@@ -2596,11 +2609,16 @@ impl SplitRenderer {
         }
 
         // Apply wrapping transform - always enabled for safety, but with different thresholds.
-        // When line_wrap is on: wrap at viewport width for normal text flow.
+        // When line_wrap is on: wrap at viewport width (or wrap_column if set) for normal text flow.
         // When line_wrap is off: wrap at MAX_SAFE_LINE_WIDTH to prevent memory exhaustion
         // from extremely long lines (e.g., 10MB single-line JSON files).
         let effective_width = if line_wrap_enabled {
-            content_width
+            if let Some(col) = viewport.wrap_column {
+                // Wrap at the configured column, but never beyond viewport width
+                col.min(content_width)
+            } else {
+                content_width
+            }
         } else {
             MAX_SAFE_LINE_WIDTH
         };
@@ -2950,6 +2968,7 @@ impl SplitRenderer {
     /// When a token's `source_offset` matches a break position:
     /// - For Space tokens: replace with Newline + indent Spaces
     /// - For other tokens: insert Newline + indent Spaces before the token
+    ///
     /// Tokens without source_offset (injected/virtual) pass through unchanged.
     fn apply_soft_breaks(
         tokens: Vec<fresh_core::api::ViewTokenWire>,
@@ -3511,7 +3530,6 @@ impl SplitRenderer {
         gutter_width: usize,
         hanging_indent: bool,
     ) -> Vec<fresh_core::api::ViewTokenWire> {
-        use crate::primitives::display_width::str_width;
         use crate::primitives::visual_layout::visual_width;
         use fresh_core::api::{ViewTokenWire, ViewTokenWireKind};
 
@@ -3583,23 +3601,28 @@ impl SplitRenderer {
                 ViewTokenWireKind::Text(text) => {
                     // Measure leading whitespace at the start of a logical line
                     if measuring_indent {
-                        let leading_ws: usize = text
-                            .chars()
-                            .take_while(|c| *c == ' ' || *c == '\t')
-                            .map(|c| {
-                                if c == '\t' {
-                                    crate::primitives::display_width::char_width(c)
-                                } else {
-                                    1
-                                }
-                            })
-                            .sum();
-                        if leading_ws == text.chars().count() {
+                        let mut ws_char_count = 0usize;
+                        let mut ws_visual_width = 0usize;
+                        for c in text.chars() {
+                            if c == ' ' {
+                                ws_visual_width += 1;
+                                ws_char_count += 1;
+                            } else if c == '\t' {
+                                // Expand tab to next 4-column tab stop, matching detect_indent()
+                                let tab_stop = 4;
+                                let col = line_indent + ws_visual_width;
+                                ws_visual_width += tab_stop - (col % tab_stop);
+                                ws_char_count += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if ws_char_count == text.chars().count() {
                             // Entire token is whitespace — accumulate and continue measuring
-                            line_indent += str_width(text);
+                            line_indent += ws_visual_width;
                         } else {
                             // Token has non-whitespace: finalize indent measurement
-                            line_indent += leading_ws;
+                            line_indent += ws_visual_width;
                             measuring_indent = false;
                         }
                         // Clamp indent to ensure continuation lines have room for content
@@ -3827,7 +3850,7 @@ impl SplitRenderer {
         // Enable centering/margins if:
         // 1. View mode is explicitly Compose, OR
         // 2. compose_width is set (plugin-driven compose mode)
-        let should_compose = view_mode == &ViewMode::Compose || compose_width.is_some();
+        let should_compose = view_mode == &ViewMode::PageView || compose_width.is_some();
 
         if !should_compose {
             return ComposeLayout {
@@ -4024,7 +4047,7 @@ impl SplitRenderer {
 
         // Semantic tokens are stored as overlays so their ranges track edits.
         // Convert them into highlight spans for the render pipeline.
-        let is_compose = matches!(view_mode, ViewMode::Compose);
+        let is_compose = matches!(view_mode, ViewMode::PageView);
         let md_emphasis_ns =
             fresh_core::overlay::OverlayNamespace::from_string("md-emphasis".to_string());
         let mut semantic_token_spans = Vec::new();
@@ -4242,9 +4265,9 @@ impl SplitRenderer {
             // Scan forward for \n within [lo..hi] to find subsequent line starts
             let rel_lo = lo - viewport_start;
             let rel_hi = (hi - viewport_start).min(bytes.len());
-            for i in rel_lo..rel_hi {
-                if bytes[i] == b'\n' {
-                    let next_line_start = viewport_start + i + 1;
+            for (i, &byte) in bytes[rel_lo..rel_hi].iter().enumerate() {
+                if byte == b'\n' {
+                    let next_line_start = viewport_start + rel_lo + i + 1;
                     if next_line_start < viewport_end {
                         indicators
                             .entry(next_line_start)
@@ -4318,6 +4341,7 @@ impl SplitRenderer {
             software_cursor_only,
             show_line_numbers,
             byte_offset_mode,
+            show_tilde,
         } = input;
 
         let selection_ranges = &selection.ranges;
@@ -5378,15 +5402,17 @@ impl SplitRenderer {
         // modifier can bleed through to overlays (like menus) rendered on top of these
         // lines due to how terminal escape sequences are output.
         // See: https://github.com/sinelaw/fresh/issues/458
-        let eof_fg = dim_color_for_tilde(theme.line_number_fg);
-        let eof_style = Style::default().fg(eof_fg);
-        while lines.len() < render_area.height as usize {
-            // Show tilde with dim styling, padded with spaces to fill the line
-            let tilde_line = format!(
-                "~{}",
-                " ".repeat(render_area.width.saturating_sub(1) as usize)
-            );
-            lines.push(Line::styled(tilde_line, eof_style));
+        if show_tilde {
+            let eof_fg = dim_color_for_tilde(theme.line_number_fg);
+            let eof_style = Style::default().fg(eof_fg);
+            while lines.len() < render_area.height as usize {
+                // Show tilde with dim styling, padded with spaces to fill the line
+                let tilde_line = format!(
+                    "~{}",
+                    " ".repeat(render_area.width.saturating_sub(1) as usize)
+                );
+                lines.push(Line::styled(tilde_line, eof_style));
+            }
         }
 
         LineRenderOutput {
@@ -5455,6 +5481,7 @@ impl SplitRenderer {
         software_cursor_only: bool,
         show_line_numbers: bool,
         diagnostics_inline_text: bool,
+        show_tilde: bool,
     ) -> BufferLayoutOutput {
         let _span = tracing::trace_span!("compute_buffer_layout").entered();
 
@@ -5675,6 +5702,7 @@ impl SplitRenderer {
             software_cursor_only,
             show_line_numbers,
             byte_offset_mode,
+            show_tilde,
         });
 
         let view_line_mappings = render_output.view_line_mappings.clone();
@@ -5870,6 +5898,7 @@ impl SplitRenderer {
         rulers: &[usize],
         show_line_numbers: bool,
         diagnostics_inline_text: bool,
+        show_tilde: bool,
     ) -> Vec<ViewLineMapping> {
         let layout_output = Self::compute_buffer_layout(
             state,
@@ -5891,6 +5920,7 @@ impl SplitRenderer {
             software_cursor_only,
             show_line_numbers,
             diagnostics_inline_text,
+            show_tilde,
         );
 
         let view_line_mappings = layout_output.view_line_mappings.clone();
@@ -6289,6 +6319,7 @@ mod tests {
             software_cursor_only: false,
             show_line_numbers: true, // Tests show line numbers
             byte_offset_mode: false, // Tests use exact line numbers
+            show_tilde: true,
         });
 
         (

@@ -56,31 +56,35 @@ pub fn editor_tick(
 ) -> AnyhowResult<bool> {
     let mut needs_render = false;
 
-    if {
+    let async_messages = {
         let _s = tracing::info_span!("process_async_messages").entered();
         editor.process_async_messages()
-    } {
+    };
+    if async_messages {
         needs_render = true;
     }
-    if {
+    let pending_file_opens = {
         let _s = tracing::info_span!("process_pending_file_opens").entered();
         editor.process_pending_file_opens()
-    } {
+    };
+    if pending_file_opens {
         needs_render = true;
     }
     if editor.process_line_scan() {
         needs_render = true;
     }
-    if {
+    let search_scan = {
         let _s = tracing::info_span!("process_search_scan").entered();
         editor.process_search_scan()
-    } {
+    };
+    if search_scan {
         needs_render = true;
     }
-    if {
+    let search_overlay_refresh = {
         let _s = tracing::info_span!("check_search_overlay_refresh").entered();
         editor.check_search_overlay_refresh()
-    } {
+    };
+    if search_overlay_refresh {
         needs_render = true;
     }
     if editor.check_mouse_hover_timer() {
@@ -173,7 +177,7 @@ use crate::services::plugins::PluginManager;
 use crate::services::recovery::{RecoveryConfig, RecoveryService};
 use crate::services::time_source::{RealTimeSource, SharedTimeSource};
 use crate::state::EditorState;
-use crate::types::LspServerConfig;
+use crate::types::{LspLanguageConfig, LspServerConfig, ProcessLimits};
 use crate::view::file_tree::{FileTree, FileTreeView};
 use crate::view::prompt::{Prompt, PromptType};
 use crate::view::scroll_sync::ScrollSyncManager;
@@ -208,11 +212,7 @@ pub use crate::model::event::BufferId;
 
 /// Helper function to convert lsp_types::Uri to PathBuf
 fn uri_to_path(uri: &lsp_types::Uri) -> Result<PathBuf, String> {
-    // Convert to url::Url for path conversion
-    url::Url::parse(uri.as_str())
-        .map_err(|e| format!("Failed to parse URI: {}", e))?
-        .to_file_path()
-        .map_err(|_| "URI is not a file path".to_string())
+    fresh_core::file_uri::lsp_uri_to_path(uri).ok_or_else(|| "URI is not a file path".to_string())
 }
 
 /// A pending grammar registration waiting for reload_grammars() to apply
@@ -292,6 +292,11 @@ pub struct Editor {
     /// Whether a background grammar build is in progress.
     /// When true, `flush_pending_grammars()` defers work until the build completes.
     grammar_build_in_progress: bool,
+
+    /// Whether the initial full grammar build (user grammars + language packs)
+    /// still needs to happen. Deferred from construction so that plugin-registered
+    /// grammars from the first event-loop tick are included in a single build.
+    needs_full_grammar_build: bool,
 
     /// Cancellation flag for the current streaming grep search.
     streaming_grep_cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -449,6 +454,9 @@ pub struct Editor {
     /// Whether status bar is visible
     status_bar_visible: bool,
 
+    /// Whether prompt line is visible (when no prompt is active)
+    prompt_line_visible: bool,
+
     /// Whether mouse capture is enabled
     mouse_enabled: bool,
 
@@ -484,8 +492,8 @@ pub struct Editor {
     /// Next LSP request ID
     next_lsp_request_id: u64,
 
-    /// Pending LSP completion request ID (if any)
-    pending_completion_request: Option<u64>,
+    /// Pending LSP completion request IDs (supports multiple servers)
+    pending_completion_requests: HashSet<u64>,
 
     /// Original LSP completion items (for type-to-filter)
     /// Stored when completion popup is shown, used for re-filtering as user types
@@ -512,6 +520,10 @@ pub struct Editor {
 
     /// Pending LSP code actions request ID (if any)
     pending_code_actions_request: Option<u64>,
+
+    /// Stored code actions from the most recent LSP response, used when the
+    /// user selects an action from the code-action popup.
+    pending_code_actions: Option<Vec<lsp_types::CodeActionOrCommand>>,
 
     /// Pending LSP inlay hints request ID (if any)
     pending_inlay_hints_request: Option<u64>,
@@ -632,9 +644,9 @@ pub struct Editor {
     /// LSP progress tracking (token -> progress info)
     lsp_progress: std::collections::HashMap<String, LspProgressInfo>,
 
-    /// LSP server statuses (language -> status)
+    /// LSP server statuses ((language, server_name) -> status)
     lsp_server_statuses:
-        std::collections::HashMap<String, crate::services::async_bridge::LspServerStatus>,
+        std::collections::HashMap<(String, String), crate::services::async_bridge::LspServerStatus>,
 
     /// LSP window messages (recent messages from window/showMessage)
     lsp_window_messages: Vec<LspMessageEntry>,
@@ -650,8 +662,9 @@ pub struct Editor {
     /// When set, diagnostics will be re-pulled when this instant is reached
     scheduled_diagnostic_pull: Option<(BufferId, Instant)>,
 
-    /// Stored LSP diagnostics per URI (push model - publishDiagnostics from flycheck/cargo)
-    stored_push_diagnostics: HashMap<String, Vec<lsp_types::Diagnostic>>,
+    /// Stored LSP diagnostics per URI, per server (push model - publishDiagnostics)
+    /// Outer key: URI string, Inner key: server name
+    stored_push_diagnostics: HashMap<String, HashMap<String, Vec<lsp_types::Diagnostic>>>,
 
     /// Stored LSP diagnostics per URI (pull model - native RA diagnostics)
     stored_pull_diagnostics: HashMap<String, Vec<lsp_types::Diagnostic>>,
@@ -981,8 +994,14 @@ impl Editor {
         color_capability: crate::view::color_support::ColorCapability,
         filesystem: Arc<dyn FileSystem + Send + Sync>,
     ) -> AnyhowResult<Self> {
+        tracing::info!("Building default grammar registry...");
+        let start = std::time::Instant::now();
         let grammar_registry = crate::primitives::grammar::GrammarRegistry::defaults_only();
-        let mut editor = Self::with_options(
+        tracing::info!("Default grammar registry built in {:?}", start.elapsed());
+        // Don't start background grammar build here — it's deferred to the
+        // first flush_pending_grammars() call so that plugin-registered grammars
+        // from the first event-loop tick are included in a single build.
+        Self::with_options(
             config,
             width,
             height,
@@ -993,9 +1012,7 @@ impl Editor {
             None,
             color_capability,
             grammar_registry,
-        )?;
-        editor.start_background_grammar_build();
-        Ok(editor)
+        )
     }
 
     /// Create a new editor for testing with custom backends
@@ -1016,7 +1033,7 @@ impl Editor {
     ) -> AnyhowResult<Self> {
         let grammar_registry =
             grammar_registry.unwrap_or_else(crate::primitives::grammar::GrammarRegistry::empty);
-        Self::with_options(
+        let mut editor = Self::with_options(
             config,
             width,
             height,
@@ -1027,7 +1044,11 @@ impl Editor {
             time_source,
             color_capability,
             grammar_registry,
-        )
+        )?;
+        // Tests typically have no async_bridge, so the deferred grammar build
+        // would just drain pending_grammars and early-return. Skip it entirely.
+        editor.needs_full_grammar_build = false;
+        Ok(editor)
     }
 
     /// Create a new editor with custom options
@@ -1059,8 +1080,32 @@ impl Editor {
         let working_dir = working_dir.canonicalize().unwrap_or(working_dir);
 
         // Load all themes into registry
+        tracing::info!("Loading themes...");
         let theme_loader = crate::view::theme::ThemeLoader::new(dir_context.themes_dir());
-        let theme_registry = theme_loader.load_all();
+        // Scan installed packages (language packs + bundles) before plugin loading.
+        // This replaces the JS loadInstalledPackages() — configs, grammars, plugin dirs,
+        // and theme dirs are all collected here and applied synchronously.
+        let scan_result =
+            crate::services::packages::scan_installed_packages(&dir_context.config_dir);
+
+        // Apply package language configs (user config takes priority via or_insert)
+        for (lang_id, lang_config) in &scan_result.language_configs {
+            config
+                .languages
+                .entry(lang_id.clone())
+                .or_insert_with(|| lang_config.clone());
+        }
+
+        // Apply package LSP configs (user config takes priority via or_insert)
+        for (lang_id, lsp_config) in &scan_result.lsp_configs {
+            config
+                .lsp
+                .entry(lang_id.clone())
+                .or_insert_with(|| LspLanguageConfig::Multi(vec![lsp_config.clone()]));
+        }
+
+        let theme_registry = theme_loader.load_all(&scan_result.bundle_theme_dirs);
+        tracing::info!("Themes loaded");
 
         // Get active theme from registry, falling back to default if not found
         let theme = theme_registry.get_cloned(&config.theme).unwrap_or_else(|| {
@@ -1137,8 +1182,25 @@ impl Editor {
         }
 
         // Configure LSP servers from config
-        for (language, lsp_config) in &config.lsp {
-            lsp.set_language_config(language.clone(), lsp_config.clone());
+        for (language, lsp_configs) in &config.lsp {
+            lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
+        }
+
+        // Auto-detect Deno projects: if deno.json or deno.jsonc exists in the
+        // workspace root, override JS/TS LSP to use `deno lsp` (#1191)
+        if working_dir.join("deno.json").exists() || working_dir.join("deno.jsonc").exists() {
+            tracing::info!("Detected Deno project (deno.json found), using deno lsp for JS/TS");
+            let deno_config = LspServerConfig {
+                command: "deno".to_string(),
+                args: vec!["lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: Some(serde_json::json!({"enable": true})),
+                ..Default::default()
+            };
+            lsp.set_language_config("javascript".to_string(), deno_config.clone());
+            lsp.set_language_config("typescript".to_string(), deno_config);
         }
 
         // Initialize split manager with the initial buffer
@@ -1152,6 +1214,7 @@ impl Editor {
             config.editor.line_numbers,
             config.editor.line_wrap,
             config.editor.wrap_indent,
+            config.editor.wrap_column,
             config.editor.rulers.clone(),
         );
         split_view_states.insert(initial_split_id, initial_view_state);
@@ -1252,6 +1315,12 @@ impl Editor {
                 }
             }
 
+            // Add bundle plugin directories from package scan
+            for dir in &scan_result.bundle_plugin_dirs {
+                tracing::info!("Found bundle plugin directory: {:?}", dir);
+                plugin_dirs.push(dir.clone());
+            }
+
             if plugin_dirs.is_empty() {
                 tracing::debug!(
                     "No plugins directory found next to executable or in working dir: {:?}",
@@ -1293,6 +1362,7 @@ impl Editor {
         let show_menu_bar = config.editor.show_menu_bar;
         let show_tab_bar = config.editor.show_tab_bar;
         let show_status_bar = config.editor.show_status_bar;
+        let show_prompt_line = config.editor.show_prompt_line;
 
         // Start periodic update checker if enabled (also sends daily telemetry)
         let update_checker = if check_for_updates {
@@ -1320,9 +1390,18 @@ impl Editor {
             user_config_raw,
             dir_context: dir_context.clone(),
             grammar_registry,
-            pending_grammars: Vec::new(),
+            pending_grammars: scan_result
+                .additional_grammars
+                .iter()
+                .map(|g| PendingGrammar {
+                    language: g.language.clone(),
+                    grammar_path: g.path.to_string_lossy().to_string(),
+                    extensions: g.extensions.clone(),
+                })
+                .collect(),
             grammar_reload_pending: false,
             grammar_build_in_progress: false,
+            needs_full_grammar_build: true,
             streaming_grep_cancellation: None,
             pending_grammar_callbacks: Vec::new(),
             theme,
@@ -1372,6 +1451,7 @@ impl Editor {
             menu_bar_auto_shown: false,
             tab_bar_visible: show_tab_bar,
             status_bar_visible: show_status_bar,
+            prompt_line_visible: show_prompt_line,
             mouse_enabled: true,
             same_buffer_scroll_sync: false,
             mouse_cursor_position: None,
@@ -1383,7 +1463,7 @@ impl Editor {
             position_history: PositionHistory::new(),
             in_navigation: false,
             next_lsp_request_id: 0,
-            pending_completion_request: None,
+            pending_completion_requests: HashSet::new(),
             completion_items: None,
             scheduled_completion_trigger: None,
             pending_goto_definition_request: None,
@@ -1392,6 +1472,7 @@ impl Editor {
             pending_references_symbol: String::new(),
             pending_signature_help_request: None,
             pending_code_actions_request: None,
+            pending_code_actions: None,
             pending_inlay_hints_request: None,
             pending_folding_range_requests: HashMap::new(),
             folding_ranges_in_flight: HashMap::new(),
@@ -1552,24 +1633,42 @@ impl Editor {
     }
 
     /// Spawn a background thread to build the full grammar registry
-    /// (embedded grammars, user grammars, and language packs).
-    /// Called by production entry points after construction; tests skip this
-    /// since they provide their own registry and don't need the expensive build.
-    fn start_background_grammar_build(&mut self) {
+    /// (embedded grammars, user grammars, language packs, and any plugin-registered grammars).
+    /// Called on the first event-loop tick (via `flush_pending_grammars`) so that
+    /// plugin grammars registered during init are included in a single build.
+    fn start_background_grammar_build(
+        &mut self,
+        additional: Vec<crate::primitives::grammar::GrammarSpec>,
+        callback_ids: Vec<fresh_core::api::JsCallbackId>,
+    ) {
         let Some(bridge) = &self.async_bridge else {
             return;
         };
         self.grammar_build_in_progress = true;
         let sender = bridge.sender();
         let config_dir = self.dir_context.config_dir.clone();
+        tracing::info!(
+            "Spawning background grammar build thread ({} plugin grammars)...",
+            additional.len()
+        );
         std::thread::Builder::new()
             .name("grammar-build".to_string())
             .spawn(move || {
-                let registry = crate::primitives::grammar::GrammarRegistry::for_editor(config_dir);
+                tracing::info!("[grammar-build] Thread started");
+                let start = std::time::Instant::now();
+                let registry = if additional.is_empty() {
+                    crate::primitives::grammar::GrammarRegistry::for_editor(config_dir)
+                } else {
+                    crate::primitives::grammar::GrammarRegistry::for_editor_with_additional(
+                        config_dir,
+                        &additional,
+                    )
+                };
+                tracing::info!("[grammar-build] Complete in {:?}", start.elapsed());
                 drop(sender.send(
                     crate::services::async_bridge::AsyncMessage::GrammarRegistryBuilt {
                         registry,
-                        callback_ids: Vec::new(),
+                        callback_ids,
                     },
                 ));
             })
@@ -1729,13 +1828,12 @@ impl Editor {
             .collect()
     }
 
-    /// Check if LSP server for a given language is running (ready)
+    /// Check if any LSP server for a given language is running (ready)
     pub fn is_lsp_server_ready(&self, language: &str) -> bool {
         use crate::services::async_bridge::LspServerStatus;
-        self.lsp_server_statuses
-            .get(language)
-            .map(|status| matches!(status, LspServerStatus::Running))
-            .unwrap_or(false)
+        self.lsp_server_statuses.iter().any(|((lang, _), status)| {
+            lang == language && matches!(status, LspServerStatus::Running)
+        })
     }
 
     /// Get the LSP status string (displayed in status bar)
@@ -1786,9 +1884,9 @@ impl Editor {
     }
 
     /// Configure LSP server for a specific language
-    pub fn set_lsp_config(&mut self, language: String, config: LspServerConfig) {
+    pub fn set_lsp_config(&mut self, language: String, config: Vec<LspServerConfig>) {
         if let Some(ref mut lsp) = self.lsp {
-            lsp.set_language_config(language, config);
+            lsp.set_language_configs(language, config);
         }
     }
 
@@ -1998,19 +2096,21 @@ impl Editor {
             return false;
         };
 
-        // Mark as sent before requesting (to prevent double-sending)
-        self.mouse_state.lsp_hover_request_sent = true;
-
         // Store mouse position for popup positioning
         self.mouse_hover_screen_position = Some((screen_x, screen_y));
 
-        // Request hover at the byte position
-        if let Err(e) = self.request_hover_at_position(byte_pos) {
-            tracing::debug!("Failed to request hover: {}", e);
-            return false;
+        // Request hover at the byte position — only mark as sent if dispatched
+        match self.request_hover_at_position(byte_pos) {
+            Ok(true) => {
+                self.mouse_state.lsp_hover_request_sent = true;
+                true
+            }
+            Ok(false) => false, // no server ready, timer will retry
+            Err(e) => {
+                tracing::debug!("Failed to request hover: {}", e);
+                false
+            }
         }
-
-        true
     }
 
     /// Check if semantic highlight debounce timer has expired
@@ -2058,9 +2158,11 @@ impl Editor {
         let Some(lsp) = self.lsp.as_mut() else {
             return false;
         };
-        let Some(client) = lsp.get_handle_mut(&language) else {
+        let Some(sh) = lsp.handle_for_feature_mut(&language, crate::types::LspFeature::Diagnostics)
+        else {
             return false;
         };
+        let client = &mut sh.handle;
 
         let request_id = self.next_lsp_request_id;
         self.next_lsp_request_id += 1;
@@ -2366,6 +2468,24 @@ impl Editor {
     /// - Any other cross-cutting concerns
     ///
     /// All event applications MUST go through this method to ensure consistency.
+    /// Log an event and apply it to the active buffer.
+    /// For Delete events, captures displaced marker positions before applying
+    /// so undo can restore them to their exact original positions.
+    pub fn log_and_apply_event(&mut self, event: &Event) {
+        // Capture displaced markers before the event is applied
+        if let Event::Delete { range, .. } = event {
+            let displaced = self.active_state().capture_displaced_markers(range);
+            self.active_event_log_mut().append(event.clone());
+            if !displaced.is_empty() {
+                self.active_event_log_mut()
+                    .set_displaced_markers_on_last(displaced);
+            }
+        } else {
+            self.active_event_log_mut().append(event.clone());
+        }
+        self.apply_event_to_active_buffer(event);
+    }
+
     pub fn apply_event_to_active_buffer(&mut self, event: &Event) {
         // Handle View events at Editor level - View events go to SplitViewState, not EditorState
         // This properly separates Buffer state from View state
@@ -2450,7 +2570,22 @@ impl Editor {
         self.trigger_plugin_hooks_for_event(event, line_info);
 
         // 4. Notify LSP of the change using pre-calculated positions
-        self.send_lsp_changes_for_buffer(self.active_buffer(), lsp_changes);
+        // For BulkEdit events (undo/redo of code actions, renames, etc.),
+        // collect_lsp_changes returns empty because there are no incremental byte
+        // positions to convert — BulkEdit restores a tree snapshot.  Send a
+        // full-document replacement so the LSP server stays in sync.
+        if lsp_changes.is_empty() && event.modifies_buffer() {
+            if let Some(full_text) = self.active_state().buffer.to_string() {
+                let full_change = vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: full_text,
+                }];
+                self.send_lsp_changes_for_buffer(self.active_buffer(), full_change);
+            }
+        } else {
+            self.send_lsp_changes_for_buffer(self.active_buffer(), lsp_changes);
+        }
     }
 
     /// Apply multiple Insert/Delete events efficiently using bulk edit optimization.
@@ -2530,8 +2665,56 @@ impl Editor {
             .map(|(pos, del, text)| (*pos, *del, text.as_str()))
             .collect();
 
+        // Snapshot displaced markers before edits so undo can restore them exactly.
+        let displaced_markers = state.capture_displaced_markers_bulk(&edits);
+
         // Apply bulk edits
         let _delta = state.buffer.apply_bulk_edits(&edit_refs);
+
+        // Convert edit list to lengths-only for marker replay.
+        // Merge edits at the same position into a single (pos, del_len, ins_len)
+        // tuple. This is necessary because delete+insert at the same position
+        // (e.g., line move: delete block, insert rearranged block) should be
+        // treated as a replacement, not two independent adjustments.
+        let edit_lengths: Vec<(usize, usize, usize)> = {
+            let mut lengths: Vec<(usize, usize, usize)> = Vec::new();
+            for (pos, del_len, text) in &edits {
+                if let Some(last) = lengths.last_mut() {
+                    if last.0 == *pos {
+                        // Same position: merge del and ins lengths
+                        last.1 += del_len;
+                        last.2 += text.len();
+                        continue;
+                    }
+                }
+                lengths.push((*pos, *del_len, text.len()));
+            }
+            lengths
+        };
+
+        // Adjust markers and margins using the merged edit lengths.
+        // Using merged edits (net delta for same-position replacements) avoids
+        // the marker-at-boundary problem where sequential delete+insert at the
+        // same position pushes markers incorrectly.
+        for &(pos, del_len, ins_len) in &edit_lengths {
+            if del_len > 0 && ins_len > 0 {
+                // Replacement: adjust by net delta only
+                if ins_len > del_len {
+                    state.marker_list.adjust_for_insert(pos, ins_len - del_len);
+                    state.margins.adjust_for_insert(pos, ins_len - del_len);
+                } else if del_len > ins_len {
+                    state.marker_list.adjust_for_delete(pos, del_len - ins_len);
+                    state.margins.adjust_for_delete(pos, del_len - ins_len);
+                }
+                // Equal: net delta 0, no adjustment needed
+            } else if del_len > 0 {
+                state.marker_list.adjust_for_delete(pos, del_len);
+                state.margins.adjust_for_delete(pos, del_len);
+            } else if ins_len > 0 {
+                state.marker_list.adjust_for_insert(pos, ins_len);
+                state.margins.adjust_for_insert(pos, ins_len);
+            }
+        }
 
         // Snapshot buffer state after edits (for redo)
         let new_snapshot = state.buffer.snapshot_buffer_state();
@@ -2677,6 +2860,8 @@ impl Editor {
             old_cursors,
             new_cursors,
             description,
+            edits: edit_lengths,
+            displaced_markers,
         };
 
         // Post-processing (layout invalidation, split cursor sync, etc.)
@@ -4352,40 +4537,28 @@ impl Editor {
 
         for message in messages {
             match message {
-                AsyncMessage::LspDiagnostics { uri, diagnostics } => {
-                    self.handle_lsp_diagnostics(uri, diagnostics);
+                AsyncMessage::LspDiagnostics {
+                    uri,
+                    diagnostics,
+                    server_name,
+                } => {
+                    self.handle_lsp_diagnostics(uri, diagnostics, server_name);
                 }
                 AsyncMessage::LspInitialized {
                     language,
-                    completion_trigger_characters,
-                    semantic_tokens_legend,
-                    semantic_tokens_full,
-                    semantic_tokens_full_delta,
-                    semantic_tokens_range,
-                    folding_ranges_supported,
+                    server_name,
+                    capabilities,
                 } => {
-                    tracing::info!("LSP server initialized for language: {}", language);
-                    tracing::debug!(
-                        "LSP completion trigger characters for {}: {:?}",
-                        language,
-                        completion_trigger_characters
+                    tracing::info!(
+                        "LSP server '{}' initialized for language: {}",
+                        server_name,
+                        language
                     );
                     self.status_message = Some(format!("LSP ({}) ready", language));
 
-                    // Store completion trigger characters
+                    // Store capabilities on the specific server handle
                     if let Some(lsp) = &mut self.lsp {
-                        lsp.set_completion_trigger_characters(
-                            &language,
-                            completion_trigger_characters,
-                        );
-                        lsp.set_semantic_tokens_capabilities(
-                            &language,
-                            semantic_tokens_legend,
-                            semantic_tokens_full,
-                            semantic_tokens_full_delta,
-                            semantic_tokens_range,
-                        );
-                        lsp.set_folding_ranges_supported(&language, folding_ranges_supported);
+                        lsp.set_server_capabilities(&language, &server_name, capabilities);
                     }
 
                     // Send didOpen for all open buffers of this language
@@ -4406,6 +4579,7 @@ impl Editor {
                         .config
                         .lsp
                         .get(&language)
+                        .and_then(|configs| configs.as_slice().first())
                         .map(|c| c.command.clone())
                         .unwrap_or_else(|| "unknown".to_string());
 
@@ -4674,10 +4848,11 @@ impl Editor {
                 }
                 AsyncMessage::LspStatusUpdate {
                     language,
+                    server_name,
                     status,
                     message: _,
                 } => {
-                    self.handle_lsp_status_update(language, status);
+                    self.handle_lsp_status_update(language, server_name, status);
                 }
                 AsyncMessage::FileOpenDirectoryLoaded(result) => {
                     self.handle_file_open_directory_loaded(result);
@@ -4934,10 +5109,10 @@ impl Editor {
         use crate::services::async_bridge::LspServerStatus;
 
         // Collect all server statuses
-        let mut statuses: Vec<(String, LspServerStatus)> = self
+        let mut statuses: Vec<((String, String), LspServerStatus)> = self
             .lsp_server_statuses
             .iter()
-            .map(|(lang, status)| (lang.clone(), *status))
+            .map(|((lang, name), status)| ((lang.clone(), name.clone()), *status))
             .collect();
 
         if statuses.is_empty() {
@@ -4945,13 +5120,20 @@ impl Editor {
             return;
         }
 
-        // Sort by language name for consistent display
+        // Sort by language then server name for consistent display
         statuses.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Group by language to decide display format
+        let mut lang_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for ((lang, _), _) in &statuses {
+            *lang_counts.entry(lang.as_str()).or_default() += 1;
+        }
 
         // Build status string
         let status_parts: Vec<String> = statuses
             .iter()
-            .map(|(lang, status)| {
+            .map(|((lang, name), status)| {
                 let status_str = match status {
                     LspServerStatus::Starting => "starting",
                     LspServerStatus::Initializing => "initializing",
@@ -4959,7 +5141,12 @@ impl Editor {
                     LspServerStatus::Error => "error",
                     LspServerStatus::Shutdown => "shutdown",
                 };
-                format!("{}: {}", lang, status_str)
+                // Show server name when multiple servers exist for a language
+                if lang_counts.get(lang.as_str()).copied().unwrap_or(0) > 1 {
+                    format!("{}/{}: {}", lang, name, status_str)
+                } else {
+                    format!("{}: {}", lang, status_str)
+                }
             })
             .collect();
 
@@ -5002,7 +5189,7 @@ impl Editor {
                     .and_then(|vs| vs.buffer_state(*buffer_id))
                     .map(|bs| match bs.view_mode {
                         crate::state::ViewMode::Source => "source",
-                        crate::state::ViewMode::Compose => "compose",
+                        crate::state::ViewMode::PageView => "compose",
                     })
                     .unwrap_or("source");
                 let compose_width = active_vs
@@ -5010,7 +5197,7 @@ impl Editor {
                     .and_then(|bs| bs.compose_width);
                 let is_composing_in_any_split = self.split_view_states.values().any(|vs| {
                     vs.buffer_state(*buffer_id)
-                        .map(|bs| matches!(bs.view_mode, crate::state::ViewMode::Compose))
+                        .map(|bs| matches!(bs.view_mode, crate::state::ViewMode::PageView))
                         .unwrap_or(false)
                 });
                 let buffer_info = BufferInfo {
@@ -5031,7 +5218,6 @@ impl Editor {
                     BufferSavedDiff {
                         equal: diff.equal,
                         byte_ranges: diff.byte_ranges.clone(),
-                        line_ranges: diff.line_ranges.clone(),
                     }
                 };
                 snapshot.buffer_saved_diffs.insert(*buffer_id, diff);
@@ -6042,8 +6228,10 @@ impl Editor {
                         );
                         view_state.apply_config_defaults(
                             self.config.editor.line_numbers,
-                            line_wrap.unwrap_or(self.config.editor.line_wrap),
+                            line_wrap
+                                .unwrap_or_else(|| self.resolve_line_wrap_for_buffer(buffer_id)),
                             self.config.editor.wrap_indent,
+                            self.resolve_wrap_column_for_buffer(buffer_id),
                             self.config.editor.rulers.clone(),
                         );
                         // Override with plugin-requested show_line_numbers
@@ -6310,9 +6498,11 @@ impl Editor {
                 }
 
                 // 2. Update the config to disable the language
-                if let Some(lsp_config) = self.config.lsp.get_mut(&language) {
-                    lsp_config.enabled = false;
-                    lsp_config.auto_start = false;
+                if let Some(lsp_configs) = self.config.lsp.get_mut(&language) {
+                    for c in lsp_configs.as_mut_slice() {
+                        c.enabled = false;
+                        c.auto_start = false;
+                    }
                     tracing::info!("Disabled LSP config for {}", language);
                 }
 
@@ -6334,8 +6524,12 @@ impl Editor {
             PluginCommand::RestartLspForLanguage { language } => {
                 tracing::info!("Plugin restarting LSP for language: {}", language);
 
+                let file_path = self
+                    .buffer_metadata
+                    .get(&self.active_buffer())
+                    .and_then(|meta| meta.file_path().cloned());
                 let success = if let Some(ref mut lsp) = self.lsp {
-                    let (ok, msg) = lsp.manual_restart(&language);
+                    let (ok, msg) = lsp.manual_restart(&language, file_path.as_deref());
                     self.status_message = Some(msg);
                     ok
                 } else {
@@ -6559,6 +6753,7 @@ impl Editor {
                                         self.config.editor.line_numbers,
                                         false,
                                         false,
+                                        None,
                                         self.config.editor.rulers.clone(),
                                     );
                                     self.split_view_states.insert(new_split_id, view_state);

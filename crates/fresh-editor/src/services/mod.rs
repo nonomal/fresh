@@ -5,11 +5,13 @@
 
 pub mod async_bridge;
 pub mod clipboard;
+pub mod counters;
 pub mod fs;
 #[cfg(target_os = "linux")]
 pub mod gpm;
 pub mod log_dirs;
 pub mod lsp;
+pub mod packages;
 pub mod plugins;
 pub mod process_limits;
 pub mod recovery;

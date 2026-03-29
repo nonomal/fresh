@@ -573,7 +573,7 @@ impl Editor {
         tracing::debug!("Using URI from metadata: {}", uri.as_str());
         tracing::debug!("Attempting to spawn LSP client for language: {}", language);
 
-        match lsp.try_spawn(&language) {
+        match lsp.try_spawn(&language, Some(path)) {
             LspSpawnResult::Spawned => {
                 if let Some(client) = lsp.get_handle_mut(&language) {
                     // Send didOpen
@@ -686,7 +686,7 @@ impl Editor {
             let Some(lsp) = self.lsp.as_mut() else {
                 return;
             };
-            lsp.try_spawn(&language)
+            lsp.try_spawn(&language, Some(path))
         };
 
         // Only proceed if spawned successfully (or already running)
@@ -737,16 +737,19 @@ impl Editor {
             }
         }
 
-        // Use full document sync - send the entire new content
+        // Use full document sync - broadcast to all handles
         if let Some(lsp) = &mut self.lsp {
-            if let Some(client) = lsp.get_handle_mut(&language) {
-                let content_change = TextDocumentContentChangeEvent {
-                    range: None, // None means full document replacement
-                    range_length: None,
-                    text: content,
-                };
-                if let Err(e) = client.did_change(lsp_uri, vec![content_change]) {
-                    tracing::warn!("Failed to notify LSP of file change: {}", e);
+            let content_change = TextDocumentContentChangeEvent {
+                range: None, // None means full document replacement
+                range_length: None,
+                text: content,
+            };
+            for sh in lsp.get_handles_mut(&language) {
+                if let Err(e) = sh
+                    .handle
+                    .did_change(lsp_uri.clone(), vec![content_change.clone()])
+                {
+                    tracing::warn!("Failed to notify LSP '{}' of file change: {}", sh.name, e);
                 }
             }
         }

@@ -971,17 +971,6 @@ async fn plugin_thread_loop(
     }
 }
 
-/// Execute an action while processing incoming hook requests concurrently.
-///
-/// This prevents deadlock when an action awaits a response from the main thread
-/// while the main thread is waiting for a blocking hook to complete.
-///
-/// # Safety (clippy::await_holding_refcell_ref)
-/// The RefCell borrow held across await is safe because:
-/// - This runs on a single-threaded tokio runtime (no parallel task execution)
-/// - No spawn_local calls exist that could create concurrent access to `runtime`
-/// - The runtime Rc<RefCell<>> is never shared with other concurrent tasks
-
 /// Run a hook with Rc<RefCell<QuickJsBackend>>
 ///
 /// # Safety (clippy::await_holding_refcell_ref)
@@ -1018,6 +1007,7 @@ async fn run_hook_internal_rc(
 }
 
 /// Handle a single request in the plugin thread
+#[allow(clippy::await_holding_refcell_ref)]
 async fn handle_request(
     request: PluginRequest,
     runtime: Rc<RefCell<QuickJsBackend>>,
@@ -1199,13 +1189,128 @@ async fn handle_request(
     false
 }
 
-/// Load a plugin from a file
+/// Result of the parallel preparation phase for a single plugin.
+/// Contains everything needed to execute the plugin — no further I/O or transpilation required.
+struct PreparedPlugin {
+    name: String,
+    path: PathBuf,
+    js_code: String,
+    i18n: Option<HashMap<String, HashMap<String, String>>>,
+    dependencies: Vec<String>,
+}
+
+/// Prepare a plugin for execution: read source, transpile, extract dependencies.
 ///
-/// # Safety (clippy::await_holding_refcell_ref)
-/// The RefCell borrow held across await is safe because:
-/// - This runs on a single-threaded tokio runtime (no parallel task execution)
-/// - No spawn_local calls exist that could create concurrent access to `runtime`
-/// - The runtime Rc<RefCell<>> is never shared with other concurrent tasks
+/// This function does I/O and CPU-bound work only — no QuickJS interaction.
+/// It is safe to call from any thread (all inputs/outputs are Send).
+fn prepare_plugin(path: &Path) -> Result<PreparedPlugin> {
+    let plugin_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("Invalid plugin filename"))?
+        .to_string();
+
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("Failed to read plugin {}: {}", path.display(), e))?;
+
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("plugin.ts");
+
+    // Extract dependencies before transpilation
+    let dependencies = fresh_parser_js::extract_plugin_dependencies(&source);
+
+    // Transpile/bundle to JS (same logic as QuickJsBackend::load_module_with_source)
+    let js_code = if fresh_parser_js::has_es_imports(&source) {
+        match fresh_parser_js::bundle_module(path) {
+            Ok(bundled) => bundled,
+            Err(e) => {
+                tracing::warn!(
+                    "Plugin {} uses ES imports but bundling failed: {}. Skipping.",
+                    path.display(),
+                    e
+                );
+                return Err(anyhow!("Bundling failed for {}: {}", plugin_name, e));
+            }
+        }
+    } else if fresh_parser_js::has_es_module_syntax(&source) {
+        let stripped = fresh_parser_js::strip_imports_and_exports(&source);
+        if filename.ends_with(".ts") {
+            fresh_parser_js::transpile_typescript(&stripped, filename)?
+        } else {
+            stripped
+        }
+    } else if filename.ends_with(".ts") {
+        fresh_parser_js::transpile_typescript(&source, filename)?
+    } else {
+        source
+    };
+
+    // Load accompanying .i18n.json file
+    let i18n_path = path.with_extension("i18n.json");
+    let i18n = if i18n_path.exists() {
+        std::fs::read_to_string(&i18n_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+    } else {
+        None
+    };
+
+    Ok(PreparedPlugin {
+        name: plugin_name,
+        path: path.to_path_buf(),
+        js_code,
+        i18n,
+        dependencies,
+    })
+}
+
+/// Execute a pre-prepared plugin in QuickJS. This is the serial phase —
+/// must run on the plugin thread.
+fn execute_prepared_plugin(
+    runtime: &Rc<RefCell<QuickJsBackend>>,
+    plugins: &mut HashMap<String, TsPluginInfo>,
+    prepared: &PreparedPlugin,
+) -> Result<()> {
+    // Register i18n strings
+    if let Some(ref i18n) = prepared.i18n {
+        runtime
+            .borrow_mut()
+            .services
+            .register_plugin_strings(&prepared.name, i18n.clone());
+        tracing::debug!("Loaded i18n strings for plugin '{}'", prepared.name);
+    }
+
+    let path_str = prepared
+        .path
+        .to_str()
+        .ok_or_else(|| anyhow!("Invalid path encoding"))?;
+
+    let exec_start = std::time::Instant::now();
+    runtime
+        .borrow_mut()
+        .execute_js(&prepared.js_code, path_str)?;
+    let exec_elapsed = exec_start.elapsed();
+
+    tracing::debug!(
+        "execute_prepared_plugin: plugin '{}' executed in {:?}",
+        prepared.name,
+        exec_elapsed
+    );
+
+    plugins.insert(
+        prepared.name.clone(),
+        TsPluginInfo {
+            name: prepared.name.clone(),
+            path: prepared.path.clone(),
+            enabled: true,
+        },
+    );
+
+    Ok(())
+}
+
 #[allow(clippy::await_holding_refcell_ref)]
 async fn load_plugin_internal(
     runtime: Rc<RefCell<QuickJsBackend>>,
@@ -1382,7 +1487,8 @@ async fn load_plugins_from_dir_with_config_internal(
         }
     }
 
-    // Second pass: build discovered_plugins map and load enabled plugins
+    // Second pass: build discovered_plugins map, collect enabled plugins with paths
+    let mut enabled_plugins: Vec<(String, std::path::PathBuf)> = Vec::new();
     for (plugin_name, path) in plugin_files {
         // Check if we have an existing config for this plugin
         let config = if let Some(existing_config) = plugin_configs.get(&plugin_name) {
@@ -1399,17 +1505,8 @@ async fn load_plugins_from_dir_with_config_internal(
         // Add to discovered plugins
         discovered_plugins.insert(plugin_name.clone(), config.clone());
 
-        // Only load if enabled
         if config.enabled {
-            tracing::debug!(
-                "load_plugins_from_dir_with_config_internal: loading enabled plugin '{}'",
-                plugin_name
-            );
-            if let Err(e) = load_plugin_internal(Rc::clone(&runtime), plugins, &path).await {
-                let err = format!("Failed to load {:?}: {}", path, e);
-                tracing::error!("{}", err);
-                errors.push(err);
-            }
+            enabled_plugins.push((plugin_name, path));
         } else {
             tracing::info!(
                 "load_plugins_from_dir_with_config_internal: skipping disabled plugin '{}'",
@@ -1418,10 +1515,111 @@ async fn load_plugins_from_dir_with_config_internal(
         }
     }
 
+    // Phase 1: Parallel preparation — read files, transpile TS→JS, extract deps
+    // All I/O and CPU-bound work happens here, concurrently across threads.
+    let prep_start = std::time::Instant::now();
+    let paths: Vec<std::path::PathBuf> = enabled_plugins.iter().map(|(_, p)| p.clone()).collect();
+    let prepared_results: Vec<(String, Result<PreparedPlugin>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let result = prepare_plugin(&path);
+                    (name, result)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let prep_elapsed = prep_start.elapsed();
+
+    // Collect successful preparations and errors
+    let mut prepared_map: std::collections::HashMap<String, PreparedPlugin> =
+        std::collections::HashMap::new();
+    for (name, result) in prepared_results {
+        match result {
+            Ok(prepared) => {
+                prepared_map.insert(name, prepared);
+            }
+            Err(e) => {
+                let err = format!("Failed to prepare plugin '{}': {}", name, e);
+                tracing::error!("{}", err);
+                errors.push(err);
+            }
+        }
+    }
+
+    tracing::info!(
+        "Parallel plugin preparation completed in {:?} ({} plugins)",
+        prep_elapsed,
+        prepared_map.len()
+    );
+
+    // Build dependency map from prepared plugins
+    let mut dependency_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (name, prepared) in &prepared_map {
+        if !prepared.dependencies.is_empty() {
+            tracing::debug!(
+                "Plugin '{}' declares dependencies: {:?}",
+                name,
+                prepared.dependencies
+            );
+            dependency_map.insert(name.clone(), prepared.dependencies.clone());
+        }
+    }
+
+    // Topologically sort by dependencies
+    let plugin_names: Vec<String> = prepared_map.keys().cloned().collect();
+    let load_order = match fresh_parser_js::topological_sort_plugins(&plugin_names, &dependency_map)
+    {
+        Ok(order) => order,
+        Err(e) => {
+            let err = format!("Plugin dependency resolution failed: {}", e);
+            tracing::error!("{}", err);
+            errors.push(err);
+            // Fall back to alphabetical order
+            let mut names = plugin_names;
+            names.sort();
+            names
+        }
+    };
+
+    // Phase 2: Serial execution — run prepared JS in QuickJS (must be single-threaded)
+    let exec_start = std::time::Instant::now();
+    for plugin_name in load_order {
+        if let Some(prepared) = prepared_map.get(&plugin_name) {
+            tracing::debug!(
+                "load_plugins_from_dir_with_config_internal: executing plugin '{}'",
+                plugin_name
+            );
+            if let Err(e) = execute_prepared_plugin(&runtime, plugins, prepared) {
+                let err = format!("Failed to execute plugin '{}': {}", plugin_name, e);
+                tracing::error!("{}", err);
+                errors.push(err);
+            }
+        }
+    }
+    let exec_elapsed = exec_start.elapsed();
+
+    tracing::info!(
+        "Serial plugin execution completed in {:?} ({} plugins)",
+        exec_elapsed,
+        plugins.len()
+    );
+
     tracing::debug!(
-        "load_plugins_from_dir_with_config_internal: finished. Discovered {} plugins, {} errors",
+        "load_plugins_from_dir_with_config_internal: finished. Discovered {} plugins, {} errors (prep: {:?}, exec: {:?})",
         discovered_plugins.len(),
-        errors.len()
+        errors.len(),
+        prep_elapsed,
+        exec_elapsed
     );
 
     (errors, discovered_plugins)

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use syntect::parsing::{SyntaxSet, SyntaxSetBuilder};
 
-use super::types::{GrammarRegistry, PackageManifest};
+use super::types::{GrammarRegistry, GrammarSpec, PackageManifest};
 
 /// Trait for loading grammar files from various sources.
 ///
@@ -24,6 +24,9 @@ pub trait GrammarLoader: Send + Sync {
 
     /// Get the language packages directory path (installed via pkg manager).
     fn languages_packages_dir(&self) -> Option<PathBuf>;
+
+    /// Get the bundles packages directory path (installed bundles with grammars).
+    fn bundles_packages_dir(&self) -> Option<PathBuf>;
 
     /// Read file contents as string.
     fn read_file(&self, path: &Path) -> io::Result<String>;
@@ -68,6 +71,10 @@ impl GrammarLoader for LocalGrammarLoader {
             .map(|p| p.join("languages/packages"))
     }
 
+    fn bundles_packages_dir(&self) -> Option<PathBuf> {
+        self.config_dir.as_ref().map(|p| p.join("bundles/packages"))
+    }
+
     fn read_file(&self, path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
@@ -99,25 +106,92 @@ impl GrammarRegistry {
     /// 3. User-installed grammars from ~/.config/fresh/grammars/
     /// 4. Language pack grammars from ~/.config/fresh/languages/packages/
     pub fn load(loader: &dyn GrammarLoader) -> Self {
-        let mut user_extensions = HashMap::new();
+        Self::load_with_additional(loader, &[])
+    }
 
-        // Start with syntect defaults, convert to builder to add more
-        let defaults = SyntaxSet::load_defaults_newlines();
-        let mut builder = defaults.into_builder();
+    /// Create a fully-loaded grammar registry for the editor.
+    /// Uses LocalGrammarLoader to load grammars from the filesystem.
+    pub fn for_editor(config_dir: std::path::PathBuf) -> Arc<Self> {
+        Arc::new(Self::load(&LocalGrammarLoader::new(config_dir)))
+    }
 
-        // Add embedded grammars (TOML, etc.)
-        Self::add_embedded_grammars(&mut builder);
+    /// Create a fully-loaded grammar registry for the editor, also including
+    /// additional grammars registered by plugins.
+    ///
+    /// This performs a single build that combines filesystem grammars (user grammars,
+    /// language packs) with plugin-registered grammars, avoiding redundant rebuilds.
+    pub fn for_editor_with_additional(
+        config_dir: std::path::PathBuf,
+        additional: &[GrammarSpec],
+    ) -> Arc<Self> {
+        Arc::new(Self::load_with_additional(
+            &LocalGrammarLoader::new(config_dir),
+            additional,
+        ))
+    }
 
-        // Add user grammars from ~/.config/fresh/grammars/
-        if let Some(grammars_dir) = loader.grammars_dir() {
-            if loader.exists(&grammars_dir) {
+    /// Load grammar registry using a GrammarLoader, including additional grammars.
+    ///
+    /// Same as `load()` but includes extra grammars (from plugins) in the same
+    /// builder pass, so only one `builder.build()` call is needed.
+    pub fn load_with_additional(loader: &dyn GrammarLoader, additional: &[GrammarSpec]) -> Self {
+        // Start with built-in extra extension mappings, user grammars override these
+        let mut user_extensions = Self::build_extra_extensions();
+
+        // Check if there are any user grammars or language packs to add
+        let has_user_grammars = loader.grammars_dir().is_some_and(|dir| loader.exists(&dir));
+        let has_language_packs = loader
+            .languages_packages_dir()
+            .is_some_and(|dir| loader.exists(&dir));
+        let has_bundle_packs = loader
+            .bundles_packages_dir()
+            .is_some_and(|dir| loader.exists(&dir));
+
+        let needs_builder =
+            has_user_grammars || has_language_packs || has_bundle_packs || !additional.is_empty();
+        let mut loaded_grammar_paths = Vec::new();
+
+        let syntax_set = if !needs_builder {
+            // Fast path: no user additions or plugin grammars, use packdump directly
+            tracing::info!(
+                "[grammar-build] No user grammars, language packs, or plugin grammars — using pre-compiled packdump"
+            );
+            let ss: SyntaxSet = syntect::dumps::from_uncompressed_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/default_syntaxes.packdump"
+            )))
+            .expect("Failed to load pre-compiled syntax packdump");
+            tracing::info!(
+                "[grammar-build] Loaded {} syntaxes from packdump",
+                ss.syntaxes().len()
+            );
+            ss
+        } else {
+            // Slow path: need to add grammars, must go through builder
+            tracing::info!("[grammar-build] Loading pre-compiled packdump as builder base...");
+            let base: SyntaxSet = syntect::dumps::from_uncompressed_data(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/default_syntaxes.packdump"
+            )))
+            .expect("Failed to load pre-compiled syntax packdump");
+            tracing::info!("[grammar-build] Converting to builder...");
+            let mut builder = base.into_builder();
+
+            if has_user_grammars {
+                let grammars_dir = loader.grammars_dir().unwrap();
+                tracing::info!(
+                    "[grammar-build] Loading user grammars from {:?}...",
+                    grammars_dir
+                );
                 load_user_grammars(loader, &grammars_dir, &mut builder, &mut user_extensions);
             }
-        }
 
-        // Add language pack grammars from ~/.config/fresh/languages/packages/
-        if let Some(packages_dir) = loader.languages_packages_dir() {
-            if loader.exists(&packages_dir) {
+            if has_language_packs {
+                let packages_dir = loader.languages_packages_dir().unwrap();
+                tracing::info!(
+                    "[grammar-build] Loading language pack grammars from {:?}...",
+                    packages_dir
+                );
                 load_language_pack_grammars(
                     loader,
                     &packages_dir,
@@ -125,9 +199,63 @@ impl GrammarRegistry {
                     &mut user_extensions,
                 );
             }
-        }
 
-        let syntax_set = builder.build();
+            if has_bundle_packs {
+                let bundles_dir = loader.bundles_packages_dir().unwrap();
+                tracing::info!(
+                    "[grammar-build] Loading bundle grammars from {:?}...",
+                    bundles_dir
+                );
+                load_bundle_grammars(
+                    loader,
+                    &bundles_dir,
+                    &mut builder,
+                    &mut user_extensions,
+                    &mut loaded_grammar_paths,
+                );
+            }
+
+            // Add plugin-registered grammars in the same builder pass
+            if !additional.is_empty() {
+                tracing::info!(
+                    "[grammar-build] Adding {} plugin-registered grammars...",
+                    additional.len()
+                );
+                for spec in additional {
+                    match Self::load_grammar_file(&spec.path) {
+                        Ok(syntax) => {
+                            let scope = syntax.scope.to_string();
+                            tracing::info!(
+                                "[grammar-build] Loaded plugin grammar '{}' from {:?}",
+                                spec.language,
+                                spec.path
+                            );
+                            builder.add(syntax);
+                            for ext in &spec.extensions {
+                                user_extensions.insert(ext.clone(), scope.clone());
+                            }
+                            loaded_grammar_paths.push(spec.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[grammar-build] Failed to load plugin grammar '{}' from {:?}: {}",
+                                spec.language,
+                                spec.path,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            tracing::info!(
+                "[grammar-build] Building syntax set ({} syntaxes)...",
+                builder.syntaxes().len()
+            );
+            let ss = builder.build();
+            tracing::info!("[grammar-build] Syntax set built");
+            ss
+        };
         let filename_scopes = Self::build_filename_scopes();
 
         tracing::info!(
@@ -137,13 +265,12 @@ impl GrammarRegistry {
             filename_scopes.len()
         );
 
-        Self::new(syntax_set, user_extensions, filename_scopes)
-    }
-
-    /// Create a fully-loaded grammar registry for the editor.
-    /// Uses LocalGrammarLoader to load grammars from the filesystem.
-    pub fn for_editor(config_dir: std::path::PathBuf) -> Arc<Self> {
-        Arc::new(Self::load(&LocalGrammarLoader::new(config_dir)))
+        Self::new_with_loaded_paths(
+            syntax_set,
+            user_extensions,
+            filename_scopes,
+            loaded_grammar_paths,
+        )
     }
 
     /// Get the grammars directory path for the given config directory.
@@ -416,6 +543,123 @@ fn load_language_pack_grammars(
     }
 }
 
+/// Load grammars from bundle packages (installed via pkg manager).
+///
+/// Bundles use a `fresh.languages` array in their `package.json`, where each
+/// language entry may have a `grammar` with a `file` path. This loads all
+/// grammar files found in bundle manifests.
+fn load_bundle_grammars(
+    loader: &dyn GrammarLoader,
+    bundles_dir: &Path,
+    builder: &mut SyntaxSetBuilder,
+    user_extensions: &mut HashMap<String, String>,
+    loaded_grammar_paths: &mut Vec<GrammarSpec>,
+) {
+    let entries = match loader.read_dir(bundles_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!(
+                "Failed to read bundle packages directory {:?}: {}",
+                bundles_dir,
+                e
+            );
+            return;
+        }
+    };
+
+    for package_path in entries {
+        if !loader.is_dir(&package_path) {
+            continue;
+        }
+
+        let manifest_path = package_path.join("package.json");
+        if !loader.exists(&manifest_path) {
+            continue;
+        }
+
+        let content = match loader.read_file(&manifest_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("Failed to read {:?}: {}", manifest_path, e);
+                continue;
+            }
+        };
+
+        // Parse the manifest to find bundle language grammars
+        let manifest: crate::services::packages::PackageManifest =
+            match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!("Failed to parse {:?}: {}", manifest_path, e);
+                    continue;
+                }
+            };
+
+        let fresh = match &manifest.fresh {
+            Some(f) => f,
+            None => continue,
+        };
+
+        for lang in &fresh.languages {
+            let grammar_config = match &lang.grammar {
+                Some(g) => g,
+                None => continue,
+            };
+
+            let grammar_path = package_path.join(&grammar_config.file);
+            if !loader.exists(&grammar_path) {
+                tracing::warn!(
+                    "Bundle grammar file not found for '{}' in '{}': {:?}",
+                    lang.id,
+                    manifest.name,
+                    grammar_path
+                );
+                continue;
+            }
+
+            let content = match loader.read_file(&grammar_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to read bundle grammar {:?}: {}", grammar_path, e);
+                    continue;
+                }
+            };
+
+            match syntect::parsing::SyntaxDefinition::load_from_str(
+                &content,
+                true,
+                grammar_path.file_stem().and_then(|s| s.to_str()),
+            ) {
+                Ok(syntax) => {
+                    let scope = syntax.scope.to_string();
+                    tracing::info!(
+                        "Loaded bundle grammar '{}' from {:?} (scope: {}, extensions: {:?})",
+                        lang.id,
+                        grammar_path,
+                        scope,
+                        grammar_config.extensions
+                    );
+                    builder.add(syntax);
+
+                    for ext in &grammar_config.extensions {
+                        let ext_clean = ext.trim_start_matches('.');
+                        user_extensions.insert(ext_clean.to_string(), scope.clone());
+                    }
+
+                    loaded_grammar_paths.push(GrammarSpec {
+                        language: lang.id.clone(),
+                        path: grammar_path,
+                        extensions: grammar_config.extensions.clone(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse bundle grammar for '{}': {}", lang.id, e);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +693,10 @@ mod tests {
         }
 
         fn languages_packages_dir(&self) -> Option<PathBuf> {
+            None // Not used in current tests
+        }
+
+        fn bundles_packages_dir(&self) -> Option<PathBuf> {
             None // Not used in current tests
         }
 
@@ -526,7 +774,11 @@ mod tests {
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -563,6 +815,52 @@ mod tests {
             "script.myext should be detected as shell/bash, got: {}",
             syntax.name
         );
+    }
+
+    #[test]
+    fn test_load_delegates_to_load_with_additional() {
+        // load() should produce the same result as load_with_additional(loader, &[])
+        let loader = MockGrammarLoader::new();
+        let registry_via_load = GrammarRegistry::load(&loader);
+        let registry_via_additional = GrammarRegistry::load_with_additional(&loader, &[]);
+
+        assert_eq!(
+            registry_via_load.available_syntaxes().len(),
+            registry_via_additional.available_syntaxes().len()
+        );
+        assert_eq!(
+            registry_via_load.user_extensions().len(),
+            registry_via_additional.user_extensions().len()
+        );
+        // No additional grammars loaded, so loaded_grammar_paths should be empty
+        assert!(registry_via_additional.loaded_grammar_paths().is_empty());
+    }
+
+    #[test]
+    fn test_load_with_additional_empty_is_same_as_load() {
+        // for_editor_with_additional with empty slice should behave like for_editor
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().to_path_buf();
+        let registry = GrammarRegistry::for_editor_with_additional(config_dir, &[]);
+        assert!(!registry.available_syntaxes().is_empty());
+        assert!(registry.loaded_grammar_paths().is_empty());
+    }
+
+    #[test]
+    fn test_load_with_additional_bad_path_is_skipped() {
+        let loader = MockGrammarLoader::new();
+        let specs = vec![GrammarSpec {
+            language: "nonexistent".to_string(),
+            path: PathBuf::from("/nonexistent/grammar.sublime-syntax"),
+            extensions: vec!["nope".to_string()],
+        }];
+        let registry = GrammarRegistry::load_with_additional(&loader, &specs);
+        // Should still have built-in syntaxes
+        assert!(!registry.available_syntaxes().is_empty());
+        // The bad grammar should not be in loaded_grammar_paths
+        assert!(registry.loaded_grammar_paths().is_empty());
+        // The extension should NOT be mapped (grammar failed to load)
+        assert!(!registry.user_extensions().contains_key("nope"));
     }
 
     #[test]

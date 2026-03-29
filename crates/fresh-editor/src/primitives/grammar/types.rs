@@ -14,6 +14,20 @@ pub use crate::primitives::glob_match::{
     filename_glob_matches, is_glob_pattern, is_path_pattern, path_glob_matches,
 };
 
+/// A grammar specification: language name, path to grammar file, and associated file extensions.
+///
+/// Used to pass grammar information between the plugin layer, loader, and registry
+/// without relying on anonymous tuples.
+#[derive(Clone, Debug)]
+pub struct GrammarSpec {
+    /// Language identifier (e.g., "elixir")
+    pub language: String,
+    /// Path to the grammar file (.sublime-syntax)
+    pub path: PathBuf,
+    /// File extensions to associate with this grammar (e.g., ["ex", "exs"])
+    pub extensions: Vec<String>,
+}
+
 /// Embedded TOML grammar (syntect doesn't include one)
 pub const TOML_GRAMMAR: &str = include_str!("../../grammars/toml.sublime-syntax");
 
@@ -42,6 +56,67 @@ pub const GITATTRIBUTES_GRAMMAR: &str = include_str!("../../grammars/gitattribut
 /// Embedded Typst grammar (syntect doesn't include one)
 pub const TYPST_GRAMMAR: &str = include_str!("../../grammars/typst.sublime-syntax");
 
+/// Embedded Dockerfile grammar
+pub const DOCKERFILE_GRAMMAR: &str = include_str!("../../grammars/dockerfile.sublime-syntax");
+/// Embedded INI grammar (also handles .env, .cfg, .editorconfig, etc.)
+pub const INI_GRAMMAR: &str = include_str!("../../grammars/ini.sublime-syntax");
+/// Embedded CMake grammar
+pub const CMAKE_GRAMMAR: &str = include_str!("../../grammars/cmake.sublime-syntax");
+/// Embedded SCSS grammar
+pub const SCSS_GRAMMAR: &str = include_str!("../../grammars/scss.sublime-syntax");
+/// Embedded LESS grammar
+pub const LESS_GRAMMAR: &str = include_str!("../../grammars/less.sublime-syntax");
+/// Embedded PowerShell grammar
+pub const POWERSHELL_GRAMMAR: &str = include_str!("../../grammars/powershell.sublime-syntax");
+/// Embedded Kotlin grammar
+pub const KOTLIN_GRAMMAR: &str = include_str!("../../grammars/kotlin.sublime-syntax");
+/// Embedded Swift grammar
+pub const SWIFT_GRAMMAR: &str = include_str!("../../grammars/swift.sublime-syntax");
+/// Embedded Dart grammar
+pub const DART_GRAMMAR: &str = include_str!("../../grammars/dart.sublime-syntax");
+/// Embedded Elixir grammar
+pub const ELIXIR_GRAMMAR: &str = include_str!("../../grammars/elixir.sublime-syntax");
+/// Embedded F# grammar
+pub const FSHARP_GRAMMAR: &str = include_str!("../../grammars/fsharp.sublime-syntax");
+/// Embedded Nix grammar
+pub const NIX_GRAMMAR: &str = include_str!("../../grammars/nix.sublime-syntax");
+/// Embedded HCL/Terraform grammar
+pub const HCL_GRAMMAR: &str = include_str!("../../grammars/hcl.sublime-syntax");
+/// Embedded Protocol Buffers grammar
+pub const PROTOBUF_GRAMMAR: &str = include_str!("../../grammars/protobuf.sublime-syntax");
+/// Embedded GraphQL grammar
+pub const GRAPHQL_GRAMMAR: &str = include_str!("../../grammars/graphql.sublime-syntax");
+/// Embedded Julia grammar
+pub const JULIA_GRAMMAR: &str = include_str!("../../grammars/julia.sublime-syntax");
+/// Embedded Nim grammar
+pub const NIM_GRAMMAR: &str = include_str!("../../grammars/nim.sublime-syntax");
+/// Embedded Gleam grammar
+pub const GLEAM_GRAMMAR: &str = include_str!("../../grammars/gleam.sublime-syntax");
+/// Embedded V language grammar
+pub const VLANG_GRAMMAR: &str = include_str!("../../grammars/vlang.sublime-syntax");
+/// Embedded Solidity grammar
+pub const SOLIDITY_GRAMMAR: &str = include_str!("../../grammars/solidity.sublime-syntax");
+/// Embedded KDL grammar
+pub const KDL_GRAMMAR: &str = include_str!("../../grammars/kdl.sublime-syntax");
+/// Embedded Nushell grammar
+pub const NUSHELL_GRAMMAR: &str = include_str!("../../grammars/nushell.sublime-syntax");
+/// Embedded Starlark/Bazel grammar
+pub const STARLARK_GRAMMAR: &str = include_str!("../../grammars/starlark.sublime-syntax");
+/// Embedded Justfile grammar
+pub const JUSTFILE_GRAMMAR: &str = include_str!("../../grammars/justfile.sublime-syntax");
+/// Embedded Earthfile grammar
+pub const EARTHFILE_GRAMMAR: &str = include_str!("../../grammars/earthfile.sublime-syntax");
+/// Embedded Go Module grammar
+pub const GOMOD_GRAMMAR: &str = include_str!("../../grammars/gomod.sublime-syntax");
+/// Embedded Vue grammar
+pub const VUE_GRAMMAR: &str = include_str!("../../grammars/vue.sublime-syntax");
+/// Embedded Svelte grammar
+pub const SVELTE_GRAMMAR: &str = include_str!("../../grammars/svelte.sublime-syntax");
+/// Embedded Astro grammar
+pub const ASTRO_GRAMMAR: &str = include_str!("../../grammars/astro.sublime-syntax");
+/// Embedded Hyprlang grammar (Hyprland config)
+pub const HYPRLANG_GRAMMAR: &str = include_str!("../../grammars/hyprlang.sublime-syntax");
+
 /// Registry of all available TextMate grammars.
 ///
 /// This struct holds the compiled syntax set and provides lookup methods.
@@ -62,7 +137,7 @@ pub struct GrammarRegistry {
     /// Filename -> scope name mapping for dotfiles and special files
     filename_scopes: HashMap<String, String>,
     /// Paths to dynamically loaded grammar files (for reloading when adding more)
-    loaded_grammar_paths: Vec<(String, PathBuf, Vec<String>)>,
+    loaded_grammar_paths: Vec<GrammarSpec>,
 }
 
 impl GrammarRegistry {
@@ -75,11 +150,24 @@ impl GrammarRegistry {
         user_extensions: HashMap<String, String>,
         filename_scopes: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_loaded_paths(syntax_set, user_extensions, filename_scopes, Vec::new())
+    }
+
+    /// Create a GrammarRegistry with pre-loaded grammar path tracking.
+    ///
+    /// Used by the loader when plugin grammars were included in the initial build,
+    /// so that `loaded_grammar_paths()` reflects what was actually loaded.
+    pub fn new_with_loaded_paths(
+        syntax_set: SyntaxSet,
+        user_extensions: HashMap<String, String>,
+        filename_scopes: HashMap<String, String>,
+        loaded_grammar_paths: Vec<GrammarSpec>,
+    ) -> Self {
         Self {
             syntax_set: Arc::new(syntax_set),
             user_extensions,
             filename_scopes,
-            loaded_grammar_paths: Vec::new(),
+            loaded_grammar_paths,
         }
     }
 
@@ -102,14 +190,44 @@ impl GrammarRegistry {
     /// without any `SyntaxSetBuilder::build()` call. Use this at startup,
     /// then swap in a full registry built on a background thread.
     pub fn defaults_only() -> Arc<Self> {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        // Load pre-compiled syntax set (defaults + embedded grammars) from
+        // build-time packdump. This avoids the expensive into_builder() + build()
+        // cycle at runtime (~12s → ~300ms).
+        tracing::info!("defaults_only: loading pre-compiled syntax packdump...");
+        let syntax_set: SyntaxSet = syntect::dumps::from_uncompressed_data(include_bytes!(
+            concat!(env!("OUT_DIR"), "/default_syntaxes.packdump")
+        ))
+        .expect("Failed to load pre-compiled syntax packdump");
+        tracing::info!(
+            "defaults_only: loaded ({} syntaxes)",
+            syntax_set.syntaxes().len()
+        );
         let filename_scopes = Self::build_filename_scopes();
+        let extra_extensions = Self::build_extra_extensions();
         Arc::new(Self {
             syntax_set: Arc::new(syntax_set),
-            user_extensions: HashMap::new(),
+            user_extensions: extra_extensions,
             filename_scopes,
             loaded_grammar_paths: Vec::new(),
         })
+    }
+
+    /// Build extra extension -> scope mappings for extensions not covered by syntect defaults.
+    ///
+    /// These map common file extensions to existing syntect grammar scopes,
+    /// filling gaps where syntect's built-in extension lists are incomplete.
+    pub fn build_extra_extensions() -> HashMap<String, String> {
+        let mut map = HashMap::new();
+
+        // JavaScript variants not in syntect defaults (["js", "htc"])
+        let js_scope = "source.js".to_string();
+        map.insert("cjs".to_string(), js_scope.clone());
+        map.insert("mjs".to_string(), js_scope);
+
+        // Dockerfile variants (e.g. Dockerfile.dev -> .dev extension)
+        // These won't match by extension, handled by filename_scopes and first_line_match
+
+        map
     }
 
     /// Build the default filename -> scope mappings for dotfiles and special files.
@@ -158,6 +276,62 @@ impl GrammarRegistry {
         // Git attributes files
         let gitattributes_scope = "source.gitattributes".to_string();
         map.insert(".gitattributes".to_string(), gitattributes_scope);
+
+        // Jenkinsfile -> Groovy
+        let groovy_scope = "source.groovy".to_string();
+        map.insert("Jenkinsfile".to_string(), groovy_scope);
+
+        // Vagrantfile -> Ruby (syntect already handles this, but be explicit)
+        // Brewfile -> Ruby
+        let ruby_scope = "source.ruby".to_string();
+        map.insert("Brewfile".to_string(), ruby_scope);
+
+        // Dockerfile and variants (exact names; Dockerfile.* handled via prefix check)
+        let dockerfile_scope = "source.dockerfile".to_string();
+        map.insert("Dockerfile".to_string(), dockerfile_scope.clone());
+        map.insert("Containerfile".to_string(), dockerfile_scope.clone());
+        // Common Dockerfile variants
+        map.insert("Dockerfile.dev".to_string(), dockerfile_scope.clone());
+        map.insert("Dockerfile.prod".to_string(), dockerfile_scope.clone());
+        map.insert("Dockerfile.test".to_string(), dockerfile_scope.clone());
+        map.insert("Dockerfile.build".to_string(), dockerfile_scope.clone());
+
+        // CMake
+        let cmake_scope = "source.cmake".to_string();
+        map.insert("CMakeLists.txt".to_string(), cmake_scope);
+
+        // Starlark/Bazel
+        let starlark_scope = "source.starlark".to_string();
+        map.insert("BUILD".to_string(), starlark_scope.clone());
+        map.insert("BUILD.bazel".to_string(), starlark_scope.clone());
+        map.insert("WORKSPACE".to_string(), starlark_scope.clone());
+        map.insert("WORKSPACE.bazel".to_string(), starlark_scope.clone());
+        map.insert("Tiltfile".to_string(), starlark_scope);
+
+        // Justfile (various casings)
+        let justfile_scope = "source.justfile".to_string();
+        map.insert("justfile".to_string(), justfile_scope.clone());
+        map.insert("Justfile".to_string(), justfile_scope.clone());
+        map.insert(".justfile".to_string(), justfile_scope);
+
+        // EditorConfig -> INI
+        let ini_scope = "source.ini".to_string();
+        map.insert(".editorconfig".to_string(), ini_scope);
+
+        // Earthfile
+        let earthfile_scope = "source.earthfile".to_string();
+        map.insert("Earthfile".to_string(), earthfile_scope);
+
+        // Hyprlang (Hyprland config files)
+        let hyprlang_scope = "source.hyprlang".to_string();
+        map.insert("hyprland.conf".to_string(), hyprlang_scope.clone());
+        map.insert("hyprpaper.conf".to_string(), hyprlang_scope.clone());
+        map.insert("hyprlock.conf".to_string(), hyprlang_scope);
+
+        // go.mod / go.sum
+        let gomod_scope = "source.gomod".to_string();
+        map.insert("go.mod".to_string(), gomod_scope.clone());
+        map.insert("go.sum".to_string(), gomod_scope);
 
         map
     }
@@ -263,6 +437,52 @@ impl GrammarRegistry {
                 tracing::warn!("Failed to load embedded Typst grammar: {}", e);
             }
         }
+
+        // Additional embedded grammars for languages not in syntect defaults
+        let additional_grammars: &[(&str, &str)] = &[
+            (DOCKERFILE_GRAMMAR, "Dockerfile"),
+            (INI_GRAMMAR, "INI"),
+            (CMAKE_GRAMMAR, "CMake"),
+            (SCSS_GRAMMAR, "SCSS"),
+            (LESS_GRAMMAR, "LESS"),
+            (POWERSHELL_GRAMMAR, "PowerShell"),
+            (KOTLIN_GRAMMAR, "Kotlin"),
+            (SWIFT_GRAMMAR, "Swift"),
+            (DART_GRAMMAR, "Dart"),
+            (ELIXIR_GRAMMAR, "Elixir"),
+            (FSHARP_GRAMMAR, "FSharp"),
+            (NIX_GRAMMAR, "Nix"),
+            (HCL_GRAMMAR, "HCL"),
+            (PROTOBUF_GRAMMAR, "Protocol Buffers"),
+            (GRAPHQL_GRAMMAR, "GraphQL"),
+            (JULIA_GRAMMAR, "Julia"),
+            (NIM_GRAMMAR, "Nim"),
+            (GLEAM_GRAMMAR, "Gleam"),
+            (VLANG_GRAMMAR, "V"),
+            (SOLIDITY_GRAMMAR, "Solidity"),
+            (KDL_GRAMMAR, "KDL"),
+            (NUSHELL_GRAMMAR, "Nushell"),
+            (STARLARK_GRAMMAR, "Starlark"),
+            (JUSTFILE_GRAMMAR, "Justfile"),
+            (EARTHFILE_GRAMMAR, "Earthfile"),
+            (GOMOD_GRAMMAR, "Go Module"),
+            (VUE_GRAMMAR, "Vue"),
+            (SVELTE_GRAMMAR, "Svelte"),
+            (ASTRO_GRAMMAR, "Astro"),
+            (HYPRLANG_GRAMMAR, "Hyprlang"),
+        ];
+
+        for (grammar_str, name) in additional_grammars {
+            match SyntaxDefinition::load_from_str(grammar_str, true, Some(name)) {
+                Ok(syntax) => {
+                    builder.add(syntax);
+                    tracing::debug!("Loaded embedded {} grammar", name);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load embedded {} grammar: {}", name, e);
+                }
+            }
+        }
     }
 
     /// Find syntax for a file by path/extension/filename.
@@ -273,7 +493,21 @@ impl GrammarRegistry {
     /// 3. By filename (custom dotfile mappings like .zshrc)
     /// 4. By filename via syntect (handles Makefile, .bashrc, etc.)
     pub fn find_syntax_for_file(&self, path: &Path) -> Option<&SyntaxReference> {
-        // Try extension-based lookup first
+        // Try filename-based lookup FIRST for dotfiles, special files, and exact matches
+        // This must come before extension lookup since files like CMakeLists.txt
+        // would otherwise match Plain Text via the .txt extension.
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+            if let Some(scope) = self.filename_scopes.get(filename) {
+                if let Some(syntax) = syntect::parsing::Scope::new(scope)
+                    .ok()
+                    .and_then(|s| self.syntax_set.find_syntax_by_scope(s))
+                {
+                    return Some(syntax);
+                }
+            }
+        }
+
+        // Try extension-based lookup
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             // Check user grammars first (higher priority)
             if let Some(scope) = self.user_extensions.get(ext) {
@@ -310,17 +544,7 @@ impl GrammarRegistry {
             }
         }
 
-        // Try filename-based lookup for dotfiles and special files
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(scope) = self.filename_scopes.get(filename) {
-                if let Some(syntax) = syntect::parsing::Scope::new(scope)
-                    .ok()
-                    .and_then(|s| self.syntax_set.find_syntax_by_scope(s))
-                {
-                    return Some(syntax);
-                }
-            }
-        }
+        // Filename-based lookup already done above (before extension lookup)
 
         // Try syntect's full file detection (handles special filenames like Makefile)
         // This may do I/O for first-line detection, but handles many cases
@@ -555,10 +779,17 @@ impl GrammarRegistry {
         &self.filename_scopes
     }
 
+    /// Get the loaded grammar paths (for deduplication in flush_pending_grammars)
+    pub fn loaded_grammar_paths(&self) -> &[GrammarSpec] {
+        &self.loaded_grammar_paths
+    }
+
     /// Create a new registry with additional grammar files
     ///
     /// This builds a new GrammarRegistry that includes all grammars from
     /// the base registry plus the additional grammars specified.
+    /// Uses the base registry's syntax_set as the builder base, preserving
+    /// all existing grammars (user grammars, language packs, etc.).
     ///
     /// # Arguments
     /// * `base` - The base registry to extend
@@ -568,61 +799,34 @@ impl GrammarRegistry {
     /// A new GrammarRegistry with the additional grammars, or None if rebuilding fails
     pub fn with_additional_grammars(
         base: &GrammarRegistry,
-        additional: &[(String, PathBuf, Vec<String>)],
+        additional: &[GrammarSpec],
     ) -> Option<Self> {
         tracing::info!(
-            "[SYNTAX DEBUG] with_additional_grammars: adding {} grammars, base has {} user_extensions, {} previously loaded grammars",
+            "[SYNTAX DEBUG] with_additional_grammars: adding {} grammars to base with {} syntaxes",
             additional.len(),
-            base.user_extensions.len(),
-            base.loaded_grammar_paths.len()
+            base.syntax_set.syntaxes().len()
         );
 
-        // Start with defaults and embedded grammars (same as Default impl)
-        let defaults = SyntaxSet::load_defaults_newlines();
-        let mut builder = defaults.into_builder();
-        Self::add_embedded_grammars(&mut builder);
+        // Use the base registry's syntax_set as builder base — this preserves
+        // ALL existing grammars (defaults, embedded, user, language packs)
+        // without needing to reload them from disk.
+        let mut builder = (*base.syntax_set).clone().into_builder();
 
-        // Start fresh with user extensions - we'll rebuild from loaded grammars
-        let mut user_extensions = HashMap::new();
+        // Preserve existing user extensions and add new ones
+        let mut user_extensions = base.user_extensions.clone();
 
-        // Track all loaded grammar paths (existing + new)
+        // Track loaded grammar paths (existing + new)
         let mut loaded_grammar_paths = base.loaded_grammar_paths.clone();
 
-        // First, reload all previously loaded grammars from base
-        for (language, path, extensions) in &base.loaded_grammar_paths {
-            tracing::info!(
-                "[SYNTAX DEBUG] reloading existing grammar: lang='{}', path={:?}",
-                language,
-                path
-            );
-            match Self::load_grammar_file(path) {
-                Ok(syntax) => {
-                    let scope = syntax.scope.to_string();
-                    builder.add(syntax);
-                    for ext in extensions {
-                        user_extensions.insert(ext.clone(), scope.clone());
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to reload grammar for '{}' from {:?}: {}",
-                        language,
-                        path,
-                        e
-                    );
-                }
-            }
-        }
-
         // Add each new grammar
-        for (language, path, extensions) in additional {
+        for spec in additional {
             tracing::info!(
                 "[SYNTAX DEBUG] loading new grammar file: lang='{}', path={:?}, extensions={:?}",
-                language,
-                path,
-                extensions
+                spec.language,
+                spec.path,
+                spec.extensions
             );
-            match Self::load_grammar_file(path) {
+            match Self::load_grammar_file(&spec.path) {
                 Ok(syntax) => {
                     let scope = syntax.scope.to_string();
                     tracing::info!(
@@ -633,22 +837,22 @@ impl GrammarRegistry {
                     builder.add(syntax);
                     tracing::info!(
                         "Loaded grammar for '{}' from {:?} with extensions {:?}",
-                        language,
-                        path,
-                        extensions
+                        spec.language,
+                        spec.path,
+                        spec.extensions
                     );
                     // Register extensions for this grammar
-                    for ext in extensions {
+                    for ext in &spec.extensions {
                         user_extensions.insert(ext.clone(), scope.clone());
                     }
                     // Track this grammar path for future reloads
-                    loaded_grammar_paths.push((language.clone(), path.clone(), extensions.clone()));
+                    loaded_grammar_paths.push(spec.clone());
                 }
                 Err(e) => {
                     tracing::warn!(
                         "Failed to load grammar for '{}' from {:?}: {}",
-                        language,
-                        path,
+                        spec.language,
+                        spec.path,
                         e
                     );
                 }
@@ -668,7 +872,7 @@ impl GrammarRegistry {
     /// Only Sublime Text (.sublime-syntax) format is supported.
     /// TextMate (.tmLanguage) grammars use a completely different format
     /// and cannot be loaded by syntect's yaml-load feature.
-    fn load_grammar_file(path: &Path) -> Result<SyntaxDefinition, String> {
+    pub(crate) fn load_grammar_file(path: &Path) -> Result<SyntaxDefinition, String> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
@@ -698,8 +902,9 @@ impl Default for GrammarRegistry {
         Self::add_embedded_grammars(&mut builder);
         let syntax_set = builder.build();
         let filename_scopes = Self::build_filename_scopes();
+        let extra_extensions = Self::build_extra_extensions();
 
-        Self::new(syntax_set, HashMap::new(), filename_scopes)
+        Self::new(syntax_set, extra_extensions, filename_scopes)
     }
 }
 
@@ -859,7 +1064,11 @@ mod tests {
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -901,7 +1110,11 @@ mod tests {
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -948,7 +1161,11 @@ mod tests {
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -970,7 +1187,11 @@ mod tests {
                 highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,

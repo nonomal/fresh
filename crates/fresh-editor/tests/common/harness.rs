@@ -63,7 +63,7 @@ pub mod layout {
 }
 use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
-use fresh::primitives::highlight_engine::HighlightEngine;
+use fresh::primitives::highlight_engine::{HighlightEngine, HighlightStats};
 use fresh::services::fs::{BackendMetrics, SlowFileSystem, SlowFsConfig};
 use fresh::services::time_source::{SharedTimeSource, TestTimeSource};
 use fresh::{app::Editor, config::Config};
@@ -673,6 +673,13 @@ impl EditorTestHarness {
     /// Returns the TempDir which should be kept alive until the test ends.
     pub fn take_temp_dir(&mut self) -> Option<TempDir> {
         self._temp_dir.take()
+    }
+
+    /// Enable software-cursor-only mode (no hardware cursor).
+    /// Use this in tests that need REVERSED cell styling on cursor positions,
+    /// e.g. when verifying that cursor styling doesn't bleed through overlays.
+    pub fn set_software_cursor_only(&mut self, enabled: bool) {
+        self.editor.set_software_cursor_only(enabled);
     }
 
     /// Enable shadow buffer validation
@@ -1762,6 +1769,19 @@ impl EditorTestHarness {
         )
     }
 
+    /// Get highlight performance stats (TextMate engine only).
+    pub fn highlight_stats(&self) -> Option<&HighlightStats> {
+        self.editor.active_state().highlighter.highlight_stats()
+    }
+
+    /// Reset highlight performance counters.
+    pub fn reset_highlight_stats(&mut self) {
+        self.editor
+            .active_state_mut()
+            .highlighter
+            .reset_highlight_stats();
+    }
+
     /// Get the shadow string (for property testing)
     pub fn get_shadow_string(&self) -> &str {
         &self.shadow_string
@@ -1989,9 +2009,10 @@ impl EditorTestHarness {
         self.render()?;
         Ok(())
     }
-    /// Wait indefinitely for async operations until condition is met
-    /// Repeatedly processes async messages until condition is met (no timeout)
-    /// Use this for semantic events that must eventually occur
+    /// Wait indefinitely for async operations until condition is met.
+    /// Runs a full editor tick each iteration — the same work the real event
+    /// loop performs between frames — so that hover timers, debounced requests,
+    /// diagnostic pulls, and all other periodic checks fire naturally.
     ///
     /// Note: Uses a short real wall-clock sleep between iterations to allow
     /// async I/O operations (running on tokio runtime) time to complete.
@@ -2003,7 +2024,7 @@ impl EditorTestHarness {
 
         tracing::info!("waiting...");
         loop {
-            self.process_async_and_render()?;
+            self.tick_and_render()?;
             if condition(self) {
                 return Ok(());
             }

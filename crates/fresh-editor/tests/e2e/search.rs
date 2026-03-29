@@ -2192,13 +2192,12 @@ fn test_f3_continues_searching_after_buffer_modification() {
     // - Second "foo" at position 8 (was 4)
     // - Third "foo" at position 12 (was 8)
     //
-    // Before typing, current_match_index was 1 (we were at second match at position 4)
-    // F3 increments to index 2, which now points to position 12 (third "foo")
-    // The key thing is that positions are CORRECT (not stale) after the fix
+    // Cursor is at position 4 (on the first "foo"). find_next searches forward
+    // from the cursor, so it should jump to the next "foo" at position 8.
     let cursor_after_f3 = harness.cursor_position();
     assert_eq!(
-        cursor_after_f3, 12,
-        "F3 should jump to third 'foo' at updated position 12. Got: {}",
+        cursor_after_f3, 8,
+        "F3 should jump to second 'foo' at position 8 (next match after cursor at 4). Got: {}",
         cursor_after_f3
     );
 
@@ -2210,6 +2209,16 @@ fn test_f3_continues_searching_after_buffer_modification() {
         screen_after_edit_f3
     );
 
+    // Press F3 again - should go to third "foo" at position 12
+    harness.send_key(KeyCode::F(3), KeyModifiers::NONE).unwrap();
+    harness.process_async_and_render().unwrap();
+    let cursor_third = harness.cursor_position();
+    assert_eq!(
+        cursor_third, 12,
+        "F3 should go to third 'foo' (position 12). Got: {}",
+        cursor_third
+    );
+
     // Press F3 again - should wrap to first "foo" at position 4
     harness.send_key(KeyCode::F(3), KeyModifiers::NONE).unwrap();
     harness.process_async_and_render().unwrap();
@@ -2218,16 +2227,6 @@ fn test_f3_continues_searching_after_buffer_modification() {
         cursor_wrap, 4,
         "F3 should wrap to first 'foo' (position 4). Got: {}",
         cursor_wrap
-    );
-
-    // Press F3 again - should go to second "foo" at position 8
-    harness.send_key(KeyCode::F(3), KeyModifiers::NONE).unwrap();
-    harness.process_async_and_render().unwrap();
-    let cursor_second = harness.cursor_position();
-    assert_eq!(
-        cursor_second, 8,
-        "F3 should go to second 'foo' (position 8). Got: {}",
-        cursor_second
     );
 }
 

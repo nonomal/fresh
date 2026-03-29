@@ -473,6 +473,32 @@ impl MarginManager {
         by_line
     }
 
+    /// Get the byte position of a line indicator's marker.
+    ///
+    /// Returns the current byte offset for the given marker ID, or None if the
+    /// marker doesn't exist. Useful for testing that marker positions survive
+    /// undo/redo correctly.
+    pub fn get_indicator_position(&self, marker_id: MarkerId) -> Option<usize> {
+        self.indicator_markers.get_position(marker_id)
+    }
+
+    /// Query indicator markers in a byte range.
+    /// Returns (MarkerId, start, end) tuples for markers in the range.
+    pub fn query_indicator_range(&self, start: usize, end: usize) -> Vec<(MarkerId, usize, usize)> {
+        self.indicator_markers.query_range(start, end)
+    }
+
+    /// Move a line indicator's marker to a new byte position.
+    ///
+    /// This is a no-op if the marker doesn't exist in the indicator markers.
+    /// Used to restore displaced markers after undo.
+    pub fn set_indicator_position(&mut self, marker_id: MarkerId, new_position: usize) {
+        // Only move if this marker is actually tracked by margins
+        if self.line_indicators.contains_key(&marker_id.0) {
+            self.indicator_markers.set_position(marker_id, new_position);
+        }
+    }
+
     /// Add an annotation to a margin
     pub fn add_annotation(&mut self, annotation: MarginAnnotation) {
         let annotations = match annotation.position {

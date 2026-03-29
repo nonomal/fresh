@@ -7,8 +7,9 @@ use crate::model::cursor::{Cursors, Position2D, SelectionMode};
 use crate::model::event::{CursorId, Event};
 use crate::primitives::display_width::{byte_offset_at_visual_column, str_width};
 use crate::primitives::highlighter::HighlightCategory;
+use crate::primitives::indent_pattern::PatternIndentCalculator;
 use crate::primitives::word_navigation::{
-    find_word_end, find_word_end_right, find_word_start, find_word_start_left,
+    find_vi_word_end, find_word_end, find_word_end_right, find_word_start, find_word_start_left,
     find_word_start_right,
 };
 use crate::state::EditorState;
@@ -145,7 +146,14 @@ fn collect_line_starts(
     // Collect all line starts by iterating through lines using a single iterator
     // The iterator naturally handles the trailing empty line case without infinite loops
     while let Some((line_start, _)) = iter.next_line() {
+        // If the selection ends exactly at a line's start (and spans at least one line),
+        // that line has no selected content and should not be included (fixes #1304).
+        // When start_pos == end_pos (no selection / single point), we still include the
+        // line the cursor is on.
         if line_start > end_pos || line_start > buffer_len {
+            break;
+        }
+        if line_start == end_pos && line_start > start_pos {
             break;
         }
         line_starts.push(line_start);
@@ -424,7 +432,15 @@ pub fn get_auto_close_char(ch: char, auto_close: bool, language: &str) -> Option
     }
 }
 
-/// Calculate the correct indent for a closing delimiter using tree-sitter.
+/// Calculate the correct indent for a closing delimiter.
+///
+/// Uses tree-sitter when available, otherwise falls back to pattern-based
+/// delimiter matching which works for any C-style language (braces, brackets, parens).
+///
+/// TODO: Consider adding Sublime Text-style regex indent rules (`increaseIndentPattern`/
+/// `decreaseIndentPattern` per language) as a middle tier between tree-sitter and pattern
+/// matching. This would handle language-specific constructs (e.g., Python's `:`, Ruby's
+/// `end`) without requiring a full tree-sitter grammar for each language.
 fn calculate_closing_delimiter_indent(
     state: &mut EditorState,
     insert_position: usize,
@@ -438,7 +454,16 @@ fn calculate_closing_delimiter_indent(
             .calculate_dedent_for_delimiter(&state.buffer, insert_position, ch, language, tab_size)
             .unwrap_or(0)
     } else {
-        0
+        // No tree-sitter language available — use pattern-based fallback.
+        // This handles all C-style languages (Dart, Kotlin, Swift, etc.) by
+        // scanning backwards for the matching unmatched opening delimiter.
+        PatternIndentCalculator::calculate_dedent_for_delimiter(
+            &state.buffer,
+            insert_position,
+            ch,
+            tab_size,
+        )
+        .unwrap_or(0)
     }
 }
 
@@ -1584,6 +1609,90 @@ pub fn action_to_events(
             }
         }
 
+        Action::ViMoveWordEnd => {
+            for (cursor_id, cursor) in cursors.iter() {
+                let new_pos = find_vi_word_end(&state.buffer, cursor.position);
+                let new_anchor = if cursor.deselect_on_move {
+                    None
+                } else {
+                    cursor.anchor
+                };
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: cursor.position,
+                    new_position: new_pos,
+                    old_anchor: cursor.anchor,
+                    new_anchor,
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: 0,
+                });
+            }
+        }
+
+        Action::MoveLeftInLine => {
+            for (cursor_id, cursor) in cursors.iter() {
+                let new_pos = state.buffer.prev_grapheme_boundary(cursor.position);
+                let new_pos = adjust_position_for_crlf_left(&state.buffer, new_pos);
+                // Check if moving left would cross a line boundary
+                let mut iter = state
+                    .buffer
+                    .line_iterator(cursor.position, estimated_line_length);
+                let line_start = iter.next_line().map(|(ls, _)| ls).unwrap_or(0);
+                let clamped = new_pos.max(line_start);
+                let new_anchor = if cursor.deselect_on_move {
+                    None
+                } else {
+                    cursor.anchor
+                };
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: cursor.position,
+                    new_position: clamped,
+                    old_anchor: cursor.anchor,
+                    new_anchor,
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: 0,
+                });
+            }
+        }
+
+        Action::MoveRightInLine => {
+            for (cursor_id, cursor) in cursors.iter() {
+                let max_pos = max_cursor_position(&state.buffer);
+                let new_pos = next_position_for_crlf(&state.buffer, cursor.position, max_pos);
+                // Clamp to last character on the line (before the newline)
+                let mut iter = state
+                    .buffer
+                    .line_iterator(cursor.position, estimated_line_length);
+                let line_last_char = iter
+                    .next_line()
+                    .map(|(ls, lc)| {
+                        let content_len = content_len_without_line_ending(&lc);
+                        if content_len > 0 {
+                            ls + content_len - 1
+                        } else {
+                            ls
+                        }
+                    })
+                    .unwrap_or(max_pos);
+                let clamped = new_pos.min(line_last_char);
+                let new_anchor = if cursor.deselect_on_move {
+                    None
+                } else {
+                    cursor.anchor
+                };
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: cursor.position,
+                    new_position: clamped,
+                    old_anchor: cursor.anchor,
+                    new_anchor,
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: 0,
+                });
+            }
+        }
+
         Action::MoveDocumentStart => {
             for (cursor_id, cursor) in cursors.iter() {
                 // Preserve anchor if deselect_on_move is false (Emacs mark mode)
@@ -1992,6 +2101,22 @@ pub fn action_to_events(
             }
         }
 
+        Action::ViSelectWordEnd => {
+            for (cursor_id, cursor) in cursors.iter() {
+                let new_pos = find_vi_word_end(&state.buffer, cursor.position);
+                let anchor = cursor.anchor.unwrap_or(cursor.position);
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: cursor.position,
+                    new_position: new_pos,
+                    old_anchor: cursor.anchor,
+                    new_anchor: Some(anchor),
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: 0,
+                });
+            }
+        }
+
         Action::SelectDocumentStart => {
             for (cursor_id, cursor) in cursors.iter() {
                 let anchor = cursor.anchor.unwrap_or(cursor.position);
@@ -2322,6 +2447,29 @@ pub fn action_to_events(
             apply_deletions(state, deletions, &mut events);
         }
 
+        Action::DeleteViWordEnd => {
+            // Delete from cursor to vim word end (inclusive of last char)
+            let deletions: Vec<_> = cursors
+                .iter()
+                .filter_map(|(cursor_id, cursor)| {
+                    if let Some(range) = cursor.selection_range() {
+                        Some((cursor_id, range))
+                    } else {
+                        let word_end = find_vi_word_end(&state.buffer, cursor.position);
+                        // +1 because vim 'de' is inclusive of the last character
+                        let end = (word_end + 1).min(state.buffer.len());
+                        if cursor.position < end {
+                            Some((cursor_id, cursor.position..end))
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            apply_deletions(state, deletions, &mut events);
+        }
+
         Action::DeleteLine => {
             // Collect line ranges first to avoid borrow checker issues
             let deletions: Vec<_> = cursors
@@ -2446,6 +2594,58 @@ pub fn action_to_events(
 
         Action::ToLowerCase => {
             transform_case(state, cursors, &mut events, |s| s.to_lowercase());
+        }
+
+        Action::ToggleCase => {
+            // Toggle case of char under cursor (vim ~ behavior) and advance cursor
+            for (cursor_id, cursor) in cursors.iter() {
+                let pos = cursor.position;
+                let buf_len = state.buffer.len();
+                if pos >= buf_len {
+                    continue;
+                }
+                let next_pos = state.buffer.next_grapheme_boundary(pos);
+                if next_pos <= pos || next_pos > buf_len {
+                    continue;
+                }
+                let text = state.get_text_range(pos, next_pos);
+                if text.is_empty() || text == "\n" || text == "\r\n" {
+                    continue;
+                }
+                let toggled: String = text
+                    .chars()
+                    .map(|c| {
+                        if c.is_uppercase() {
+                            c.to_lowercase().to_string()
+                        } else {
+                            c.to_uppercase().to_string()
+                        }
+                    })
+                    .collect();
+                if toggled != text {
+                    events.push(Event::Delete {
+                        range: pos..next_pos,
+                        deleted_text: text,
+                        cursor_id,
+                    });
+                    events.push(Event::Insert {
+                        position: pos,
+                        text: toggled,
+                        cursor_id,
+                    });
+                }
+                // Advance cursor to next character
+                let advance_pos = next_pos.min(buf_len);
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: pos,
+                    new_position: advance_pos,
+                    old_anchor: cursor.anchor,
+                    new_anchor: None,
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: 0,
+                });
+            }
         }
 
         Action::SortLines => {
@@ -2661,6 +2861,7 @@ pub fn action_to_events(
         | Action::YankWordBackward
         | Action::YankToLineEnd
         | Action::YankToLineStart
+        | Action::YankViWordEnd
         | Action::AddCursorNextMatch
         | Action::AddCursorAbove
         | Action::AddCursorBelow
@@ -2669,8 +2870,8 @@ pub fn action_to_events(
         | Action::ShowHelp
         | Action::ToggleLineWrap
         | Action::ToggleReadOnly
-        | Action::ToggleComposeMode
-        | Action::SetComposeWidth
+        | Action::TogglePageView
+        | Action::SetPageWidth
         | Action::IncreaseSplitSize
         | Action::DecreaseSplitSize
         | Action::ToggleMaximizeSplit
@@ -2747,6 +2948,7 @@ pub fn action_to_events(
         | Action::ToggleMenuBar
         | Action::ToggleTabBar
         | Action::ToggleStatusBar
+        | Action::TogglePromptLine
         | Action::ToggleVerticalScrollbar
         | Action::ToggleHorizontalScrollbar
         | Action::FocusFileExplorer
@@ -5614,13 +5816,18 @@ mod property_tests {
                 }
             }
             // Filter to those in range, considering that we start from the line containing start_pos
+            // A line start at exactly end_pos is excluded when end_pos > start_pos (the selection
+            // ends at a line boundary, so that line has no selected content)
             let first_line_start = expected_line_starts.iter()
                 .filter(|&&pos| pos <= start_pos)
                 .max()
                 .copied()
                 .unwrap_or(0);
             let expected_in_range: Vec<usize> = expected_line_starts.iter()
-                .filter(|&&pos| pos >= first_line_start && pos <= end_pos)
+                .filter(|&&pos| {
+                    pos >= first_line_start
+                        && (pos < end_pos || (pos == end_pos && pos == start_pos))
+                })
                 .copied()
                 .collect();
 
@@ -5679,16 +5886,15 @@ mod property_tests {
 
             let line_starts = collect_line_starts(&mut buffer, 0, buffer_len, 80);
 
-            // Expected: 1 (for position 0) + num_trailing_newlines (one for each \n creates a new line start)
-            // But we only count line starts that are <= end_pos
-            // If prefix is empty and we have N newlines, we should have positions: 0, 1, 2, ..., N
-            // But the last one at position N would be > buffer_len - 1 only if it's the synthetic empty line
-            let expected_count = if prefix.is_empty() {
-                // Just newlines: positions 0, 1, 2, ..., up to buffer_len
-                num_trailing_newlines.min(buffer_len) + 1
+            // Expected line starts: position 0, then one for each \n.
+            // The last \n creates a line start at buffer_len, but since start_pos=0 < end_pos=buffer_len,
+            // a line start at exactly end_pos is excluded (no selected content on that line).
+            // So the count is: 1 (pos 0) + num_trailing_newlines - 1 (last excluded) = num_trailing_newlines
+            // when num_trailing_newlines > 0. When num_trailing_newlines == 0, count is 1 (just pos 0).
+            let expected_count = if num_trailing_newlines > 0 {
+                num_trailing_newlines
             } else {
-                // prefix + newlines
-                1 + num_trailing_newlines
+                1
             };
 
             prop_assert_eq!(

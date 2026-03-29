@@ -47,6 +47,24 @@ impl Editor {
             return PopupConfirmResult::EarlyReturn;
         }
 
+        // Check if this is a code action popup
+        if self.pending_code_actions.is_some() {
+            let selected_index = self
+                .active_state()
+                .popups
+                .top()
+                .and_then(|p| p.selected_item())
+                .and_then(|item| item.data.as_ref())
+                .and_then(|data| data.parse::<usize>().ok());
+
+            self.hide_popup();
+            if let Some(index) = selected_index {
+                self.execute_code_action(index);
+            }
+            self.pending_code_actions = None;
+            return PopupConfirmResult::EarlyReturn;
+        }
+
         // Check if this is an LSP confirmation popup
         if self.pending_lsp_confirmation.is_some() {
             let action = self
@@ -114,8 +132,7 @@ impl Editor {
                 cursor_id,
             };
 
-            self.active_event_log_mut().append(delete_event.clone());
-            self.apply_event_to_active_buffer(&delete_event);
+            self.log_and_apply_event(&delete_event);
 
             let buffer_len = self.active_state().buffer.len();
             word_start.min(buffer_len)
@@ -129,8 +146,7 @@ impl Editor {
             cursor_id,
         };
 
-        self.active_event_log_mut().append(insert_event.clone());
-        self.apply_event_to_active_buffer(&insert_event);
+        self.log_and_apply_event(&insert_event);
 
         // If this was a snippet, position cursor at the snippet's $0 location
         if let Some(offset) = cursor_offset {
@@ -183,6 +199,12 @@ impl Editor {
             return;
         }
 
+        if self.pending_code_actions.is_some() {
+            self.pending_code_actions = None;
+            self.hide_popup();
+            return;
+        }
+
         if self.pending_lsp_confirmation.is_some() {
             self.pending_lsp_confirmation = None;
             self.set_status_message(t!("lsp.startup_cancelled_msg").to_string());
@@ -207,8 +229,7 @@ impl Editor {
             cursor_id,
         };
 
-        self.active_event_log_mut().append(insert_event.clone());
-        self.apply_event_to_active_buffer(&insert_event);
+        self.log_and_apply_event(&insert_event);
 
         // Now re-filter the completion list
         self.refilter_completion_popup();
@@ -250,8 +271,7 @@ impl Editor {
             cursor_id,
         };
 
-        self.active_event_log_mut().append(delete_event.clone());
-        self.apply_event_to_active_buffer(&delete_event);
+        self.log_and_apply_event(&delete_event);
 
         // Now re-filter the completion list
         self.refilter_completion_popup();

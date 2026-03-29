@@ -3009,3 +3009,182 @@ fn test_bracket_paste_in_terminal_mode() {
     // Clean up: send Ctrl+D to exit cat
     harness.editor_mut().send_terminal_input(b"\x04");
 }
+
+/// Test that arrow keys work in programs that enable application cursor keys (DECCKM).
+/// Programs like `less` and `git log` set DECCKM mode, which means arrow keys
+/// must be sent as SS3 sequences (\x1bOA) instead of CSI (\x1b[A).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_arrow_keys_in_less() {
+    use std::time::{Duration, Instant};
+
+    crate::common::tracing::init_tracing_from_env();
+
+    let mut harness = harness_or_return!(80, 24);
+
+    /// Helper: wait for `condition` with periodic screen dumps and a hard timeout.
+    /// Panics with full screen contents if the timeout is reached.
+    fn wait_until_with_logging(
+        harness: &mut EditorTestHarness,
+        label: &str,
+        timeout: Duration,
+        mut condition: impl FnMut(&EditorTestHarness) -> bool,
+    ) {
+        let start = Instant::now();
+        let mut iter: u32 = 0;
+        let wait_sleep = Duration::from_millis(50);
+
+        tracing::info!("[arrow_keys] waiting: {}", label);
+        eprintln!("[arrow_keys] waiting: {}", label);
+
+        loop {
+            harness.process_async_and_render().unwrap();
+            if condition(harness) {
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "[arrow_keys] ✓ {} — done after {:.1}s ({} iters)",
+                    label,
+                    elapsed.as_secs_f64(),
+                    iter
+                );
+                eprintln!(
+                    "[arrow_keys] ✓ {} — done after {:.1}s ({} iters)",
+                    label,
+                    elapsed.as_secs_f64(),
+                    iter
+                );
+                return;
+            }
+
+            // Periodic progress logging (every ~5s)
+            if iter % 100 == 0 && iter > 0 {
+                let screen = harness.screen_to_string();
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "[arrow_keys] still waiting: {} ({:.1}s)\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    elapsed.as_secs_f64(),
+                    screen
+                );
+                eprintln!(
+                    "[arrow_keys] still waiting: {} ({:.1}s)\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    elapsed.as_secs_f64(),
+                    screen
+                );
+            }
+
+            if start.elapsed() > timeout {
+                let screen = harness.screen_to_string();
+                tracing::error!(
+                    "[arrow_keys] TIMEOUT waiting: {} after {:.1}s\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    start.elapsed().as_secs_f64(),
+                    screen
+                );
+                eprintln!(
+                    "[arrow_keys] TIMEOUT waiting: {} after {:.1}s\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    start.elapsed().as_secs_f64(),
+                    screen
+                );
+                panic!(
+                    "[arrow_keys] TIMEOUT after {:.1}s waiting for: {}\nScreen:\n{}",
+                    start.elapsed().as_secs_f64(),
+                    label,
+                    screen
+                );
+            }
+
+            std::thread::sleep(wait_sleep);
+            harness.advance_time(wait_sleep);
+            iter += 1;
+        }
+    }
+
+    let timeout = Duration::from_secs(60);
+
+    // Create a numbered file in an isolated temp directory
+    let tmp = tempfile::TempDir::new().unwrap();
+    let test_file = tmp.path().join("less_arrows.txt");
+    let content: String = (1..=100)
+        .map(|i| format!("TLINE_{}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&test_file, &content).unwrap();
+
+    harness.editor_mut().open_terminal();
+    eprintln!("[arrow_keys] terminal opened");
+
+    // Open the file in less (this enters alternate screen and enables DECCKM)
+    let less_cmd = format!("less {}\n", test_file.display());
+    harness
+        .editor_mut()
+        .send_terminal_input(less_cmd.as_bytes());
+    eprintln!("[arrow_keys] sent less command: {}", less_cmd.trim());
+
+    // Wait for less to show the file content
+    wait_until_with_logging(&mut harness, "less shows TLINE_1", timeout, |h| {
+        h.screen_to_string().contains("TLINE_1")
+    });
+
+    // Verify we see the first few lines
+    harness.assert_screen_contains("TLINE_2");
+    harness.assert_screen_contains("TLINE_3");
+
+    // Verify we're NOT seeing lines near the end yet
+    harness.assert_screen_not_contains("TLINE_100");
+    eprintln!("[arrow_keys] initial screen verified, sending Down arrows");
+
+    // Press Down arrow multiple times to scroll down.
+    // In less with DECCKM, this requires SS3 sequences to work.
+    // Send in batches with async processing to let less keep up under load.
+    for batch in 0..4 {
+        for _ in 0..10 {
+            harness
+                .editor_mut()
+                .handle_key(KeyCode::Down, KeyModifiers::NONE)
+                .unwrap();
+        }
+        harness.process_async_and_render().unwrap();
+        eprintln!("[arrow_keys] Down batch {}/4 sent", batch + 1);
+    }
+
+    // After scrolling down 40 lines, line 41 should be visible
+    wait_until_with_logging(
+        &mut harness,
+        "TLINE_41 visible after 40x Down",
+        timeout,
+        |h| h.screen_to_string().contains("TLINE_41"),
+    );
+
+    // The first line should no longer be visible
+    harness.assert_screen_not_contains("TLINE_1");
+    eprintln!("[arrow_keys] Down scroll verified, sending Up arrows");
+
+    // Now press Up arrow to scroll back up
+    for _ in 0..10 {
+        harness
+            .editor_mut()
+            .handle_key(KeyCode::Up, KeyModifiers::NONE)
+            .unwrap();
+    }
+
+    // After scrolling up 10 lines, line 31 should be visible
+    wait_until_with_logging(
+        &mut harness,
+        "TLINE_31 visible after 10x Up",
+        timeout,
+        |h| h.screen_to_string().contains("TLINE_31"),
+    );
+
+    eprintln!("[arrow_keys] Up scroll verified, exiting less");
+
+    // Exit less with 'q'
+    harness
+        .editor_mut()
+        .handle_key(KeyCode::Char('q'), KeyModifiers::NONE)
+        .unwrap();
+
+    eprintln!("[arrow_keys] test complete");
+}

@@ -539,7 +539,6 @@ type BackgroundProcessResult = {
 type BufferSavedDiff = {
 	equal: boolean;
 	byte_ranges: Array<[number, number]>;
-	line_ranges: Array<[number, number]> | null;
 };
 type CreateVirtualBufferInExistingSplitOptions = {
 	/**
@@ -1031,6 +1030,31 @@ interface EditorAPI {
 	*/
 	readDir(path: string): DirEntry[];
 	/**
+	* Create a directory (and all parent directories) recursively.
+	* Returns true if the directory was created or already exists.
+	*/
+	createDir(path: string): boolean;
+	/**
+	* Remove a file or directory by moving it to the OS trash/recycle bin.
+	* For safety, the path must be under the OS temp directory or the Fresh
+	* config directory. Returns true on success.
+	*/
+	removePath(path: string): boolean;
+	/**
+	* Rename/move a file or directory. Returns true on success.
+	* Falls back to copy then trash for cross-filesystem moves.
+	*/
+	renamePath(from: string, to: string): boolean;
+	/**
+	* Copy a file or directory recursively to a new location.
+	* Returns true on success.
+	*/
+	copyPath(from: string, to: string): boolean;
+	/**
+	* Get the OS temporary directory path.
+	*/
+	getTempDir(): string;
+	/**
 	* Get current config as JS object
 	*/
 	getConfig(): unknown;
@@ -1070,6 +1094,11 @@ interface EditorAPI {
 	* Returns a Promise that resolves when the grammar rebuild completes.
 	*/
 	reloadGrammars(): Promise<void>;
+	/**
+	* Get the directory where this plugin's files are stored.
+	* For package plugins this is `<plugins_dir>/packages/<plugin_name>/`.
+	*/
+	getPluginDir(): string;
 	/**
 	* Get config directory path
 	*/

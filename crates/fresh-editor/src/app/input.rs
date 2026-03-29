@@ -109,13 +109,11 @@ impl Editor {
             context = self.get_key_context();
         }
 
-        // Only check buffer mode keybindings if we're not in a higher-priority context
-        // (Menu, Prompt, Popup should take precedence over mode bindings)
-        let should_check_mode_bindings = matches!(
-            context,
-            crate::input::keybindings::KeyContext::Normal
-                | crate::input::keybindings::KeyContext::FileExplorer
-        );
+        // Only check buffer mode keybindings when the editor buffer has focus.
+        // FileExplorer, Menu, Prompt, Popup contexts should not trigger mode bindings
+        // (e.g. markdown-source's Enter handler should not fire while the explorer is focused).
+        let should_check_mode_bindings =
+            matches!(context, crate::input::keybindings::KeyContext::Normal);
 
         if should_check_mode_bindings {
             // effective_mode() returns buffer-local mode if present, else global mode.
@@ -448,6 +446,7 @@ impl Editor {
             Action::YankWordBackward => self.yank_word_backward(),
             Action::YankToLineEnd => self.yank_to_line_end(),
             Action::YankToLineStart => self.yank_to_line_start(),
+            Action::YankViWordEnd => self.yank_vi_word_end(),
             Action::Undo => {
                 self.handle_undo();
             }
@@ -525,10 +524,21 @@ impl Editor {
             Action::ToggleLineWrap => {
                 self.config.editor.line_wrap = !self.config.editor.line_wrap;
 
-                // Update all viewports to reflect the new line wrap setting
-                for view_state in self.split_view_states.values_mut() {
-                    view_state.viewport.line_wrap_enabled = self.config.editor.line_wrap;
-                    view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                // Update all viewports to reflect the new line wrap setting,
+                // respecting per-language overrides
+                let leaf_ids: Vec<_> = self.split_view_states.keys().copied().collect();
+                for leaf_id in leaf_ids {
+                    let buffer_id = self
+                        .split_manager
+                        .get_buffer_id(leaf_id.into())
+                        .unwrap_or(BufferId(0));
+                    let effective_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+                    let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
+                    if let Some(view_state) = self.split_view_states.get_mut(&leaf_id) {
+                        view_state.viewport.line_wrap_enabled = effective_wrap;
+                        view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                        view_state.viewport.wrap_column = wrap_column;
+                    }
                 }
 
                 let state = if self.config.editor.line_wrap {
@@ -554,10 +564,10 @@ impl Editor {
                 };
                 self.set_status_message(t!("view.read_only_state", state = state_str).to_string());
             }
-            Action::ToggleComposeMode => {
-                self.handle_toggle_compose_mode();
+            Action::TogglePageView => {
+                self.handle_toggle_page_view();
             }
-            Action::SetComposeWidth => {
+            Action::SetPageWidth => {
                 let active_split = self.split_manager.active_split();
                 let current = self
                     .split_view_states
@@ -565,8 +575,8 @@ impl Editor {
                     .and_then(|v| v.compose_width.map(|w| w.to_string()))
                     .unwrap_or_default();
                 self.start_prompt_with_initial_text(
-                    "Compose width (empty = viewport): ".to_string(),
-                    PromptType::SetComposeWidth,
+                    "Page width (empty = viewport): ".to_string(),
+                    PromptType::SetPageWidth,
                     current,
                 );
             }
@@ -740,6 +750,7 @@ impl Editor {
             Action::ToggleMenuBar => self.toggle_menu_bar(),
             Action::ToggleTabBar => self.toggle_tab_bar(),
             Action::ToggleStatusBar => self.toggle_status_bar(),
+            Action::TogglePromptLine => self.toggle_prompt_line(),
             Action::ToggleVerticalScrollbar => self.toggle_vertical_scrollbar(),
             Action::ToggleHorizontalScrollbar => self.toggle_horizontal_scrollbar(),
             Action::ToggleLineNumbers => self.toggle_line_numbers(),
@@ -866,7 +877,9 @@ impl Editor {
                 }
             }
             Action::MenuOpen(menu_name) => {
-                self.handle_menu_open(&menu_name);
+                if self.config.editor.menu_bar_mnemonics {
+                    self.handle_menu_open(&menu_name);
+                }
             }
 
             Action::SwitchKeybindingMap(map_name) => {
@@ -1437,10 +1450,11 @@ impl Editor {
             }
         }
 
-        // Otherwise, scroll the editor in the active split
-        // Use SplitViewState's viewport (View events go to SplitViewState, not EditorState)
-        let active_split = self.split_manager.active_split();
-        let buffer_id = self.active_buffer();
+        // Scroll the split under the mouse pointer (not necessarily the focused split).
+        // Fall back to the active split if the pointer isn't over any split area.
+        let (target_split, buffer_id) = self
+            .split_at_position(col, row)
+            .unwrap_or_else(|| (self.split_manager.active_split(), self.active_buffer()));
 
         // Check if this is a composite buffer - if so, use composite scroll
         if self.is_composite_buffer(buffer_id) {
@@ -1451,7 +1465,7 @@ impl Editor {
                 .unwrap_or(0);
             if let Some(view_state) = self
                 .composite_view_states
-                .get_mut(&(active_split, buffer_id))
+                .get_mut(&(target_split, buffer_id))
             {
                 view_state.scroll(delta as isize, max_row);
                 tracing::trace!(
@@ -1466,13 +1480,13 @@ impl Editor {
         // Get view_transform tokens from SplitViewState (if any)
         let view_transform_tokens = self
             .split_view_states
-            .get(&active_split)
+            .get(&target_split)
             .and_then(|vs| vs.view_transform.as_ref())
             .map(|vt| vt.tokens.clone());
 
         // Get mutable references to both buffer state and view state
         let state = self.buffers.get_mut(&buffer_id);
-        let view_state = self.split_view_states.get_mut(&active_split);
+        let view_state = self.split_view_states.get_mut(&target_split);
 
         if let (Some(state), Some(view_state)) = (state, view_state) {
             let buffer = &mut state.buffer;
@@ -1536,13 +1550,16 @@ impl Editor {
     /// Handle horizontal scroll (Shift+ScrollWheel or native ScrollLeft/ScrollRight)
     pub(super) fn handle_horizontal_scroll(
         &mut self,
-        _col: u16,
-        _row: u16,
+        col: u16,
+        row: u16,
         delta: i32,
     ) -> AnyhowResult<()> {
-        let active_split = self.split_manager.active_split();
+        let target_split = self
+            .split_at_position(col, row)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| self.split_manager.active_split());
 
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
+        if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             // Don't scroll horizontally when line wrap is enabled
             if view_state.viewport.line_wrap_enabled {
                 return Ok(());
@@ -3785,8 +3802,7 @@ impl Editor {
             } else {
                 // Single cursor - apply normally
                 for event in events {
-                    self.active_event_log_mut().append(event.clone());
-                    self.apply_event_to_active_buffer(&event);
+                    self.log_and_apply_event(&event);
                     self.track_cursor_movement(&event);
                 }
             }

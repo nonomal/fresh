@@ -1,4 +1,4 @@
-use crate::types::{context_keys, LspServerConfig, ProcessLimits};
+use crate::types::{context_keys, LspLanguageConfig, LspServerConfig, ProcessLimits};
 
 use rust_i18n::t;
 use schemars::JsonSchema;
@@ -153,16 +153,6 @@ impl CursorStyle {
         "_ Blinking underline",
         "_ Solid underline",
     ];
-
-    /// Returns true for block-style cursors where REVERSED cell styling
-    /// is visually consistent with the cursor shape.  Bar and underline
-    /// cursors are thin and get hidden by a full-cell REVERSED highlight.
-    pub fn is_block(self) -> bool {
-        matches!(
-            self,
-            Self::BlinkingBlock | Self::SteadyBlock | Self::Default
-        )
-    }
 
     /// Convert to crossterm cursor style (runtime only)
     #[cfg(feature = "runtime")]
@@ -417,9 +407,18 @@ pub struct Config {
     #[serde(default)]
     pub languages: HashMap<String, LanguageConfig>,
 
-    /// LSP server configurations by language
+    /// Fallback configuration for files whose type cannot be detected.
+    /// Applied when no extension, filename, glob, or built-in detection matches.
+    /// Useful for setting a default grammar (e.g., "bash") and comment_prefix
+    /// for unrecognized .conf, .rc, .rules, etc. files.
     #[serde(default)]
-    pub lsp: HashMap<String, LspServerConfig>,
+    pub fallback: Option<LanguageConfig>,
+
+    /// LSP server configurations by language.
+    /// Each language maps to one or more server configs (multi-LSP support).
+    /// Accepts both single-object and array forms for backwards compatibility.
+    #[serde(default)]
+    pub lsp: HashMap<String, LspLanguageConfig>,
 
     /// Warning notification settings
     #[serde(default)]
@@ -571,6 +570,21 @@ pub struct EditorConfig {
     #[schemars(extend("x-section" = "Display"))]
     pub wrap_indent: bool,
 
+    /// Column at which to wrap lines when line wrapping is enabled.
+    /// If not specified (`null`), lines wrap at the viewport edge (default behavior).
+    /// Example: `80` wraps at column 80. The actual wrap column is clamped to the
+    /// viewport width (lines can't wrap beyond the visible area).
+    #[serde(default)]
+    #[schemars(extend("x-section" = "Display"))]
+    pub wrap_column: Option<usize>,
+
+    /// Width of the page in page view mode (in columns).
+    /// Controls the content width when page view is active, with centering margins.
+    /// Defaults to 80. Set to `null` to use the full viewport width.
+    #[serde(default = "default_page_width")]
+    #[schemars(extend("x-section" = "Display"))]
+    pub page_width: Option<usize>,
+
     /// Enable syntax highlighting for code files
     #[serde(default = "default_true")]
     #[schemars(extend("x-section" = "Display"))]
@@ -583,6 +597,14 @@ pub struct EditorConfig {
     #[serde(default = "default_true")]
     #[schemars(extend("x-section" = "Display"))]
     pub show_menu_bar: bool,
+
+    /// Whether menu bar mnemonics (Alt+letter shortcuts) are enabled.
+    /// When enabled, pressing Alt+F opens the File menu, Alt+E opens Edit, etc.
+    /// Disabling this frees up Alt+letter keybindings for other actions.
+    /// Default: true
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-section" = "Display"))]
+    pub menu_bar_mnemonics: bool,
 
     /// Whether the tab bar is visible by default.
     /// The tab bar shows open files in each split pane.
@@ -600,6 +622,15 @@ pub struct EditorConfig {
     #[schemars(extend("x-section" = "Display"))]
     pub show_status_bar: bool,
 
+    /// Whether the prompt line is visible by default.
+    /// The prompt line is the bottom-most line used for command input, search, file open, etc.
+    /// When hidden, the prompt line only appears when a prompt is active.
+    /// Can be toggled at runtime via command palette or keybinding.
+    /// Default: true
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-section" = "Display"))]
+    pub show_prompt_line: bool,
+
     /// Whether the vertical scrollbar is visible in each split pane.
     /// Can be toggled at runtime via command palette or keybinding.
     /// Default: true
@@ -614,6 +645,13 @@ pub struct EditorConfig {
     #[serde(default = "default_false")]
     #[schemars(extend("x-section" = "Display"))]
     pub show_horizontal_scrollbar: bool,
+
+    /// Show tilde (~) markers on lines after the end of the file.
+    /// These vim-style markers indicate lines that are not part of the file content.
+    /// Default: true
+    #[serde(default = "default_true")]
+    #[schemars(extend("x-section" = "Display"))]
+    pub show_tilde: bool,
 
     /// Use the terminal's default background color instead of the theme's editor background.
     /// When enabled, the editor background inherits from the terminal emulator,
@@ -690,6 +728,14 @@ pub struct EditorConfig {
     pub whitespace_tabs_trailing: bool,
 
     // ===== Editing =====
+    /// Whether pressing Tab inserts a tab character instead of spaces.
+    /// This is the global default; individual languages can override it
+    /// via their own `use_tabs` setting.
+    /// Default: false (insert spaces)
+    #[serde(default = "default_false")]
+    #[schemars(extend("x-section" = "Editing"))]
+    pub use_tabs: bool,
+
     /// Number of spaces per tab character
     #[serde(default = "default_tab_size")]
     #[schemars(extend("x-section" = "Editing"))]
@@ -783,9 +829,10 @@ pub struct EditorConfig {
     pub suggest_on_trigger_characters: bool,
 
     /// Controls whether pressing Enter accepts the selected completion.
-    /// - "on": Enter always accepts the completion
-    /// - "off": Enter inserts a newline (use Tab to accept)
-    /// - "smart": Enter accepts only if the completion text differs from typed text
+    ///   - "on": Enter always accepts the completion
+    ///   - "off": Enter inserts a newline (use Tab to accept)
+    ///   - "smart": Enter accepts only if the completion text differs from typed text
+    ///
     /// Default: "on"
     #[serde(default = "default_accept_suggestion_on_enter")]
     #[schemars(extend("x-section" = "Completion"))]
@@ -815,8 +862,14 @@ pub struct EditorConfig {
     // ===== Mouse =====
     /// Whether mouse hover triggers LSP hover requests.
     /// When enabled, hovering over code with the mouse will show documentation.
-    /// Default: true
-    #[serde(default = "default_true")]
+    /// On Windows, this also controls the mouse tracking mode: when disabled,
+    /// the editor uses xterm mode 1002 (cell motion — click, drag, release only);
+    /// when enabled, it uses mode 1003 (all motion — full mouse movement tracking).
+    /// Mode 1003 generates high event volume on Windows and may cause input
+    /// corruption on some systems. On macOS and Linux this setting only controls
+    /// LSP hover; the mouse tracking mode is always full motion.
+    /// Default: true (macOS/Linux), false (Windows)
+    #[serde(default = "default_mouse_hover_enabled")]
     #[schemars(extend("x-section" = "Mouse"))]
     pub mouse_hover_enabled: bool,
 
@@ -1044,6 +1097,10 @@ fn default_highlight_context_bytes() -> usize {
     10_000 // 10KB context for accurate syntax highlighting
 }
 
+fn default_mouse_hover_enabled() -> bool {
+    !cfg!(windows)
+}
+
 fn default_mouse_hover_delay() -> u64 {
     500 // 500ms delay before showing hover info
 }
@@ -1063,6 +1120,7 @@ fn default_file_tree_poll_interval() -> u64 {
 impl Default for EditorConfig {
     fn default() -> Self {
         Self {
+            use_tabs: false,
             tab_size: default_tab_size(),
             auto_indent: true,
             auto_close: true,
@@ -1073,6 +1131,8 @@ impl Default for EditorConfig {
             syntax_highlighting: true,
             line_wrap: true,
             wrap_indent: true,
+            wrap_column: None,
+            page_width: default_page_width(),
             highlight_timeout_ms: default_highlight_timeout(),
             snapshot_interval: default_snapshot_interval(),
             large_file_threshold_bytes: default_large_file_threshold(),
@@ -1086,7 +1146,7 @@ impl Default for EditorConfig {
             recovery_enabled: true,
             auto_recovery_save_interval_secs: default_auto_recovery_save_interval(),
             highlight_context_bytes: default_highlight_context_bytes(),
-            mouse_hover_enabled: true,
+            mouse_hover_enabled: default_mouse_hover_enabled(),
             mouse_hover_delay_ms: default_mouse_hover_delay(),
             double_click_time_ms: default_double_click_time(),
             auto_revert_poll_interval_ms: default_auto_revert_poll_interval(),
@@ -1107,10 +1167,13 @@ impl Default for EditorConfig {
             suggest_on_trigger_characters: true,
             accept_suggestion_on_enter: default_accept_suggestion_on_enter(),
             show_menu_bar: true,
+            menu_bar_mnemonics: true,
             show_tab_bar: true,
             show_status_bar: true,
+            show_prompt_line: true,
             show_vertical_scrollbar: true,
             show_horizontal_scrollbar: false,
+            show_tilde: true,
             use_terminal_bg: false,
             rulers: Vec::new(),
             whitespace_show: true,
@@ -1371,6 +1434,10 @@ fn default_on_save_timeout() -> u64 {
     10000
 }
 
+fn default_page_width() -> Option<usize> {
+    Some(80)
+}
+
 /// Language-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(extend("x-display-field" = "/grammar"))]
@@ -1419,11 +1486,36 @@ pub struct LanguageConfig {
     #[serde(default = "default_true")]
     pub show_whitespace_tabs: bool,
 
+    /// Whether to enable line wrapping for this language.
+    /// If not specified (`null`), falls back to the global `editor.line_wrap` setting.
+    /// Useful for prose-heavy languages like Markdown where wrapping is desirable
+    /// even if globally disabled.
+    #[serde(default)]
+    pub line_wrap: Option<bool>,
+
+    /// Column at which to wrap lines for this language.
+    /// If not specified (`null`), falls back to the global `editor.wrap_column` setting.
+    #[serde(default)]
+    pub wrap_column: Option<usize>,
+
+    /// Whether to automatically enable page view (compose mode) for this language.
+    /// Page view provides a document-style layout with centered content,
+    /// concealed formatting markers, and intelligent word wrapping.
+    /// If not specified (`null`), page view is not auto-activated.
+    #[serde(default)]
+    pub page_view: Option<bool>,
+
+    /// Width of the page in page view mode (in columns).
+    /// Controls the content width when page view is active, with centering margins.
+    /// If not specified (`null`), falls back to the global `editor.page_width` setting.
+    #[serde(default)]
+    pub page_width: Option<usize>,
+
     /// Whether pressing Tab should insert a tab character instead of spaces.
-    /// Defaults to false (insert spaces based on tab_size).
+    /// If not specified (`null`), falls back to the global `editor.use_tabs` setting.
     /// Set to true for languages like Go and Makefile that require tabs.
-    #[serde(default = "default_false")]
-    pub use_tabs: bool,
+    #[serde(default)]
+    pub use_tabs: Option<bool>,
 
     /// Tab size (number of spaces per tab) for this language.
     /// If not specified, falls back to the global editor.tab_size setting.
@@ -1468,6 +1560,12 @@ pub struct BufferConfig {
     /// Whether to surround selected text with matching pairs
     pub auto_surround: bool,
 
+    /// Whether line wrapping is enabled for this buffer
+    pub line_wrap: bool,
+
+    /// Column at which to wrap lines (None = viewport width)
+    pub wrap_column: Option<usize>,
+
     /// Resolved whitespace indicator visibility
     pub whitespace: WhitespaceVisibility,
 
@@ -1503,10 +1601,12 @@ impl BufferConfig {
         let mut whitespace = WhitespaceVisibility::from_editor_config(editor);
         let mut config = BufferConfig {
             tab_size: editor.tab_size,
-            use_tabs: false, // Global default is spaces
+            use_tabs: editor.use_tabs,
             auto_indent: editor.auto_indent,
             auto_close: editor.auto_close,
             auto_surround: editor.auto_surround,
+            line_wrap: editor.line_wrap,
+            wrap_column: editor.wrap_column,
             whitespace,
             formatter: None,
             format_on_save: false,
@@ -1515,54 +1615,74 @@ impl BufferConfig {
             textmate_grammar: None,
         };
 
-        // Apply language-specific overrides if available
-        if let Some(lang_id) = language_id {
-            if let Some(lang_config) = global_config.languages.get(lang_id) {
-                // Tab size: use language setting if specified, else global
-                if let Some(ts) = lang_config.tab_size {
-                    config.tab_size = ts;
+        // Apply language-specific overrides if available.
+        // If no language config matches and the language is "text" (undetected),
+        // try the fallback config (#1219).
+        let lang_config_ref = language_id
+            .and_then(|id| global_config.languages.get(id))
+            .or({
+                // Apply fallback only when language is unknown ("text" or None)
+                match language_id {
+                    None | Some("text") => global_config.fallback.as_ref(),
+                    _ => None,
                 }
-
-                // Use tabs: language override
-                config.use_tabs = lang_config.use_tabs;
-
-                // Auto indent: language override
-                config.auto_indent = lang_config.auto_indent;
-
-                // Auto close: language override (only if globally enabled)
-                if config.auto_close {
-                    if let Some(lang_auto_close) = lang_config.auto_close {
-                        config.auto_close = lang_auto_close;
-                    }
-                }
-
-                // Auto surround: language override (only if globally enabled)
-                if config.auto_surround {
-                    if let Some(lang_auto_surround) = lang_config.auto_surround {
-                        config.auto_surround = lang_auto_surround;
-                    }
-                }
-
-                // Whitespace tabs: language override can disable tab indicators
-                whitespace =
-                    whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
-                config.whitespace = whitespace;
-
-                // Formatter: from language config
-                config.formatter = lang_config.formatter.clone();
-
-                // Format on save: from language config
-                config.format_on_save = lang_config.format_on_save;
-
-                // On save actions: from language config
-                config.on_save = lang_config.on_save.clone();
-
-                // Highlighter preference: from language config
-                config.highlighter = lang_config.highlighter;
-
-                // TextMate grammar path: from language config
-                config.textmate_grammar = lang_config.textmate_grammar.clone();
+            });
+        if let Some(lang_config) = lang_config_ref {
+            // Tab size: use language setting if specified, else global
+            if let Some(ts) = lang_config.tab_size {
+                config.tab_size = ts;
             }
+
+            // Use tabs: language override (only if explicitly set)
+            if let Some(use_tabs) = lang_config.use_tabs {
+                config.use_tabs = use_tabs;
+            }
+
+            // Line wrap: language override (only if explicitly set)
+            if let Some(line_wrap) = lang_config.line_wrap {
+                config.line_wrap = line_wrap;
+            }
+
+            // Wrap column: language override (only if explicitly set)
+            if lang_config.wrap_column.is_some() {
+                config.wrap_column = lang_config.wrap_column;
+            }
+
+            // Auto indent: language override
+            config.auto_indent = lang_config.auto_indent;
+
+            // Auto close: language override (only if globally enabled)
+            if config.auto_close {
+                if let Some(lang_auto_close) = lang_config.auto_close {
+                    config.auto_close = lang_auto_close;
+                }
+            }
+
+            // Auto surround: language override (only if globally enabled)
+            if config.auto_surround {
+                if let Some(lang_auto_surround) = lang_config.auto_surround {
+                    config.auto_surround = lang_auto_surround;
+                }
+            }
+
+            // Whitespace tabs: language override can disable tab indicators
+            whitespace = whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
+            config.whitespace = whitespace;
+
+            // Formatter: from language config
+            config.formatter = lang_config.formatter.clone();
+
+            // Format on save: from language config
+            config.format_on_save = lang_config.format_on_save;
+
+            // On save actions: from language config
+            config.on_save = lang_config.on_save.clone();
+
+            // Highlighter preference: from language config
+            config.highlighter = lang_config.highlighter;
+
+            // TextMate grammar path: from language config
+            config.textmate_grammar = lang_config.textmate_grammar.clone();
         }
 
         config
@@ -1661,7 +1781,7 @@ pub fn generate_dynamic_items(source: &str, themes_dir: &std::path::Path) -> Vec
         "copy_with_theme" => {
             // Generate theme options from available themes
             let loader = crate::view::theme::ThemeLoader::new(themes_dir.to_path_buf());
-            let registry = loader.load_all();
+            let registry = loader.load_all(&[]);
             registry
                 .list()
                 .iter()
@@ -1707,6 +1827,7 @@ impl Default for Config {
             keybinding_maps: HashMap::new(), // User-defined maps go here
             active_keybinding_map: default_keybinding_map_name(),
             languages: Self::default_languages(),
+            fallback: None,
             lsp: Self::default_lsp_config(),
             warnings: WarningsConfig::default(),
             plugins: HashMap::new(), // Populated when scanning for plugins
@@ -2000,8 +2121,8 @@ impl MenuConfig {
                         checkbox: None,
                     },
                     MenuItem::Action {
-                        label: t!("menu.view.set_compose_width").to_string(),
-                        action: "set_compose_width".to_string(),
+                        label: t!("menu.view.set_page_width").to_string(),
+                        action: "set_page_width".to_string(),
                         args: HashMap::new(),
                         when: None,
                         checkbox: None,
@@ -2591,7 +2712,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "rustfmt".to_string(),
@@ -2617,7 +2742,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "prettier".to_string(),
@@ -2643,7 +2772,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "prettier".to_string(),
@@ -2669,7 +2802,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "ruff".to_string(),
@@ -2699,7 +2836,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "clang-format".to_string(),
@@ -2732,7 +2873,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "clang-format".to_string(),
@@ -2758,7 +2903,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -2794,7 +2943,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -2819,8 +2972,12 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: true,    // Makefiles require tabs for recipes
-                tab_size: Some(8), // Makefiles traditionally use 8-space tabs
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: Some(true), // Makefiles require tabs for recipes
+                tab_size: Some(8),    // Makefiles traditionally use 8-space tabs
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
@@ -2840,7 +2997,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -2861,7 +3022,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "prettier".to_string(),
@@ -2887,7 +3052,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -2908,7 +3077,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: Some(FormatterConfig {
                     command: "prettier".to_string(),
@@ -2934,7 +3107,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -2956,8 +3133,12 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: false,
-                use_tabs: true,    // Go convention is to use tabs
-                tab_size: Some(8), // Go convention is 8-space tab width
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: Some(true), // Go convention is to use tabs
+                tab_size: Some(8),    // Go convention is 8-space tab width
                 formatter: Some(FormatterConfig {
                     command: "gofmt".to_string(),
                     args: vec![],
@@ -2982,7 +3163,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: false,
-                use_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: Some(true),
                 tab_size: Some(8),
                 formatter: None,
                 format_on_save: false,
@@ -3003,7 +3188,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3024,7 +3213,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3052,7 +3245,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3073,7 +3270,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3095,7 +3296,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3121,7 +3326,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3147,7 +3356,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3168,7 +3381,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3189,7 +3406,11 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3210,7 +3431,1080 @@ impl Config {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        // --- Languages added for LSP support ---
+        // These entries ensure detect_language() maps file extensions to language
+        // names that match the LSP config keys in default_lsp_config().
+
+        languages.insert(
+            "kotlin".to_string(),
+            LanguageConfig {
+                extensions: vec!["kt".to_string(), "kts".to_string()],
+                filenames: vec![],
+                grammar: "Kotlin".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "swift".to_string(),
+            LanguageConfig {
+                extensions: vec!["swift".to_string()],
+                filenames: vec![],
+                grammar: "Swift".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "scala".to_string(),
+            LanguageConfig {
+                extensions: vec!["scala".to_string(), "sc".to_string()],
+                filenames: vec![],
+                grammar: "Scala".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "dart".to_string(),
+            LanguageConfig {
+                extensions: vec!["dart".to_string()],
+                filenames: vec![],
+                grammar: "Dart".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "elixir".to_string(),
+            LanguageConfig {
+                extensions: vec!["ex".to_string(), "exs".to_string()],
+                filenames: vec![],
+                grammar: "Elixir".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "erlang".to_string(),
+            LanguageConfig {
+                extensions: vec!["erl".to_string(), "hrl".to_string()],
+                filenames: vec![],
+                grammar: "Erlang".to_string(),
+                comment_prefix: Some("%".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "haskell".to_string(),
+            LanguageConfig {
+                extensions: vec!["hs".to_string(), "lhs".to_string()],
+                filenames: vec![],
+                grammar: "Haskell".to_string(),
+                comment_prefix: Some("--".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "ocaml".to_string(),
+            LanguageConfig {
+                extensions: vec!["ml".to_string(), "mli".to_string()],
+                filenames: vec![],
+                grammar: "OCaml".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "clojure".to_string(),
+            LanguageConfig {
+                extensions: vec![
+                    "clj".to_string(),
+                    "cljs".to_string(),
+                    "cljc".to_string(),
+                    "edn".to_string(),
+                ],
+                filenames: vec![],
+                grammar: "Clojure".to_string(),
+                comment_prefix: Some(";".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "r".to_string(),
+            LanguageConfig {
+                extensions: vec!["r".to_string(), "R".to_string(), "rmd".to_string()],
+                filenames: vec![],
+                grammar: "R".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "julia".to_string(),
+            LanguageConfig {
+                extensions: vec!["jl".to_string()],
+                filenames: vec![],
+                grammar: "Julia".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "perl".to_string(),
+            LanguageConfig {
+                extensions: vec!["pl".to_string(), "pm".to_string(), "t".to_string()],
+                filenames: vec![],
+                grammar: "Perl".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "nim".to_string(),
+            LanguageConfig {
+                extensions: vec!["nim".to_string(), "nims".to_string(), "nimble".to_string()],
+                filenames: vec![],
+                grammar: "Nim".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "gleam".to_string(),
+            LanguageConfig {
+                extensions: vec!["gleam".to_string()],
+                filenames: vec![],
+                grammar: "Gleam".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "fsharp".to_string(),
+            LanguageConfig {
+                extensions: vec!["fs".to_string(), "fsi".to_string(), "fsx".to_string()],
+                filenames: vec![],
+                grammar: "FSharp".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "nix".to_string(),
+            LanguageConfig {
+                extensions: vec!["nix".to_string()],
+                filenames: vec![],
+                grammar: "Nix".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "nushell".to_string(),
+            LanguageConfig {
+                extensions: vec!["nu".to_string()],
+                filenames: vec![],
+                grammar: "Nushell".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "solidity".to_string(),
+            LanguageConfig {
+                extensions: vec!["sol".to_string()],
+                filenames: vec![],
+                grammar: "Solidity".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "ruby".to_string(),
+            LanguageConfig {
+                extensions: vec!["rb".to_string(), "rake".to_string(), "gemspec".to_string()],
+                filenames: vec![
+                    "Gemfile".to_string(),
+                    "Rakefile".to_string(),
+                    "Guardfile".to_string(),
+                ],
+                grammar: "Ruby".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "php".to_string(),
+            LanguageConfig {
+                extensions: vec!["php".to_string(), "phtml".to_string()],
+                filenames: vec![],
+                grammar: "PHP".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "lua".to_string(),
+            LanguageConfig {
+                extensions: vec!["lua".to_string()],
+                filenames: vec![],
+                grammar: "Lua".to_string(),
+                comment_prefix: Some("--".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "html".to_string(),
+            LanguageConfig {
+                extensions: vec!["html".to_string(), "htm".to_string()],
+                filenames: vec![],
+                grammar: "HTML".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "css".to_string(),
+            LanguageConfig {
+                extensions: vec!["css".to_string()],
+                filenames: vec![],
+                grammar: "CSS".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "sql".to_string(),
+            LanguageConfig {
+                extensions: vec!["sql".to_string()],
+                filenames: vec![],
+                grammar: "SQL".to_string(),
+                comment_prefix: Some("--".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "graphql".to_string(),
+            LanguageConfig {
+                extensions: vec!["graphql".to_string(), "gql".to_string()],
+                filenames: vec![],
+                grammar: "GraphQL".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "protobuf".to_string(),
+            LanguageConfig {
+                extensions: vec!["proto".to_string()],
+                filenames: vec![],
+                grammar: "Protocol Buffers".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "cmake".to_string(),
+            LanguageConfig {
+                extensions: vec!["cmake".to_string()],
+                filenames: vec!["CMakeLists.txt".to_string()],
+                grammar: "CMake".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "terraform".to_string(),
+            LanguageConfig {
+                extensions: vec!["tf".to_string(), "tfvars".to_string(), "hcl".to_string()],
+                filenames: vec![],
+                grammar: "HCL".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "vue".to_string(),
+            LanguageConfig {
+                extensions: vec!["vue".to_string()],
+                filenames: vec![],
+                grammar: "Vue".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "svelte".to_string(),
+            LanguageConfig {
+                extensions: vec!["svelte".to_string()],
+                filenames: vec![],
+                grammar: "Svelte".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "astro".to_string(),
+            LanguageConfig {
+                extensions: vec!["astro".to_string()],
+                filenames: vec![],
+                grammar: "Astro".to_string(),
+                comment_prefix: None,
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        // --- Languages for embedded grammars (syntax highlighting only) ---
+
+        languages.insert(
+            "scss".to_string(),
+            LanguageConfig {
+                extensions: vec!["scss".to_string()],
+                filenames: vec![],
+                grammar: "SCSS".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "less".to_string(),
+            LanguageConfig {
+                extensions: vec!["less".to_string()],
+                filenames: vec![],
+                grammar: "LESS".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "powershell".to_string(),
+            LanguageConfig {
+                extensions: vec!["ps1".to_string(), "psm1".to_string(), "psd1".to_string()],
+                filenames: vec![],
+                grammar: "PowerShell".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "kdl".to_string(),
+            LanguageConfig {
+                extensions: vec!["kdl".to_string()],
+                filenames: vec![],
+                grammar: "KDL".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "starlark".to_string(),
+            LanguageConfig {
+                extensions: vec!["bzl".to_string(), "star".to_string()],
+                filenames: vec!["BUILD".to_string(), "WORKSPACE".to_string()],
+                grammar: "Starlark".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "justfile".to_string(),
+            LanguageConfig {
+                extensions: vec![],
+                filenames: vec![
+                    "justfile".to_string(),
+                    "Justfile".to_string(),
+                    ".justfile".to_string(),
+                ],
+                grammar: "Justfile".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: Some(true),
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "earthfile".to_string(),
+            LanguageConfig {
+                extensions: vec!["earth".to_string()],
+                filenames: vec!["Earthfile".to_string()],
+                grammar: "Earthfile".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "gomod".to_string(),
+            LanguageConfig {
+                extensions: vec![],
+                filenames: vec!["go.mod".to_string(), "go.sum".to_string()],
+                grammar: "Go Module".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: Some(true),
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "vlang".to_string(),
+            LanguageConfig {
+                extensions: vec!["v".to_string(), "vv".to_string()],
+                filenames: vec![],
+                grammar: "V".to_string(),
+                comment_prefix: Some("//".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "ini".to_string(),
+            LanguageConfig {
+                extensions: vec!["ini".to_string(), "cfg".to_string()],
+                filenames: vec![],
+                grammar: "INI".to_string(),
+                comment_prefix: Some(";".to_string()),
+                auto_indent: false,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
+                tab_size: None,
+                formatter: None,
+                format_on_save: false,
+                on_save: vec![],
+            },
+        );
+
+        languages.insert(
+            "hyprlang".to_string(),
+            LanguageConfig {
+                extensions: vec!["hl".to_string()],
+                filenames: vec!["hyprland.conf".to_string()],
+                grammar: "Hyprlang".to_string(),
+                comment_prefix: Some("#".to_string()),
+                auto_indent: true,
+                auto_close: None,
+                auto_surround: None,
+                highlighter: HighlighterPreference::Auto,
+                textmate_grammar: None,
+                show_whitespace_tabs: true,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
@@ -3223,7 +4517,7 @@ impl Config {
 
     /// Create default LSP configurations
     #[cfg(feature = "runtime")]
-    fn default_lsp_config() -> HashMap<String, LspServerConfig> {
+    fn default_lsp_config() -> HashMap<String, LspLanguageConfig> {
         let mut lsp = HashMap::new();
 
         // rust-analyzer (installed via rustup or package manager)
@@ -3238,19 +4532,19 @@ impl Config {
 
     /// Create empty LSP configurations for WASM builds
     #[cfg(not(feature = "runtime"))]
-    fn default_lsp_config() -> HashMap<String, LspServerConfig> {
+    fn default_lsp_config() -> HashMap<String, LspLanguageConfig> {
         // LSP is not available in WASM builds
         HashMap::new()
     }
 
     #[cfg(feature = "runtime")]
-    fn populate_lsp_config(lsp: &mut HashMap<String, LspServerConfig>, ra_log_path: String) {
+    fn populate_lsp_config(lsp: &mut HashMap<String, LspLanguageConfig>, ra_log_path: String) {
         // rust-analyzer: full mode by default (no init param restrictions, no process limits).
         // Users can switch to reduced-memory mode via the "Rust LSP: Reduced Memory Mode"
         // command palette command (provided by the rust-lsp plugin).
         lsp.insert(
             "rust".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "rust-analyzer".to_string(),
                 args: vec!["--log-file".to_string(), ra_log_path],
                 enabled: true,
@@ -3259,13 +4553,21 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "Cargo.toml".to_string(),
+                    "rust-project.json".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // pylsp (installed via pip)
         lsp.insert(
             "python".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "pylsp".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3274,14 +4576,24 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "pyproject.toml".to_string(),
+                    "setup.py".to_string(),
+                    "setup.cfg".to_string(),
+                    "pyrightconfig.json".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // typescript-language-server (installed via npm)
         // Alternative: use "deno lsp" with initialization_options: {"enable": true}
         lsp.insert(
             "javascript".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "typescript-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 enabled: true,
@@ -3293,11 +4605,20 @@ impl Config {
                     "jsx".to_string(),
                     "javascriptreact".to_string(),
                 )]),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "tsconfig.json".to_string(),
+                    "jsconfig.json".to_string(),
+                    "package.json".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
         lsp.insert(
             "typescript".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "typescript-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 enabled: true,
@@ -3309,13 +4630,22 @@ impl Config {
                     "tsx".to_string(),
                     "typescriptreact".to_string(),
                 )]),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "tsconfig.json".to_string(),
+                    "jsconfig.json".to_string(),
+                    "package.json".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // vscode-html-language-server (installed via npm install -g vscode-langservers-extracted)
         lsp.insert(
             "html".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "vscode-html-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 enabled: true,
@@ -3324,13 +4654,17 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // vscode-css-language-server (installed via npm install -g vscode-langservers-extracted)
         lsp.insert(
             "css".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "vscode-css-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 enabled: true,
@@ -3339,13 +4673,17 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // clangd (installed via package manager)
         lsp.insert(
             "c".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "clangd".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3354,11 +4692,20 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "compile_commands.json".to_string(),
+                    "CMakeLists.txt".to_string(),
+                    "Makefile".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
         lsp.insert(
             "cpp".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "clangd".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3367,13 +4714,22 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "compile_commands.json".to_string(),
+                    "CMakeLists.txt".to_string(),
+                    "Makefile".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // gopls (installed via go install)
         lsp.insert(
             "go".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "gopls".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3382,13 +4738,21 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "go.mod".to_string(),
+                    "go.work".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // vscode-json-language-server (installed via npm install -g vscode-langservers-extracted)
         lsp.insert(
             "json".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "vscode-json-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 enabled: true,
@@ -3397,13 +4761,17 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // csharp-language-server (installed via dotnet tool install -g csharp-ls)
         lsp.insert(
             "csharp".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "csharp-ls".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3412,14 +4780,22 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "*.csproj".to_string(),
+                    "*.sln".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // ols - Odin Language Server (https://github.com/DanielGavin/ols)
         // Build from source: cd ols && ./build.sh (Linux/macOS) or ./build.bat (Windows)
         lsp.insert(
             "odin".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "ols".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3428,14 +4804,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // zls - Zig Language Server (https://github.com/zigtools/zls)
         // Install via package manager or download from releases
         lsp.insert(
             "zig".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "zls".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3444,14 +4824,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // jdtls - Eclipse JDT Language Server for Java
         // Install via package manager or download from Eclipse
         lsp.insert(
             "java".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "jdtls".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3460,14 +4844,23 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "pom.xml".to_string(),
+                    "build.gradle".to_string(),
+                    "build.gradle.kts".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // texlab - LaTeX Language Server (https://github.com/latex-lsp/texlab)
         // Install via cargo install texlab or package manager
         lsp.insert(
             "latex".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "texlab".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3476,14 +4869,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // marksman - Markdown Language Server (https://github.com/artempyanykh/marksman)
         // Install via package manager or download from releases
         lsp.insert(
             "markdown".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "marksman".to_string(),
                 args: vec!["server".to_string()],
                 enabled: true,
@@ -3492,14 +4889,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // templ - Templ Language Server (https://templ.guide)
         // Install via go install github.com/a-h/templ/cmd/templ@latest
         lsp.insert(
             "templ".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "templ".to_string(),
                 args: vec!["lsp".to_string()],
                 enabled: true,
@@ -3508,14 +4909,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // tinymist - Typst Language Server (https://github.com/Myriad-Dreamin/tinymist)
         // Install via cargo install tinymist or download from releases
         lsp.insert(
             "typst".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "tinymist".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3524,13 +4929,17 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // bash-language-server (installed via npm install -g bash-language-server)
         lsp.insert(
             "bash".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "bash-language-server".to_string(),
                 args: vec!["start".to_string()],
                 enabled: true,
@@ -3539,14 +4948,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // lua-language-server (https://github.com/LuaLS/lua-language-server)
         // Install via package manager or download from releases
         lsp.insert(
             "lua".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "lua-language-server".to_string(),
                 args: vec![],
                 enabled: true,
@@ -3555,13 +4968,23 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    ".luarc.json".to_string(),
+                    ".luarc.jsonc".to_string(),
+                    ".luacheckrc".to_string(),
+                    ".stylua.toml".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // solargraph - Ruby Language Server (installed via gem install solargraph)
         lsp.insert(
             "ruby".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "solargraph".to_string(),
                 args: vec!["stdio".to_string()],
                 enabled: true,
@@ -3570,14 +4993,22 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "Gemfile".to_string(),
+                    ".ruby-version".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
         );
 
         // phpactor - PHP Language Server (https://phpactor.readthedocs.io)
         // Install via composer global require phpactor/phpactor
         lsp.insert(
             "php".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "phpactor".to_string(),
                 args: vec!["language-server".to_string()],
                 enabled: true,
@@ -3586,13 +5017,17 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec!["composer.json".to_string(), ".git".to_string()],
+            }]),
         );
 
         // yaml-language-server (installed via npm install -g yaml-language-server)
         lsp.insert(
             "yaml".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "yaml-language-server".to_string(),
                 args: vec!["--stdio".to_string()],
                 enabled: true,
@@ -3601,14 +5036,18 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
 
         // taplo - TOML Language Server (https://taplo.tamasfe.dev)
         // Install via cargo install taplo-cli or npm install -g @taplo/cli
         lsp.insert(
             "toml".to_string(),
-            LspServerConfig {
+            LspLanguageConfig::Multi(vec![LspServerConfig {
                 command: "taplo".to_string(),
                 args: vec!["lsp".to_string(), "stdio".to_string()],
                 enabled: true,
@@ -3617,11 +5056,565 @@ impl Config {
                 initialization_options: None,
                 env: Default::default(),
                 language_id_overrides: Default::default(),
-            },
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // dart - Dart Language Server (#1252)
+        // Included with the Dart SDK
+        lsp.insert(
+            "dart".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "dart".to_string(),
+                args: vec!["language-server".to_string(), "--protocol=lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec!["pubspec.yaml".to_string(), ".git".to_string()],
+            }]),
+        );
+
+        // nu - Nushell Language Server (#1031)
+        // Built into the Nushell binary
+        lsp.insert(
+            "nushell".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "nu".to_string(),
+                args: vec!["--lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // solc - Solidity Language Server (#857)
+        // Install via npm install -g @nomicfoundation/solidity-language-server
+        lsp.insert(
+            "solidity".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "nomicfoundation-solidity-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // --- DevOps / infrastructure LSP servers ---
+
+        // terraform-ls - Terraform Language Server (https://github.com/hashicorp/terraform-ls)
+        // Install via package manager or download from releases
+        lsp.insert(
+            "terraform".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "terraform-ls".to_string(),
+                args: vec!["serve".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec![
+                    "*.tf".to_string(),
+                    ".terraform".to_string(),
+                    ".git".to_string(),
+                ],
+            }]),
+        );
+
+        // cmake-language-server (https://github.com/regen100/cmake-language-server)
+        // Install via pip: pip install cmake-language-server
+        lsp.insert(
+            "cmake".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "cmake-language-server".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: vec!["CMakeLists.txt".to_string(), ".git".to_string()],
+            }]),
+        );
+
+        // buf - Protobuf Language Server (https://buf.build)
+        // Install via package manager or curl
+        lsp.insert(
+            "protobuf".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "buf".to_string(),
+                args: vec!["beta".to_string(), "lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // graphql-lsp (https://github.com/graphql/graphiql/tree/main/packages/graphql-language-service-cli)
+        // Install via npm: npm install -g graphql-language-service-cli
+        lsp.insert(
+            "graphql".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "graphql-lsp".to_string(),
+                args: vec!["server".to_string(), "-m".to_string(), "stream".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // sqls - SQL Language Server (https://github.com/sqls-server/sqls)
+        // Install via go: go install github.com/sqls-server/sqls@latest
+        lsp.insert(
+            "sql".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "sqls".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // --- Web framework LSP servers ---
+
+        // vue-language-server (installed via npm install -g @vue/language-server)
+        lsp.insert(
+            "vue".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "vue-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // svelte-language-server (installed via npm install -g svelte-language-server)
+        lsp.insert(
+            "svelte".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "svelteserver".to_string(),
+                args: vec!["--stdio".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // astro-ls - Astro Language Server (installed via npm install -g @astrojs/language-server)
+        lsp.insert(
+            "astro".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "astro-ls".to_string(),
+                args: vec!["--stdio".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // tailwindcss-language-server (installed via npm install -g @tailwindcss/language-server)
+        lsp.insert(
+            "tailwindcss".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "tailwindcss-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // --- Programming language LSP servers ---
+
+        // nil - Nix Language Server (https://github.com/oxalica/nil)
+        // Install via nix profile install github:oxalica/nil
+        lsp.insert(
+            "nix".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "nil".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // kotlin-language-server (https://github.com/fwcd/kotlin-language-server)
+        // Install via package manager or build from source
+        lsp.insert(
+            "kotlin".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "kotlin-language-server".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // sourcekit-lsp - Swift Language Server (included with Swift toolchain)
+        lsp.insert(
+            "swift".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "sourcekit-lsp".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // metals - Scala Language Server (https://scalameta.org/metals/)
+        // Install via coursier: cs install metals
+        lsp.insert(
+            "scala".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "metals".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // elixir-ls - Elixir Language Server (https://github.com/elixir-lsp/elixir-ls)
+        // Install via mix: mix escript.install hex elixir_ls
+        lsp.insert(
+            "elixir".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "elixir-ls".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // erlang_ls - Erlang Language Server (https://github.com/erlang-ls/erlang_ls)
+        lsp.insert(
+            "erlang".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "erlang_ls".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // haskell-language-server (https://github.com/haskell/haskell-language-server)
+        // Install via ghcup: ghcup install hls
+        lsp.insert(
+            "haskell".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "haskell-language-server-wrapper".to_string(),
+                args: vec!["--lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // ocamllsp - OCaml Language Server (https://github.com/ocaml/ocaml-lsp)
+        // Install via opam: opam install ocaml-lsp-server
+        lsp.insert(
+            "ocaml".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "ocamllsp".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // clojure-lsp (https://github.com/clojure-lsp/clojure-lsp)
+        // Install via package manager or download from releases
+        lsp.insert(
+            "clojure".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "clojure-lsp".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // r-languageserver (https://github.com/REditorSupport/languageserver)
+        // Install via R: install.packages("languageserver")
+        lsp.insert(
+            "r".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "R".to_string(),
+                args: vec![
+                    "--vanilla".to_string(),
+                    "-e".to_string(),
+                    "languageserver::run()".to_string(),
+                ],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // julia LanguageServer.jl (https://github.com/julia-vscode/LanguageServer.jl)
+        // Install via Julia: using Pkg; Pkg.add("LanguageServer")
+        lsp.insert(
+            "julia".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "julia".to_string(),
+                args: vec![
+                    "--startup-file=no".to_string(),
+                    "--history-file=no".to_string(),
+                    "-e".to_string(),
+                    "using LanguageServer; runserver()".to_string(),
+                ],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // PerlNavigator (https://github.com/bscan/PerlNavigator)
+        // Install via npm: npm install -g perlnavigator-server
+        lsp.insert(
+            "perl".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "perlnavigator".to_string(),
+                args: vec!["--stdio".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // nimlangserver - Nim Language Server (https://github.com/nim-lang/langserver)
+        // Install via nimble: nimble install nimlangserver
+        lsp.insert(
+            "nim".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "nimlangserver".to_string(),
+                args: vec![],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // gleam lsp - Gleam Language Server (built into the gleam binary)
+        lsp.insert(
+            "gleam".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "gleam".to_string(),
+                args: vec!["lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
+        );
+
+        // fsharp - F# Language Server (https://github.com/fsharp/FsAutoComplete)
+        // Install via dotnet: dotnet tool install -g fsautocomplete
+        lsp.insert(
+            "fsharp".to_string(),
+            LspLanguageConfig::Multi(vec![LspServerConfig {
+                command: "fsautocomplete".to_string(),
+                args: vec!["--adaptive-lsp-server-enabled".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                name: None,
+                only_features: None,
+                except_features: None,
+                root_markers: Default::default(),
+            }]),
         );
     }
-
-    /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate tab size
         if self.editor.tab_size == 0 {
@@ -3793,7 +5786,7 @@ mod tests {
         // User's rust override should be present
         assert!(loaded.lsp.contains_key("rust"));
         assert_eq!(
-            loaded.lsp["rust"].command,
+            loaded.lsp["rust"].as_slice()[0].command,
             "custom-rust-analyzer".to_string()
         );
 
@@ -3854,7 +5847,7 @@ mod tests {
                 assert_eq!(label, "Test");
                 // Should have items for each available theme (embedded themes only, no user themes in temp dir)
                 let loader = crate::view::theme::ThemeLoader::embedded_only();
-                let registry = loader.load_all();
+                let registry = loader.load_all(&[]);
                 assert_eq!(items.len(), registry.len());
 
                 // Each item should be an Action with copy_with_theme
@@ -3936,8 +5929,12 @@ mod tests {
                 highlighter: HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: false, // Go hides tab indicators
-                use_tabs: true,              // Go uses tabs
-                tab_size: Some(8),           // Go uses 8-space tabs
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: Some(true), // Go uses tabs
+                tab_size: Some(8),    // Go uses 8-space tabs
                 formatter: Some(FormatterConfig {
                     command: "gofmt".to_string(),
                     args: vec![],
@@ -3970,6 +5967,68 @@ mod tests {
     }
 
     #[test]
+    fn test_buffer_config_per_language_line_wrap() {
+        let mut config = Config::default();
+        config.editor.line_wrap = false;
+
+        // Add markdown with line_wrap override
+        config.languages.insert(
+            "markdown".to_string(),
+            LanguageConfig {
+                extensions: vec!["md".to_string()],
+                line_wrap: Some(true),
+                ..Default::default()
+            },
+        );
+
+        // Markdown should override global line_wrap=false
+        let md_config = BufferConfig::resolve(&config, Some("markdown"));
+        assert!(md_config.line_wrap, "Markdown should have line_wrap=true");
+
+        // Other languages should use global default (false)
+        let other_config = BufferConfig::resolve(&config, Some("rust"));
+        assert!(
+            !other_config.line_wrap,
+            "Non-configured languages should use global line_wrap=false"
+        );
+
+        // No language should use global default
+        let no_lang_config = BufferConfig::resolve(&config, None);
+        assert!(
+            !no_lang_config.line_wrap,
+            "No language should use global line_wrap=false"
+        );
+    }
+
+    #[test]
+    fn test_buffer_config_per_language_wrap_column() {
+        let mut config = Config::default();
+        config.editor.wrap_column = Some(120);
+
+        // Add markdown with wrap_column override
+        config.languages.insert(
+            "markdown".to_string(),
+            LanguageConfig {
+                extensions: vec!["md".to_string()],
+                wrap_column: Some(80),
+                ..Default::default()
+            },
+        );
+
+        // Markdown should use its own wrap_column
+        let md_config = BufferConfig::resolve(&config, Some("markdown"));
+        assert_eq!(md_config.wrap_column, Some(80));
+
+        // Other languages should use global wrap_column
+        let other_config = BufferConfig::resolve(&config, Some("rust"));
+        assert_eq!(other_config.wrap_column, Some(120));
+
+        // No language should use global wrap_column
+        let no_lang_config = BufferConfig::resolve(&config, None);
+        assert_eq!(no_lang_config.wrap_column, Some(120));
+    }
+
+    #[test]
     fn test_buffer_config_indent_string() {
         let config = Config::default();
 
@@ -3982,12 +6041,74 @@ mod tests {
         config_with_tabs.languages.insert(
             "makefile".to_string(),
             LanguageConfig {
-                use_tabs: true,
+                use_tabs: Some(true),
                 tab_size: Some(8),
                 ..Default::default()
             },
         );
         let tabs_config = BufferConfig::resolve(&config_with_tabs, Some("makefile"));
         assert_eq!(tabs_config.indent_string(), "\t");
+    }
+
+    #[test]
+    fn test_buffer_config_global_use_tabs_inherited() {
+        // When editor.use_tabs is true, buffers without a language-specific
+        // override should inherit the global setting.
+        let mut config = Config::default();
+        config.editor.use_tabs = true;
+
+        // Unknown language inherits global
+        let buffer_config = BufferConfig::resolve(&config, Some("unknown_lang"));
+        assert!(buffer_config.use_tabs);
+
+        // No language inherits global
+        let buffer_config = BufferConfig::resolve(&config, None);
+        assert!(buffer_config.use_tabs);
+
+        // Language with explicit use_tabs: Some(false) overrides global
+        config.languages.insert(
+            "python".to_string(),
+            LanguageConfig {
+                use_tabs: Some(false),
+                ..Default::default()
+            },
+        );
+        let buffer_config = BufferConfig::resolve(&config, Some("python"));
+        assert!(!buffer_config.use_tabs);
+
+        // Language with use_tabs: None inherits global true
+        config.languages.insert(
+            "rust".to_string(),
+            LanguageConfig {
+                use_tabs: None,
+                ..Default::default()
+            },
+        );
+        let buffer_config = BufferConfig::resolve(&config, Some("rust"));
+        assert!(buffer_config.use_tabs);
+    }
+
+    /// Verify that every LSP config key has a matching entry in default_languages().
+    /// Without this, detect_language() won't map file extensions to the language name,
+    /// causing "No LSP server configured for this file type" even though the LSP config
+    /// exists. The only exception is "tailwindcss" which attaches to CSS/HTML/JS files
+    /// rather than having its own file type.
+    #[test]
+    #[cfg(feature = "runtime")]
+    fn test_lsp_languages_have_language_config() {
+        let config = Config::default();
+        let exceptions = ["tailwindcss"];
+        for lsp_key in config.lsp.keys() {
+            if exceptions.contains(&lsp_key.as_str()) {
+                continue;
+            }
+            assert!(
+                config.languages.contains_key(lsp_key),
+                "LSP config key '{}' has no matching entry in default_languages(). \
+                 Add a LanguageConfig with the correct file extensions so detect_language() \
+                 can map files to this language.",
+                lsp_key
+            );
+        }
     }
 }

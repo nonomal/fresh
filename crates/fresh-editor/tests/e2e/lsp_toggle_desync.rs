@@ -26,7 +26,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 /// This lets us inspect the exact text content sent in didOpen and
 /// the exact contentChanges sent in didChange, to verify whether the
 /// server received proper re-sync after toggle.
-fn create_body_logging_lsp_script() -> std::path::PathBuf {
+fn create_body_logging_lsp_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r#"#!/bin/bash
 
 # Log file path (passed as first argument)
@@ -119,7 +119,7 @@ while true; do
 done
 "#;
 
-    let script_path = std::env::temp_dir().join("fake_lsp_body_logging.sh");
+    let script_path = dir.join("fake_lsp_body_logging.sh");
     std::fs::write(&script_path, script).expect("Failed to write fake LSP script");
 
     #[cfg(unix)]
@@ -149,11 +149,11 @@ fn test_lsp_toggle_off_edit_toggle_on_causes_desync() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    // Create the body-logging fake LSP server script
-    let script_path = create_body_logging_lsp_script();
-
     // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    // Create the body-logging fake LSP server script (in per-test temp dir)
+    let script_path = create_body_logging_lsp_script(temp_dir.path());
     let log_file = temp_dir.path().join("lsp_toggle_desync_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     let initial_content = "fn main() {\n    let x = 5;\n}\n";
@@ -163,7 +163,7 @@ fn test_lsp_toggle_off_edit_toggle_on_causes_desync() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -172,7 +172,11 @@ fn test_lsp_toggle_off_edit_toggle_on_causes_desync() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Add keybinding for LspToggleForBuffer (Alt+T)
@@ -185,12 +189,14 @@ fn test_lsp_toggle_off_edit_toggle_on_causes_desync() -> anyhow::Result<()> {
         when: None,
     });
 
-    // Create harness
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    // Create harness with empty plugins dir to prevent loading embedded
+    // plugins (unnecessary for this test and improves isolation/speed).
+    let mut harness = EditorTestHarness::create(
         120,
         30,
-        config,
-        temp_dir.path().to_path_buf(),
+        crate::common::harness::HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
     )?;
 
     // Step 1: Open the test file (triggers didOpen)
@@ -276,9 +282,8 @@ fn test_lsp_toggle_off_sends_did_close() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_body_logging_lsp_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_body_logging_lsp_script(temp_dir.path());
     let log_file = temp_dir.path().join("lsp_toggle_close_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {}\n")?;
@@ -286,7 +291,7 @@ fn test_lsp_toggle_off_sends_did_close() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -295,7 +300,11 @@ fn test_lsp_toggle_off_sends_did_close() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     config.keybindings.push(fresh::config::Keybinding {
@@ -307,11 +316,14 @@ fn test_lsp_toggle_off_sends_did_close() -> anyhow::Result<()> {
         when: None,
     });
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    // Create harness with empty plugins dir to prevent loading embedded
+    // plugins (unnecessary for this test and improves isolation/speed).
+    let mut harness = EditorTestHarness::create(
         120,
         30,
-        config,
-        temp_dir.path().to_path_buf(),
+        crate::common::harness::HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
     )?;
 
     harness.open_file(&test_file)?;

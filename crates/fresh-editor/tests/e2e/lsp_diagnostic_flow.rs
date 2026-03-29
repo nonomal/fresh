@@ -22,7 +22,7 @@ use crate::common::harness::EditorTestHarness;
 /// - Pull diagnostics (`textDocument/diagnostic`) return empty initially
 /// - After didChange: sends `workspace/diagnostic/refresh` then `publishDiagnostics`
 ///   with empty diagnostics (clearing the errors)
-fn create_ra_replay_server_script() -> std::path::PathBuf {
+fn create_ra_replay_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     // The publishDiagnostics payload is taken verbatim from the recording,
     // with the URI made dynamic (replaced at runtime with the actual file URI).
     let script = r##"#!/bin/bash
@@ -138,8 +138,10 @@ while true; do
             break
             ;;
         *)
-            # Respond to any other request with null result
-            if [ -n "$msg_id" ]; then
+            # Only respond to requests (which have both a method and an id).
+            # Skip responses (no method) — these are replies to our
+            # workspace/diagnostic/refresh server→client requests.
+            if [ -n "$method" ] && [ -n "$msg_id" ]; then
                 send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
             fi
             ;;
@@ -149,7 +151,7 @@ done
 echo "SERVER: exiting" >> "$LOG_FILE"
 "##;
 
-    let script_path = std::env::temp_dir().join("fake_ra_replay_server.sh");
+    let script_path = dir.join("fake_ra_replay_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write RA replay server script");
 
     #[cfg(unix)]
@@ -184,9 +186,8 @@ fn test_rust_analyzer_push_diagnostics_displayed() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_replay_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_replay_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_replay_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -197,7 +198,7 @@ fn test_rust_analyzer_push_diagnostics_displayed() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -206,7 +207,11 @@ fn test_rust_analyzer_push_diagnostics_displayed() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -274,9 +279,8 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_replay_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_replay_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_clear_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -287,7 +291,7 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -296,7 +300,11 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -327,7 +335,13 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
     harness.type_text("fn main() {\n    let x: i32 = 42;\n    println!(\"{}\", x);\n}\n")?;
     harness.render()?;
 
-    // Wait for the server to receive didChange and send cleared diagnostics
+    // Wait for the server to actually receive the didChange before expecting its response
+    harness.wait_until(|_| {
+        let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log.contains("ACTION: didChange")
+    })?;
+
+    // Wait for the server to send cleared diagnostics
     harness.wait_until(|_| {
         let log = std::fs::read_to_string(&log_file).unwrap_or_default();
         log.contains("SENT: publishDiagnostics with 0 diagnostics")
@@ -375,7 +389,7 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
 ///
 /// The diagnostic content uses actual rust-analyzer E0308 formatting recorded
 /// from rust-analyzer v1.92.0.
-fn create_ra_edit_save_server_script() -> std::path::PathBuf {
+fn create_ra_edit_save_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r##"#!/bin/bash
 
 # Fake LSP server for edit/save/edit/save flow testing
@@ -440,7 +454,6 @@ while true; do
             DID_OPEN_URI=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
             VERSION=1
             echo "ACTION: didOpen uri=$DID_OPEN_URI" >> "$LOG_FILE"
-            sleep 0.1
             send_error_diagnostics
             echo "SENT: publishDiagnostics with errors (initial)" >> "$LOG_FILE"
             ;;
@@ -459,7 +472,6 @@ while true; do
             # On save, cargo check reruns and sends fresh diagnostics
             send_message '{"jsonrpc":"2.0","id":4000,"method":"workspace/diagnostic/refresh","params":{}}'
             echo "SENT: workspace/diagnostic/refresh (post-save)" >> "$LOG_FILE"
-            sleep 0.1
             # Save #1: error still present → re-send error diagnostics
             # Save #2: error was fixed → send cleared diagnostics
             if [ $SAVE_COUNT -le 1 ]; then
@@ -485,7 +497,10 @@ while true; do
             break
             ;;
         *)
-            if [ -n "$msg_id" ]; then
+            # Only respond to requests (which have both a method and an id).
+            # Skip responses (no method) — these are replies to our
+            # workspace/diagnostic/refresh server→client requests.
+            if [ -n "$method" ] && [ -n "$msg_id" ]; then
                 send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
             fi
             ;;
@@ -494,7 +509,7 @@ done
 echo "SERVER: exiting" >> "$LOG_FILE"
 "##;
 
-    let script_path = std::env::temp_dir().join("fake_ra_edit_save_server.sh");
+    let script_path = dir.join("fake_ra_edit_save_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write RA edit/save server script");
 
     #[cfg(unix)]
@@ -528,9 +543,8 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_edit_save_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_edit_save_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_edit_save_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -541,7 +555,7 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -550,7 +564,11 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -583,11 +601,7 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
     })?;
 
     // Diagnostics should persist (no cargo check has rerun, old diagnostics still active)
-    harness.process_async_and_render()?;
-    assert!(
-        harness.screen_to_string().contains("E:1"),
-        "Expected diagnostics to persist after editing (before save)"
-    );
+    harness.wait_until(|h| h.screen_to_string().contains("E:1"))?;
     eprintln!("[TEST] Step 2: After edit, diagnostics still visible (E:1)");
 
     // === Step 3: Save (cargo check reruns, error still present) ===
@@ -676,9 +690,8 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_replay_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_replay_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_refresh_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -689,7 +702,7 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -698,7 +711,11 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -750,7 +767,7 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
 /// Meanwhile, the editor continues sending didChange with newer versions.
 /// The editor should drop these stale diagnostics because the version is older
 /// than the current document version.
-fn create_stale_diagnostics_server_script() -> std::path::PathBuf {
+fn create_stale_diagnostics_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r##"#!/bin/bash
 
 # Fake LSP server that sends delayed, stale diagnostics
@@ -839,7 +856,10 @@ while true; do
             break
             ;;
         *)
-            if [ -n "$msg_id" ]; then
+            # Only respond to requests (which have both a method and an id).
+            # Skip responses (no method) — these are replies to our
+            # server→client requests.
+            if [ -n "$method" ] && [ -n "$msg_id" ]; then
                 send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
             fi
             ;;
@@ -848,7 +868,7 @@ done
 echo "SERVER: exiting" >> "$LOG_FILE"
 "##;
 
-    let script_path = std::env::temp_dir().join("fake_stale_diag_server.sh");
+    let script_path = dir.join("fake_stale_diag_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write stale diagnostics server script");
 
     #[cfg(unix)]
@@ -883,9 +903,8 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_stale_diagnostics_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_stale_diagnostics_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("stale_diag_log.txt");
     let test_file = temp_dir.path().join("test.py");
     std::fs::write(&test_file, "")?;
@@ -893,7 +912,7 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "python".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -902,7 +921,11 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(

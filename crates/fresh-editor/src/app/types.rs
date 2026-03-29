@@ -222,13 +222,11 @@ impl BufferMetadata {
         // Use canonicalized forms first to handle macOS /var -> /private/var differences.
         let display_name = Self::display_name_for_path(&path, working_dir);
 
-        // Check if this is a library file (in vendor directories or standard libraries)
+        // Check if this is a library file (in vendor directories or standard libraries).
+        // Library files are read-only (to prevent accidental edits) but LSP stays
+        // enabled so that Goto Definition, Hover, Find References, etc. still work
+        // when the user navigates into library source code (issue #1344).
         let is_library = Self::is_library_path(&path, working_dir);
-        let (lsp_enabled, lsp_disabled_reason) = if is_library {
-            (false, Some(t!("lsp.disabled.library_file").to_string()))
-        } else {
-            (true, None)
-        };
 
         Self {
             kind: BufferKind::File {
@@ -236,8 +234,8 @@ impl BufferMetadata {
                 uri: file_uri,
             },
             display_name,
-            lsp_enabled,
-            lsp_disabled_reason,
+            lsp_enabled: true,
+            lsp_disabled_reason: None,
             read_only: is_library,
             binary: false,
             lsp_opened_with: HashSet::new(),
@@ -727,6 +725,10 @@ pub(super) struct MouseState {
     pub drag_selection_split: Option<LeafId>,
     /// The buffer byte position where the selection anchor is
     pub drag_selection_anchor: Option<usize>,
+    /// When true, dragging extends selection by whole words (set by double-click)
+    pub drag_selection_by_words: bool,
+    /// The end of the initially double-clicked word (used as anchor when dragging backward)
+    pub drag_selection_word_end: Option<usize>,
     /// Tab drag state (for drag-to-split functionality)
     pub dragging_tab: Option<TabDragState>,
     /// Whether we're currently dragging a popup scrollbar (popup index)
@@ -989,37 +991,8 @@ impl CachedLayout {
 }
 
 /// Convert a file path to an `lsp_types::Uri`.
-///
-/// Uses `url::Url::from_file_path` for initial encoding, then percent-encodes
-/// characters that the `url` crate (WHATWG) leaves raw but that `lsp_types::Uri`
-/// (strict RFC 3986) rejects — specifically `[`, `]`, `{`, `}`, `|`, `^`, and `` ` ``.
 pub fn file_path_to_lsp_uri(path: &Path) -> Option<lsp_types::Uri> {
-    let url = url::Url::from_file_path(path).ok()?;
-    let url_str = url.as_str();
-
-    // Fast path: if no problematic characters, parse directly
-    if !url_str
-        .bytes()
-        .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'|' | b'^' | b'`'))
-    {
-        return url_str.parse::<lsp_types::Uri>().ok();
-    }
-
-    // Percent-encode characters that url (WHATWG) allows but lsp_types::Uri (RFC 3986) rejects
-    let mut encoded = String::with_capacity(url_str.len() + 16);
-    for byte in url_str.bytes() {
-        match byte {
-            b'[' => encoded.push_str("%5B"),
-            b']' => encoded.push_str("%5D"),
-            b'{' => encoded.push_str("%7B"),
-            b'}' => encoded.push_str("%7D"),
-            b'|' => encoded.push_str("%7C"),
-            b'^' => encoded.push_str("%5E"),
-            b'`' => encoded.push_str("%60"),
-            _ => encoded.push(byte as char),
-        }
-    }
-    encoded.parse::<lsp_types::Uri>().ok()
+    fresh_core::file_uri::path_to_lsp_uri(path)
 }
 
 #[cfg(test)]
@@ -1027,7 +1000,6 @@ mod uri_encoding_tests {
     use super::*;
 
     /// Helper to get a platform-appropriate absolute path for testing.
-    /// On Windows, url::Url::from_file_path rejects Unix-style paths.
     fn abs_path(suffix: &str) -> PathBuf {
         std::env::temp_dir().join(suffix)
     }

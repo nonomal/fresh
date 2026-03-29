@@ -3,7 +3,7 @@
 //! This module allows plugins to register custom commands dynamically
 //! while maintaining the built-in command set.
 
-use crate::input::commands::{get_all_commands, Command, Suggestion};
+use crate::input::commands::{get_all_commands, Command, CommandSource, Suggestion};
 use crate::input::fuzzy::fuzzy_match;
 use crate::input::keybindings::Action;
 use crate::input::keybindings::KeyContext;
@@ -72,6 +72,9 @@ impl CommandRegistry {
     ///
     /// If a command with the same name already exists, it will be replaced.
     /// This allows plugins to override built-in commands.
+    /// Note: For plugin commands, prefer `try_register` which enforces
+    /// first-writer-wins semantics. This method is kept for internal use
+    /// and hot-reload scenarios.
     pub fn register(&self, command: Command) {
         tracing::debug!(
             "CommandRegistry::register: name='{}', action={:?}",
@@ -89,6 +92,28 @@ impl CommandRegistry {
             "CommandRegistry::register: plugin_commands now has {} items",
             commands.len()
         );
+    }
+
+    /// Try to register a command, failing if a command with the same name
+    /// is already registered by a different plugin (first-writer-wins).
+    ///
+    /// Returns `Ok(())` on success, or `Err` with the name of the existing
+    /// plugin that owns the command.
+    pub fn try_register(&self, command: Command) -> Result<(), (String, CommandSource)> {
+        let mut commands = self.plugin_commands.write().unwrap();
+
+        if let Some(existing) = commands.iter().find(|c| c.name == command.name) {
+            // Allow same plugin to re-register (hot-reload)
+            if existing.source == command.source {
+                commands.retain(|c| c.name != command.name);
+                commands.push(command);
+                return Ok(());
+            }
+            return Err((existing.name.clone(), existing.source.clone()));
+        }
+
+        commands.push(command);
+        Ok(())
     }
 
     /// Unregister a command by name
@@ -228,9 +253,10 @@ impl CommandRegistry {
                 (suggestion, history_pos, score)
             };
 
-        // First, try to match by name only
+        // Match by name or description
         // Commands with unmet custom contexts are completely hidden
-        let mut suggestions: Vec<(Suggestion, Option<usize>, i32)> = commands
+        // match_kind: 0 = name match, 1 = description match
+        let mut suggestions: Vec<(Suggestion, Option<usize>, i32, u8)> = commands
             .iter()
             .filter(|cmd| is_visible(cmd))
             .filter_map(|cmd| {
@@ -238,73 +264,65 @@ impl CommandRegistry {
                 let name_result = fuzzy_match(query, &localized_name);
                 if name_result.matched {
                     let localized_desc = cmd.get_localized_description();
-                    Some(make_suggestion(
-                        cmd,
-                        name_result.score,
-                        localized_name,
-                        localized_desc,
-                    ))
+                    let (suggestion, hist, score) =
+                        make_suggestion(cmd, name_result.score, localized_name, localized_desc);
+                    Some((suggestion, hist, score, 0))
+                } else if !query.is_empty() {
+                    let localized_desc = cmd.get_localized_description();
+                    let desc_result = fuzzy_match(query, &localized_desc);
+                    if desc_result.matched {
+                        let (suggestion, hist, score) =
+                            make_suggestion(cmd, desc_result.score, localized_name, localized_desc);
+                        Some((suggestion, hist, score, 1))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             })
             .collect();
 
-        // If no name matches found, try description matching as a fallback
-        if suggestions.is_empty() && !query.is_empty() {
-            suggestions = commands
-                .iter()
-                .filter(|cmd| is_visible(cmd))
-                .filter_map(|cmd| {
-                    let localized_desc = cmd.get_localized_description();
-                    let desc_result = fuzzy_match(query, &localized_desc);
-                    if desc_result.matched {
-                        let localized_name = cmd.get_localized_name();
-                        // Description matches get reduced score
-                        Some(make_suggestion(
-                            cmd,
-                            desc_result.score.saturating_sub(50),
-                            localized_name,
-                            localized_desc,
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        }
-
         // Sort by:
         // 1. Disabled status (enabled first)
-        // 2. Fuzzy match score (higher is better) - only when query is not empty
-        // 3. History position (recent first, then never-used alphabetically)
+        // 2. Match kind (name matches before description matches) - only when query is not empty
+        // 3. Fuzzy match score (higher is better) - only when query is not empty
+        // 4. History position (recent first, then never-used alphabetically)
         let has_query = !query.is_empty();
-        suggestions.sort_by(|(a, a_hist, a_score), (b, b_hist, b_score)| {
-            // First sort by disabled status
-            match a.disabled.cmp(&b.disabled) {
-                std::cmp::Ordering::Equal => {}
-                other => return other,
-            }
-
-            // When there's a query, sort by fuzzy score (higher is better)
-            if has_query {
-                match b_score.cmp(a_score) {
+        suggestions.sort_by(
+            |(a, a_hist, a_score, a_kind), (b, b_hist, b_score, b_kind)| {
+                // First sort by disabled status
+                match a.disabled.cmp(&b.disabled) {
                     std::cmp::Ordering::Equal => {}
                     other => return other,
                 }
-            }
 
-            // Then sort by history position (lower = more recent = better)
-            match (a_hist, b_hist) {
-                (Some(a_pos), Some(b_pos)) => a_pos.cmp(b_pos),
-                (Some(_), None) => std::cmp::Ordering::Less, // In history beats not in history
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.text.cmp(&b.text), // Alphabetical for never-used commands
-            }
-        });
+                if has_query {
+                    // Name matches before description matches
+                    match a_kind.cmp(b_kind) {
+                        std::cmp::Ordering::Equal => {}
+                        other => return other,
+                    }
+
+                    // Within the same kind, sort by fuzzy score (higher is better)
+                    match b_score.cmp(a_score) {
+                        std::cmp::Ordering::Equal => {}
+                        other => return other,
+                    }
+                }
+
+                // Then sort by history position (lower = more recent = better)
+                match (a_hist, b_hist) {
+                    (Some(a_pos), Some(b_pos)) => a_pos.cmp(b_pos),
+                    (Some(_), None) => std::cmp::Ordering::Less, // In history beats not in history
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.text.cmp(&b.text), // Alphabetical for never-used commands
+                }
+            },
+        );
 
         // Extract just the suggestions
-        suggestions.into_iter().map(|(s, _, _)| s).collect()
+        suggestions.into_iter().map(|(s, _, _, _)| s).collect()
     }
 
     /// Get count of registered plugin commands
@@ -797,5 +815,107 @@ mod tests {
                 expected_action
             );
         }
+    }
+
+    #[test]
+    fn test_try_register_first_writer_wins() {
+        let registry = CommandRegistry::new();
+
+        let cmd_a = Command {
+            name: "My Command".to_string(),
+            description: "From plugin A".to_string(),
+            action: Action::None,
+            contexts: vec![],
+            custom_contexts: vec![],
+            source: CommandSource::Plugin("plugin-a".to_string()),
+        };
+
+        let cmd_b = Command {
+            name: "My Command".to_string(),
+            description: "From plugin B".to_string(),
+            action: Action::None,
+            contexts: vec![],
+            custom_contexts: vec![],
+            source: CommandSource::Plugin("plugin-b".to_string()),
+        };
+
+        // First registration succeeds
+        assert!(registry.try_register(cmd_a).is_ok());
+        assert_eq!(registry.plugin_command_count(), 1);
+
+        // Second registration by different plugin fails
+        let result = registry.try_register(cmd_b);
+        assert!(result.is_err());
+        assert_eq!(registry.plugin_command_count(), 1);
+
+        // Original plugin's command is still there
+        let found = registry.find_by_name("My Command").unwrap();
+        assert_eq!(found.description, "From plugin A");
+    }
+
+    #[test]
+    fn test_try_register_same_plugin_allowed() {
+        let registry = CommandRegistry::new();
+
+        let cmd1 = Command {
+            name: "My Command".to_string(),
+            description: "Version 1".to_string(),
+            action: Action::None,
+            contexts: vec![],
+            custom_contexts: vec![],
+            source: CommandSource::Plugin("plugin-a".to_string()),
+        };
+
+        let cmd2 = Command {
+            name: "My Command".to_string(),
+            description: "Version 2".to_string(),
+            action: Action::None,
+            contexts: vec![],
+            custom_contexts: vec![],
+            source: CommandSource::Plugin("plugin-a".to_string()),
+        };
+
+        assert!(registry.try_register(cmd1).is_ok());
+        // Same plugin re-registering is allowed (hot-reload)
+        assert!(registry.try_register(cmd2).is_ok());
+        assert_eq!(registry.plugin_command_count(), 1);
+
+        let found = registry.find_by_name("My Command").unwrap();
+        assert_eq!(found.description, "Version 2");
+    }
+
+    #[test]
+    fn test_try_register_after_unregister() {
+        let registry = CommandRegistry::new();
+
+        let cmd_a = Command {
+            name: "My Command".to_string(),
+            description: "From plugin A".to_string(),
+            action: Action::None,
+            contexts: vec![],
+            custom_contexts: vec![],
+            source: CommandSource::Plugin("plugin-a".to_string()),
+        };
+
+        let cmd_b = Command {
+            name: "My Command".to_string(),
+            description: "From plugin B".to_string(),
+            action: Action::None,
+            contexts: vec![],
+            custom_contexts: vec![],
+            source: CommandSource::Plugin("plugin-b".to_string()),
+        };
+
+        // Plugin A registers
+        assert!(registry.try_register(cmd_a).is_ok());
+
+        // Unregister clears the slot
+        registry.unregister("My Command");
+        assert_eq!(registry.plugin_command_count(), 0);
+
+        // Now plugin B can register
+        assert!(registry.try_register(cmd_b).is_ok());
+        let found = registry.find_by_name("My Command").unwrap();
+        assert_eq!(found.description, "From plugin B");
     }
 }

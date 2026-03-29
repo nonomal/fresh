@@ -48,8 +48,8 @@ fn test_selection_visual_rendering() {
     harness.assert_screen_contains("Hello World");
 
     // Check that the selected characters have the theme's selection background
-    // Gutter takes up 8 characters: " " (indicator) + "   1" (line num) + " │ " (separator)
-    // So "Hello" starts at column 8
+    // Gutter width scales with line count: 1 line → 1 digit → 5 chars total
+    let gutter_width = harness.editor().active_state().margins.left_total_width() as u16;
     let buffer = harness.buffer();
     let theme = harness.editor().theme();
     let selection_bg = theme.selection_bg;
@@ -58,8 +58,8 @@ fn test_selection_visual_rendering() {
     let (content_first_row, _content_last_row) = harness.content_area_rows();
     let first_line_row = content_first_row as u16;
 
-    // Check first character 'H' at position (8, first_line_row) - should have selection background
-    let h_pos = buffer.index_of(8, first_line_row);
+    // Check first character 'H' at position (gutter_width, first_line_row) - should have selection background
+    let h_pos = buffer.index_of(gutter_width, first_line_row);
     let h_cell = &buffer.content[h_pos];
     assert_eq!(h_cell.symbol(), "H");
     assert_eq!(
@@ -67,8 +67,8 @@ fn test_selection_visual_rendering() {
         "Selected character 'H' should have selection background"
     );
 
-    // Check fourth character 'l' at position (11, first_line_row) - should have selection background
-    let l_pos = buffer.index_of(11, first_line_row);
+    // Check fourth character 'l' at position (gutter_width + 3, first_line_row) - should have selection background
+    let l_pos = buffer.index_of(gutter_width + 3, first_line_row);
     let l_cell = &buffer.content[l_pos];
     assert_eq!(l_cell.symbol(), "l");
     assert_eq!(
@@ -76,8 +76,8 @@ fn test_selection_visual_rendering() {
         "Selected character 'l' should have selection background"
     );
 
-    // Check fifth character 'o' at position (12, first_line_row) - byte position 4, IN selection
-    let o_pos = buffer.index_of(12, first_line_row);
+    // Check fifth character 'o' at position (gutter_width + 4, first_line_row) - byte position 4, IN selection
+    let o_pos = buffer.index_of(gutter_width + 4, first_line_row);
     let o_cell = &buffer.content[o_pos];
     assert_eq!(o_cell.symbol(), "o");
     // This 'o' is at byte position 4, which is in the selection range 0..5
@@ -87,8 +87,8 @@ fn test_selection_visual_rendering() {
         "Selected character 'o' (byte 4) should have selection background"
     );
 
-    // Check character ' ' (space) at position (13, first_line_row) - byte position 5, cursor position
-    let space_pos = buffer.index_of(13, first_line_row);
+    // Check character ' ' (space) at position (gutter_width + 5, first_line_row) - byte position 5, cursor position
+    let space_pos = buffer.index_of(gutter_width + 5, first_line_row);
     let space_cell = &buffer.content[space_pos];
     assert_eq!(space_cell.symbol(), " ");
     // This space is at byte position 5, which is the cursor position
@@ -194,6 +194,94 @@ fn test_select_word_at_end() {
         .active_state_mut()
         .get_text_range(range.start, range.end);
     assert_eq!(selected_text, "hello", "Should select the word 'hello'");
+}
+
+/// Test select word with accented characters (issue #1332)
+/// Ctrl+W on "hibajavítás" with cursor on 'í' should select the entire word,
+/// not just "hibajav".
+///
+/// Iterates character-by-character over words from multiple languages (including
+/// accented Latin, Cyrillic, CJK, Thai, emoji, and combining diacritics) and
+/// verifies that Ctrl+W selects the correct word at every cursor position.
+#[test]
+fn test_select_word_accented_characters() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use unicode_segmentation::UnicodeSegmentation;
+
+    // Each entry: (full word, expected Ctrl+W selection at every grapheme position)
+    // For single-word entries the expected selection equals the word itself.
+    // Spaces between words let us also test that Ctrl+W from whitespace selects
+    // an adjacent word rather than nothing.
+    let test_words: &[(&str, &str)] = &[
+        // Original bug report - Hungarian
+        ("hibajavítás", "hibajavítás"),
+        // German
+        ("Änderung", "Änderung"),
+        // French
+        ("résumé", "résumé"),
+        // Czech
+        ("příliš", "příliš"),
+        // Polish
+        ("żółć", "żółć"),
+        // Cyrillic (Russian)
+        ("Привет", "Привет"),
+        // Greek
+        ("Ελληνικά", "Ελληνικά"),
+        // Korean (Hangul)
+        ("안녕하세요", "안녕하세요"),
+        // Japanese Hiragana
+        ("こんにちは", "こんにちは"),
+        // CJK
+        ("你好世界", "你好世界"),
+        // Combining diacritics: e + combining acute = "é"
+        ("caf\u{0065}\u{0301}", "caf\u{0065}\u{0301}"),
+        // Emoji (single grapheme word) — treated as punctuation by the classifier,
+        // so Ctrl+W from the emoji should select the emoji cluster itself.
+        ("🇫🇷", "🇫🇷"),
+        ("👨\u{200D}👩\u{200D}👧", "👨\u{200D}👩\u{200D}👧"),
+    ];
+
+    for &(word, expected) in test_words {
+        let grapheme_count = word.graphemes(true).count();
+
+        for grapheme_idx in 0..grapheme_count {
+            let mut harness = EditorTestHarness::new(80, 24).unwrap();
+            let _fixture = harness.load_buffer_from_text(word).unwrap();
+
+            // Position cursor at grapheme_idx
+            harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+            for _ in 0..grapheme_idx {
+                harness
+                    .send_key(KeyCode::Right, KeyModifiers::NONE)
+                    .unwrap();
+            }
+
+            // Select word with Ctrl+W
+            harness
+                .send_key(KeyCode::Char('w'), KeyModifiers::CONTROL)
+                .unwrap();
+
+            let cursor = harness.editor().active_cursors().primary();
+            let selection = cursor.selection_range();
+            assert!(
+                selection.is_some(),
+                "No selection for word {:?} at grapheme index {}",
+                word,
+                grapheme_idx,
+            );
+
+            let range = selection.unwrap();
+            let selected_text = harness
+                .editor_mut()
+                .active_state_mut()
+                .get_text_range(range.start, range.end);
+            assert_eq!(
+                selected_text, expected,
+                "Wrong selection for word {:?} at grapheme index {}: got {:?}",
+                word, grapheme_idx, selected_text,
+            );
+        }
+    }
 }
 
 /// Test select line functionality (Ctrl+L)
@@ -2226,5 +2314,39 @@ fn test_ctrl_d_at_word_end() {
     assert_eq!(
         selected, "word",
         "Ctrl+D at word end should select entire 'word'"
+    );
+}
+
+/// Test select word with accented characters (issue #1332)
+/// Ctrl+W on a word like "hibajavítás" should select the entire word,
+/// not stop at the accented character.
+#[test]
+fn test_select_word_with_accented_characters() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+
+    let _fixture = harness.load_buffer_from_text("hibajavítás\n").unwrap();
+
+    // Move cursor to beginning of the word
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+
+    // Select word with Ctrl+W
+    harness
+        .send_key(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    let cursor = harness.editor().active_cursors().primary();
+    let range = cursor
+        .selection_range()
+        .expect("Cursor should have a selection after Ctrl+W");
+    let selected_text = harness
+        .editor_mut()
+        .active_state_mut()
+        .get_text_range(range.start, range.end);
+    assert_eq!(
+        selected_text, "hibajavítás",
+        "Ctrl+W should select the entire word including accented characters"
     );
 }

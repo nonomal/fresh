@@ -83,6 +83,14 @@ impl SettingsState {
         event: &KeyEvent,
         ctx: &mut InputContext,
     ) -> InputResult {
+        // Ctrl+S saves entry dialog from any mode
+        if event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(event.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.save_entry_dialog();
+            return InputResult::Consumed;
+        }
+
         // Check if we're in a special editing mode
         let (editing_text, dropdown_open) = if let Some(dialog) = self.entry_dialog() {
             let dropdown_open = dialog
@@ -100,7 +108,7 @@ impl SettingsState {
         } else if dropdown_open {
             self.handle_entry_dialog_dropdown(event)
         } else {
-            self.handle_entry_dialog_navigation(event)
+            self.handle_entry_dialog_navigation(event, ctx)
         }
     }
 
@@ -208,9 +216,10 @@ impl SettingsState {
                         dialog.cursor_up();
                     }
                 } else {
-                    // Move to previous item in TextList
+                    // Auto-accept pending text in TextList before navigating
                     if let Some(item) = dialog.current_item_mut() {
                         if let SettingControl::TextList(state) = &mut item.control {
+                            state.add_item();
                             state.focus_prev();
                         }
                     }
@@ -225,9 +234,10 @@ impl SettingsState {
                         dialog.cursor_down();
                     }
                 } else {
-                    // Move to next item in TextList
+                    // Auto-accept pending text in TextList before navigating
                     if let Some(item) = dialog.current_item_mut() {
                         if let SettingControl::TextList(state) = &mut item.control {
+                            state.add_item();
                             state.focus_next();
                         }
                     }
@@ -257,6 +267,15 @@ impl SettingsState {
                         dialog.stop_editing();
                     }
                     // If not valid, Tab is ignored (user must fix or press Esc)
+                } else {
+                    // Auto-accept pending text in TextList before exiting
+                    if let Some(item) = dialog.current_item_mut() {
+                        if let SettingControl::TextList(state) = &mut item.control {
+                            state.add_item();
+                        }
+                    }
+                    // Tab exits text editing mode for non-JSON controls (TextList, Text)
+                    dialog.stop_editing();
                 }
             }
             _ => {}
@@ -289,7 +308,11 @@ impl SettingsState {
     }
 
     /// Handle navigation and activation in entry dialog (same pattern as handle_settings_input)
-    fn handle_entry_dialog_navigation(&mut self, event: &KeyEvent) -> InputResult {
+    fn handle_entry_dialog_navigation(
+        &mut self,
+        event: &KeyEvent,
+        ctx: &mut InputContext,
+    ) -> InputResult {
         match event.code {
             KeyCode::Esc => {
                 self.close_entry_dialog();
@@ -305,17 +328,18 @@ impl SettingsState {
                 }
             }
             KeyCode::Tab => {
+                // Tab cycles sequentially through all fields, sub-fields, and buttons
                 if let Some(dialog) = self.entry_dialog_mut() {
                     dialog.focus_next();
                 }
             }
             KeyCode::BackTab => {
+                // Shift+Tab cycles in reverse
                 if let Some(dialog) = self.entry_dialog_mut() {
                     dialog.focus_prev();
                 }
             }
             KeyCode::Left => {
-                // Decrement number or navigate within control
                 if let Some(dialog) = self.entry_dialog_mut() {
                     if !dialog.focus_on_buttons {
                         dialog.decrement_number();
@@ -325,7 +349,6 @@ impl SettingsState {
                 }
             }
             KeyCode::Right => {
-                // Increment number or navigate within control
                 if let Some(dialog) = self.entry_dialog_mut() {
                     if !dialog.focus_on_buttons {
                         dialog.increment_number();
@@ -334,14 +357,15 @@ impl SettingsState {
                     }
                 }
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
                 // Check button state first with immutable borrow
                 let button_action = self.entry_dialog().and_then(|dialog| {
                     if dialog.focus_on_buttons {
                         let cancel_idx = dialog.button_count() - 1;
                         if dialog.focused_button == 0 {
                             Some(ButtonAction::Save)
-                        } else if !dialog.is_new && dialog.focused_button == 1 {
+                        } else if !dialog.is_new && !dialog.no_delete && dialog.focused_button == 1
+                        {
                             Some(ButtonAction::Delete)
                         } else if dialog.focused_button == cancel_idx {
                             Some(ButtonAction::Cancel)
@@ -400,11 +424,66 @@ impl SettingsState {
                                 }
                             }
                             ControlAction::OpenNestedDialog => {
-                                // Handle nested Map or ObjectArray - open a nested dialog
                                 self.open_nested_entry_dialog();
                             }
                         }
                     }
+                }
+            }
+            KeyCode::Char(' ') => {
+                // Space toggles booleans, activates dropdowns (but doesn't submit form)
+                let control_action = self.entry_dialog().and_then(|dialog| {
+                    if dialog.focus_on_buttons {
+                        return None; // Space on buttons does nothing (Enter activates)
+                    }
+                    dialog.current_item().and_then(|item| match &item.control {
+                        SettingControl::Toggle(_) => Some(ControlAction::ToggleBool),
+                        SettingControl::Dropdown(_) => Some(ControlAction::ToggleDropdown),
+                        _ => None,
+                    })
+                });
+
+                if let Some(action) = control_action {
+                    match action {
+                        ControlAction::ToggleBool => {
+                            if let Some(dialog) = self.entry_dialog_mut() {
+                                dialog.toggle_bool();
+                            }
+                        }
+                        ControlAction::ToggleDropdown => {
+                            if let Some(dialog) = self.entry_dialog_mut() {
+                                dialog.toggle_dropdown();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                // Auto-enter edit mode when typing on a text or number field
+                let can_auto_edit = self
+                    .entry_dialog()
+                    .and_then(|dialog| {
+                        if dialog.focus_on_buttons {
+                            return None;
+                        }
+                        dialog.current_item().map(|item| match &item.control {
+                            SettingControl::Text(_) | SettingControl::TextList(_) => true,
+                            SettingControl::Number(_) => c.is_ascii_digit() || c == '-' || c == '.',
+                            _ => false,
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if can_auto_edit {
+                    if let Some(dialog) = self.entry_dialog_mut() {
+                        dialog.start_editing();
+                    }
+                    // Now forward the character to the text editing handler
+                    return self.handle_entry_dialog_text_editing(
+                        &KeyEvent::new(KeyCode::Char(c), event.modifiers),
+                        ctx,
+                    );
                 }
             }
             _ => {}
@@ -630,6 +709,14 @@ impl SettingsState {
                 self.handle_control_activate(ctx);
                 InputResult::Consumed
             }
+            KeyCode::PageDown => {
+                self.select_next_page();
+                InputResult::Consumed
+            }
+            KeyCode::PageUp => {
+                self.select_prev_page();
+                InputResult::Consumed
+            }
             KeyCode::Char('/') => {
                 self.start_search();
                 InputResult::Consumed
@@ -758,6 +845,12 @@ impl SettingsState {
             }
             KeyCode::Down => {
                 self.text_focus_next();
+                InputResult::Consumed
+            }
+            KeyCode::Tab => {
+                // Tab exits text editing mode and advances focus to the next panel
+                self.stop_editing();
+                self.toggle_focus();
                 InputResult::Consumed
             }
             _ => InputResult::Consumed, // Consume all during text edit
@@ -1024,15 +1117,12 @@ impl SettingsState {
     /// Handle control increment (Right arrow on numbers/dropdowns)
     fn handle_control_increment(&mut self) {
         if let Some(item) = self.current_item_mut() {
-            match &mut item.control {
-                SettingControl::Number(ref mut state) => {
-                    state.value += 1;
-                    if let Some(max) = state.max {
-                        state.value = state.value.min(max);
-                    }
-                    self.on_value_changed();
+            if let SettingControl::Number(ref mut state) = &mut item.control {
+                state.value += 1;
+                if let Some(max) = state.max {
+                    state.value = state.value.min(max);
                 }
-                _ => {}
+                self.on_value_changed();
             }
         }
     }
@@ -1040,17 +1130,14 @@ impl SettingsState {
     /// Handle control decrement (Left arrow on numbers)
     fn handle_control_decrement(&mut self) {
         if let Some(item) = self.current_item_mut() {
-            match &mut item.control {
-                SettingControl::Number(ref mut state) => {
-                    if state.value > 0 {
-                        state.value -= 1;
-                    }
-                    if let Some(min) = state.min {
-                        state.value = state.value.max(min);
-                    }
-                    self.on_value_changed();
+            if let SettingControl::Number(ref mut state) = &mut item.control {
+                if state.value > 0 {
+                    state.value -= 1;
                 }
-                _ => {}
+                if let Some(min) = state.min {
+                    state.value = state.value.max(min);
+                }
+                self.on_value_changed();
             }
         }
     }

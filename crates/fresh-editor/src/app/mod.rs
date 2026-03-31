@@ -4,6 +4,7 @@ mod calibration_actions;
 pub mod calibration_wizard;
 mod clipboard;
 mod composite_buffer_actions;
+mod dabbrev_actions;
 pub mod event_debug;
 mod event_debug_actions;
 mod file_explorer;
@@ -253,6 +254,23 @@ struct SemanticTokenFullRequest {
 struct FoldingRangeRequest {
     buffer_id: BufferId,
     version: u64,
+}
+
+/// State for the dabbrev cycling session (Alt+/ style).
+///
+/// When the user presses Alt+/ repeatedly, we cycle through candidates
+/// in proximity order without showing a popup. The session is reset when
+/// any other action is taken (typing, moving, etc.).
+#[derive(Debug, Clone)]
+pub struct DabbrevCycleState {
+    /// The original prefix the user typed before the first expansion.
+    pub original_prefix: String,
+    /// Byte position where the prefix starts.
+    pub word_start: usize,
+    /// The list of candidates (ordered by proximity).
+    pub candidates: Vec<String>,
+    /// Current index into `candidates`.
+    pub index: usize,
 }
 
 /// The main editor struct - manages multiple buffers, clipboard, and rendering
@@ -506,6 +524,11 @@ pub struct Editor {
     /// Pluggable completion service that orchestrates multiple providers
     /// (dabbrev, buffer words, LSP, plugin providers).
     completion_service: crate::services::completion::CompletionService,
+
+    /// Dabbrev cycling state: when the user presses Alt+/ repeatedly, we
+    /// cycle through candidates without a popup. `None` when not in a
+    /// dabbrev session. Reset when any other action is taken.
+    dabbrev_state: Option<DabbrevCycleState>,
 
     /// Pending LSP go-to-definition request ID (if any)
     pending_goto_definition_request: Option<u64>,
@@ -1479,6 +1502,7 @@ impl Editor {
             completion_items: None,
             scheduled_completion_trigger: None,
             completion_service: crate::services::completion::CompletionService::new(),
+            dabbrev_state: None,
             pending_goto_definition_request: None,
             pending_hover_request: None,
             pending_references_request: None,

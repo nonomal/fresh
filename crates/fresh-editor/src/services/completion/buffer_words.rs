@@ -5,15 +5,8 @@
 //! 2. **Viewport bias** — words visible on screen are boosted.
 //! 3. **Frequency** — words that appear more often get a small bonus.
 //!
-//! This approximates AST-level variable scoping through spatial locality
-//! without requiring a language server or parser. Inspired by Sublime Text's
-//! buffer-word completion.
-//!
-//! # Unicode
-//!
-//! Word boundaries are detected via Unicode grapheme clusters so that
-//! identifiers containing accented characters, CJK, or composed emoji
-//! sequences are tokenized correctly.
+//! Smart-case matching, language-aware word boundaries, and multi-buffer
+//! support are all provided through the shared `CompletionContext`.
 //!
 //! # Huge-file safety
 //!
@@ -25,14 +18,14 @@ use std::collections::HashMap;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::provider::{
-    CompletionCandidate, CompletionContext, CompletionProvider, CompletionSourceId, ProviderResult,
+    case_mismatch_penalty, is_word_grapheme_for_lang, smart_case_matches, CompletionCandidate,
+    CompletionContext, CompletionProvider, CompletionSourceId, ProviderResult,
 };
 
 /// Maximum number of candidates returned.
 const MAX_CANDIDATES: usize = 40;
 
-/// Minimum word length to be considered a candidate. Very short tokens
-/// (single-letter variables) generate too much noise.
+/// Minimum word length in grapheme clusters to be a candidate.
 const MIN_WORD_LEN_GRAPHEMES: usize = 2;
 
 pub struct BufferWordProvider;
@@ -49,30 +42,26 @@ impl Default for BufferWordProvider {
     }
 }
 
-/// Check whether a grapheme cluster is a "word" constituent.
-fn is_word_grapheme(g: &str) -> bool {
-    g.chars().any(|c| c.is_alphanumeric() || c == '_')
-}
-
-/// Entry tracking a word's occurrences within the scan window.
+/// Entry tracking a word's occurrences within a scan window.
 struct WordStats {
     /// The word text (original casing of first occurrence).
     text: String,
     /// Number of occurrences.
     count: u32,
     /// Byte offset of the occurrence closest to the cursor.
-    nearest_byte: usize,
+    nearest_offset: usize,
+    /// Absolute byte-distance of the nearest occurrence to the cursor.
+    nearest_dist: usize,
     /// Whether at least one occurrence falls within the viewport.
     in_viewport: bool,
     /// Length in grapheme clusters (for min-length filtering).
     grapheme_len: usize,
 }
 
-/// Collect word statistics from the scan window.
-///
-/// Returns a map from lowercased word to `WordStats`.
+/// Collect word statistics from a text window.
 fn collect_word_stats(
     text: &str,
+    extra: &str,
     cursor_in_window: usize,
     viewport_start_in_window: usize,
     viewport_end_in_window: usize,
@@ -85,7 +74,7 @@ fn collect_word_stats(
     let mut byte_pos: usize = 0;
 
     for grapheme in text.graphemes(true) {
-        if is_word_grapheme(grapheme) {
+        if is_word_grapheme_for_lang(grapheme, extra) {
             if current_word.is_empty() {
                 word_start = byte_pos;
                 word_grapheme_count = 0;
@@ -138,15 +127,17 @@ fn record_word(
         .entry(key)
         .and_modify(|s| {
             s.count += 1;
-            if dist < s.nearest_byte.abs_diff(cursor_in_window) {
-                s.nearest_byte = byte_offset;
+            if dist < s.nearest_dist {
+                s.nearest_dist = dist;
+                s.nearest_offset = byte_offset;
             }
             s.in_viewport |= in_vp;
         })
         .or_insert(WordStats {
             text: word,
             count: 1,
-            nearest_byte: byte_offset,
+            nearest_offset: byte_offset,
+            nearest_dist: dist,
             in_viewport: in_vp,
             grapheme_len,
         });
@@ -165,13 +156,9 @@ impl CompletionProvider for BufferWordProvider {
         !ctx.prefix.is_empty()
     }
 
-    fn provide(
-        &self,
-        ctx: &CompletionContext,
-        buffer_window: &[u8],
-    ) -> ProviderResult {
+    fn provide(&self, ctx: &CompletionContext, buffer_window: &[u8]) -> ProviderResult {
         let text = String::from_utf8_lossy(buffer_window);
-        let prefix_lower = ctx.prefix.to_lowercase();
+        let extra = &ctx.word_chars_extra;
 
         let cursor_in_window = ctx.cursor_byte.saturating_sub(ctx.scan_range.start);
         let vp_start = ctx.viewport_top_byte.saturating_sub(ctx.scan_range.start);
@@ -180,25 +167,43 @@ impl CompletionProvider for BufferWordProvider {
             .saturating_sub(ctx.scan_range.start)
             .min(buffer_window.len());
 
-        let stats = collect_word_stats(&text, cursor_in_window, vp_start, vp_end);
+        let mut all_stats = collect_word_stats(&text, extra, cursor_in_window, vp_start, vp_end);
 
-        let mut scored: Vec<(i64, &WordStats)> = stats
+        // Merge stats from other open buffers (lower priority).
+        for (i, other) in ctx.other_buffers.iter().enumerate() {
+            let other_text = String::from_utf8_lossy(&other.bytes);
+            let other_stats = collect_word_stats(&other_text, extra, 0, 0, 0);
+            let cross_buffer_dist_offset = 300_000 * (i + 1);
+            for (key, os) in other_stats {
+                all_stats.entry(key).or_insert(WordStats {
+                    text: os.text,
+                    count: os.count,
+                    nearest_offset: os.nearest_offset,
+                    nearest_dist: os.nearest_dist + cross_buffer_dist_offset,
+                    in_viewport: false,
+                    grapheme_len: os.grapheme_len,
+                });
+            }
+        }
+
+        let mut scored: Vec<(i64, &WordStats)> = all_stats
             .values()
             .filter(|s| {
                 s.grapheme_len >= MIN_WORD_LEN_GRAPHEMES
-                    && s.text.to_lowercase().starts_with(&prefix_lower)
-                    && s.text.to_lowercase() != prefix_lower
+                    && smart_case_matches(&s.text, &ctx.prefix, ctx.prefix_has_uppercase)
+                    && s.text.to_lowercase() != ctx.prefix.to_lowercase()
             })
             .map(|s| {
-                let dist = s.nearest_byte.abs_diff(cursor_in_window);
                 // Base: proximity score (closer = higher).
-                let mut score: i64 = 500_000i64.saturating_sub(dist as i64);
+                let mut score: i64 = 500_000i64.saturating_sub(s.nearest_dist as i64);
                 // Viewport boost: +100k if any occurrence is visible.
                 if s.in_viewport {
                     score += 100_000;
                 }
                 // Frequency bonus: +5k per extra occurrence (capped).
                 score += (s.count.min(10) as i64 - 1) * 5_000;
+                // Smart-case penalty.
+                score += case_mismatch_penalty(&s.text, &ctx.prefix, ctx.prefix_has_uppercase);
                 (score, s)
             })
             .collect();
@@ -221,6 +226,7 @@ impl CompletionProvider for BufferWordProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::super::provider::OtherBufferSlice;
     use super::*;
 
     fn make_ctx(prefix: &str, cursor: usize, buf_len: usize) -> CompletionContext {
@@ -234,14 +240,15 @@ mod tests {
             viewport_top_byte: 0,
             viewport_bottom_byte: buf_len,
             language_id: None,
+            word_chars_extra: String::new(),
+            prefix_has_uppercase: prefix.chars().any(|c| c.is_uppercase()),
+            other_buffers: Vec::new(),
         }
     }
 
     #[test]
     fn proximity_beats_frequency() {
         let text = b"far_match far_match far_match close_match";
-        //           0         1         2         3
-        // cursor at 38 (just before close_match)
         let provider = BufferWordProvider::new();
         let ctx = CompletionContext {
             prefix: "far".into(),
@@ -253,8 +260,10 @@ mod tests {
             viewport_top_byte: 0,
             viewport_bottom_byte: text.len(),
             language_id: None,
+            word_chars_extra: String::new(),
+            prefix_has_uppercase: false,
+            other_buffers: Vec::new(),
         };
-        // far_match appears 3 times but the nearest is at offset 30
         let result = provider.provide(&ctx, text);
         match result {
             ProviderResult::Ready(candidates) => {
@@ -267,7 +276,6 @@ mod tests {
 
     #[test]
     fn viewport_boost() {
-        // Two words at same distance but one is "in viewport"
         let text = b"alpha_one xxxxxxxxx alpha_two";
         let provider = BufferWordProvider::new();
         let ctx = CompletionContext {
@@ -277,16 +285,17 @@ mod tests {
             buffer_len: text.len(),
             is_large_file: false,
             scan_range: 0..text.len(),
-            // Viewport covers only the second half
             viewport_top_byte: 20,
             viewport_bottom_byte: text.len(),
             language_id: None,
+            word_chars_extra: String::new(),
+            prefix_has_uppercase: false,
+            other_buffers: Vec::new(),
         };
         let result = provider.provide(&ctx, text);
         match result {
             ProviderResult::Ready(candidates) => {
                 assert_eq!(candidates.len(), 2);
-                // alpha_two gets viewport boost
                 assert_eq!(candidates[0].label, "alpha_two");
             }
             _ => panic!("expected Ready"),
@@ -301,7 +310,6 @@ mod tests {
         let result = provider.provide(&ctx, text);
         match result {
             ProviderResult::Ready(candidates) => {
-                // Only "hello" matches prefix "h" and has >= 2 graphemes
                 assert_eq!(candidates.len(), 1);
                 assert_eq!(candidates[0].label, "hello");
             }
@@ -317,12 +325,57 @@ mod tests {
         let result = provider.provide(&ctx, text);
         match result {
             ProviderResult::Ready(candidates) => {
-                let labels: Vec<&str> =
-                    candidates.iter().map(|c| c.label.as_str()).collect();
+                let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
                 assert!(labels.contains(&"naïve_var"));
                 assert!(labels.contains(&"naïve_fn"));
-                // "naïf" doesn't match prefix "naïve"
                 assert!(!labels.contains(&"naïf"));
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn smart_case_penalizes_mismatch() {
+        let text = b"http_request HttpServer HTTP_CONST";
+        let provider = BufferWordProvider::new();
+        let ctx = make_ctx("http", 0, text.len());
+        let result = provider.provide(&ctx, text);
+        match result {
+            ProviderResult::Ready(candidates) => {
+                assert_eq!(candidates.len(), 3);
+                // Exact-case "http_request" should rank above "HttpServer"
+                let req = candidates
+                    .iter()
+                    .find(|c| c.label == "http_request")
+                    .unwrap();
+                let srv = candidates.iter().find(|c| c.label == "HttpServer").unwrap();
+                assert!(req.score > srv.score);
+            }
+            _ => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
+    fn multi_buffer_words() {
+        let text = b"local_var another";
+        let provider = BufferWordProvider::new();
+        let mut ctx = make_ctx("lo", 0, text.len());
+        ctx.other_buffers = vec![OtherBufferSlice {
+            buffer_id: 2,
+            bytes: b"long_name logging".to_vec(),
+            label: "other.rs".into(),
+        }];
+        let result = provider.provide(&ctx, text);
+        match result {
+            ProviderResult::Ready(candidates) => {
+                let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+                assert!(labels.contains(&"local_var"));
+                assert!(labels.contains(&"long_name"));
+                assert!(labels.contains(&"logging"));
+                // Active buffer should outscore cross-buffer
+                let local = candidates.iter().find(|c| c.label == "local_var").unwrap();
+                let long = candidates.iter().find(|c| c.label == "long_name").unwrap();
+                assert!(local.score > long.score);
             }
             _ => panic!("expected Ready"),
         }

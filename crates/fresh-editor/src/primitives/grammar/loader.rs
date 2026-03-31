@@ -783,6 +783,7 @@ mod tests {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 

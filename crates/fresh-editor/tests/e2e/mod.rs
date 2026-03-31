@@ -17,6 +17,7 @@ pub mod csharp_language_coherence;
 pub mod csi_u_session_input;
 pub mod ctrl_end_wrapped;
 pub mod cursor_style_rendering;
+pub mod dabbrev_completion;
 pub mod document_model;
 pub mod duplicate_line;
 pub mod emacs_actions;

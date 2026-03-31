@@ -1541,6 +1541,18 @@ pub struct LanguageConfig {
     /// Note: Use `formatter` + `format_on_save` for formatting, not on_save
     #[serde(default)]
     pub on_save: Vec<OnSaveAction>,
+
+    /// Extra characters (beyond alphanumeric and `_`) considered part of
+    /// identifiers for this language. Used by dabbrev and buffer-word
+    /// completion to correctly tokenise language-specific naming conventions.
+    ///
+    /// Examples:
+    /// - Lisp/Clojure/CSS: `"-"` (kebab-case identifiers)
+    /// - PHP/Bash: `"$"` (variable sigils)
+    /// - Ruby: `"?!"` (predicate/bang methods)
+    /// - Rust (default): `""` (standard alphanumeric + underscore)
+    #[serde(default)]
+    pub word_characters: Option<String>,
 }
 
 /// Resolved editor configuration for a specific buffer.
@@ -1589,6 +1601,10 @@ pub struct BufferConfig {
 
     /// Path to custom TextMate grammar (if any)
     pub textmate_grammar: Option<std::path::PathBuf>,
+
+    /// Extra word-constituent characters for this language (for completion).
+    /// Empty string means standard alphanumeric + underscore only.
+    pub word_characters: String,
 }
 
 impl BufferConfig {
@@ -1619,6 +1635,7 @@ impl BufferConfig {
             on_save: Vec::new(),
             highlighter: HighlighterPreference::Auto,
             textmate_grammar: None,
+            word_characters: String::new(),
         };
 
         // Apply language-specific overrides if available.
@@ -1689,6 +1706,11 @@ impl BufferConfig {
 
             // TextMate grammar path: from language config
             config.textmate_grammar = lang_config.textmate_grammar.clone();
+
+            // Word characters: from language config
+            if let Some(ref wc) = lang_config.word_characters {
+                config.word_characters = wc.clone();
+            }
         }
 
         config
@@ -2732,6 +2754,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2762,6 +2785,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2792,6 +2816,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2826,6 +2851,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2856,6 +2882,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2893,6 +2920,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2918,6 +2946,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2958,6 +2987,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -2987,6 +3017,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3012,6 +3043,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3042,6 +3074,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3067,6 +3100,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3097,6 +3131,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3122,6 +3157,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3153,6 +3189,7 @@ impl Config {
                 }),
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3178,6 +3215,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3203,6 +3241,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3228,6 +3267,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3260,6 +3300,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3285,6 +3326,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3311,6 +3353,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3341,6 +3384,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3371,6 +3415,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3396,6 +3441,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3421,6 +3467,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3446,6 +3493,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3475,6 +3523,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3500,6 +3549,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3525,6 +3575,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3550,6 +3601,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3575,6 +3627,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3600,6 +3653,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3625,6 +3679,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3650,6 +3705,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3680,6 +3736,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3705,6 +3762,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3730,6 +3788,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3755,6 +3814,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3780,6 +3840,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3805,6 +3866,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3830,6 +3892,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3855,6 +3918,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3880,6 +3944,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3905,6 +3970,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3934,6 +4000,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3959,6 +4026,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -3984,6 +4052,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4009,6 +4078,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4034,6 +4104,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4059,6 +4130,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4084,6 +4156,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4109,6 +4182,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4134,6 +4208,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4159,6 +4234,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4184,6 +4260,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4209,6 +4286,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4234,6 +4312,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4261,6 +4340,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4286,6 +4366,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4311,6 +4392,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4336,6 +4418,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4361,6 +4444,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4390,6 +4474,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4415,6 +4500,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4440,6 +4526,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4465,6 +4552,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4490,6 +4578,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -4515,6 +4604,7 @@ impl Config {
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -5949,6 +6039,7 @@ mod tests {
                 }),
                 format_on_save: true,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 

@@ -53,6 +53,7 @@ pub mod service;
 
 // Re-export the main types that the Editor needs.
 pub use provider::{
-    CompletionCandidate, CompletionContext, CompletionProvider, CompletionSourceId, ProviderResult,
+    CompletionCandidate, CompletionContext, CompletionProvider, CompletionSourceId,
+    OtherBufferSlice, ProviderResult,
 };
 pub use service::CompletionService;

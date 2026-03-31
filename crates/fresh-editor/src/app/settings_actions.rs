@@ -193,6 +193,12 @@ impl Editor {
                         state.buffer_settings.auto_close = lang_auto_close;
                     }
                 }
+                // Word characters: from language config
+                if let Some(ref wc) = lang_config.word_characters {
+                    state.buffer_settings.word_characters = wc.clone();
+                } else {
+                    state.buffer_settings.word_characters.clear();
+                }
             } else {
                 state.buffer_settings.tab_size = self.config.editor.tab_size;
                 state.buffer_settings.use_tabs = self.config.editor.use_tabs;

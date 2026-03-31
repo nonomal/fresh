@@ -440,6 +440,7 @@ pub struct PartialLanguageConfig {
     pub formatter: Option<FormatterConfig>,
     pub format_on_save: Option<bool>,
     pub on_save: Option<Vec<OnSaveAction>>,
+    pub word_characters: Option<Option<String>>,
 }
 
 impl Merge for PartialLanguageConfig {
@@ -464,6 +465,7 @@ impl Merge for PartialLanguageConfig {
         self.formatter.merge_from(&other.formatter);
         self.format_on_save.merge_from(&other.format_on_save);
         self.on_save.merge_from(&other.on_save);
+        self.word_characters.merge_from(&other.word_characters);
     }
 }
 
@@ -845,6 +847,7 @@ impl From<&LanguageConfig> for PartialLanguageConfig {
             formatter: cfg.formatter.clone(),
             format_on_save: Some(cfg.format_on_save),
             on_save: Some(cfg.on_save.clone()),
+            word_characters: Some(cfg.word_characters.clone()),
         }
     }
 }
@@ -879,6 +882,9 @@ impl PartialLanguageConfig {
             formatter: self.formatter.or_else(|| defaults.formatter.clone()),
             format_on_save: self.format_on_save.unwrap_or(defaults.format_on_save),
             on_save: self.on_save.unwrap_or_else(|| defaults.on_save.clone()),
+            word_characters: self
+                .word_characters
+                .unwrap_or_else(|| defaults.word_characters.clone()),
         }
     }
 }
@@ -1101,6 +1107,7 @@ impl Default for LanguageConfig {
             formatter: None,
             format_on_save: false,
             on_save: Vec::new(),
+            word_characters: None,
         }
     }
 }

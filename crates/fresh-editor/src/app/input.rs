@@ -257,6 +257,11 @@ impl Editor {
         // Record action to macro if recording
         self.record_macro_action(&action);
 
+        // Reset dabbrev cycling session on any non-dabbrev action.
+        if !matches!(action, Action::DabbrevExpand) {
+            self.reset_dabbrev_state();
+        }
+
         match action {
             Action::Quit => self.quit(),
             Action::ForceQuit => {
@@ -629,6 +634,9 @@ impl Editor {
             }
             Action::LspCompletion => {
                 self.request_completion();
+            }
+            Action::DabbrevExpand => {
+                self.dabbrev_expand();
             }
             Action::LspGotoDefinition => {
                 self.request_goto_definition()?;

@@ -2890,6 +2890,7 @@ pub fn action_to_events(
         | Action::ClearWarnings
         | Action::SmartHome
         | Action::ToggleComment
+        | Action::DabbrevExpand
         | Action::ToggleFold
         | Action::SetBookmark(_)
         | Action::JumpToBookmark(_)

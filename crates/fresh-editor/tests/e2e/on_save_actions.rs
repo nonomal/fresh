@@ -56,6 +56,7 @@ fn test_format_on_save() {
             formatter: Some(formatter),
             format_on_save: true,
             on_save: vec![],
+            word_characters: None,
         },
     );
 
@@ -125,6 +126,7 @@ fn test_on_save_linter_style() {
             formatter: None,
             format_on_save: false,
             on_save: vec![action],
+            word_characters: None,
         },
     );
 
@@ -194,6 +196,7 @@ fn test_on_save_action_failure() {
             formatter: None,
             format_on_save: false,
             on_save: vec![action],
+            word_characters: None,
         },
     );
 
@@ -272,6 +275,7 @@ fn test_on_save_file_placeholder() {
             formatter: None,
             format_on_save: false,
             on_save: vec![action],
+            word_characters: None,
         },
     );
 
@@ -344,6 +348,7 @@ fn test_formatter_stdin_mode() {
             formatter: Some(formatter),
             format_on_save: true,
             on_save: vec![],
+            word_characters: None,
         },
     );
 
@@ -423,6 +428,7 @@ fn test_on_save_stops_on_failure() {
             formatter: None,
             format_on_save: false,
             on_save: vec![action1, action2],
+            word_characters: None,
         },
     );
 
@@ -523,6 +529,7 @@ fn test_formatter_not_found_shows_message() {
             formatter: Some(formatter),
             format_on_save: true,
             on_save: vec![],
+            word_characters: None,
         },
     );
 

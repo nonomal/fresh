@@ -110,6 +110,10 @@ pub struct BufferSettings {
     /// Whether to surround selected text with matching pairs when typing a delimiter.
     /// Set based on global + language config.
     pub auto_surround: bool,
+
+    /// Extra characters (beyond alphanumeric + `_`) considered part of
+    /// identifiers for this language. Used by completion providers.
+    pub word_characters: String,
 }
 
 impl Default for BufferSettings {
@@ -120,6 +124,7 @@ impl Default for BufferSettings {
             tab_size: 4,
             auto_close: true,
             auto_surround: true,
+            word_characters: String::new(),
         }
     }
 }

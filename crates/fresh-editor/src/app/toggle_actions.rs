@@ -152,6 +152,7 @@ impl Editor {
         // Determine settings from config using buffer's stored language
         let mut whitespace = WhitespaceVisibility::from_editor_config(&self.config.editor);
         let mut auto_close = self.config.editor.auto_close;
+        let mut word_characters = String::new();
         let (tab_size, use_tabs) = if let Some(state) = self.buffers.get(&buffer_id) {
             let language = &state.language;
             if let Some(lang_config) = self.config.languages.get(language) {
@@ -162,6 +163,9 @@ impl Editor {
                     if let Some(lang_auto_close) = lang_config.auto_close {
                         auto_close = lang_auto_close;
                     }
+                }
+                if let Some(ref wc) = lang_config.word_characters {
+                    word_characters = wc.clone();
                 }
                 (
                     lang_config.tab_size.unwrap_or(self.config.editor.tab_size),
@@ -180,6 +184,7 @@ impl Editor {
             state.buffer_settings.use_tabs = use_tabs;
             state.buffer_settings.auto_close = auto_close;
             state.buffer_settings.whitespace = whitespace;
+            state.buffer_settings.word_characters = word_characters;
         }
 
         self.set_status_message(t!("toggle.buffer_settings_reset").to_string());

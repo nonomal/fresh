@@ -185,11 +185,7 @@ mod tests {
         fn is_enabled(&self, _ctx: &CompletionContext) -> bool {
             true
         }
-        fn provide(
-            &self,
-            _ctx: &CompletionContext,
-            _buffer_window: &[u8],
-        ) -> ProviderResult {
+        fn provide(&self, _ctx: &CompletionContext, _buffer_window: &[u8]) -> ProviderResult {
             ProviderResult::Ready(self.candidates.clone())
         }
         fn priority(&self) -> u32 {
@@ -208,6 +204,9 @@ mod tests {
             viewport_top_byte: 0,
             viewport_bottom_byte: 100,
             language_id: None,
+            word_chars_extra: String::new(),
+            prefix_has_uppercase: false,
+            other_buffers: Vec::new(),
         }
     }
 

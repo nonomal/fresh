@@ -67,6 +67,22 @@ impl fmt::Display for CompletionSourceId {
     }
 }
 
+/// A byte-slice from another open buffer, for multi-buffer scanning.
+///
+/// The `CompletionService` provides these in MRU order (most recently
+/// focused first). Each slice is capped to `NORMAL_SCAN_RADIUS` bytes
+/// around the buffer's last-known cursor position, so huge background
+/// buffers stay cheap.
+#[derive(Debug, Clone)]
+pub struct OtherBufferSlice {
+    /// The buffer's id (for dedup / labelling).
+    pub buffer_id: u64,
+    /// Pre-extracted bytes from the other buffer.
+    pub bytes: Vec<u8>,
+    /// Human-readable label (filename or "untitled").
+    pub label: String,
+}
+
 /// Context passed to every provider when completion is requested.
 ///
 /// All byte ranges are clamped to valid buffer positions by the service
@@ -102,6 +118,29 @@ pub struct CompletionContext {
 
     /// The file extension or language id, if known.
     pub language_id: Option<String>,
+
+    /// Extra characters (beyond alphanumeric and `_`) that are considered
+    /// part of an identifier in the current language.
+    ///
+    /// Examples:
+    /// - Lisp/Clojure/CSS: `"-"` (kebab-case)
+    /// - PHP/Bash: `"$"` (sigils)
+    /// - Ruby: `"?!"`
+    /// - Rust (default): `""` (only `[A-Za-z0-9_]`)
+    ///
+    /// Populated from `LanguageConfig::word_characters` if set, otherwise
+    /// empty (standard alphanumeric + underscore).
+    pub word_chars_extra: String,
+
+    /// Whether the prefix contains at least one uppercase character.
+    /// When `true`, providers should use **smart-case** matching:
+    /// prefer case-sensitive matches, and penalise case mismatches in scoring
+    /// rather than filtering them out entirely.
+    pub prefix_has_uppercase: bool,
+
+    /// Pre-sliced byte windows from other open buffers, ordered by MRU
+    /// (most recently used first). Enables multi-buffer dabbrev scanning.
+    pub other_buffers: Vec<OtherBufferSlice>,
 }
 
 /// Maximum scan radius (in bytes) around the cursor for normal files.
@@ -166,16 +205,63 @@ pub trait CompletionProvider: Send {
     /// `buffer_window` slice, which corresponds exactly to `ctx.scan_range`.
     /// This avoids giving providers direct `Buffer` access (which would be
     /// unsafe for the huge-file contract).
-    fn provide(
-        &self,
-        ctx: &CompletionContext,
-        buffer_window: &[u8],
-    ) -> ProviderResult;
+    fn provide(&self, ctx: &CompletionContext, buffer_window: &[u8]) -> ProviderResult;
 
     /// Priority tier for this provider. Lower numbers run first and their
     /// results are shown higher in the list when scores are equal.
     /// Convention: 0 = LSP, 10 = ctags/index, 20 = buffer words, 30 = dabbrev.
     fn priority(&self) -> u32 {
         20
+    }
+}
+
+// ============================================================================
+// Shared helpers for smart-case matching and language-aware word detection
+// ============================================================================
+
+/// Check whether a character is a word constituent for the given context.
+///
+/// This replaces the naive `is_alphanumeric() || c == '_'` check with a
+/// language-aware test that also respects `word_chars_extra`.
+pub fn is_word_char_for_lang(c: char, extra: &str) -> bool {
+    c.is_alphanumeric() || c == '_' || extra.contains(c)
+}
+
+/// Check whether a grapheme cluster is a word constituent.
+///
+/// A grapheme is a word constituent if *any* of its characters satisfy
+/// `is_word_char_for_lang`. This handles composed characters (e.g., `é`
+/// as `e` + combining acute) correctly.
+pub fn is_word_grapheme_for_lang(g: &str, extra: &str) -> bool {
+    g.chars().any(|c| is_word_char_for_lang(c, extra))
+}
+
+/// Determine whether a prefix match should be case-sensitive.
+///
+/// **Smart-case rule**: if the prefix contains any uppercase letter, use
+/// case-sensitive matching. Otherwise, match case-insensitively.
+pub fn smart_case_matches(candidate: &str, prefix: &str, prefix_has_upper: bool) -> bool {
+    if prefix_has_upper {
+        candidate.starts_with(prefix)
+    } else {
+        candidate.to_lowercase().starts_with(&prefix.to_lowercase())
+    }
+}
+
+/// Score penalty for case mismatch (when smart-case is off but casing differs).
+///
+/// Applied when the prefix is all-lowercase and the candidate has different
+/// casing. The candidate still matches, but ranks lower than an exact-case hit.
+pub fn case_mismatch_penalty(candidate: &str, prefix: &str, prefix_has_upper: bool) -> i64 {
+    if prefix_has_upper {
+        // Strict mode — no penalty if it matched (it's already exact-case).
+        0
+    } else {
+        // Lenient mode — penalise if the candidate's prefix differs in casing.
+        if candidate.starts_with(prefix) {
+            0 // exact casing, no penalty
+        } else {
+            -50_000 // case mismatch penalty
+        }
     }
 }

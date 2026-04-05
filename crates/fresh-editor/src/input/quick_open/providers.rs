@@ -46,14 +46,6 @@ impl QuickOpenProvider for CommandProvider {
         ">"
     }
 
-    fn name(&self) -> &str {
-        "Commands"
-    }
-
-    fn hint(&self) -> &str {
-        ">  Commands"
-    }
-
     fn suggestions(&self, query: &str, context: &QuickOpenContext) -> Vec<Suggestion> {
         let registry = self.command_registry.read().unwrap();
         let keybindings = self.keybinding_resolver.read().unwrap();
@@ -71,47 +63,36 @@ impl QuickOpenProvider for CommandProvider {
 
     fn on_select(
         &self,
-        selected_index: Option<usize>,
-        query: &str,
-        context: &QuickOpenContext,
+        suggestion: Option<&Suggestion>,
+        _query: &str,
+        _context: &QuickOpenContext,
     ) -> QuickOpenResult {
-        let registry = self.command_registry.read().unwrap();
-        let keybindings = self.keybinding_resolver.read().unwrap();
-
-        let suggestions = registry.filter(
-            query,
-            context.key_context.clone(),
-            &keybindings,
-            context.has_selection,
-            &context.custom_contexts,
-            context.buffer_mode.as_deref(),
-            context.has_lsp_config,
-        );
-
-        if let Some(idx) = selected_index {
-            if let Some(suggestion) = suggestions.get(idx) {
-                if suggestion.disabled {
-                    return QuickOpenResult::Error(t!("status.command_not_available").to_string());
-                }
-
-                // Find the command by name
-                let commands = registry.get_all();
-                if let Some(cmd) = commands
-                    .iter()
-                    .find(|c| c.get_localized_name() == suggestion.text)
-                {
-                    // Record usage for frecency
-                    drop(keybindings);
-                    drop(registry);
-                    if let Ok(mut reg) = self.command_registry.write() {
-                        reg.record_usage(&cmd.name);
-                    }
-                    return QuickOpenResult::ExecuteAction(cmd.action.clone());
-                }
+        let suggestion = match suggestion {
+            Some(s) if !s.disabled => s,
+            Some(_) => {
+                return QuickOpenResult::Error(t!("status.command_not_available").to_string())
             }
-        }
+            None => return QuickOpenResult::None,
+        };
 
-        QuickOpenResult::None
+        let registry = self.command_registry.read().unwrap();
+        let cmd = registry
+            .get_all()
+            .into_iter()
+            .find(|c| c.get_localized_name() == suggestion.text);
+
+        let Some(cmd) = cmd else {
+            return QuickOpenResult::None;
+        };
+
+        let action = cmd.action.clone();
+        let name = cmd.name.clone();
+        drop(registry);
+
+        if let Ok(mut reg) = self.command_registry.write() {
+            reg.record_usage(&name);
+        }
+        QuickOpenResult::ExecuteAction(action)
     }
 }
 
@@ -139,30 +120,13 @@ impl QuickOpenProvider for BufferProvider {
         "#"
     }
 
-    fn name(&self) -> &str {
-        "Buffers"
-    }
-
-    fn hint(&self) -> &str {
-        "#  Buffers"
-    }
-
     fn suggestions(&self, query: &str, context: &QuickOpenContext) -> Vec<Suggestion> {
-        let mut suggestions: Vec<(Suggestion, i32, usize)> = context
+        let mut scored: Vec<(Suggestion, i32, usize)> = context
             .open_buffers
             .iter()
+            .filter(|buf| !buf.path.is_empty())
             .filter_map(|buf| {
-                if buf.path.is_empty() {
-                    return None; // Skip unnamed buffers
-                }
-
-                let display_name = if buf.modified {
-                    format!("{} [+]", buf.name)
-                } else {
-                    buf.name.clone()
-                };
-
-                let match_result = if query.is_empty() {
+                let m = if query.is_empty() {
                     crate::input::fuzzy::FuzzyMatch {
                         matched: true,
                         score: 0,
@@ -171,62 +135,39 @@ impl QuickOpenProvider for BufferProvider {
                 } else {
                     fuzzy_match(query, &buf.name)
                 };
-
-                if match_result.matched {
-                    Some((
-                        Suggestion {
-                            text: display_name,
-                            description: Some(buf.path.clone()),
-                            value: Some(buf.id.to_string()),
-                            disabled: false,
-                            keybinding: None,
-                            source: None,
-                        },
-                        match_result.score,
-                        buf.id,
-                    ))
-                } else {
-                    None
+                if !m.matched {
+                    return None;
                 }
+
+                let display_name = if buf.modified {
+                    format!("{} [+]", buf.name)
+                } else {
+                    buf.name.clone()
+                };
+
+                let suggestion = Suggestion::new(display_name)
+                    .with_description(buf.path.clone())
+                    .with_value(buf.id.to_string());
+                Some((suggestion, m.score, buf.id))
             })
             .collect();
 
         // Sort by score (higher is better), then by ID (lower = older = higher priority when tied)
-        suggestions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-
-        suggestions.into_iter().map(|(s, _, _)| s).collect()
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        scored.into_iter().map(|(s, _, _)| s).collect()
     }
 
     fn on_select(
         &self,
-        selected_index: Option<usize>,
-        query: &str,
-        context: &QuickOpenContext,
+        suggestion: Option<&Suggestion>,
+        _query: &str,
+        _context: &QuickOpenContext,
     ) -> QuickOpenResult {
-        let suggestions = self.suggestions(query, context);
-
-        if let Some(idx) = selected_index {
-            if let Some(suggestion) = suggestions.get(idx) {
-                if let Some(value) = &suggestion.value {
-                    if let Ok(buffer_id) = value.parse::<usize>() {
-                        return QuickOpenResult::ShowBuffer(buffer_id);
-                    }
-                }
-            }
-        }
-
-        QuickOpenResult::None
-    }
-
-    fn preview(
-        &self,
-        selected_index: usize,
-        context: &QuickOpenContext,
-    ) -> Option<(String, Option<usize>)> {
-        let suggestions = self.suggestions("", context);
-        suggestions
-            .get(selected_index)
-            .and_then(|s| s.description.clone().map(|path| (path, None)))
+        suggestion
+            .and_then(|s| s.value.as_deref())
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(QuickOpenResult::ShowBuffer)
+            .unwrap_or(QuickOpenResult::None)
     }
 }
 
@@ -254,66 +195,41 @@ impl QuickOpenProvider for GotoLineProvider {
         ":"
     }
 
-    fn name(&self) -> &str {
-        "Go to Line"
-    }
-
-    fn hint(&self) -> &str {
-        ":  Go to Line"
-    }
-
     fn suggestions(&self, query: &str, _context: &QuickOpenContext) -> Vec<Suggestion> {
         if query.is_empty() {
-            return vec![Suggestion {
-                text: t!("quick_open.goto_line_hint").to_string(),
-                description: Some(t!("quick_open.goto_line_desc").to_string()),
-                value: None,
-                disabled: true,
-                keybinding: None,
-                source: None,
-            }];
+            return vec![
+                Suggestion::disabled(t!("quick_open.goto_line_hint").to_string())
+                    .with_description(t!("quick_open.goto_line_desc").to_string()),
+            ];
         }
 
-        if let Ok(line_num) = query.parse::<usize>() {
-            if line_num > 0 {
-                return vec![Suggestion {
-                    text: t!("quick_open.goto_line", line = line_num.to_string()).to_string(),
-                    description: Some(t!("quick_open.press_enter").to_string()),
-                    value: Some(line_num.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }];
+        match query.parse::<usize>() {
+            Ok(n) if n > 0 => {
+                vec![
+                    Suggestion::new(t!("quick_open.goto_line", line = n.to_string()).to_string())
+                        .with_description(t!("quick_open.press_enter").to_string())
+                        .with_value(n.to_string()),
+                ]
             }
+            _ => vec![
+                Suggestion::disabled(t!("quick_open.invalid_line").to_string())
+                    .with_description(query.to_string()),
+            ],
         }
-
-        // Invalid input
-        vec![Suggestion {
-            text: t!("quick_open.invalid_line").to_string(),
-            description: Some(query.to_string()),
-            value: None,
-            disabled: true,
-            keybinding: None,
-            source: None,
-        }]
     }
 
     fn on_select(
         &self,
-        selected_index: Option<usize>,
-        query: &str,
+        suggestion: Option<&Suggestion>,
+        _query: &str,
         _context: &QuickOpenContext,
     ) -> QuickOpenResult {
-        // Try to parse from the suggestion value first, then from query
-        if selected_index.is_some() {
-            if let Ok(line_num) = query.parse::<usize>() {
-                if line_num > 0 {
-                    return QuickOpenResult::GotoLine(line_num);
-                }
-            }
-        }
-
-        QuickOpenResult::None
+        suggestion
+            .and_then(|s| s.value.as_deref())
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(QuickOpenResult::GotoLine)
+            .unwrap_or(QuickOpenResult::None)
     }
 }
 
@@ -321,15 +237,49 @@ impl QuickOpenProvider for GotoLineProvider {
 // File Provider (default, no prefix)
 // ============================================================================
 
+/// Directory names to skip during file walking (shared with plugin_commands.rs pattern).
+const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".hg",
+    ".svn",
+    ".DS_Store",
+];
+
+const MAX_FILES: usize = 50_000;
+
 /// Provider for finding files in the project
 ///
-/// This is the default provider (empty prefix) that provides file suggestions
-/// using git ls-files, fd, find, or directory traversal.
+/// Uses `git ls-files` via [`ProcessSpawner`] as the fast path (respects
+/// `.gitignore`, works on remote hosts), then falls back to recursive
+/// directory walking via the [`FileSystem`] trait (works on all platforms
+/// including Windows, and on remote filesystems).
 pub struct FileProvider {
     /// Cached file list (populated lazily)
     file_cache: std::sync::Arc<std::sync::RwLock<Option<Vec<FileEntry>>>>,
     /// Frecency data for ranking
     frecency: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, FrecencyData>>>,
+    /// Filesystem abstraction (local or remote)
+    filesystem: std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+    /// Process spawner for running git (local or remote)
+    process_spawner: std::sync::Arc<dyn crate::services::remote::ProcessSpawner>,
+    /// Tokio runtime handle for blocking on async ProcessSpawner calls
+    runtime_handle: Option<tokio::runtime::Handle>,
+}
+
+// Manual Clone: all fields are Arc/Option<Handle> which are Clone
+impl Clone for FileProvider {
+    fn clone(&self) -> Self {
+        Self {
+            file_cache: self.file_cache.clone(),
+            frecency: self.frecency.clone(),
+            filesystem: self.filesystem.clone(),
+            process_spawner: self.process_spawner.clone(),
+            runtime_handle: self.runtime_handle.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -345,10 +295,17 @@ struct FrecencyData {
 }
 
 impl FileProvider {
-    pub fn new() -> Self {
+    pub fn new(
+        filesystem: std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+        process_spawner: std::sync::Arc<dyn crate::services::remote::ProcessSpawner>,
+        runtime_handle: Option<tokio::runtime::Handle>,
+    ) -> Self {
         Self {
             file_cache: std::sync::Arc::new(std::sync::RwLock::new(None)),
             frecency: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            filesystem,
+            process_spawner,
+            runtime_handle,
         }
     }
 
@@ -406,11 +363,11 @@ impl FileProvider {
             }
         }
 
-        // Try different file discovery methods
+        // Fast path: git ls-files via ProcessSpawner (works locally and remotely)
+        // Fallback: recursive walk via FileSystem trait (works on all platforms)
         let files = self
             .try_git_files(cwd)
-            .or_else(|| self.try_fd_files(cwd))
-            .or_else(|| self.try_find_files(cwd))
+            .or_else(|| self.try_walk_dir(cwd))
             .unwrap_or_default();
 
         // Add frecency scores
@@ -430,18 +387,31 @@ impl FileProvider {
         files
     }
 
+    /// Try listing files via `git ls-files` using the ProcessSpawner.
+    ///
+    /// This is the fast path: it respects `.gitignore`, is fast on large repos,
+    /// and works on remote hosts via RemoteProcessSpawner.
     fn try_git_files(&self, cwd: &str) -> Option<Vec<String>> {
-        let output = std::process::Command::new("git")
-            .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-            .current_dir(cwd)
-            .output()
+        let handle = self.runtime_handle.as_ref()?;
+        let result = handle
+            .block_on(self.process_spawner.spawn(
+                "git".to_string(),
+                vec![
+                    "ls-files".to_string(),
+                    "--cached".to_string(),
+                    "--others".to_string(),
+                    "--exclude-standard".to_string(),
+                ],
+                Some(cwd.to_string()),
+            ))
             .ok()?;
 
-        if !output.status.success() {
+        if result.exit_code != 0 {
             return None;
         }
 
-        let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        let files: Vec<String> = result
+            .stdout
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with(".git/"))
             .map(|s| s.to_string())
@@ -450,75 +420,56 @@ impl FileProvider {
         Some(files)
     }
 
-    fn try_fd_files(&self, cwd: &str) -> Option<Vec<String>> {
-        let output = std::process::Command::new("fd")
-            .args([
-                "--type",
-                "f",
-                "--hidden",
-                "--exclude",
-                ".git",
-                "--max-results",
-                "50000",
-            ])
-            .current_dir(cwd)
-            .output()
-            .ok()?;
+    /// Recursive directory walk via the FileSystem trait.
+    ///
+    /// This is the universal fallback that works on all platforms (including
+    /// Windows where git/fd/find may not be available) and on remote
+    /// filesystems via RemoteFileSystem.
+    fn try_walk_dir(&self, cwd: &str) -> Option<Vec<String>> {
+        use std::path::Path;
 
-        if !output.status.success() {
-            return None;
+        let base = Path::new(cwd);
+        let mut files = Vec::new();
+        let mut stack = vec![base.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = match self.filesystem.read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for entry in entries {
+                // Skip hidden files/dirs (dot-prefixed)
+                if entry.name.starts_with('.') {
+                    continue;
+                }
+
+                match entry.entry_type {
+                    crate::model::filesystem::EntryType::File => {
+                        if let Ok(rel) = entry.path.strip_prefix(base) {
+                            // Normalize to forward slashes for consistent display
+                            let rel_str = rel.to_string_lossy().replace('\\', "/");
+                            files.push(rel_str);
+                            if files.len() >= MAX_FILES {
+                                return Some(files);
+                            }
+                        }
+                    }
+                    crate::model::filesystem::EntryType::Directory => {
+                        if !IGNORED_DIRS.contains(&entry.name.as_str()) {
+                            stack.push(entry.path);
+                        }
+                    }
+                    _ => {} // skip symlinks etc.
+                }
+            }
         }
 
-        let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-
-        Some(files)
-    }
-
-    fn try_find_files(&self, cwd: &str) -> Option<Vec<String>> {
-        let output = std::process::Command::new("find")
-            .args([
-                ".",
-                "-type",
-                "f",
-                "-not",
-                "-path",
-                "*/.git/*",
-                "-not",
-                "-path",
-                "*/node_modules/*",
-                "-not",
-                "-path",
-                "*/target/*",
-                "-not",
-                "-path",
-                "*/__pycache__/*",
-            ])
-            .current_dir(cwd)
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
+        if files.is_empty() {
+            None
+        } else {
+            Some(files)
         }
-
-        let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|s| s.trim_start_matches("./").to_string())
-            .take(50000)
-            .collect();
-
-        Some(files)
-    }
-}
-
-impl Default for FileProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -527,32 +478,29 @@ impl QuickOpenProvider for FileProvider {
         ""
     }
 
-    fn name(&self) -> &str {
-        "Files"
-    }
-
-    fn hint(&self) -> &str {
-        "Files"
-    }
-
     fn suggestions(&self, query: &str, context: &QuickOpenContext) -> Vec<Suggestion> {
-        let files = self.load_files(&context.cwd);
+        // Strip :line:col suffix so fuzzy matching works when the user appends a jump target
+        let (path_part, _, _) = super::parse_path_line_col(query);
+        let search_query = if path_part.is_empty() {
+            query
+        } else {
+            &path_part
+        };
 
+        // Show a clear error when the remote connection is lost
+        if !self.filesystem.is_remote_connected() {
+            return vec![Suggestion::disabled(
+                "Remote connection lost — cannot list files".to_string(),
+            )];
+        }
+
+        let files = self.load_files(&context.cwd);
         if files.is_empty() {
-            return vec![Suggestion {
-                text: t!("quick_open.no_files").to_string(),
-                description: None,
-                value: None,
-                disabled: true,
-                keybinding: None,
-                source: None,
-            }];
+            return vec![Suggestion::disabled(t!("quick_open.no_files").to_string())];
         }
 
         let max_results = 100;
-
-        let mut scored_files: Vec<(FileEntry, i32)> = if query.is_empty() {
-            // Sort by frecency when no query
+        let mut scored: Vec<(FileEntry, i32)> = if search_query.is_empty() {
             let mut files = files;
             files.sort_by(|a, b| {
                 b.frecency_score
@@ -565,74 +513,59 @@ impl QuickOpenProvider for FileProvider {
                 .map(|f| (f, 0))
                 .collect()
         } else {
-            // Filter and score by fuzzy match
             files
                 .into_iter()
                 .filter_map(|file| {
-                    let match_result = fuzzy_match(query, &file.relative_path);
-                    if match_result.matched {
-                        // Boost score by frecency (normalized)
-                        let frecency_boost = (file.frecency_score / 100.0).min(20.0) as i32;
-                        Some((file, match_result.score + frecency_boost))
-                    } else {
-                        None
+                    let m = fuzzy_match(search_query, &file.relative_path);
+                    if !m.matched {
+                        return None;
                     }
+                    let frecency_boost = (file.frecency_score / 100.0).min(20.0) as i32;
+                    Some((file, m.score + frecency_boost))
                 })
                 .collect()
         };
 
-        // Sort by score
-        scored_files.sort_by(|a, b| b.1.cmp(&a.1));
-        scored_files.truncate(max_results);
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.truncate(max_results);
 
-        scored_files
+        scored
             .into_iter()
-            .map(|(file, _)| Suggestion {
-                text: file.relative_path.clone(),
-                description: None,
-                value: Some(file.relative_path),
-                disabled: false,
-                keybinding: None,
-                source: None,
+            .map(|(file, _)| {
+                Suggestion::new(file.relative_path.clone()).with_value(file.relative_path)
             })
             .collect()
     }
 
     fn on_select(
         &self,
-        selected_index: Option<usize>,
+        suggestion: Option<&Suggestion>,
         query: &str,
-        context: &QuickOpenContext,
+        _context: &QuickOpenContext,
     ) -> QuickOpenResult {
-        let suggestions = self.suggestions(query, context);
+        let (path_part, line, column) = super::parse_path_line_col(query);
 
-        if let Some(idx) = selected_index {
-            if let Some(suggestion) = suggestions.get(idx) {
-                if let Some(path) = &suggestion.value {
-                    // Record access for frecency
-                    self.record_access(path);
+        // Use the selected suggestion's path if available
+        if let Some(path) = suggestion.and_then(|s| s.value.as_deref()) {
+            self.record_access(path);
+            return QuickOpenResult::OpenFile {
+                path: path.to_string(),
+                line,
+                column,
+            };
+        }
 
-                    return QuickOpenResult::OpenFile {
-                        path: path.clone(),
-                        line: None,
-                        column: None,
-                    };
-                }
-            }
+        // Fallback: direct path input with :line:col
+        if line.is_some() && !path_part.is_empty() {
+            self.record_access(&path_part);
+            return QuickOpenResult::OpenFile {
+                path: path_part,
+                line,
+                column,
+            };
         }
 
         QuickOpenResult::None
-    }
-
-    fn preview(
-        &self,
-        selected_index: usize,
-        context: &QuickOpenContext,
-    ) -> Option<(String, Option<usize>)> {
-        let suggestions = self.suggestions("", context);
-        suggestions
-            .get(selected_index)
-            .and_then(|s| s.value.clone().map(|path| (path, None)))
     }
 }
 
@@ -641,9 +574,9 @@ mod tests {
     use super::*;
     use crate::input::quick_open::BufferInfo;
 
-    fn make_test_context() -> QuickOpenContext {
+    fn make_test_context(cwd: &str) -> QuickOpenContext {
         QuickOpenContext {
-            cwd: "/tmp".to_string(),
+            cwd: cwd.to_string(),
             open_buffers: vec![
                 BufferInfo {
                     id: 1,
@@ -671,7 +604,7 @@ mod tests {
     #[test]
     fn test_buffer_provider_suggestions() {
         let provider = BufferProvider::new();
-        let context = make_test_context();
+        let context = make_test_context("/tmp");
 
         let suggestions = provider.suggestions("", &context);
         assert_eq!(suggestions.len(), 2);
@@ -687,7 +620,7 @@ mod tests {
     #[test]
     fn test_buffer_provider_filter() {
         let provider = BufferProvider::new();
-        let context = make_test_context();
+        let context = make_test_context("/tmp");
 
         let suggestions = provider.suggestions("main", &context);
         assert_eq!(suggestions.len(), 1);
@@ -697,7 +630,7 @@ mod tests {
     #[test]
     fn test_goto_line_provider() {
         let provider = GotoLineProvider::new();
-        let context = make_test_context();
+        let context = make_test_context("/tmp");
 
         // Valid line number
         let suggestions = provider.suggestions("42", &context);
@@ -718,12 +651,141 @@ mod tests {
     #[test]
     fn test_goto_line_on_select() {
         let provider = GotoLineProvider::new();
-        let context = make_test_context();
+        let context = make_test_context("/tmp");
 
-        let result = provider.on_select(Some(0), "42", &context);
+        let suggestions = provider.suggestions("42", &context);
+        let result = provider.on_select(suggestions.first(), "42", &context);
         match result {
             QuickOpenResult::GotoLine(line) => assert_eq!(line, 42),
             _ => panic!("Expected GotoLine result"),
         }
+    }
+
+    // ====================================================================
+    // FileProvider tests
+    // ====================================================================
+
+    /// A ProcessSpawner that always fails — forces FileProvider to use the
+    /// FileSystem walk fallback, which is exactly the code path that was
+    /// broken on Windows and remote filesystems.
+    struct FailingSpawner;
+
+    #[async_trait::async_trait]
+    impl crate::services::remote::ProcessSpawner for FailingSpawner {
+        async fn spawn(
+            &self,
+            _command: String,
+            _args: Vec<String>,
+            _cwd: Option<String>,
+        ) -> Result<crate::services::remote::SpawnResult, crate::services::remote::SpawnError>
+        {
+            Err(crate::services::remote::SpawnError::Process(
+                "no git in test".to_string(),
+            ))
+        }
+    }
+
+    /// Create a FileProvider backed by StdFileSystem and a FailingSpawner
+    /// (no runtime handle, so try_git_files is skipped entirely).
+    fn make_file_provider() -> FileProvider {
+        FileProvider::new(
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+            std::sync::Arc::new(FailingSpawner),
+            None, // no runtime → git ls-files path is skipped
+        )
+    }
+
+    #[test]
+    fn test_file_provider_discovers_files_via_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        // Create a small project structure
+        std::fs::write(base.join("main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(base.join("lib.rs"), b"pub mod foo;").unwrap();
+        std::fs::create_dir(base.join("src")).unwrap();
+        std::fs::write(base.join("src").join("foo.rs"), b"// foo").unwrap();
+
+        let provider = make_file_provider();
+        let context = make_test_context(&base.display().to_string());
+        let suggestions = provider.suggestions("", &context);
+
+        // Should find all 3 files
+        assert_eq!(suggestions.len(), 3);
+        let paths: Vec<&str> = suggestions
+            .iter()
+            .filter_map(|s| s.value.as_deref())
+            .collect();
+        assert!(paths.contains(&"main.rs"));
+        assert!(paths.contains(&"lib.rs"));
+        assert!(paths.contains(&"src/foo.rs"));
+    }
+
+    #[test]
+    fn test_file_provider_skips_ignored_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        std::fs::write(base.join("app.rs"), b"").unwrap();
+        // These directories should be skipped
+        std::fs::create_dir(base.join("node_modules")).unwrap();
+        std::fs::write(base.join("node_modules").join("pkg.js"), b"").unwrap();
+        std::fs::create_dir(base.join("target")).unwrap();
+        std::fs::write(base.join("target").join("debug.o"), b"").unwrap();
+
+        let provider = make_file_provider();
+        let context = make_test_context(&base.display().to_string());
+        let suggestions = provider.suggestions("", &context);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value.as_deref(), Some("app.rs"));
+    }
+
+    #[test]
+    fn test_file_provider_skips_hidden_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        std::fs::write(base.join("visible.txt"), b"").unwrap();
+        std::fs::write(base.join(".hidden"), b"").unwrap();
+        std::fs::create_dir(base.join(".git")).unwrap();
+        std::fs::write(base.join(".git").join("config"), b"").unwrap();
+
+        let provider = make_file_provider();
+        let context = make_test_context(&base.display().to_string());
+        let suggestions = provider.suggestions("", &context);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value.as_deref(), Some("visible.txt"));
+    }
+
+    #[test]
+    fn test_file_provider_fuzzy_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        std::fs::write(base.join("main.rs"), b"").unwrap();
+        std::fs::write(base.join("lib.rs"), b"").unwrap();
+        std::fs::write(base.join("README.md"), b"").unwrap();
+
+        let provider = make_file_provider();
+        let context = make_test_context(&base.display().to_string());
+        let suggestions = provider.suggestions("main", &context);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value.as_deref(), Some("main.rs"));
+    }
+
+    #[test]
+    fn test_file_provider_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let provider = make_file_provider();
+        let context = make_test_context(&dir.path().display().to_string());
+        let suggestions = provider.suggestions("", &context);
+
+        // Should show "no files" disabled suggestion
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].disabled);
     }
 }

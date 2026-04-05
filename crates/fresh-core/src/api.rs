@@ -370,27 +370,6 @@ where
     seq.end()
 }
 
-/// Serialize optional ranges as [start, end] tuples for JS compatibility
-fn serialize_opt_ranges_as_tuples<S>(
-    ranges: &Option<Vec<Range<usize>>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match ranges {
-        Some(ranges) => {
-            use serde::ser::SerializeSeq;
-            let mut seq = serializer.serialize_seq(Some(ranges.len()))?;
-            for range in ranges {
-                seq.serialize_element(&(range.start, range.end))?;
-            }
-            seq.end()
-        }
-        None => serializer.serialize_none(),
-    }
-}
-
 /// Diff between current buffer content and last saved snapshot
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -399,9 +378,6 @@ pub struct BufferSavedDiff {
     #[serde(serialize_with = "serialize_ranges_as_tuples")]
     #[ts(type = "Array<[number, number]>")]
     pub byte_ranges: Vec<Range<usize>>,
-    #[serde(serialize_with = "serialize_opt_ranges_as_tuples")]
-    #[ts(type = "Array<[number, number]> | null")]
-    pub line_ranges: Option<Vec<Range<usize>>>,
 }
 
 /// Information about the viewport
@@ -763,6 +739,9 @@ pub struct EditorStateSnapshot {
     /// Fields not present here are using default values
     #[ts(type = "any")]
     pub user_config: serde_json::Value,
+    /// Available grammars with provenance info, updated when grammar registry changes
+    #[ts(type = "GrammarInfo[]")]
+    pub available_grammars: Vec<GrammarInfoSnapshot>,
     /// Global editor mode for modal editing (e.g., "vi-normal", "vi-insert")
     /// When set, this mode's keybindings take precedence over normal key handling
     pub editor_mode: Option<String>,
@@ -814,6 +793,7 @@ impl EditorStateSnapshot {
             folding_ranges: HashMap::new(),
             config: serde_json::Value::Null,
             user_config: serde_json::Value::Null,
+            available_grammars: Vec::new(),
             editor_mode: None,
             plugin_view_states: HashMap::new(),
             plugin_view_states_split: 0,
@@ -827,6 +807,20 @@ impl Default for EditorStateSnapshot {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Grammar info exposed to plugins, mirroring the editor's grammar provenance tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GrammarInfoSnapshot {
+    /// The grammar name as used in config files (case-insensitive matching)
+    pub name: String,
+    /// Where this grammar was loaded from (e.g. "built-in", "plugin (myplugin)")
+    pub source: String,
+    /// File extensions associated with this grammar
+    pub file_extensions: Vec<String>,
+    /// Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+    pub short_name: Option<String>,
 }
 
 /// Position for inserting menu items or menus
@@ -2810,6 +2804,112 @@ impl Clone for PluginApi {
             state_snapshot: Arc::clone(&self.state_snapshot),
         }
     }
+}
+
+// ============================================================================
+// Pluggable Completion Service — TypeScript Plugin API Types
+// ============================================================================
+//
+// These types are the bridge between the Rust `CompletionService` and
+// TypeScript plugins that want to provide completion candidates.  They are
+// serialised to/from JSON via serde and generate TypeScript definitions via
+// ts-rs so that the plugin API stays in sync automatically.
+
+/// A completion candidate produced by a TypeScript plugin provider.
+///
+/// This mirrors `CompletionCandidate` in the Rust `completion::provider`
+/// module but uses serde-friendly primitives for the JS ↔ Rust boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionCandidate {
+    /// Display text shown in the completion popup.
+    pub label: String,
+
+    /// Text to insert when accepted. Falls back to `label` if omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+
+    /// Short detail string shown next to the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+
+    /// Single-character icon hint (e.g. `"λ"`, `"v"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+
+    /// Provider-assigned relevance score (higher = better).
+    #[serde(default)]
+    pub score: i64,
+
+    /// Whether `insert_text` uses LSP snippet syntax (`$0`, `${1:ph}`, …).
+    #[serde(default)]
+    pub is_snippet: bool,
+
+    /// Opaque data carried through to the `completionAccepted` hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<String>,
+}
+
+/// Context sent to a TypeScript plugin's `provideCompletions` handler.
+///
+/// Plugins receive this as a read-only snapshot so they never need direct
+/// buffer access (which would be unsafe for huge files).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionContext {
+    /// The word prefix typed so far.
+    pub prefix: String,
+
+    /// Byte offset of the cursor.
+    pub cursor_byte: usize,
+
+    /// Byte offset of the word start (for replacement range).
+    pub word_start_byte: usize,
+
+    /// Total buffer size in bytes.
+    pub buffer_len: usize,
+
+    /// Whether the buffer is a lazily-loaded huge file.
+    pub is_large_file: bool,
+
+    /// A text excerpt around the cursor (the contents of the safe scan window).
+    /// Plugins should search only this string, not request the full buffer.
+    pub text_around_cursor: String,
+
+    /// Byte offset within `text_around_cursor` that corresponds to the cursor.
+    pub cursor_offset_in_text: usize,
+
+    /// File language id (e.g. `"rust"`, `"typescript"`), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+}
+
+/// Registration payload sent by a plugin to register a completion provider.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionProviderRegistration {
+    /// Unique id for this provider (e.g., `"my-snippets"`).
+    pub id: String,
+
+    /// Human-readable name shown in status/debug UI.
+    pub display_name: String,
+
+    /// Priority tier (lower = higher priority). Convention:
+    /// 0 = LSP, 10 = ctags, 20 = buffer words, 30 = dabbrev, 50 = plugin.
+    #[serde(default = "default_plugin_provider_priority")]
+    pub priority: u32,
+
+    /// Optional list of language ids this provider is active for.
+    /// If empty/omitted, the provider is active for all languages.
+    #[serde(default)]
+    pub language_ids: Vec<String>,
+}
+
+fn default_plugin_provider_priority() -> u32 {
+    50
 }
 
 #[cfg(test)]

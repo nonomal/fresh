@@ -171,6 +171,10 @@ pub enum Action {
     SmartHome,
     DedentSelection,
     ToggleComment,
+    /// Cycle through dabbrev completions (Emacs Alt+/ style).
+    /// Unlike popup-based completion, this inserts the best match directly
+    /// and cycles through alternatives on repeated invocations.
+    DabbrevExpand,
 
     // Bookmarks
     SetBookmark(char),
@@ -214,8 +218,8 @@ pub enum Action {
     CommandPalette,
     ToggleLineWrap,
     ToggleReadOnly,
-    ToggleComposeMode,
-    SetComposeWidth,
+    TogglePageView,
+    SetPageWidth,
     InspectThemeAtCursor,
     SelectTheme,
     SelectKeybindingMap,

@@ -3,7 +3,7 @@
 //! This module contains the `GrammarRegistry` struct and all syntax lookup methods
 //! that don't require filesystem access. This enables WASM compatibility and easier testing.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +13,67 @@ use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBu
 pub use crate::primitives::glob_match::{
     filename_glob_matches, is_glob_pattern, is_path_pattern, path_glob_matches,
 };
+
+/// A grammar specification: language name, path to grammar file, and associated file extensions.
+///
+/// Used to pass grammar information between the plugin layer, loader, and registry
+/// without relying on anonymous tuples.
+#[derive(Clone, Debug)]
+pub struct GrammarSpec {
+    /// Language identifier (e.g., "elixir")
+    pub language: String,
+    /// Path to the grammar file (.sublime-syntax)
+    pub path: PathBuf,
+    /// File extensions to associate with this grammar (e.g., ["ex", "exs"])
+    pub extensions: Vec<String>,
+}
+
+/// Where a grammar was loaded from.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum GrammarSource {
+    /// Built-in to Fresh (pre-compiled syntect defaults + embedded grammars)
+    #[serde(rename = "built-in")]
+    BuiltIn,
+    /// Installed from a user grammar directory (~/.config/fresh/grammars/)
+    #[serde(rename = "user")]
+    User { path: PathBuf },
+    /// From a language pack (~/.config/fresh/languages/packages/)
+    #[serde(rename = "language-pack")]
+    LanguagePack { name: String, path: PathBuf },
+    /// From a bundle package (~/.config/fresh/bundles/packages/)
+    #[serde(rename = "bundle")]
+    Bundle { name: String, path: PathBuf },
+    /// Registered by a plugin at runtime
+    #[serde(rename = "plugin")]
+    Plugin { plugin: String, path: PathBuf },
+}
+
+impl std::fmt::Display for GrammarSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GrammarSource::BuiltIn => write!(f, "built-in"),
+            GrammarSource::User { path } => write!(f, "user ({})", path.display()),
+            GrammarSource::LanguagePack { name, .. } => write!(f, "language-pack ({})", name),
+            GrammarSource::Bundle { name, .. } => write!(f, "bundle ({})", name),
+            GrammarSource::Plugin { plugin, .. } => write!(f, "plugin ({})", plugin),
+        }
+    }
+}
+
+/// Information about an available grammar, including its provenance.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GrammarInfo {
+    /// The grammar name as used in config files (case-insensitive matching)
+    pub name: String,
+    /// Where this grammar was loaded from
+    pub source: GrammarSource,
+    /// File extensions associated with this grammar
+    pub file_extensions: Vec<String>,
+    /// Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_name: Option<String>,
+}
 
 /// Embedded TOML grammar (syntect doesn't include one)
 pub const TOML_GRAMMAR: &str = include_str!("../../grammars/toml.sublime-syntax");
@@ -42,6 +103,67 @@ pub const GITATTRIBUTES_GRAMMAR: &str = include_str!("../../grammars/gitattribut
 /// Embedded Typst grammar (syntect doesn't include one)
 pub const TYPST_GRAMMAR: &str = include_str!("../../grammars/typst.sublime-syntax");
 
+/// Embedded Dockerfile grammar
+pub const DOCKERFILE_GRAMMAR: &str = include_str!("../../grammars/dockerfile.sublime-syntax");
+/// Embedded INI grammar (also handles .env, .cfg, .editorconfig, etc.)
+pub const INI_GRAMMAR: &str = include_str!("../../grammars/ini.sublime-syntax");
+/// Embedded CMake grammar
+pub const CMAKE_GRAMMAR: &str = include_str!("../../grammars/cmake.sublime-syntax");
+/// Embedded SCSS grammar
+pub const SCSS_GRAMMAR: &str = include_str!("../../grammars/scss.sublime-syntax");
+/// Embedded LESS grammar
+pub const LESS_GRAMMAR: &str = include_str!("../../grammars/less.sublime-syntax");
+/// Embedded PowerShell grammar
+pub const POWERSHELL_GRAMMAR: &str = include_str!("../../grammars/powershell.sublime-syntax");
+/// Embedded Kotlin grammar
+pub const KOTLIN_GRAMMAR: &str = include_str!("../../grammars/kotlin.sublime-syntax");
+/// Embedded Swift grammar
+pub const SWIFT_GRAMMAR: &str = include_str!("../../grammars/swift.sublime-syntax");
+/// Embedded Dart grammar
+pub const DART_GRAMMAR: &str = include_str!("../../grammars/dart.sublime-syntax");
+/// Embedded Elixir grammar
+pub const ELIXIR_GRAMMAR: &str = include_str!("../../grammars/elixir.sublime-syntax");
+/// Embedded F# grammar
+pub const FSHARP_GRAMMAR: &str = include_str!("../../grammars/fsharp.sublime-syntax");
+/// Embedded Nix grammar
+pub const NIX_GRAMMAR: &str = include_str!("../../grammars/nix.sublime-syntax");
+/// Embedded HCL/Terraform grammar
+pub const HCL_GRAMMAR: &str = include_str!("../../grammars/hcl.sublime-syntax");
+/// Embedded Protocol Buffers grammar
+pub const PROTOBUF_GRAMMAR: &str = include_str!("../../grammars/protobuf.sublime-syntax");
+/// Embedded GraphQL grammar
+pub const GRAPHQL_GRAMMAR: &str = include_str!("../../grammars/graphql.sublime-syntax");
+/// Embedded Julia grammar
+pub const JULIA_GRAMMAR: &str = include_str!("../../grammars/julia.sublime-syntax");
+/// Embedded Nim grammar
+pub const NIM_GRAMMAR: &str = include_str!("../../grammars/nim.sublime-syntax");
+/// Embedded Gleam grammar
+pub const GLEAM_GRAMMAR: &str = include_str!("../../grammars/gleam.sublime-syntax");
+/// Embedded V language grammar
+pub const VLANG_GRAMMAR: &str = include_str!("../../grammars/vlang.sublime-syntax");
+/// Embedded Solidity grammar
+pub const SOLIDITY_GRAMMAR: &str = include_str!("../../grammars/solidity.sublime-syntax");
+/// Embedded KDL grammar
+pub const KDL_GRAMMAR: &str = include_str!("../../grammars/kdl.sublime-syntax");
+/// Embedded Nushell grammar
+pub const NUSHELL_GRAMMAR: &str = include_str!("../../grammars/nushell.sublime-syntax");
+/// Embedded Starlark/Bazel grammar
+pub const STARLARK_GRAMMAR: &str = include_str!("../../grammars/starlark.sublime-syntax");
+/// Embedded Justfile grammar
+pub const JUSTFILE_GRAMMAR: &str = include_str!("../../grammars/justfile.sublime-syntax");
+/// Embedded Earthfile grammar
+pub const EARTHFILE_GRAMMAR: &str = include_str!("../../grammars/earthfile.sublime-syntax");
+/// Embedded Go Module grammar
+pub const GOMOD_GRAMMAR: &str = include_str!("../../grammars/gomod.sublime-syntax");
+/// Embedded Vue grammar
+pub const VUE_GRAMMAR: &str = include_str!("../../grammars/vue.sublime-syntax");
+/// Embedded Svelte grammar
+pub const SVELTE_GRAMMAR: &str = include_str!("../../grammars/svelte.sublime-syntax");
+/// Embedded Astro grammar
+pub const ASTRO_GRAMMAR: &str = include_str!("../../grammars/astro.sublime-syntax");
+/// Embedded Hyprlang grammar (Hyprland config)
+pub const HYPRLANG_GRAMMAR: &str = include_str!("../../grammars/hyprlang.sublime-syntax");
+
 /// Registry of all available TextMate grammars.
 ///
 /// This struct holds the compiled syntax set and provides lookup methods.
@@ -62,7 +184,13 @@ pub struct GrammarRegistry {
     /// Filename -> scope name mapping for dotfiles and special files
     filename_scopes: HashMap<String, String>,
     /// Paths to dynamically loaded grammar files (for reloading when adding more)
-    loaded_grammar_paths: Vec<(String, PathBuf, Vec<String>)>,
+    loaded_grammar_paths: Vec<GrammarSpec>,
+    /// Provenance info for each grammar (keyed by grammar name)
+    grammar_sources: HashMap<String, GrammarInfo>,
+    /// Short name aliases: lowercase short_name -> full syntect grammar name.
+    /// Provides a deterministic, one-to-one mapping so users can write
+    /// `grammar = "bash"` instead of `grammar = "Bourne Again Shell (bash)"`.
+    aliases: HashMap<String, String>,
 }
 
 impl GrammarRegistry {
@@ -75,11 +203,33 @@ impl GrammarRegistry {
         user_extensions: HashMap<String, String>,
         filename_scopes: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_loaded_paths(
+            syntax_set,
+            user_extensions,
+            filename_scopes,
+            Vec::new(),
+            HashMap::new(),
+        )
+    }
+
+    /// Create a GrammarRegistry with pre-loaded grammar path tracking.
+    ///
+    /// Used by the loader when plugin grammars were included in the initial build,
+    /// so that `loaded_grammar_paths()` reflects what was actually loaded.
+    pub fn new_with_loaded_paths(
+        syntax_set: SyntaxSet,
+        user_extensions: HashMap<String, String>,
+        filename_scopes: HashMap<String, String>,
+        loaded_grammar_paths: Vec<GrammarSpec>,
+        grammar_sources: HashMap<String, GrammarInfo>,
+    ) -> Self {
         Self {
             syntax_set: Arc::new(syntax_set),
             user_extensions,
             filename_scopes,
-            loaded_grammar_paths: Vec::new(),
+            loaded_grammar_paths,
+            grammar_sources,
+            aliases: HashMap::new(),
         }
     }
 
@@ -92,6 +242,8 @@ impl GrammarRegistry {
             user_extensions: HashMap::new(),
             filename_scopes: HashMap::new(),
             loaded_grammar_paths: Vec::new(),
+            grammar_sources: HashMap::new(),
+            aliases: HashMap::new(),
         })
     }
 
@@ -102,14 +254,49 @@ impl GrammarRegistry {
     /// without any `SyntaxSetBuilder::build()` call. Use this at startup,
     /// then swap in a full registry built on a background thread.
     pub fn defaults_only() -> Arc<Self> {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        // Load pre-compiled syntax set (defaults + embedded grammars) from
+        // build-time packdump. This avoids the expensive into_builder() + build()
+        // cycle at runtime (~12s → ~300ms).
+        tracing::info!("defaults_only: loading pre-compiled syntax packdump...");
+        let syntax_set: SyntaxSet = syntect::dumps::from_uncompressed_data(include_bytes!(
+            concat!(env!("OUT_DIR"), "/default_syntaxes.packdump")
+        ))
+        .expect("Failed to load pre-compiled syntax packdump");
+        tracing::info!(
+            "defaults_only: loaded ({} syntaxes)",
+            syntax_set.syntaxes().len()
+        );
+        let grammar_sources = Self::build_grammar_sources_from_syntax_set(&syntax_set);
         let filename_scopes = Self::build_filename_scopes();
-        Arc::new(Self {
+        let extra_extensions = Self::build_extra_extensions();
+        let mut registry = Self {
             syntax_set: Arc::new(syntax_set),
-            user_extensions: HashMap::new(),
+            user_extensions: extra_extensions,
             filename_scopes,
             loaded_grammar_paths: Vec::new(),
-        })
+            grammar_sources,
+            aliases: HashMap::new(),
+        };
+        registry.populate_built_in_aliases();
+        Arc::new(registry)
+    }
+
+    /// Build extra extension -> scope mappings for extensions not covered by syntect defaults.
+    ///
+    /// These map common file extensions to existing syntect grammar scopes,
+    /// filling gaps where syntect's built-in extension lists are incomplete.
+    pub fn build_extra_extensions() -> HashMap<String, String> {
+        let mut map = HashMap::new();
+
+        // JavaScript variants not in syntect defaults (["js", "htc"])
+        let js_scope = "source.js".to_string();
+        map.insert("cjs".to_string(), js_scope.clone());
+        map.insert("mjs".to_string(), js_scope);
+
+        // Dockerfile variants (e.g. Dockerfile.dev -> .dev extension)
+        // These won't match by extension, handled by filename_scopes and first_line_match
+
+        map
     }
 
     /// Build the default filename -> scope mappings for dotfiles and special files.
@@ -158,6 +345,62 @@ impl GrammarRegistry {
         // Git attributes files
         let gitattributes_scope = "source.gitattributes".to_string();
         map.insert(".gitattributes".to_string(), gitattributes_scope);
+
+        // Jenkinsfile -> Groovy
+        let groovy_scope = "source.groovy".to_string();
+        map.insert("Jenkinsfile".to_string(), groovy_scope);
+
+        // Vagrantfile -> Ruby (syntect already handles this, but be explicit)
+        // Brewfile -> Ruby
+        let ruby_scope = "source.ruby".to_string();
+        map.insert("Brewfile".to_string(), ruby_scope);
+
+        // Dockerfile and variants (exact names; Dockerfile.* handled via prefix check)
+        let dockerfile_scope = "source.dockerfile".to_string();
+        map.insert("Dockerfile".to_string(), dockerfile_scope.clone());
+        map.insert("Containerfile".to_string(), dockerfile_scope.clone());
+        // Common Dockerfile variants
+        map.insert("Dockerfile.dev".to_string(), dockerfile_scope.clone());
+        map.insert("Dockerfile.prod".to_string(), dockerfile_scope.clone());
+        map.insert("Dockerfile.test".to_string(), dockerfile_scope.clone());
+        map.insert("Dockerfile.build".to_string(), dockerfile_scope.clone());
+
+        // CMake
+        let cmake_scope = "source.cmake".to_string();
+        map.insert("CMakeLists.txt".to_string(), cmake_scope);
+
+        // Starlark/Bazel
+        let starlark_scope = "source.starlark".to_string();
+        map.insert("BUILD".to_string(), starlark_scope.clone());
+        map.insert("BUILD.bazel".to_string(), starlark_scope.clone());
+        map.insert("WORKSPACE".to_string(), starlark_scope.clone());
+        map.insert("WORKSPACE.bazel".to_string(), starlark_scope.clone());
+        map.insert("Tiltfile".to_string(), starlark_scope);
+
+        // Justfile (various casings)
+        let justfile_scope = "source.justfile".to_string();
+        map.insert("justfile".to_string(), justfile_scope.clone());
+        map.insert("Justfile".to_string(), justfile_scope.clone());
+        map.insert(".justfile".to_string(), justfile_scope);
+
+        // EditorConfig -> INI
+        let ini_scope = "source.ini".to_string();
+        map.insert(".editorconfig".to_string(), ini_scope);
+
+        // Earthfile
+        let earthfile_scope = "source.earthfile".to_string();
+        map.insert("Earthfile".to_string(), earthfile_scope);
+
+        // Hyprlang (Hyprland config files)
+        let hyprlang_scope = "source.hyprlang".to_string();
+        map.insert("hyprland.conf".to_string(), hyprlang_scope.clone());
+        map.insert("hyprpaper.conf".to_string(), hyprlang_scope.clone());
+        map.insert("hyprlock.conf".to_string(), hyprlang_scope);
+
+        // go.mod / go.sum
+        let gomod_scope = "source.gomod".to_string();
+        map.insert("go.mod".to_string(), gomod_scope.clone());
+        map.insert("go.sum".to_string(), gomod_scope);
 
         map
     }
@@ -263,6 +506,52 @@ impl GrammarRegistry {
                 tracing::warn!("Failed to load embedded Typst grammar: {}", e);
             }
         }
+
+        // Additional embedded grammars for languages not in syntect defaults
+        let additional_grammars: &[(&str, &str)] = &[
+            (DOCKERFILE_GRAMMAR, "Dockerfile"),
+            (INI_GRAMMAR, "INI"),
+            (CMAKE_GRAMMAR, "CMake"),
+            (SCSS_GRAMMAR, "SCSS"),
+            (LESS_GRAMMAR, "LESS"),
+            (POWERSHELL_GRAMMAR, "PowerShell"),
+            (KOTLIN_GRAMMAR, "Kotlin"),
+            (SWIFT_GRAMMAR, "Swift"),
+            (DART_GRAMMAR, "Dart"),
+            (ELIXIR_GRAMMAR, "Elixir"),
+            (FSHARP_GRAMMAR, "FSharp"),
+            (NIX_GRAMMAR, "Nix"),
+            (HCL_GRAMMAR, "HCL"),
+            (PROTOBUF_GRAMMAR, "Protocol Buffers"),
+            (GRAPHQL_GRAMMAR, "GraphQL"),
+            (JULIA_GRAMMAR, "Julia"),
+            (NIM_GRAMMAR, "Nim"),
+            (GLEAM_GRAMMAR, "Gleam"),
+            (VLANG_GRAMMAR, "V"),
+            (SOLIDITY_GRAMMAR, "Solidity"),
+            (KDL_GRAMMAR, "KDL"),
+            (NUSHELL_GRAMMAR, "Nushell"),
+            (STARLARK_GRAMMAR, "Starlark"),
+            (JUSTFILE_GRAMMAR, "Justfile"),
+            (EARTHFILE_GRAMMAR, "Earthfile"),
+            (GOMOD_GRAMMAR, "Go Module"),
+            (VUE_GRAMMAR, "Vue"),
+            (SVELTE_GRAMMAR, "Svelte"),
+            (ASTRO_GRAMMAR, "Astro"),
+            (HYPRLANG_GRAMMAR, "Hyprlang"),
+        ];
+
+        for (grammar_str, name) in additional_grammars {
+            match SyntaxDefinition::load_from_str(grammar_str, true, Some(name)) {
+                Ok(syntax) => {
+                    builder.add(syntax);
+                    tracing::debug!("Loaded embedded {} grammar", name);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load embedded {} grammar: {}", name, e);
+                }
+            }
+        }
     }
 
     /// Find syntax for a file by path/extension/filename.
@@ -273,7 +562,21 @@ impl GrammarRegistry {
     /// 3. By filename (custom dotfile mappings like .zshrc)
     /// 4. By filename via syntect (handles Makefile, .bashrc, etc.)
     pub fn find_syntax_for_file(&self, path: &Path) -> Option<&SyntaxReference> {
-        // Try extension-based lookup first
+        // Try filename-based lookup FIRST for dotfiles, special files, and exact matches
+        // This must come before extension lookup since files like CMakeLists.txt
+        // would otherwise match Plain Text via the .txt extension.
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+            if let Some(scope) = self.filename_scopes.get(filename) {
+                if let Some(syntax) = syntect::parsing::Scope::new(scope)
+                    .ok()
+                    .and_then(|s| self.syntax_set.find_syntax_by_scope(s))
+                {
+                    return Some(syntax);
+                }
+            }
+        }
+
+        // Try extension-based lookup
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             // Check user grammars first (higher priority)
             if let Some(scope) = self.user_extensions.get(ext) {
@@ -310,17 +613,7 @@ impl GrammarRegistry {
             }
         }
 
-        // Try filename-based lookup for dotfiles and special files
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            if let Some(scope) = self.filename_scopes.get(filename) {
-                if let Some(syntax) = syntect::parsing::Scope::new(scope)
-                    .ok()
-                    .and_then(|s| self.syntax_set.find_syntax_by_scope(s))
-                {
-                    return Some(syntax);
-                }
-            }
-        }
+        // Filename-based lookup already done above (before extension lookup)
 
         // Try syntect's full file detection (handles special filenames like Makefile)
         // This may do I/O for first-line detection, but handles many cases
@@ -360,6 +653,12 @@ impl GrammarRegistry {
             languages.keys().collect::<Vec<_>>()
         );
 
+        // Track whether any user config rule matched, even if the grammar
+        // couldn't be resolved to a syntect syntax.  When a config match exists
+        // we must NOT fall through to built-in detection, which may map the
+        // extension to a completely different language (e.g. `.fish` → bash).
+        let mut config_matched = false;
+
         // Try filename match from languages config first (exact then glob)
         if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
             // First pass: exact matches only (highest priority)
@@ -377,6 +676,7 @@ impl GrammarRegistry {
                     if let Some(syntax) = self.find_syntax_for_lang_config(lang_config) {
                         return Some(syntax);
                     }
+                    config_matched = true;
                 }
             }
 
@@ -403,6 +703,7 @@ impl GrammarRegistry {
                     if let Some(syntax) = self.find_syntax_for_lang_config(lang_config) {
                         return Some(syntax);
                     }
+                    config_matched = true;
                 }
             }
         }
@@ -417,7 +718,10 @@ impl GrammarRegistry {
                         lang_name,
                         lang_config.grammar
                     );
-                    // Found a match - try to find syntax by grammar name
+                    // Only try grammar name lookup here (not the extension
+                    // fallback in find_syntax_for_lang_config).  The extension
+                    // fallback would use syntect's built-in mapping which may
+                    // return a wrong language (e.g. .fish → bash).
                     if let Some(syntax) = self.find_syntax_by_name(&lang_config.grammar) {
                         tracing::info!(
                             "[SYNTAX DEBUG] found syntax by grammar name: {}",
@@ -430,11 +734,21 @@ impl GrammarRegistry {
                             lang_config.grammar
                         );
                     }
+                    config_matched = true;
                 }
             }
         }
 
-        // Fall back to built-in detection
+        // Fall back to built-in detection only if no user config rule matched.
+        // When a config rule matched but the grammar couldn't be resolved (e.g.
+        // the user configured a language whose grammar isn't in syntect), we
+        // return None to avoid misdetecting the file as a different language.
+        if config_matched {
+            tracing::info!(
+                "[SYNTAX DEBUG] config matched but grammar not resolved; skipping built-in fallback"
+            );
+            return None;
+        }
         tracing::info!("[SYNTAX DEBUG] falling back to find_syntax_for_file");
         let result = self.find_syntax_for_file(path);
         tracing::info!(
@@ -489,21 +803,193 @@ impl GrammarRegistry {
         self.syntax_set.find_syntax_by_scope(scope)
     }
 
-    /// Find syntax by name (case-insensitive)
+    /// Find syntax by name, with alias resolution.
     ///
-    /// This allows config files to use lowercase grammar names like "go" while
-    /// matching syntect's actual names like "Go".
+    /// Lookup order:
+    /// 1. Exact match against syntect grammar names
+    /// 2. Case-insensitive match against syntect grammar names
+    /// 3. Alias lookup (short_name -> full grammar name, then exact syntect match)
+    ///
+    /// This allows config files to use `"go"` (case-insensitive match of `"Go"`),
+    /// or `"bash"` (alias for `"Bourne Again Shell (bash)"`).
     pub fn find_syntax_by_name(&self, name: &str) -> Option<&SyntaxReference> {
-        // Try exact match first
+        // 1. Exact match
         if let Some(syntax) = self.syntax_set.find_syntax_by_name(name) {
             return Some(syntax);
         }
-        // Fall back to case-insensitive match
+        // 2. Case-insensitive match
         let name_lower = name.to_lowercase();
-        self.syntax_set
+        if let Some(syntax) = self
+            .syntax_set
             .syntaxes()
             .iter()
             .find(|s| s.name.to_lowercase() == name_lower)
+        {
+            return Some(syntax);
+        }
+        // 3. Alias lookup
+        if let Some(full_name) = self.aliases.get(&name_lower) {
+            return self.syntax_set.find_syntax_by_name(full_name);
+        }
+        None
+    }
+
+    // === Alias management ===
+
+    /// Hardcoded short-name aliases for built-in and embedded grammars.
+    ///
+    /// Each entry maps a short name (lowercase) to the exact syntect grammar name.
+    /// Only grammars whose full name differs significantly from a natural short
+    /// form need an entry here. Grammars already short (e.g., "Rust", "Go") are
+    /// reachable via case-insensitive matching and don't need aliases.
+    fn built_in_aliases() -> Vec<(&'static str, &'static str)> {
+        vec![
+            // Syntect built-in grammars with verbose names
+            ("bash", "Bourne Again Shell (bash)"),
+            ("shell", "Bourne Again Shell (bash)"),
+            ("sh", "Bourne Again Shell (bash)"),
+            ("c++", "C++"),
+            ("cpp", "C++"),
+            ("csharp", "C#"),
+            ("objc", "Objective-C"),
+            ("objcpp", "Objective-C++"),
+            ("regex", "Regular Expressions (Python)"),
+            ("regexp", "Regular Expressions (Python)"),
+            // Embedded grammars with multi-word or non-obvious names
+            ("proto", "Protocol Buffers"),
+            ("protobuf", "Protocol Buffers"),
+            ("gomod", "Go Module"),
+            ("git-rebase", "Git Rebase Todo"),
+            ("git-commit", "Git Commit Message"),
+            ("git-config", "Git Config"),
+            ("git-attributes", "Git Attributes"),
+            ("gitignore", "Gitignore"),
+            ("fsharp", "FSharp"),
+            ("f#", "FSharp"),
+            ("terraform", "HCL"),
+            ("tf", "HCL"),
+            ("ts", "TypeScript"),
+            ("js", "JavaScript"),
+            ("py", "Python"),
+            ("rb", "Ruby"),
+            ("rs", "Rust"),
+            ("md", "Markdown"),
+            ("yml", "YAML"),
+            ("dockerfile", "Dockerfile"),
+        ]
+    }
+
+    /// Populate aliases from the built-in table.
+    ///
+    /// Validates that:
+    /// - Each alias target (full name) exists in the syntax set
+    /// - No alias collides (case-insensitive) with an existing grammar full name
+    /// - No duplicate aliases exist
+    pub fn populate_built_in_aliases(&mut self) {
+        for (short, full) in Self::built_in_aliases() {
+            self.register_alias_inner(short, full, true);
+        }
+    }
+
+    /// Register a short-name alias for a grammar.
+    ///
+    /// Returns `true` if the alias was registered, `false` if rejected due to
+    /// collision or missing target. For built-in aliases, collisions panic
+    /// (they indicate a bug). For dynamic aliases, collisions log a warning.
+    pub fn register_alias(&mut self, short_name: &str, full_name: &str) -> bool {
+        self.register_alias_inner(short_name, full_name, false)
+    }
+
+    fn register_alias_inner(
+        &mut self,
+        short_name: &str,
+        full_name: &str,
+        is_built_in: bool,
+    ) -> bool {
+        let short_lower = short_name.to_lowercase();
+
+        // Validate: target grammar must exist in the syntax set
+        let target_exists = self
+            .syntax_set
+            .syntaxes()
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(full_name));
+        if !target_exists {
+            if is_built_in {
+                // Built-in alias targets should always exist; warn but don't panic
+                // (grammar might have been removed from syntect upstream)
+                tracing::warn!(
+                    "[grammar-alias] Built-in alias '{}' -> '{}': target grammar not found, skipping",
+                    short_name, full_name
+                );
+            } else {
+                tracing::warn!(
+                    "[grammar-alias] Alias '{}' -> '{}': target grammar not found, skipping",
+                    short_name,
+                    full_name
+                );
+            }
+            return false;
+        }
+
+        // Validate: short name must not collide (case-insensitive) with any grammar full name
+        let collides_with_full_name = self
+            .syntax_set
+            .syntaxes()
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(&short_lower));
+        if collides_with_full_name {
+            // This is actually fine — the short name matches a full name directly,
+            // so find_syntax_by_name's case-insensitive search will find it.
+            // No alias needed.
+            tracing::debug!(
+                "[grammar-alias] Alias '{}' matches an existing grammar name, skipping (not needed)",
+                short_name
+            );
+            return false;
+        }
+
+        // Validate: no duplicate alias (case-insensitive)
+        if let Some(existing_target) = self.aliases.get(&short_lower) {
+            if existing_target.eq_ignore_ascii_case(full_name) {
+                // Same mapping, no-op
+                return true;
+            }
+            let msg = format!(
+                "Alias '{}' already maps to '{}', cannot remap to '{}'",
+                short_name, existing_target, full_name
+            );
+            if is_built_in {
+                panic!("[grammar-alias] Built-in alias collision: {}", msg);
+            } else {
+                tracing::warn!("[grammar-alias] {}", msg);
+                return false;
+            }
+        }
+
+        // Resolve the exact syntect name (preserving original case)
+        let exact_name = self
+            .syntax_set
+            .syntaxes()
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(full_name))
+            .map(|s| s.name.clone())
+            .unwrap();
+
+        self.aliases.insert(short_lower, exact_name);
+        true
+    }
+
+    /// Get the aliases map (short_name -> full grammar name)
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
+    }
+
+    /// Look up the full grammar name for a short alias.
+    pub fn resolve_alias(&self, short_name: &str) -> Option<&str> {
+        self.aliases
+            .get(&short_name.to_lowercase())
+            .map(|s| s.as_str())
     }
 
     /// Get the underlying syntax set
@@ -523,6 +1009,83 @@ impl GrammarRegistry {
             .iter()
             .map(|s| s.name.as_str())
             .collect()
+    }
+
+    /// List all available grammars with provenance information.
+    ///
+    /// Returns a sorted list of `GrammarInfo` entries. Each entry includes
+    /// the grammar name, where it was loaded from, and associated file extensions.
+    pub fn available_grammar_info(&self) -> Vec<GrammarInfo> {
+        // Build reverse map: full_name -> list of short aliases
+        let mut reverse_aliases: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (short, full) in &self.aliases {
+            reverse_aliases
+                .entry(full.as_str())
+                .or_default()
+                .push(short.as_str());
+        }
+
+        let mut result: Vec<GrammarInfo> = self
+            .syntax_set
+            .syntaxes()
+            .iter()
+            .filter(|s| s.name != "Plain Text")
+            .map(|s| {
+                let name = s.name.clone();
+                let source = self
+                    .grammar_sources
+                    .get(&name)
+                    .map(|info| info.source.clone())
+                    .unwrap_or(GrammarSource::BuiltIn);
+                let file_extensions = s.file_extensions.clone();
+                // Pick the first (shortest) alias as the canonical short name
+                let short_name = reverse_aliases.get(name.as_str()).and_then(|aliases| {
+                    aliases
+                        .iter()
+                        .min_by_key(|a| a.len())
+                        .map(|a| a.to_string())
+                });
+                GrammarInfo {
+                    name,
+                    source,
+                    file_extensions,
+                    short_name,
+                }
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        result
+    }
+
+    /// Get the grammar sources map.
+    pub fn grammar_sources(&self) -> &HashMap<String, GrammarInfo> {
+        &self.grammar_sources
+    }
+
+    /// Get a mutable reference to the grammar sources map.
+    pub fn grammar_sources_mut(&mut self) -> &mut HashMap<String, GrammarInfo> {
+        &mut self.grammar_sources
+    }
+
+    /// Build grammar source info from a pre-compiled syntax set.
+    ///
+    /// All grammars in the packdump (syntect defaults + embedded) are tagged as built-in.
+    pub fn build_grammar_sources_from_syntax_set(
+        syntax_set: &SyntaxSet,
+    ) -> HashMap<String, GrammarInfo> {
+        let mut sources = HashMap::new();
+        for syntax in syntax_set.syntaxes() {
+            sources.insert(
+                syntax.name.clone(),
+                GrammarInfo {
+                    name: syntax.name.clone(),
+                    source: GrammarSource::BuiltIn,
+                    file_extensions: syntax.file_extensions.clone(),
+                    short_name: None,
+                },
+            );
+        }
+        sources
     }
 
     /// Debug helper: get user extensions as a string for logging
@@ -555,10 +1118,17 @@ impl GrammarRegistry {
         &self.filename_scopes
     }
 
+    /// Get the loaded grammar paths (for deduplication in flush_pending_grammars)
+    pub fn loaded_grammar_paths(&self) -> &[GrammarSpec] {
+        &self.loaded_grammar_paths
+    }
+
     /// Create a new registry with additional grammar files
     ///
     /// This builds a new GrammarRegistry that includes all grammars from
     /// the base registry plus the additional grammars specified.
+    /// Uses the base registry's syntax_set as the builder base, preserving
+    /// all existing grammars (user grammars, language packs, etc.).
     ///
     /// # Arguments
     /// * `base` - The base registry to extend
@@ -568,87 +1138,77 @@ impl GrammarRegistry {
     /// A new GrammarRegistry with the additional grammars, or None if rebuilding fails
     pub fn with_additional_grammars(
         base: &GrammarRegistry,
-        additional: &[(String, PathBuf, Vec<String>)],
+        additional: &[GrammarSpec],
     ) -> Option<Self> {
         tracing::info!(
-            "[SYNTAX DEBUG] with_additional_grammars: adding {} grammars, base has {} user_extensions, {} previously loaded grammars",
+            "[SYNTAX DEBUG] with_additional_grammars: adding {} grammars to base with {} syntaxes",
             additional.len(),
-            base.user_extensions.len(),
-            base.loaded_grammar_paths.len()
+            base.syntax_set.syntaxes().len()
         );
 
-        // Start with defaults and embedded grammars (same as Default impl)
-        let defaults = SyntaxSet::load_defaults_newlines();
-        let mut builder = defaults.into_builder();
-        Self::add_embedded_grammars(&mut builder);
+        // Use the base registry's syntax_set as builder base — this preserves
+        // ALL existing grammars (defaults, embedded, user, language packs)
+        // without needing to reload them from disk.
+        let mut builder = (*base.syntax_set).clone().into_builder();
 
-        // Start fresh with user extensions - we'll rebuild from loaded grammars
-        let mut user_extensions = HashMap::new();
+        // Preserve existing user extensions and add new ones
+        let mut user_extensions = base.user_extensions.clone();
 
-        // Track all loaded grammar paths (existing + new)
+        // Track loaded grammar paths (existing + new)
         let mut loaded_grammar_paths = base.loaded_grammar_paths.clone();
 
-        // First, reload all previously loaded grammars from base
-        for (language, path, extensions) in &base.loaded_grammar_paths {
-            tracing::info!(
-                "[SYNTAX DEBUG] reloading existing grammar: lang='{}', path={:?}",
-                language,
-                path
-            );
-            match Self::load_grammar_file(path) {
-                Ok(syntax) => {
-                    let scope = syntax.scope.to_string();
-                    builder.add(syntax);
-                    for ext in extensions {
-                        user_extensions.insert(ext.clone(), scope.clone());
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to reload grammar for '{}' from {:?}: {}",
-                        language,
-                        path,
-                        e
-                    );
-                }
-            }
-        }
+        // Preserve existing grammar sources
+        let mut grammar_sources = base.grammar_sources.clone();
 
         // Add each new grammar
-        for (language, path, extensions) in additional {
+        for spec in additional {
             tracing::info!(
                 "[SYNTAX DEBUG] loading new grammar file: lang='{}', path={:?}, extensions={:?}",
-                language,
-                path,
-                extensions
+                spec.language,
+                spec.path,
+                spec.extensions
             );
-            match Self::load_grammar_file(path) {
+            match Self::load_grammar_file(&spec.path) {
                 Ok(syntax) => {
                     let scope = syntax.scope.to_string();
+                    let syntax_name = syntax.name.clone();
                     tracing::info!(
                         "[SYNTAX DEBUG] grammar loaded successfully: name='{}', scope='{}'",
-                        syntax.name,
+                        syntax_name,
                         scope
                     );
                     builder.add(syntax);
                     tracing::info!(
                         "Loaded grammar for '{}' from {:?} with extensions {:?}",
-                        language,
-                        path,
-                        extensions
+                        spec.language,
+                        spec.path,
+                        spec.extensions
                     );
                     // Register extensions for this grammar
-                    for ext in extensions {
+                    for ext in &spec.extensions {
                         user_extensions.insert(ext.clone(), scope.clone());
                     }
+                    // Track provenance
+                    grammar_sources.insert(
+                        syntax_name.clone(),
+                        GrammarInfo {
+                            name: syntax_name,
+                            source: GrammarSource::Plugin {
+                                plugin: spec.language.clone(),
+                                path: spec.path.clone(),
+                            },
+                            file_extensions: spec.extensions.clone(),
+                            short_name: None,
+                        },
+                    );
                     // Track this grammar path for future reloads
-                    loaded_grammar_paths.push((language.clone(), path.clone(), extensions.clone()));
+                    loaded_grammar_paths.push(spec.clone());
                 }
                 Err(e) => {
                     tracing::warn!(
                         "Failed to load grammar for '{}' from {:?}: {}",
-                        language,
-                        path,
+                        spec.language,
+                        spec.path,
                         e
                     );
                 }
@@ -660,6 +1220,8 @@ impl GrammarRegistry {
             user_extensions,
             filename_scopes: base.filename_scopes.clone(),
             loaded_grammar_paths,
+            grammar_sources,
+            aliases: base.aliases.clone(),
         })
     }
 
@@ -668,7 +1230,7 @@ impl GrammarRegistry {
     /// Only Sublime Text (.sublime-syntax) format is supported.
     /// TextMate (.tmLanguage) grammars use a completely different format
     /// and cannot be loaded by syntect's yaml-load feature.
-    fn load_grammar_file(path: &Path) -> Result<SyntaxDefinition, String> {
+    pub(crate) fn load_grammar_file(path: &Path) -> Result<SyntaxDefinition, String> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
@@ -698,8 +1260,11 @@ impl Default for GrammarRegistry {
         Self::add_embedded_grammars(&mut builder);
         let syntax_set = builder.build();
         let filename_scopes = Self::build_filename_scopes();
+        let extra_extensions = Self::build_extra_extensions();
 
-        Self::new(syntax_set, HashMap::new(), filename_scopes)
+        let mut registry = Self::new(syntax_set, extra_extensions, filename_scopes);
+        registry.populate_built_in_aliases();
+        registry
     }
 }
 
@@ -856,14 +1421,18 @@ mod tests {
                 auto_indent: true,
                 auto_close: None,
                 auto_surround: None,
-                highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -898,14 +1467,18 @@ mod tests {
                 auto_indent: true,
                 auto_close: None,
                 auto_surround: None,
-                highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -945,14 +1518,18 @@ mod tests {
                 auto_indent: true,
                 auto_close: None,
                 auto_surround: None,
-                highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -967,14 +1544,18 @@ mod tests {
                 auto_indent: true,
                 auto_close: None,
                 auto_surround: None,
-                highlighter: crate::config::HighlighterPreference::Auto,
                 textmate_grammar: None,
                 show_whitespace_tabs: true,
-                use_tabs: false,
+                line_wrap: None,
+                wrap_column: None,
+                page_view: None,
+                page_width: None,
+                use_tabs: None,
                 tab_size: None,
                 formatter: None,
                 format_on_save: false,
                 on_save: vec![],
+                word_characters: None,
             },
         );
 
@@ -987,5 +1568,142 @@ mod tests {
             "exact match should win over glob, got: {}",
             syntax.name
         );
+    }
+
+    #[test]
+    fn test_built_in_aliases_resolve() {
+        let registry = GrammarRegistry::default();
+
+        // "bash" should resolve to "Bourne Again Shell (bash)" via alias
+        let syntax = registry.find_syntax_by_name("bash");
+        assert!(syntax.is_some(), "alias 'bash' should resolve");
+        assert_eq!(syntax.unwrap().name, "Bourne Again Shell (bash)");
+
+        // "cpp" should resolve to "C++"
+        let syntax = registry.find_syntax_by_name("cpp");
+        assert!(syntax.is_some(), "alias 'cpp' should resolve");
+        assert_eq!(syntax.unwrap().name, "C++");
+
+        // "csharp" should resolve to "C#"
+        let syntax = registry.find_syntax_by_name("csharp");
+        assert!(syntax.is_some(), "alias 'csharp' should resolve");
+        assert_eq!(syntax.unwrap().name, "C#");
+
+        // "sh" should also resolve to bash
+        let syntax = registry.find_syntax_by_name("sh");
+        assert!(syntax.is_some(), "alias 'sh' should resolve");
+        assert_eq!(syntax.unwrap().name, "Bourne Again Shell (bash)");
+
+        // "proto" should resolve to "Protocol Buffers"
+        let syntax = registry.find_syntax_by_name("proto");
+        assert!(syntax.is_some(), "alias 'proto' should resolve");
+        assert_eq!(syntax.unwrap().name, "Protocol Buffers");
+    }
+
+    #[test]
+    fn test_alias_case_insensitive_input() {
+        let registry = GrammarRegistry::default();
+
+        // Aliases should be case-insensitive on input
+        let syntax = registry.find_syntax_by_name("BASH");
+        assert!(
+            syntax.is_some(),
+            "alias 'BASH' should resolve case-insensitively"
+        );
+        assert_eq!(syntax.unwrap().name, "Bourne Again Shell (bash)");
+
+        let syntax = registry.find_syntax_by_name("Cpp");
+        assert!(
+            syntax.is_some(),
+            "alias 'Cpp' should resolve case-insensitively"
+        );
+        assert_eq!(syntax.unwrap().name, "C++");
+    }
+
+    #[test]
+    fn test_full_name_still_works() {
+        let registry = GrammarRegistry::default();
+
+        // Full names should still work (exact match)
+        let syntax = registry.find_syntax_by_name("Bourne Again Shell (bash)");
+        assert!(syntax.is_some(), "full name should still resolve");
+        assert_eq!(syntax.unwrap().name, "Bourne Again Shell (bash)");
+
+        // Case-insensitive full name should still work
+        let syntax = registry.find_syntax_by_name("bourne again shell (bash)");
+        assert!(
+            syntax.is_some(),
+            "case-insensitive full name should resolve"
+        );
+        assert_eq!(syntax.unwrap().name, "Bourne Again Shell (bash)");
+    }
+
+    #[test]
+    fn test_alias_does_not_shadow_full_names() {
+        let registry = GrammarRegistry::default();
+
+        // "Rust" should resolve directly via case-insensitive match, not via alias
+        let syntax = registry.find_syntax_by_name("rust");
+        assert!(syntax.is_some());
+        assert_eq!(syntax.unwrap().name, "Rust");
+
+        // "Go" should resolve directly
+        let syntax = registry.find_syntax_by_name("go");
+        assert!(syntax.is_some());
+        assert_eq!(syntax.unwrap().name, "Go");
+    }
+
+    #[test]
+    fn test_register_alias_rejects_collision() {
+        let mut registry = GrammarRegistry::default();
+
+        // Trying to register an alias that maps to two different targets should fail
+        assert!(registry.register_alias("myalias", "Rust"));
+        assert!(!registry.register_alias("myalias", "Go"));
+
+        // Same mapping is fine (idempotent)
+        assert!(registry.register_alias("myalias", "Rust"));
+    }
+
+    #[test]
+    fn test_register_alias_rejects_nonexistent_target() {
+        let mut registry = GrammarRegistry::default();
+        assert!(!registry.register_alias("nope", "Nonexistent Grammar"));
+    }
+
+    #[test]
+    fn test_register_alias_skips_existing_grammar_name() {
+        let mut registry = GrammarRegistry::default();
+
+        // "rust" case-insensitively matches the grammar "Rust", so no alias needed
+        assert!(!registry.register_alias("rust", "Rust"));
+        // Should still be resolvable via case-insensitive match
+        assert!(registry.find_syntax_by_name("rust").is_some());
+    }
+
+    #[test]
+    fn test_available_grammar_info_includes_short_names() {
+        let registry = GrammarRegistry::default();
+        let infos = registry.available_grammar_info();
+
+        let bash_info = infos.iter().find(|g| g.name == "Bourne Again Shell (bash)");
+        assert!(bash_info.is_some(), "bash grammar should be in the list");
+        let bash_info = bash_info.unwrap();
+        assert!(
+            bash_info.short_name.is_some(),
+            "bash grammar should have a short_name"
+        );
+        // The shortest alias for bash is "sh"
+        assert_eq!(bash_info.short_name.as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn test_resolve_alias() {
+        let registry = GrammarRegistry::default();
+        assert_eq!(
+            registry.resolve_alias("bash"),
+            Some("Bourne Again Shell (bash)")
+        );
+        assert_eq!(registry.resolve_alias("nonexistent"), None);
     }
 }

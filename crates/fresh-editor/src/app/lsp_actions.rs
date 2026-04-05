@@ -12,48 +12,107 @@ use rust_i18n::t;
 impl Editor {
     /// Handle the LspRestart action.
     ///
-    /// Restarts the LSP server for the current buffer's language and re-sends
-    /// didOpen notifications for all buffers of that language.
+    /// For a single-server config, restarts immediately (no prompt).
+    /// For multiple servers, shows a prompt to select which server(s) to restart.
     pub fn handle_lsp_restart(&mut self) {
-        // Get the language from the buffer's stored state
+        // Get the language and file path from the active buffer
         let buffer_id = self.active_buffer();
         let Some(state) = self.buffers.get(&buffer_id) else {
             return;
         };
         let language = state.language.clone();
+        let file_path = self
+            .buffer_metadata
+            .get(&buffer_id)
+            .and_then(|meta| meta.file_path().cloned());
 
-        // Check if LSP is configured for this language before attempting restart
-        let lsp_configured = self
+        // Get configured servers for this language
+        let configs: Vec<_> = self
             .lsp
             .as_ref()
-            .and_then(|lsp| lsp.get_config(&language))
-            .is_some();
+            .and_then(|lsp| lsp.get_configs(&language))
+            .map(|c| c.to_vec())
+            .unwrap_or_default();
 
-        if !lsp_configured {
+        if configs.is_empty() {
             self.set_status_message(t!("lsp.no_server_configured").to_string());
             return;
         }
 
-        // Attempt restart
-        let Some(lsp) = self.lsp.as_mut() else {
-            self.set_status_message(t!("lsp.no_manager").to_string());
-            return;
-        };
+        // Single server: restart immediately without a prompt (backward compat)
+        if configs.len() == 1 {
+            let Some(lsp) = self.lsp.as_mut() else {
+                self.set_status_message(t!("lsp.no_manager").to_string());
+                return;
+            };
 
-        let (success, message) = lsp.manual_restart(&language);
-        self.status_message = Some(message);
+            let (success, message) = lsp.manual_restart(&language, file_path.as_deref());
+            self.status_message = Some(message);
 
-        if !success {
+            if success {
+                self.reopen_buffers_for_language(&language);
+            }
             return;
         }
 
-        // Re-send didOpen for all buffers of this language
-        self.reopen_buffers_for_language(&language);
+        // Multiple servers: show a prompt
+        let mut suggestions: Vec<Suggestion> = Vec::new();
+
+        // Default option: restart all enabled servers
+        let enabled_names: Vec<_> = configs
+            .iter()
+            .filter(|c| c.enabled && !c.command.is_empty())
+            .map(|c| c.display_name())
+            .collect();
+        let all_description = if enabled_names.is_empty() {
+            Some("No enabled servers".to_string())
+        } else {
+            Some(enabled_names.join(", "))
+        };
+        suggestions.push(Suggestion {
+            text: format!("{} (all enabled)", language),
+            description: all_description,
+            value: Some(language.clone()),
+            disabled: enabled_names.is_empty(),
+            keybinding: None,
+            source: None,
+        });
+
+        // Individual server options
+        for config in &configs {
+            if config.command.is_empty() {
+                continue;
+            }
+            let name = config.display_name();
+            let status = if config.enabled { "" } else { " [disabled]" };
+            suggestions.push(Suggestion {
+                text: format!("{}/{}{}", language, name, status),
+                description: Some(format!("Command: {}", config.command)),
+                value: Some(format!("{}/{}", language, name)),
+                disabled: false,
+                keybinding: None,
+                source: None,
+            });
+        }
+
+        // Start prompt with suggestions
+        self.prompt = Some(Prompt::with_suggestions(
+            "Restart LSP server: ".to_string(),
+            PromptType::RestartLspServer,
+            suggestions.clone(),
+        ));
+
+        // Configure initial selection
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.selected_suggestion = Some(0);
+        }
     }
 
-    /// Re-send didOpen notifications for all buffers of a given language.
+    /// Send didOpen notifications for all buffers of a given language to any
+    /// server handles that haven't received them yet.
     ///
-    /// Called after LSP server restart to re-register open files.
+    /// Called after an LSP server starts or restarts so it immediately knows
+    /// about every open file (rather than waiting for the next user edit).
     pub(crate) fn reopen_buffers_for_language(&mut self, language: &str) {
         // Collect buffer info first to avoid borrow conflicts
         // Use buffer's stored language rather than detecting from path
@@ -89,17 +148,40 @@ impl Editor {
             if let Some(lsp) = self.lsp.as_mut() {
                 // Respect auto_start setting for this user action
                 use crate::services::lsp::manager::LspSpawnResult;
-                if lsp.try_spawn(&lang_id) == LspSpawnResult::Spawned {
-                    if let Some(handle) = lsp.get_handle_mut(&lang_id) {
-                        let handle_id = handle.id();
-                        if let Err(e) = handle.did_open(uri, content, lang_id) {
-                            tracing::warn!("LSP did_open failed: {}", e);
-                        } else {
-                            // Mark buffer as opened with this handle so that
-                            // send_lsp_changes_for_buffer doesn't re-send didOpen
-                            if let Some(metadata) = self.buffer_metadata.get_mut(&buffer_id) {
-                                metadata.lsp_opened_with.insert(handle_id);
-                            }
+                if lsp.try_spawn(&lang_id, Some(&buf_path)) != LspSpawnResult::Spawned {
+                    continue;
+                }
+
+                // Collect handles that need didOpen (not yet tracked in
+                // lsp_opened_with for this buffer).
+                let opened_with = self
+                    .buffer_metadata
+                    .get(&buffer_id)
+                    .map(|m| m.lsp_opened_with.clone())
+                    .unwrap_or_default();
+
+                let handles_needing_open: Vec<(String, u64)> = lsp
+                    .get_handles(&lang_id)
+                    .iter()
+                    .filter(|sh| !opened_with.contains(&sh.handle.id()))
+                    .map(|sh| (sh.name.clone(), sh.handle.id()))
+                    .collect();
+
+                // Send didOpen to each handle that hasn't seen this buffer yet
+                for (name, handle_id) in handles_needing_open {
+                    let sh = lsp
+                        .get_handles_mut(&lang_id)
+                        .iter_mut()
+                        .find(|s| s.handle.id() == handle_id);
+
+                    if let Some(sh) = sh {
+                        if let Err(e) =
+                            sh.handle
+                                .did_open(uri.clone(), content.clone(), lang_id.clone())
+                        {
+                            tracing::warn!("LSP did_open to '{}' failed: {}", name, e);
+                        } else if let Some(metadata) = self.buffer_metadata.get_mut(&buffer_id) {
+                            metadata.lsp_opened_with.insert(handle_id);
                         }
                     }
                 }
@@ -112,21 +194,43 @@ impl Editor {
     /// Shows a prompt to select which LSP server to stop, with suggestions
     /// for all currently running servers.
     pub fn handle_lsp_stop(&mut self) {
-        let running_servers: Vec<String> = self
+        let running_languages: Vec<String> = self
             .lsp
             .as_ref()
             .map(|lsp| lsp.running_servers())
             .unwrap_or_default();
 
-        if running_servers.is_empty() {
+        if running_languages.is_empty() {
             self.set_status_message(t!("lsp.no_servers_running").to_string());
             return;
         }
 
-        // Create suggestions from running servers
-        let suggestions: Vec<Suggestion> = running_servers
-            .iter()
-            .map(|lang| {
+        // Build suggestions showing server names when multiple servers per language
+        let mut suggestions: Vec<Suggestion> = Vec::new();
+        for lang in &running_languages {
+            let server_names: Vec<String> = self
+                .lsp
+                .as_ref()
+                .map(|lsp| lsp.server_names_for_language(lang))
+                .unwrap_or_default();
+
+            if server_names.len() > 1 {
+                // Multiple servers: show each individually
+                for name in &server_names {
+                    let description = Some(format!("Server: {}", name));
+                    suggestions.push(Suggestion {
+                        text: format!("{}/{}", lang, name),
+                        description,
+                        // Value carries "language/server_name" so the handler
+                        // knows exactly which server to stop.
+                        value: Some(format!("{}/{}", lang, name)),
+                        disabled: false,
+                        keybinding: None,
+                        source: None,
+                    });
+                }
+            } else {
+                // Single server: show language only (value = just language)
                 let description = self
                     .lsp
                     .as_ref()
@@ -134,29 +238,29 @@ impl Editor {
                     .filter(|c| !c.command.is_empty())
                     .map(|c| format!("Command: {}", c.command));
 
-                Suggestion {
+                suggestions.push(Suggestion {
                     text: lang.clone(),
                     description,
                     value: Some(lang.clone()),
                     disabled: false,
                     keybinding: None,
                     source: None,
-                }
-            })
-            .collect();
+                });
+            }
+        }
 
         // Start prompt with suggestions
         self.prompt = Some(Prompt::with_suggestions(
             "Stop LSP server: ".to_string(),
             PromptType::StopLspServer,
-            suggestions,
+            suggestions.clone(),
         ));
 
         // Configure initial selection
         if let Some(prompt) = self.prompt.as_mut() {
-            if running_servers.len() == 1 {
-                // If only one server, pre-fill the input with it
-                prompt.input = running_servers[0].clone();
+            if suggestions.len() == 1 {
+                // If only one entry, pre-fill the input with it
+                prompt.input = suggestions[0].text.clone();
                 prompt.cursor_pos = prompt.input.len();
                 prompt.selected_suggestion = Some(0);
             } else if !prompt.suggestions.is_empty() {
@@ -394,6 +498,43 @@ impl Editor {
         }
     }
 
+    /// Send didClose to a specific named server for all buffers of a language.
+    ///
+    /// Used when stopping a single server out of multiple for the same language,
+    /// where we don't want to fully disable LSP for the buffers.
+    pub(crate) fn send_did_close_to_server(&mut self, language: &str, server_name: &str) {
+        let uris: Vec<_> = self
+            .buffers
+            .iter()
+            .filter(|(_, s)| s.language == language)
+            .filter_map(|(id, _)| {
+                self.buffer_metadata
+                    .get(id)
+                    .and_then(|m| m.file_uri())
+                    .cloned()
+            })
+            .collect();
+
+        if let Some(lsp) = self.lsp.as_mut() {
+            for sh in lsp.get_handles_mut(language) {
+                if sh.name == server_name {
+                    for uri in &uris {
+                        tracing::info!(
+                            "Sending didClose for {} to '{}' (language: {})",
+                            uri.as_str(),
+                            sh.name,
+                            language
+                        );
+                        if let Err(e) = sh.handle.did_close(uri.clone()) {
+                            tracing::warn!("Failed to send didClose to '{}': {}", sh.name, e);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /// Disable LSP for a specific buffer and clear all LSP-related data
     pub(crate) fn disable_lsp_for_buffer(&mut self, buffer_id: crate::model::event::BufferId) {
         // Send didClose to the LSP server so it removes the document from its
@@ -413,20 +554,25 @@ impl Editor {
                 .map(|s| s.language.clone())
                 .unwrap_or_default();
             if let Some(lsp) = self.lsp.as_mut() {
-                if let Some(handle) = lsp.get_handle_mut(&language) {
-                    tracing::info!(
-                        "Sending didClose for {} (language: {})",
-                        uri.as_str(),
-                        language
-                    );
-                    if let Err(e) = handle.did_close(uri) {
-                        tracing::warn!("Failed to send didClose to LSP: {}", e);
-                    }
-                } else {
+                // Broadcast didClose to all handles for this language
+                let handles = lsp.get_handles_mut(&language);
+                if handles.is_empty() {
                     tracing::warn!(
                         "disable_lsp_for_buffer: no handle for language '{}'",
                         language
                     );
+                } else {
+                    for sh in handles {
+                        tracing::info!(
+                            "Sending didClose for {} to '{}' (language: {})",
+                            uri.as_str(),
+                            sh.name,
+                            language
+                        );
+                        if let Err(e) = sh.handle.did_close(uri.clone()) {
+                            tracing::warn!("Failed to send didClose to '{}': {}", sh.name, e);
+                        }
+                    }
                 }
             } else {
                 tracing::warn!("disable_lsp_for_buffer: no LSP manager");
@@ -529,11 +675,16 @@ impl Editor {
 
         // Try to spawn and send didOpen
         use crate::services::lsp::manager::LspSpawnResult;
+        let file_path = self
+            .buffer_metadata
+            .get(&buffer_id)
+            .and_then(|m| m.file_path())
+            .cloned();
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
 
-        if lsp.try_spawn(language) != LspSpawnResult::Spawned {
+        if lsp.try_spawn(language, file_path.as_deref()) != LspSpawnResult::Spawned {
             return;
         }
 

@@ -24,7 +24,7 @@ use fresh::{
 use ratatui::Terminal;
 use std::{
     io::{self, stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -36,6 +36,7 @@ use std::{
     "Commands (use --cmd):\n",
     "  config show               Print effective configuration\n",
     "  config paths              Show directories used by Fresh\n",
+    "  grammar list              List all available grammars (with source info)\n",
     "  init                      Initialize a new plugin/theme/language\n",
     "\n",
     "Session commands:\n",
@@ -94,7 +95,7 @@ use std::{
 ))]
 struct Cli {
     /// Run a command instead of opening files
-    /// Commands: session (list|attach|new|kill|open-file), config (show|paths), init
+    /// Commands: session (list|attach|new|kill|open-file), config (show|paths), grammar (list), init
     #[arg(long, num_args = 1.., value_name = "COMMAND", allow_hyphen_values = true)]
     cmd: Vec<String>,
 
@@ -184,6 +185,7 @@ struct Args {
     no_upgrade_check: bool,
     dump_config: bool,
     show_paths: bool,
+    list_grammars: bool,
     locale: Option<String>,
     check_plugin: Option<PathBuf>,
     init: Option<Option<String>>,
@@ -202,6 +204,17 @@ struct Args {
 
 impl From<Cli> for Args {
     fn from(cli: Cli) -> Self {
+        // Check for grammar list command before the main tuple parsing
+        let list_grammars = if !cli.cmd.is_empty() {
+            let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
+            matches!(
+                cmd_args.as_slice(),
+                ["grammar", "list"] | ["grammars", "list"] | ["grammar", "ls"] | ["grammars"]
+            )
+        } else {
+            false
+        };
+
         // Parse --cmd arguments to determine command
         let (
             list_sessions,
@@ -230,7 +243,7 @@ impl From<Cli> for Args {
                     } else {
                         Some((*name).to_string())
                     };
-                    let wait = files.iter().any(|s| *s == "--wait");
+                    let wait = files.contains(&"--wait");
                     let file_list: Vec<String> = files
                         .iter()
                         .filter(|s| **s != "--wait")
@@ -360,10 +373,14 @@ impl From<Cli> for Args {
                     cli.files,
                     None,
                 ),
+                // Grammar commands (handled via list_grammars flag above)
+                ["grammar", "list"] | ["grammars", "list"] | ["grammar", "ls"] | ["grammars"] => (
+                    false, None, false, None, false, false, None, cli.files, None,
+                ),
                 // Unknown command
                 _ => {
                     eprintln!("Unknown command: {}", cli.cmd.join(" "));
-                    eprintln!("Available commands: session (list|attach|new|kill|info|open-file), config (show|paths), init");
+                    eprintln!("Available commands: session (list|attach|new|kill|info|open-file), config (show|paths), grammar (list), init");
                     std::process::exit(1);
                 }
             }
@@ -406,6 +423,7 @@ impl From<Cli> for Args {
             no_upgrade_check: cli.no_upgrade_check,
             dump_config,
             show_paths,
+            list_grammars,
             locale: cli.locale,
             check_plugin: cli.check_plugin,
             init,
@@ -823,6 +841,37 @@ fn handle_first_run_setup(
 /// prefix properly using std::path APIs.
 ///
 /// If the full path exists as a file, it's used as-is (handles files with colons in name).
+/// Build FileRequest structs from CLI file arguments, resolving paths relative to `working_dir`.
+/// Directories are silently skipped.
+fn build_file_requests(
+    files: &[String],
+    working_dir: &std::path::Path,
+) -> Vec<fresh::server::protocol::FileRequest> {
+    use fresh::server::protocol::FileRequest;
+    let mut requests = Vec::new();
+    for f in files {
+        let loc = parse_file_location(f);
+        let abs_path = if loc.path.is_relative() {
+            working_dir.join(&loc.path)
+        } else {
+            loc.path.clone()
+        };
+        let canonical_path = abs_path.canonicalize().unwrap_or(abs_path);
+        if canonical_path.is_dir() {
+            continue;
+        }
+        requests.push(FileRequest {
+            path: canonical_path.to_string_lossy().to_string(),
+            line: loc.line,
+            column: loc.column,
+            end_line: loc.end_line,
+            end_column: loc.end_column,
+            message: loc.message,
+        });
+    }
+    requests
+}
+
 fn parse_file_location(input: &str) -> FileLocation {
     use std::path::{Component, Path};
 
@@ -1062,6 +1111,8 @@ struct RemoteSession {
     _connection: remote::SshConnection,
     /// Tokio runtime for async operations
     _runtime: tokio::runtime::Runtime,
+    /// Background reconnect task handle - dropping this aborts the task
+    _reconnect_handle: tokio::task::JoinHandle<()>,
 }
 
 /// Result of creating filesystem - includes optional remote session to keep alive
@@ -1099,6 +1150,8 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
         identity_file: None,
     };
 
+    eprintln!("Connecting via SSH to {}@{}...", remote.user, remote.host);
+
     // Establish SSH connection (this is async, so we block on it)
     let connection = rt
         .block_on(remote::SshConnection::connect(connection_params))
@@ -1109,6 +1162,7 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
 
     let connection_string = connection.connection_string();
     let channel = connection.channel();
+    let reconnect_params = connection.params().clone();
 
     tracing::info!("Connected to remote host: {}", connection_string);
 
@@ -1116,7 +1170,14 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
         channel.clone(),
         connection_string,
     ));
-    let process_spawner = std::sync::Arc::new(remote::RemoteProcessSpawner::new(channel));
+    let process_spawner = std::sync::Arc::new(remote::RemoteProcessSpawner::new(channel.clone()));
+
+    // Spawn background reconnect task on the runtime.
+    // We need a runtime context for tokio::spawn inside spawn_reconnect_task.
+    let reconnect_handle = {
+        let _guard = rt.enter();
+        remote::spawn_reconnect_task(channel, reconnect_params)
+    };
 
     Ok(FilesystemResult {
         filesystem,
@@ -1124,6 +1185,7 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
         remote_session: Some(RemoteSession {
             _connection: connection,
             _runtime: rt,
+            _reconnect_handle: reconnect_handle,
         }),
     })
 }
@@ -1138,7 +1200,11 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
     // Clean up stale log files from dead processes on startup
     fresh::services::log_dirs::cleanup_stale_logs();
 
-    tracing::info!("Editor starting");
+    tracing::info!(
+        "Editor starting (v{} {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("FRESH_GIT_HASH")
+    );
 
     signal_handler::install_signal_handlers();
     tracing::info!("Signal handlers installed");
@@ -1249,11 +1315,13 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
 
     // Create filesystem early - needed for remote directory detection
     // For remote editing, this establishes the SSH connection
+    tracing::info!("Creating filesystem...");
     let FilesystemResult {
         filesystem,
         process_spawner,
         remote_session,
     } = create_filesystem(&remote_info)?;
+    tracing::info!("Filesystem created");
 
     let mut working_dir = None;
     let mut show_file_explorer = false;
@@ -1273,6 +1341,7 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
 
     // Load config using the layered config system
     // For remote editing, use current local dir for config (remote doesn't have our config)
+    tracing::info!("Loading config...");
     let effective_working_dir = if remote_info.is_some() {
         std::env::current_dir().unwrap_or_default()
     } else {
@@ -1300,6 +1369,8 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
     } else {
         config::Config::load_with_layers(&dir_context, &effective_working_dir)
     };
+
+    tracing::info!("Config loaded");
 
     // CLI flag overrides config
     if args.no_upgrade_check {
@@ -1350,10 +1421,13 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
     let size = terminal.size()?;
     tracing::info!("Terminal size: {}x{}", size.width, size.height);
 
+    tracing::info!("Loading directory context...");
     let dir_context = DirectoryContext::from_system()?;
+    tracing::info!("Directory context loaded");
     let current_working_dir = working_dir;
 
     // Load key translator for input calibration
+    tracing::info!("Loading key translator...");
     let key_translator = match KeyTranslator::load_from_config_dir(&dir_context.config_dir) {
         Ok(translator) => translator,
         Err(e) => {
@@ -1362,6 +1436,7 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         }
     };
 
+    tracing::info!("Key translator loaded, returning SetupState");
     Ok(SetupState {
         config,
         tracing_handles,
@@ -1600,7 +1675,7 @@ fn init_package_command(package_type: Option<String>) -> AnyhowResult<()> {
 }
 
 /// Write a validation script that checks package.json against the official schema
-fn write_validate_script(dir: &PathBuf) -> AnyhowResult<()> {
+fn write_validate_script(dir: &Path) -> AnyhowResult<()> {
     let validate_sh = r#"#!/bin/bash
 # Validate package.json against the official Fresh package schema
 #
@@ -1611,7 +1686,7 @@ curl -sSL https://raw.githubusercontent.com/sinelaw/fresh/main/scripts/validate-
 }
 
 /// Write a validation script for themes (validates both package.json and theme.json)
-fn write_theme_validate_script(dir: &PathBuf) -> AnyhowResult<()> {
+fn write_theme_validate_script(dir: &Path) -> AnyhowResult<()> {
     let validate_sh = r#"#!/bin/bash
 # Validate Fresh theme package
 #
@@ -1644,7 +1719,7 @@ except jsonschema.ValidationError as e:
     write_script_file(dir, "validate.sh", validate_sh)
 }
 
-fn write_script_file(dir: &PathBuf, name: &str, content: &str) -> AnyhowResult<()> {
+fn write_script_file(dir: &Path, name: &str, content: &str) -> AnyhowResult<()> {
     std::fs::write(dir.join(name), content)?;
 
     // Make executable on Unix
@@ -1660,7 +1735,7 @@ fn write_script_file(dir: &PathBuf, name: &str, content: &str) -> AnyhowResult<(
 }
 
 fn create_plugin_package(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     description: &str,
     author: &str,
@@ -1768,7 +1843,7 @@ MIT
 }
 
 fn create_theme_package(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     description: &str,
     author: &str,
@@ -1881,7 +1956,7 @@ MIT
 }
 
 fn create_language_package(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     description: &str,
     author: &str,
@@ -2051,6 +2126,72 @@ MIT
 // === Session persistence commands ===
 
 /// List active sessions
+fn list_grammars_command() -> AnyhowResult<()> {
+    let dir_context = fresh::config_io::DirectoryContext::from_system()?;
+    let config_dir = dir_context.config_dir.clone();
+    let registry = fresh::primitives::grammar::GrammarRegistry::for_editor(config_dir);
+    let grammars = registry.available_grammar_info();
+
+    if grammars.is_empty() {
+        println!("No grammars available.");
+        return Ok(());
+    }
+
+    // Find the longest name and short name for alignment
+    let max_name_len = grammars.iter().map(|g| g.name.len()).max().unwrap_or(0);
+    let max_short_len = grammars
+        .iter()
+        .map(|g| g.short_name.as_ref().map_or(0, |s| s.len()))
+        .max()
+        .unwrap_or(0)
+        .max("SHORT NAME".len());
+
+    println!(
+        "{:<nw$}  {:<sw$}  {:<12}  {}",
+        "GRAMMAR",
+        "SHORT NAME",
+        "SOURCE",
+        "EXTENSIONS",
+        nw = max_name_len,
+        sw = max_short_len
+    );
+    println!(
+        "{:<nw$}  {:<sw$}  {:<12}  {}",
+        "-------",
+        "----------",
+        "------",
+        "----------",
+        nw = max_name_len,
+        sw = max_short_len
+    );
+    for grammar in &grammars {
+        let extensions = if grammar.file_extensions.is_empty() {
+            String::new()
+        } else {
+            grammar
+                .file_extensions
+                .iter()
+                .map(|e| format!(".{}", e))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let short = grammar.short_name.as_deref().unwrap_or("");
+        println!(
+            "{:<nw$}  {:<sw$}  {:<12}  {}",
+            grammar.name,
+            short,
+            grammar.source.to_string(),
+            extensions,
+            nw = max_name_len,
+            sw = max_short_len
+        );
+    }
+
+    println!("\n{} grammars available.", grammars.len());
+    println!("Use the grammar name or short name in config: languages -> <language> -> grammar");
+    Ok(())
+}
+
 fn list_sessions_command() -> AnyhowResult<()> {
     let socket_dir = SocketPaths::socket_directory()?;
 
@@ -2261,7 +2402,7 @@ fn run_open_files_command(
 ) -> AnyhowResult<()> {
     use fresh::server::daemon::is_process_running;
     use fresh::server::protocol::{
-        ClientControl, ClientHello, FileRequest, ServerControl, TermSize, PROTOCOL_VERSION,
+        ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
     };
     use fresh::server::spawn_server_detached;
 
@@ -2271,43 +2412,10 @@ fn run_open_files_command(
     }
 
     let working_dir = std::env::current_dir()?;
+    let file_requests = build_file_requests(files, &working_dir);
 
-    // Build file requests BEFORE starting server, filtering out directories
-    let mut file_requests: Vec<FileRequest> = Vec::new();
-    let mut skipped_dirs = 0;
-
-    for f in files {
-        let loc = parse_file_location(f);
-        // Resolve relative paths to absolute paths based on client's working directory
-        let abs_path = if loc.path.is_relative() {
-            working_dir.join(&loc.path)
-        } else {
-            loc.path.clone()
-        };
-        // Canonicalize to resolve symlinks and normalize
-        let canonical_path = abs_path.canonicalize().unwrap_or(abs_path);
-
-        if canonical_path.is_dir() {
-            skipped_dirs += 1;
-            eprintln!("Skipping directory: {}", canonical_path.display());
-            continue;
-        }
-
-        file_requests.push(FileRequest {
-            path: canonical_path.to_string_lossy().to_string(),
-            line: loc.line,
-            column: loc.column,
-            end_line: loc.end_line,
-            end_column: loc.end_column,
-            message: loc.message,
-        });
-    }
-
-    // Check if we have any files to open BEFORE starting the server
     if file_requests.is_empty() {
-        if skipped_dirs > 0 {
-            eprintln!("No files to open (only directories were specified).");
-        }
+        eprintln!("No files to open (only directories were specified).");
         return Ok(());
     }
 
@@ -2388,7 +2496,7 @@ fn run_open_files_command(
         // and attach as a normal interactive client so the user can see the
         // editor. --wait is ignored in this path; the user quits normally.
         drop(conn);
-        return run_attach(session_name);
+        return run_attach(session_name, &[]);
     } else if wait {
         // Existing session — block until the server sends WaitComplete
         loop {
@@ -2414,10 +2522,10 @@ fn run_open_files_command(
 
 /// Attach to an existing session, starting a server if needed
 fn run_attach_command(args: &Args) -> AnyhowResult<()> {
-    run_attach(args.session_name.as_deref())
+    run_attach(args.session_name.as_deref(), &args.files)
 }
 
-fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
+fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> {
     use crossterm::terminal::enable_raw_mode;
     use fresh::server::protocol::{
         ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
@@ -2537,7 +2645,23 @@ fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
         }
     }
 
+    // Send file open requests if any files were specified on the command line
+    if !files.is_empty() {
+        let file_requests = build_file_requests(files, &working_dir);
+        if !file_requests.is_empty() {
+            let msg = serde_json::to_string(&ClientControl::OpenFiles {
+                files: file_requests,
+                wait: false,
+            })?;
+            conn.write_control(&msg)?;
+        }
+    }
+
     // Continue to relay loop
+
+    // Save original console mode before anything modifies it
+    #[cfg(windows)]
+    let original_console_mode = fresh_winterm::save_console_mode();
 
     // Enable raw mode - the server sends terminal setup sequences (alternate screen, etc.)
     // but we need raw mode so key presses are forwarded immediately
@@ -2550,6 +2674,11 @@ fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
     // The server sends terminal setup sequences (alternate screen, mouse capture, etc.)
     // through us, so we must undo all of them, not just raw mode.
     fresh::services::terminal_modes::emergency_cleanup();
+
+    // Restore original console mode AFTER all cleanup to ensure Quick Edit
+    // mode is properly restored on Windows.
+    #[cfg(windows)]
+    let _ = fresh_winterm::restore_console_mode(original_console_mode);
 
     // Handle result
     match result {
@@ -2600,10 +2729,30 @@ fn print_deprecation_warnings(cli: &Cli) {
 }
 
 fn main() -> AnyhowResult<()> {
-    real_main()
+    match real_main() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // SSH connection errors are expected user-facing failures, not bugs.
+            // Print a clean error message without the stack backtrace.
+            if e.downcast_ref::<remote::SshError>().is_some()
+                || e.chain()
+                    .any(|cause| cause.downcast_ref::<remote::SshError>().is_some())
+            {
+                eprintln!("Error: {:#}", e);
+                std::process::exit(1);
+            }
+            Err(e)
+        }
+    }
 }
 
 fn real_main() -> AnyhowResult<()> {
+    // Enable backtraces for error reporting if not already set.
+    // Errors that crash the editor are bugs — backtraces help diagnose them.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+
     let cli = Cli::parse();
 
     // Print deprecation warnings for old flags
@@ -2656,6 +2805,11 @@ fn real_main() -> AnyhowResult<()> {
         }
     }
 
+    // Handle grammar list early (no terminal setup needed)
+    if args.list_grammars {
+        return list_grammars_command();
+    }
+
     // Handle --check-plugin early (no terminal setup needed)
     #[cfg(feature = "plugins")]
     if let Some(plugin_path) = &args.check_plugin {
@@ -2705,6 +2859,11 @@ fn real_main() -> AnyhowResult<()> {
         );
     }
 
+    // Save the original console mode BEFORE anything modifies it (raw mode,
+    // enable_vt_input, etc.). Restored at the very end after all cleanup.
+    #[cfg(windows)]
+    let original_console_mode = fresh_winterm::save_console_mode();
+
     let SetupState {
         config,
         mut tracing_handles,
@@ -2747,6 +2906,7 @@ fn real_main() -> AnyhowResult<()> {
         // Use the filesystem created during initialization (supports both local and remote)
         let fs = filesystem.clone();
 
+        tracing::info!("Creating editor instance...");
         let mut editor = Editor::with_working_dir(
             config.clone(),
             terminal_width,
@@ -2758,6 +2918,7 @@ fn real_main() -> AnyhowResult<()> {
             fs,
         )
         .context("Failed to create editor instance")?;
+        tracing::info!("Editor instance created");
 
         // Set the process spawner (LocalProcessSpawner for local, RemoteProcessSpawner for remote)
         editor.set_process_spawner(process_spawner.clone());
@@ -2768,6 +2929,7 @@ fn real_main() -> AnyhowResult<()> {
         }
 
         if first_run {
+            tracing::info!("Running first-run setup...");
             handle_first_run_setup(
                 &mut editor,
                 &args,
@@ -2778,6 +2940,7 @@ fn real_main() -> AnyhowResult<()> {
                 workspace_enabled,
             )
             .context("Failed first run setup")?;
+            tracing::info!("First-run setup complete");
         } else {
             if restore_workspace_on_restart {
                 match editor.try_restore_workspace() {
@@ -2841,6 +3004,13 @@ fn real_main() -> AnyhowResult<()> {
     // Restore terminal state
     terminal_modes.undo();
 
+    // Restore the original console mode AFTER all other cleanup (crossterm's
+    // disable_raw_mode, DisableMouseCapture, etc.) to ensure Quick Edit mode
+    // is properly restored. Without this, text selection with mouse doesn't
+    // work in Windows Terminal after exiting fresh.
+    #[cfg(windows)]
+    let _ = fresh_winterm::restore_console_mode(original_console_mode);
+
     // Check for updates after terminal is restored (using cached result)
     if let Some(update_result) = last_update_result {
         if update_result.update_available {
@@ -2891,10 +3061,25 @@ fn run_event_loop(
     workspace_enabled: bool,
     key_translator: &KeyTranslator,
 ) -> AnyhowResult<()> {
-    use fresh::client::win_vt_input::{self, VtInputEvent};
     use fresh::server::input_parser::InputParser;
+    use fresh_winterm::{VtInputEvent, VtInputReader};
 
-    let old_console_mode = win_vt_input::enable_vt_input()?;
+    let _old_console_mode = fresh_winterm::enable_vt_input()?;
+    // Use the configured mouse mode: when mouse_hover_enabled is true, use
+    // mode 1003 (all motion) for full hover support; otherwise use mode 1002
+    // (cell motion) which avoids the high event volume that can cause input
+    // corruption on Windows.
+    let mouse_mode = if editor.config().editor.mouse_hover_enabled {
+        fresh_winterm::MouseMode::AllMotion
+    } else {
+        fresh_winterm::MouseMode::CellMotion
+    };
+    fresh_winterm::enable_mouse_tracking(mouse_mode)?;
+
+    // Spawn a dedicated reader thread to drain the console buffer as fast
+    // as possible. This prevents the Windows console from dropping bytes
+    // from VT mouse sequences under high event rates (1003 all-motion).
+    let reader = VtInputReader::spawn();
 
     let mut input_parser = InputParser::new();
     let mut event_buffer: std::collections::VecDeque<CrosstermEvent> =
@@ -2911,54 +3096,53 @@ fn run_event_loop(
                 return Ok(Some(event));
             }
 
-            // Check for timed-out escape sequences
-            let flushed = input_parser.flush_timeout();
-            if !flushed.is_empty() {
-                for event in flushed {
-                    event_buffer.push_back(event);
-                }
-                return Ok(event_buffer.pop_front());
-            }
+            // Drain all available events from the reader thread
+            let mut got_any = false;
+            loop {
+                let event = if !got_any {
+                    reader.poll(timeout)
+                } else {
+                    // Subsequent: non-blocking drain of anything queued
+                    reader.try_recv()
+                };
 
-            // Wait for input with timeout
-            if !win_vt_input::poll_vt_input(timeout)? {
-                return Ok(None);
-            }
-
-            // Read VT input events
-            let vt_events = win_vt_input::read_vt_input()?;
-            for vt_event in vt_events {
-                match vt_event {
-                    VtInputEvent::VtBytes(bytes) => {
-                        // Parse raw VT bytes into crossterm events
+                match event {
+                    Some(VtInputEvent::VtBytes(bytes)) => {
                         let parsed = input_parser.parse(&bytes);
-                        for event in parsed {
-                            event_buffer.push_back(event);
+                        for ev in parsed {
+                            event_buffer.push_back(ev);
                         }
+                        got_any = true;
                     }
-                    VtInputEvent::Resize => {
-                        // Query actual terminal size
+                    Some(VtInputEvent::Resize) => {
                         if let Ok((cols, rows)) = crossterm::terminal::size() {
                             event_buffer.push_back(CrosstermEvent::Resize(cols, rows));
                         }
+                        got_any = true;
                     }
-                    VtInputEvent::FocusGained => {
+                    Some(VtInputEvent::FocusGained) => {
                         event_buffer.push_back(CrosstermEvent::FocusGained);
+                        got_any = true;
                     }
-                    VtInputEvent::FocusLost => {
+                    Some(VtInputEvent::FocusLost) => {
                         event_buffer.push_back(CrosstermEvent::FocusLost);
+                        got_any = true;
                     }
+                    None => break,
+                }
+            }
+
+            if !got_any {
+                // Timed out — flush standalone ESC if any (MS Edit pattern)
+                let flushed = input_parser.parse(b"");
+                for ev in flushed {
+                    event_buffer.push_back(ev);
                 }
             }
 
             Ok(event_buffer.pop_front())
         },
     );
-
-    // Restore console mode
-    if let Err(e) = win_vt_input::restore_console_mode(old_console_mode) {
-        tracing::warn!("Failed to restore console mode: {}", e);
-    }
 
     result
 }
@@ -3047,7 +3231,10 @@ where
         if needs_render && last_render.elapsed() >= FRAME_DURATION {
             {
                 let _span = tracing::info_span!("terminal_draw").entered();
+                use crossterm::ExecutableCommand;
+                stdout().execute(crossterm::terminal::BeginSynchronizedUpdate)?;
                 terminal.draw(|frame| editor.render(frame))?;
+                stdout().execute(crossterm::terminal::EndSynchronizedUpdate)?;
             }
             last_render = Instant::now();
             needs_render = false;
@@ -3111,6 +3298,10 @@ where
             CrosstermEvent::Paste(text) => {
                 // External paste from terminal (bracketed paste mode)
                 editor.paste_text(text);
+                needs_render = true;
+            }
+            CrosstermEvent::FocusGained => {
+                editor.focus_gained();
                 needs_render = true;
             }
             _ => {}

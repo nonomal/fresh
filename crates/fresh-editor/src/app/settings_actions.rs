@@ -10,6 +10,7 @@
 use crate::config::Config;
 use crate::config_io::{ConfigLayer, ConfigResolver};
 use crate::input::keybindings::KeybindingResolver;
+use crate::types::LspServerConfig;
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
 
@@ -66,6 +67,8 @@ impl Editor {
         let old_theme = self.config.theme.clone();
         let old_locale = self.config.locale.clone();
         let old_plugins = self.config.plugins.clone();
+        #[cfg(windows)]
+        let old_mouse_hover = self.config.editor.mouse_hover_enabled;
 
         // Get target layer, new config, and the actual changes made
         let (target_layer, new_config, pending_changes, pending_deletions) = {
@@ -132,12 +135,25 @@ impl Editor {
         self.apply_plugin_config_changes(&old_plugins);
 
         // Update keybindings
-        self.keybindings = KeybindingResolver::new(&self.config);
+        *self.keybindings.write().unwrap() = KeybindingResolver::new(&self.config);
 
         // Update LSP configs
         if let Some(ref mut lsp) = self.lsp {
-            for (language, lsp_config) in &self.config.lsp {
-                lsp.set_language_config(language.clone(), lsp_config.clone());
+            for (language, lsp_configs) in &self.config.lsp {
+                lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
+            }
+            // Append enabled universal LSP servers to every configured language
+            let universal_servers: Vec<LspServerConfig> = self
+                .config
+                .universal_lsp
+                .values()
+                .flat_map(|lc| lc.as_slice().to_vec())
+                .filter(|c| c.enabled)
+                .collect();
+            if !universal_servers.is_empty() {
+                for language in lsp.configured_languages() {
+                    lsp.append_language_configs(language, universal_servers.clone());
+                }
             }
         }
 
@@ -153,6 +169,24 @@ impl Editor {
         self.menu_bar_visible = self.config.editor.show_menu_bar;
         self.tab_bar_visible = self.config.editor.show_tab_bar;
         self.status_bar_visible = self.config.editor.show_status_bar;
+        self.prompt_line_visible = self.config.editor.show_prompt_line;
+
+        // On Windows, switch mouse tracking mode when mouse_hover_enabled changes.
+        // Mode 1003 (all motion) is used for hover; mode 1002 (cell motion) otherwise.
+        #[cfg(windows)]
+        if old_mouse_hover != self.config.editor.mouse_hover_enabled {
+            let mode = if self.config.editor.mouse_hover_enabled {
+                fresh_winterm::MouseMode::AllMotion
+            } else {
+                // Clear any pending hover state when disabling
+                self.mouse_state.lsp_hover_state = None;
+                self.mouse_state.lsp_hover_request_sent = false;
+                fresh_winterm::MouseMode::CellMotion
+            };
+            if let Err(e) = fresh_winterm::set_mouse_mode(mode) {
+                tracing::error!("Failed to switch mouse mode: {}", e);
+            }
+        }
 
         // Propagate tab_size/use_tabs/auto_close/whitespace visibility to all open buffers
         // Each buffer resolves its settings from its language + the new global config
@@ -163,7 +197,8 @@ impl Editor {
             if let Some(lang_config) = self.config.languages.get(&state.language) {
                 state.buffer_settings.tab_size =
                     lang_config.tab_size.unwrap_or(self.config.editor.tab_size);
-                state.buffer_settings.use_tabs = lang_config.use_tabs;
+                state.buffer_settings.use_tabs =
+                    lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs);
                 whitespace =
                     whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
                 // Auto close: language override (only if globally enabled)
@@ -172,8 +207,15 @@ impl Editor {
                         state.buffer_settings.auto_close = lang_auto_close;
                     }
                 }
+                // Word characters: from language config
+                if let Some(ref wc) = lang_config.word_characters {
+                    state.buffer_settings.word_characters = wc.clone();
+                } else {
+                    state.buffer_settings.word_characters.clear();
+                }
             } else {
                 state.buffer_settings.tab_size = self.config.editor.tab_size;
+                state.buffer_settings.use_tabs = self.config.editor.use_tabs;
             }
             state.buffer_settings.whitespace = whitespace;
         }
@@ -346,9 +388,18 @@ impl Editor {
                     }
                 }
                 1 => {
-                    // Reset button
+                    // Reset/Inherit button — for nullable items, set to null (inherit);
+                    // for non-nullable items, reset to default
                     if let Some(ref mut state) = self.settings_state {
-                        state.reset_current_to_default();
+                        let is_nullable_set = state
+                            .current_item()
+                            .map(|item| item.nullable && !item.is_null)
+                            .unwrap_or(false);
+                        if is_nullable_set {
+                            state.set_current_to_null();
+                        } else {
+                            state.reset_current_to_default();
+                        }
                     }
                 }
                 2 => {

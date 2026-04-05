@@ -1498,8 +1498,10 @@ mod tests {
         assert_eq!(config.editor.tab_size, 2);
 
         // User disables LSP via UI
-        if let Some(lsp_config) = config.lsp.get_mut("python") {
-            lsp_config.enabled = false;
+        if let Some(lsp_configs) = config.lsp.get_mut("python") {
+            for c in lsp_configs.as_mut_slice().iter_mut() {
+                c.enabled = false;
+            }
         }
 
         // Save using save_to_layer
@@ -1540,9 +1542,9 @@ mod tests {
         let reloaded = resolver.resolve().unwrap();
         assert_eq!(reloaded.theme.0, "dracula");
         assert_eq!(reloaded.editor.tab_size, 2);
-        assert!(!reloaded.lsp["python"].enabled);
+        assert!(!reloaded.lsp["python"].as_slice()[0].enabled);
         // Command should come from defaults
-        assert_eq!(reloaded.lsp["python"].command, "pylsp");
+        assert_eq!(reloaded.lsp["python"].as_slice()[0].command, "pylsp");
     }
 
     /// Test that toggling LSP enabled/disabled preserves the command field.
@@ -1562,7 +1564,7 @@ mod tests {
 
         // Load and verify default command
         let config = resolver.resolve().unwrap();
-        let original_command = config.lsp["python"].command.clone();
+        let original_command = config.lsp["python"].as_slice()[0].command.clone();
         assert!(
             !original_command.is_empty(),
             "Default python LSP should have a command"
@@ -1570,7 +1572,7 @@ mod tests {
 
         // Step 2: Disable python LSP, save
         let mut config = resolver.resolve().unwrap();
-        config.lsp.get_mut("python").unwrap().enabled = false;
+        config.lsp.get_mut("python").unwrap().as_mut_slice()[0].enabled = false;
         resolver.save_to_layer(&config, ConfigLayer::User).unwrap();
 
         // Verify saved file only has enabled:false, not empty command/args
@@ -1588,16 +1590,17 @@ mod tests {
 
         // Step 3: Load again, enable python LSP, save
         let mut config = resolver.resolve().unwrap();
-        assert!(!config.lsp["python"].enabled);
-        config.lsp.get_mut("python").unwrap().enabled = true;
+        assert!(!config.lsp["python"].as_slice()[0].enabled);
+        config.lsp.get_mut("python").unwrap().as_mut_slice()[0].enabled = true;
         resolver.save_to_layer(&config, ConfigLayer::User).unwrap();
 
         // Step 4: Load and verify command is still the same
         let config = resolver.resolve().unwrap();
         assert_eq!(
-            config.lsp["python"].command, original_command,
+            config.lsp["python"].as_slice()[0].command,
+            original_command,
             "Command should be preserved after toggling enabled. Got: '{}'",
-            config.lsp["python"].command
+            config.lsp["python"].as_slice()[0].command
         );
     }
 
@@ -1668,12 +1671,13 @@ mod tests {
         // Load and check that command comes from defaults
         let config = resolver.resolve().unwrap();
         assert_eq!(
-            config.lsp["rust"].command, "rust-analyzer",
+            config.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Command should come from defaults when not in file. Got: '{}'",
-            config.lsp["rust"].command
+            config.lsp["rust"].as_slice()[0].command
         );
         assert!(
-            !config.lsp["rust"].enabled,
+            !config.lsp["rust"].as_slice()[0].enabled,
             "enabled should be false from file"
         );
     }
@@ -1695,11 +1699,12 @@ mod tests {
         // Load resolved config - should have rust with command="rust-analyzer"
         let config = resolver.resolve().unwrap();
         assert_eq!(
-            config.lsp["rust"].command, "rust-analyzer",
+            config.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Default rust command should be rust-analyzer"
         );
         assert!(
-            config.lsp["rust"].enabled,
+            config.lsp["rust"].as_slice()[0].enabled,
             "Default rust enabled should be true"
         );
 
@@ -1721,11 +1726,15 @@ mod tests {
         // Step 4: Reload and verify command is preserved
         let reloaded = resolver.resolve().unwrap();
         assert_eq!(
-            reloaded.lsp["rust"].command, "rust-analyzer",
+            reloaded.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Command should be preserved after save/reload (disabled). Got: '{}'",
-            reloaded.lsp["rust"].command
+            reloaded.lsp["rust"].as_slice()[0].command
         );
-        assert!(!reloaded.lsp["rust"].enabled, "rust should be disabled");
+        assert!(
+            !reloaded.lsp["rust"].as_slice()[0].enabled,
+            "rust should be disabled"
+        );
 
         // Step 5: Re-enable rust LSP (simulating Settings UI)
         let mut changes = std::collections::HashMap::new();
@@ -1744,11 +1753,15 @@ mod tests {
         // Step 7: Reload and verify command is STILL preserved
         let final_config = resolver.resolve().unwrap();
         assert_eq!(
-            final_config.lsp["rust"].command, "rust-analyzer",
+            final_config.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Command should be preserved after toggle cycle. Got: '{}'",
-            final_config.lsp["rust"].command
+            final_config.lsp["rust"].as_slice()[0].command
         );
-        assert!(final_config.lsp["rust"].enabled, "rust should be enabled");
+        assert!(
+            final_config.lsp["rust"].as_slice()[0].enabled,
+            "rust should be enabled"
+        );
     }
 
     /// Issue #806 REPRODUCTION: Manual config.json edits are lost when saving from Settings UI.
@@ -1792,7 +1805,7 @@ mod tests {
             config.lsp.contains_key("rust-analyzer"),
             "Config should contain manually-added 'rust-analyzer' LSP entry"
         );
-        let rust_analyzer = &config.lsp["rust-analyzer"];
+        let rust_analyzer = &config.lsp["rust-analyzer"].as_slice()[0];
         assert!(rust_analyzer.enabled, "rust-analyzer should be enabled");
         assert_eq!(
             rust_analyzer.command, "rust-analyzer",
@@ -1881,7 +1894,7 @@ mod tests {
             reloaded.lsp.contains_key("rust-analyzer"),
             "BUG #806: rust-analyzer should still exist after reload"
         );
-        let reloaded_ra = &reloaded.lsp["rust-analyzer"];
+        let reloaded_ra = &reloaded.lsp["rust-analyzer"].as_slice()[0];
         assert_eq!(
             reloaded_ra.args,
             vec!["--log-file", "/tmp/rust-analyzer-{pid}.log"],
@@ -2207,6 +2220,105 @@ mod tests {
              With save_to_layer_with_baseline, the theme field should be removed from file \
              so the default applies. File content: {}",
             saved_content
+        );
+    }
+
+    /// Test that universal_lsp config round-trips through save/load correctly.
+    /// This exercises the PartialConfig From/resolve_with_defaults paths.
+    #[test]
+    fn universal_lsp_round_trip_via_config_resolver() {
+        let (_temp, resolver) = create_test_resolver();
+        let user_config_path = resolver.user_config_path();
+        std::fs::create_dir_all(user_config_path.parent().unwrap()).unwrap();
+
+        // Write a config that enables quicklsp
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "universal_lsp": {
+                    "quicklsp": { "enabled": true, "auto_start": true }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = resolver.resolve().unwrap();
+
+        // quicklsp should be enabled (user override merged with defaults)
+        assert!(config.universal_lsp.contains_key("quicklsp"));
+        let server = &config.universal_lsp["quicklsp"].as_slice()[0];
+        assert!(server.enabled, "User override should enable quicklsp");
+        assert!(server.auto_start, "User override should enable auto_start");
+        assert_eq!(
+            server.command, "quicklsp",
+            "Command should come from defaults"
+        );
+    }
+
+    /// Test that universal_lsp supports adding custom servers alongside defaults.
+    #[test]
+    fn universal_lsp_custom_server_merges_with_defaults() {
+        let (_temp, resolver) = create_test_resolver();
+        let user_config_path = resolver.user_config_path();
+        std::fs::create_dir_all(user_config_path.parent().unwrap()).unwrap();
+
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "universal_lsp": {
+                    "my-universal-server": {
+                        "command": "my-server-bin",
+                        "enabled": true
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = resolver.resolve().unwrap();
+
+        // Custom server should be present
+        assert!(
+            config.universal_lsp.contains_key("my-universal-server"),
+            "Custom universal server should be loaded"
+        );
+        assert_eq!(
+            config.universal_lsp["my-universal-server"].as_slice()[0].command,
+            "my-server-bin"
+        );
+
+        // Default quicklsp should still be present (merged from defaults)
+        assert!(
+            config.universal_lsp.contains_key("quicklsp"),
+            "Default quicklsp should be preserved when adding custom servers"
+        );
+    }
+
+    /// Test that the PartialConfig conversion (Config -> PartialConfig -> Config)
+    /// preserves universal_lsp entries. This catches bugs where universal_lsp
+    /// is missing from the PartialConfig struct or its From/resolve impls.
+    #[test]
+    fn universal_lsp_partial_config_round_trip() {
+        use crate::partial_config::PartialConfig;
+
+        let mut config = Config::default();
+        // Enable quicklsp in the original config
+        if let Some(quicklsp) = config.universal_lsp.get_mut("quicklsp") {
+            quicklsp.as_mut_slice()[0].enabled = true;
+        }
+
+        // Convert to partial and back
+        let partial = PartialConfig::from(&config);
+        let resolved = partial.resolve();
+
+        // Verify universal_lsp survived the round trip
+        assert!(
+            resolved.universal_lsp.contains_key("quicklsp"),
+            "quicklsp should survive Config -> PartialConfig -> Config round trip"
+        );
+        assert!(
+            resolved.universal_lsp["quicklsp"].as_slice()[0].enabled,
+            "quicklsp enabled state should be preserved through round trip"
         );
     }
 }

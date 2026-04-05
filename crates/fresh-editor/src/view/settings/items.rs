@@ -239,6 +239,10 @@ pub struct SettingItem {
     pub read_only: bool,
     /// Whether this is an auto-managed map (no_add) that should never show as modified
     pub is_auto_managed: bool,
+    /// Whether this setting accepts null (can be "unset" to inherit)
+    pub nullable: bool,
+    /// Whether this setting's current value is null (inherited/unset)
+    pub is_null: bool,
     /// Section/group within the category (from x-section)
     pub section: Option<String>,
     /// Whether this item is the first in its section (for rendering section headers)
@@ -317,6 +321,47 @@ impl SettingControl {
             }
             // All other controls fit in 1 line
             _ => 1,
+        }
+    }
+
+    /// Whether this is a composite control (TextList, Map, ObjectArray) that has
+    /// internal sub-items. For composite controls, highlighting should be per-row,
+    /// not across the entire control area.
+    pub fn is_composite(&self) -> bool {
+        matches!(
+            self,
+            Self::TextList(_) | Self::Map(_) | Self::ObjectArray(_)
+        )
+    }
+
+    /// Get the row offset of the focused sub-item within a composite control.
+    /// Returns 0 for non-composite controls or if no sub-item is focused.
+    /// The offset is relative to the start of the control's render area.
+    pub fn focused_sub_row(&self) -> u16 {
+        match self {
+            Self::TextList(state) => {
+                // Row 0 = label, rows 1..N = items, row N+1 = add-new
+                match state.focused_item {
+                    Some(idx) => 1 + idx as u16,          // item rows start at offset 1
+                    None => 1 + state.items.len() as u16, // add-new row
+                }
+            }
+            Self::ObjectArray(state) => {
+                // Row 0 = label, rows 1..N = bindings, row N+1 = add-new
+                match state.focused_index {
+                    Some(idx) => 1 + idx as u16,
+                    None => 1 + state.bindings.len() as u16,
+                }
+            }
+            Self::Map(state) => {
+                // Row 0 = label, row 1 = header (if display_field), then entries, then add-new
+                let header_offset = if state.display_field.is_some() { 1 } else { 0 };
+                match state.focused_entry {
+                    Some(idx) => 1 + header_offset + idx as u16,
+                    None => 1 + header_offset + state.entries.len() as u16,
+                }
+            }
+            _ => 0,
         }
     }
 }
@@ -535,6 +580,8 @@ pub struct SettingsPage {
     pub path: String,
     /// Description
     pub description: Option<String>,
+    /// Whether this page represents a nullable category that can be cleared as a whole
+    pub nullable: bool,
     /// Settings on this page
     pub items: Vec<SettingItem>,
     /// Subpages
@@ -605,6 +652,7 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
         name: category.name.clone(),
         path: category.path.clone(),
         description: category.description.clone(),
+        nullable: category.nullable,
         items,
         subpages,
     }
@@ -614,6 +662,12 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
 pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
     // Get current value from config
     let current_value = ctx.config_value.pointer(&schema.path);
+
+    // Detect if the current value is null (inherited/unset) for nullable fields
+    let is_null = schema.nullable
+        && current_value
+            .map(|v| v.is_null())
+            .unwrap_or(schema.default.as_ref().map(|d| d.is_null()).unwrap_or(true));
 
     // Check if this is an auto-managed map (no_add)
     let is_auto_managed = matches!(&schema.setting_type, SettingType::Map { no_add: true, .. });
@@ -669,8 +723,37 @@ pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
                 .or_else(|| schema.default.as_ref().and_then(|d| d.as_str()))
                 .unwrap_or("");
 
-            let state = TextInputState::new(&schema.name).with_value(value);
-            SettingControl::Text(state)
+            // Check for dynamic enum: derive dropdown options from another config field's keys
+            if let Some(ref source_path) = schema.enum_from {
+                let mut options: Vec<String> = ctx
+                    .config_value
+                    .pointer(source_path)
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_default();
+                options.sort();
+
+                // Add empty option for nullable fields (unset/inherit)
+                let mut display_names = Vec::new();
+                let mut values = Vec::new();
+                if schema.nullable {
+                    display_names.push("(none)".to_string());
+                    values.push(String::new());
+                }
+                for key in &options {
+                    display_names.push(key.clone());
+                    values.push(key.clone());
+                }
+
+                let current = if is_null { "" } else { value };
+                let selected = values.iter().position(|v| v == current).unwrap_or(0);
+                let state = DropdownState::with_values(display_names, values, &schema.name)
+                    .with_selected(selected);
+                SettingControl::Dropdown(state)
+            } else {
+                let state = TextInputState::new(&schema.name).with_value(value);
+                SettingControl::Text(state)
+            }
         }
 
         SettingType::Enum { options } => {
@@ -832,6 +915,8 @@ pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
         layer_source,
         read_only: schema.read_only,
         is_auto_managed,
+        nullable: schema.nullable,
+        is_null,
         section: schema.section.clone(),
         is_section_start: false, // Set later in build_page after sorting
         layout_width: 0,
@@ -1036,6 +1121,11 @@ pub fn build_item_from_value(
     // Check if this is an auto-managed map (no_add)
     let is_auto_managed = matches!(&schema.setting_type, SettingType::Map { no_add: true, .. });
 
+    let is_null = schema.nullable
+        && current_value
+            .map(|v| v.is_null())
+            .unwrap_or(schema.default.as_ref().map(|d| d.is_null()).unwrap_or(true));
+
     SettingItem {
         path: schema.path.clone(),
         name: schema.name.clone(),
@@ -1047,6 +1137,8 @@ pub fn build_item_from_value(
         layer_source: ConfigLayer::System,
         read_only: schema.read_only,
         is_auto_managed,
+        nullable: schema.nullable,
+        is_null,
         section: schema.section.clone(),
         is_section_start: false, // Not used in dialogs
         layout_width: 0,
@@ -1164,6 +1256,9 @@ mod tests {
             default: Some(serde_json::Value::Bool(true)),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
         };
 
         let config = sample_config();
@@ -1193,6 +1288,9 @@ mod tests {
             default: Some(serde_json::Value::Bool(true)),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
         };
 
         let config = sample_config();
@@ -1220,6 +1318,9 @@ mod tests {
             default: Some(serde_json::Value::Number(4.into())),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
         };
 
         let config = sample_config();
@@ -1248,6 +1349,9 @@ mod tests {
             default: Some(serde_json::Value::String("high-contrast".to_string())),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
         };
 
         let config = sample_config();

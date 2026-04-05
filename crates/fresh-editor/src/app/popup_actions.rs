@@ -47,6 +47,24 @@ impl Editor {
             return PopupConfirmResult::EarlyReturn;
         }
 
+        // Check if this is a code action popup
+        if self.pending_code_actions.is_some() {
+            let selected_index = self
+                .active_state()
+                .popups
+                .top()
+                .and_then(|p| p.selected_item())
+                .and_then(|item| item.data.as_ref())
+                .and_then(|data| data.parse::<usize>().ok());
+
+            self.hide_popup();
+            if let Some(index) = selected_index {
+                self.execute_code_action(index);
+            }
+            self.pending_code_actions = None;
+            return PopupConfirmResult::EarlyReturn;
+        }
+
         // Check if this is an LSP confirmation popup
         if self.pending_lsp_confirmation.is_some() {
             let action = self
@@ -63,17 +81,22 @@ impl Editor {
         }
 
         // If it's a completion popup, insert the selected item
-        let completion_text = self
+        let completion_info = self
             .active_state()
             .popups
             .top()
             .filter(|p| p.kind == crate::view::popup::PopupKind::Completion)
             .and_then(|p| p.selected_item())
-            .and_then(|item| item.data.clone());
+            .map(|item| (item.text.clone(), item.data.clone()));
 
         // Perform the completion if we have text
-        if let Some(text) = completion_text {
-            self.insert_completion_text(text);
+        if let Some((label, insert_text)) = completion_info {
+            if let Some(text) = insert_text {
+                self.insert_completion_text(text);
+            }
+
+            // Apply additional_text_edits (e.g., auto-imports) from the matching CompletionItem
+            self.apply_completion_additional_edits(&label);
         }
 
         self.hide_popup();
@@ -114,8 +137,7 @@ impl Editor {
                 cursor_id,
             };
 
-            self.active_event_log_mut().append(delete_event.clone());
-            self.apply_event_to_active_buffer(&delete_event);
+            self.log_and_apply_event(&delete_event);
 
             let buffer_len = self.active_state().buffer.len();
             word_start.min(buffer_len)
@@ -129,8 +151,7 @@ impl Editor {
             cursor_id,
         };
 
-        self.active_event_log_mut().append(insert_event.clone());
-        self.apply_event_to_active_buffer(&insert_event);
+        self.log_and_apply_event(&insert_event);
 
         // If this was a snippet, position cursor at the snippet's $0 location
         if let Some(offset) = cursor_offset {
@@ -153,6 +174,44 @@ impl Editor {
                 let cursors = &mut self.split_view_states.get_mut(&split_id).unwrap().cursors;
                 state.apply(cursors, &move_event);
             }
+        }
+    }
+
+    /// Apply additional_text_edits from the accepted completion item (e.g. auto-imports).
+    /// If the item already has additional_text_edits, apply them directly.
+    /// If not and the server supports completionItem/resolve, send a resolve request
+    /// so the server can fill them in (the response is handled asynchronously).
+    fn apply_completion_additional_edits(&mut self, label: &str) {
+        // Find the matching CompletionItem from stored items
+        let item = self
+            .completion_items
+            .as_ref()
+            .and_then(|items| items.iter().find(|item| item.label == label).cloned());
+
+        let Some(item) = item else { return };
+
+        if let Some(edits) = &item.additional_text_edits {
+            if !edits.is_empty() {
+                tracing::info!(
+                    "Applying {} additional text edits from completion '{}'",
+                    edits.len(),
+                    label
+                );
+                let buffer_id = self.active_buffer();
+                if let Err(e) = self.apply_lsp_text_edits(buffer_id, edits.clone()) {
+                    tracing::error!("Failed to apply completion additional_text_edits: {}", e);
+                }
+                return;
+            }
+        }
+
+        // No additional_text_edits present — try resolve if server supports it
+        if self.server_supports_completion_resolve() {
+            tracing::info!(
+                "Completion '{}' has no additional_text_edits, sending completionItem/resolve",
+                label
+            );
+            self.send_completion_resolve(item);
         }
     }
 
@@ -183,6 +242,12 @@ impl Editor {
             return;
         }
 
+        if self.pending_code_actions.is_some() {
+            self.pending_code_actions = None;
+            self.hide_popup();
+            return;
+        }
+
         if self.pending_lsp_confirmation.is_some() {
             self.pending_lsp_confirmation = None;
             self.set_status_message(t!("lsp.startup_cancelled_msg").to_string());
@@ -190,6 +255,13 @@ impl Editor {
         self.hide_popup();
         // Clear completion items when popup is closed
         self.completion_items = None;
+    }
+
+    /// Get the formatted key hint for the completion accept action (e.g. "Tab").
+    /// Looks up the keybinding for the ConfirmPopup/Tab action in completion context.
+    pub(crate) fn completion_accept_key_hint(&self) -> Option<String> {
+        // Tab is hardcoded in the completion input handler, so default to "Tab"
+        Some("Tab".to_string())
     }
 
     /// Handle typing a character while completion popup is open.
@@ -207,8 +279,7 @@ impl Editor {
             cursor_id,
         };
 
-        self.active_event_log_mut().append(insert_event.clone());
-        self.apply_event_to_active_buffer(&insert_event);
+        self.log_and_apply_event(&insert_event);
 
         // Now re-filter the completion list
         self.refilter_completion_popup();
@@ -250,8 +321,7 @@ impl Editor {
             cursor_id,
         };
 
-        self.active_event_log_mut().append(delete_event.clone());
-        self.apply_event_to_active_buffer(&delete_event);
+        self.log_and_apply_event(&delete_event);
 
         // Now re-filter the completion list
         self.refilter_completion_popup();
@@ -260,14 +330,8 @@ impl Editor {
     /// Re-filter the completion popup based on current prefix.
     /// If no items match, dismiss the popup.
     fn refilter_completion_popup(&mut self) {
-        // Get stored completion items
-        let items = match &self.completion_items {
-            Some(items) if !items.is_empty() => items.clone(),
-            _ => {
-                self.hide_popup();
-                return;
-            }
-        };
+        // Get stored LSP completion items (may be empty if no LSP).
+        let lsp_items = self.completion_items.clone().unwrap_or_default();
 
         // Get current prefix
         let (word_start, cursor_pos) = {
@@ -285,11 +349,11 @@ impl Editor {
             String::new()
         };
 
-        // Filter items
-        let filtered_items: Vec<&lsp_types::CompletionItem> = if prefix.is_empty() {
-            items.iter().collect()
+        // Filter LSP items
+        let filtered_lsp: Vec<&lsp_types::CompletionItem> = if prefix.is_empty() {
+            lsp_items.iter().collect()
         } else {
-            items
+            lsp_items
                 .iter()
                 .filter(|item| {
                     item.label.to_lowercase().starts_with(&prefix)
@@ -302,8 +366,21 @@ impl Editor {
                 .collect()
         };
 
-        // If no items match, dismiss popup
-        if filtered_items.is_empty() {
+        // Build combined items: LSP first, then buffer-word results.
+        let mut all_popup_items = lsp_items_to_popup_items(&filtered_lsp);
+        let buffer_word_items = self.get_buffer_completion_popup_items();
+        let lsp_labels: std::collections::HashSet<String> = all_popup_items
+            .iter()
+            .map(|i| i.text.to_lowercase())
+            .collect();
+        all_popup_items.extend(
+            buffer_word_items
+                .into_iter()
+                .filter(|item| !lsp_labels.contains(&item.text.to_lowercase())),
+        );
+
+        // If no items match from either source, dismiss popup.
+        if all_popup_items.is_empty() {
             self.hide_popup();
             self.completion_items = None;
             return;
@@ -319,37 +396,51 @@ impl Editor {
 
         // Try to preserve selection
         let selected = current_selection
-            .and_then(|sel| filtered_items.iter().position(|item| item.label == sel))
+            .and_then(|sel| all_popup_items.iter().position(|item| item.text == sel))
             .unwrap_or(0);
 
-        let popup_data = build_completion_popup(&filtered_items, selected);
+        let popup_data = build_completion_popup_from_items(all_popup_items, selected);
+        let accept_hint = self.completion_accept_key_hint();
 
         // Close old popup and show new one
         self.hide_popup();
-        let split_id = self.split_manager.active_split();
         let buffer_id = self.active_buffer();
         let state = self.buffers.get_mut(&buffer_id).unwrap();
-        let cursors = &mut self.split_view_states.get_mut(&split_id).unwrap().cursors;
-        state.apply(
-            cursors,
-            &crate::model::event::Event::ShowPopup { popup: popup_data },
-        );
+        let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
+        popup_obj.accept_key_hint = accept_hint;
+        state.popups.show_or_replace(popup_obj);
     }
 }
 
-/// Build a completion `PopupData` from a list of LSP `CompletionItem`s.
+/// Build a completion popup from a combined list of already-converted items.
 ///
-/// This is the single code path for creating completion popups, used both for
-/// the initial LSP completion response and for re-filtering during type-to-filter.
-pub(crate) fn build_completion_popup(
-    items: &[&lsp_types::CompletionItem],
+/// Used when merging LSP results + buffer-word results into a single popup.
+pub(crate) fn build_completion_popup_from_items(
+    items: Vec<crate::model::event::PopupListItemData>,
     selected: usize,
 ) -> crate::model::event::PopupData {
-    use crate::model::event::{
-        PopupContentData, PopupKindHint, PopupListItemData, PopupPositionData,
-    };
+    use crate::model::event::{PopupContentData, PopupKindHint, PopupPositionData};
 
-    let list_items: Vec<PopupListItemData> = items
+    crate::model::event::PopupData {
+        kind: PopupKindHint::Completion,
+        title: None,
+        description: None,
+        transient: false,
+        content: PopupContentData::List { items, selected },
+        position: PopupPositionData::BelowCursor,
+        width: 50,
+        max_height: 15,
+        bordered: true,
+    }
+}
+
+/// Convert LSP `CompletionItem`s to `PopupListItemData`s.
+pub(crate) fn lsp_items_to_popup_items(
+    items: &[&lsp_types::CompletionItem],
+) -> Vec<crate::model::event::PopupListItemData> {
+    use crate::model::event::PopupListItemData;
+
+    items
         .iter()
         .map(|item| {
             let icon = match item.kind {
@@ -373,20 +464,5 @@ pub(crate) fn build_completion_popup(
                     .or_else(|| Some(item.label.clone())),
             }
         })
-        .collect();
-
-    crate::model::event::PopupData {
-        kind: PopupKindHint::Completion,
-        title: None,
-        description: None,
-        transient: false,
-        content: PopupContentData::List {
-            items: list_items,
-            selected,
-        },
-        position: PopupPositionData::BelowCursor,
-        width: 50,
-        max_height: 15,
-        bordered: true,
-    }
+        .collect()
 }

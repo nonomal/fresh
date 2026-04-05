@@ -93,6 +93,11 @@ pub struct BufferViewState {
     /// Compose mode forces this to false; leaving compose restores from config.
     pub show_line_numbers: bool,
 
+    /// Per-split current line highlight visibility.
+    /// When true, the line containing the cursor gets a distinct background color.
+    /// Initialized from config when the split is created.
+    pub highlight_current_line: bool,
+
     /// Optional view transform payload
     pub view_transform: Option<ViewTransformPayload>,
 
@@ -137,6 +142,7 @@ impl BufferViewState {
             compose_column_guides: None,
             rulers: Vec::new(),
             show_line_numbers: true,
+            highlight_current_line: true,
             view_transform: None,
             view_transform_stale: false,
             plugin_state: std::collections::HashMap::new(),
@@ -146,21 +152,39 @@ impl BufferViewState {
 
     /// Apply editor config defaults for display settings.
     ///
-    /// Sets `show_line_numbers`, `line_wrap`, and `rulers` from the given
-    /// config values. Call this after creating a new `BufferViewState` (via
-    /// `new()` or `ensure_buffer_state()`) to ensure the view respects the
-    /// user's settings.
+    /// Sets `show_line_numbers`, `highlight_current_line`, `line_wrap`,
+    /// `wrap_column`, and `rulers` from the given config values. Call this after
+    /// creating a new `BufferViewState` (via `new()` or `ensure_buffer_state()`)
+    /// to ensure the view respects the user's settings.
     pub fn apply_config_defaults(
         &mut self,
         line_numbers: bool,
+        highlight_current_line: bool,
         line_wrap: bool,
         wrap_indent: bool,
+        wrap_column: Option<usize>,
         rulers: Vec<usize>,
     ) {
         self.show_line_numbers = line_numbers;
+        self.highlight_current_line = highlight_current_line;
         self.viewport.line_wrap_enabled = line_wrap;
         self.viewport.wrap_indent = wrap_indent;
+        self.viewport.wrap_column = wrap_column;
         self.rulers = rulers;
+    }
+
+    /// Activate page view (compose mode) with an optional page width.
+    ///
+    /// This sets the view mode to Compose, disables builtin line wrap
+    /// (the compose plugin handles wrapping), hides line numbers,
+    /// and optionally sets the compose width for centering.
+    pub fn activate_page_view(&mut self, page_width: Option<usize>) {
+        self.view_mode = ViewMode::PageView;
+        self.show_line_numbers = false;
+        self.viewport.line_wrap_enabled = false;
+        if let Some(width) = page_width {
+            self.compose_width = Some(width as u16);
+        }
     }
 }
 
@@ -174,6 +198,7 @@ impl Clone for BufferViewState {
             compose_column_guides: self.compose_column_guides.clone(),
             rulers: self.rulers.clone(),
             show_line_numbers: self.show_line_numbers,
+            highlight_current_line: self.highlight_current_line,
             view_transform: self.view_transform.clone(),
             view_transform_stale: self.view_transform_stale,
             plugin_state: self.plugin_state.clone(),
@@ -972,14 +997,12 @@ impl SplitManager {
     pub fn get_visible_buffers(&self, viewport_rect: Rect) -> Vec<(LeafId, BufferId, Rect)> {
         // If a split is maximized, only show that split taking up the full viewport
         if let Some(maximized_id) = self.maximized_split {
-            if let Some(node) = self.root.find(maximized_id) {
-                if let SplitNode::Leaf {
-                    buffer_id,
-                    split_id,
-                } = node
-                {
-                    return vec![(*split_id, *buffer_id, viewport_rect)];
-                }
+            if let Some(SplitNode::Leaf {
+                buffer_id,
+                split_id,
+            }) = self.root.find(maximized_id)
+            {
+                return vec![(*split_id, *buffer_id, viewport_rect)];
             }
             // Maximized split no longer exists, clear it and fall through
         }

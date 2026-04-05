@@ -214,6 +214,8 @@ impl Editor {
                 self.mouse_state.dragging_text_selection = false;
                 self.mouse_state.drag_selection_split = None;
                 self.mouse_state.drag_selection_anchor = None;
+                self.mouse_state.drag_selection_by_words = false;
+                self.mouse_state.drag_selection_word_end = None;
                 // Clear popup scrollbar drag state
                 self.mouse_state.dragging_popup_scrollbar = None;
                 self.mouse_state.drag_start_popup_scroll = None;
@@ -561,6 +563,17 @@ impl Editor {
     fn update_lsp_hover_state(&mut self, col: u16, row: u16) {
         tracing::trace!(col, row, "update_lsp_hover_state: raw mouse position");
 
+        // Suppress LSP hover when a popup is already visible (e.g. theme info popup,
+        // tab context menu) to avoid hover tooltips overlapping other popups.
+        if self.theme_info_popup.is_some() || self.tab_context_menu.is_some() {
+            if self.mouse_state.lsp_hover_state.is_some() {
+                self.mouse_state.lsp_hover_state = None;
+                self.mouse_state.lsp_hover_request_sent = false;
+                self.dismiss_transient_popups();
+            }
+            return;
+        }
+
         // Check if mouse is over a transient popup - if so, keep hover active
         if self.is_mouse_over_transient_popup(col, row) {
             return;
@@ -728,6 +741,29 @@ impl Editor {
         self.file_browser_layout
             .as_ref()
             .is_some_and(|layout| layout.contains(col, row))
+    }
+
+    /// Find the split whose content or scrollbar area contains (col, row).
+    /// Returns the split id and its buffer id, or None if not over any split.
+    pub(super) fn split_at_position(&self, col: u16, row: u16) -> Option<(LeafId, BufferId)> {
+        for &(split_id, buffer_id, content_rect, scrollbar_rect, _, _) in
+            &self.cached_layout.split_areas
+        {
+            let in_content = col >= content_rect.x
+                && col < content_rect.x + content_rect.width
+                && row >= content_rect.y
+                && row < content_rect.y + content_rect.height;
+            let in_scrollbar = scrollbar_rect.width > 0
+                && scrollbar_rect.height > 0
+                && col >= scrollbar_rect.x
+                && col < scrollbar_rect.x + scrollbar_rect.width
+                && row >= scrollbar_rect.y
+                && row < scrollbar_rect.y + scrollbar_rect.height;
+            if in_content || in_scrollbar {
+                return Some((split_id, buffer_id));
+            }
+        }
+        None
     }
 
     /// Compute what hover target is at the given position
@@ -1140,6 +1176,23 @@ impl Editor {
 
         // Now select the word under cursor
         self.handle_action(Action::SelectWord)?;
+
+        // Set up drag state so subsequent drag events extend selection word-by-word
+        if let Some(cursor) = self
+            .split_view_states
+            .get(&leaf_id)
+            .map(|vs| vs.cursors.primary())
+        {
+            // Store both edges of the selected word so we can use the appropriate
+            // anchor when dragging forward (use word start) vs backward (use word end).
+            let sel_start = cursor.selection_start();
+            let sel_end = cursor.selection_end();
+            self.mouse_state.dragging_text_selection = true;
+            self.mouse_state.drag_selection_split = Some(split_id);
+            self.mouse_state.drag_selection_anchor = Some(sel_start);
+            self.mouse_state.drag_selection_by_words = true;
+            self.mouse_state.drag_selection_word_end = Some(sel_end);
+        }
 
         Ok(())
     }
@@ -2093,6 +2146,7 @@ impl Editor {
     /// Handle text selection drag - extends selection from anchor to current position
     fn handle_text_selection_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
         use crate::model::event::Event;
+        use crate::primitives::word_navigation::{find_word_end, find_word_start};
 
         let Some(split_id) = self.mouse_state.drag_selection_split else {
             return Ok(());
@@ -2164,6 +2218,27 @@ impl Editor {
                 return Ok(());
             };
 
+            // When drag started with double-click, snap to word boundaries.
+            // When dragging forward, anchor at word start and extend to word end.
+            // When dragging backward, anchor at word end and extend to word start,
+            // so the initially double-clicked word stays selected.
+            let (new_position, anchor_position) = if self.mouse_state.drag_selection_by_words {
+                if target_position >= anchor_position {
+                    (
+                        find_word_end(&state.buffer, target_position),
+                        anchor_position,
+                    )
+                } else {
+                    let word_end = self
+                        .mouse_state
+                        .drag_selection_word_end
+                        .unwrap_or(anchor_position);
+                    (find_word_start(&state.buffer, target_position), word_end)
+                }
+            } else {
+                (target_position, anchor_position)
+            };
+
             let (primary_cursor_id, old_position, old_anchor, old_sticky_column) = self
                 .split_view_states
                 .get(&leaf_id)
@@ -2180,13 +2255,13 @@ impl Editor {
 
             let new_sticky_column = state
                 .buffer
-                .offset_to_position(target_position)
+                .offset_to_position(new_position)
                 .map(|pos| pos.column)
                 .unwrap_or(old_sticky_column);
             let event = Event::MoveCursor {
                 cursor_id: primary_cursor_id,
                 old_position,
-                new_position: target_position,
+                new_position,
                 old_anchor,
                 new_anchor: Some(anchor_position), // Keep anchor to maintain selection
                 old_sticky_column,

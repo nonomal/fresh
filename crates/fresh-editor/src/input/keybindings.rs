@@ -290,7 +290,10 @@ pub enum Action {
     MoveDown,
     MoveWordLeft,
     MoveWordRight,
-    MoveWordEnd, // Move to end of current word
+    MoveWordEnd,     // Move to end of current word (Ctrl+Right style, past the end)
+    ViMoveWordEnd,   // Vim 'e' - move to end of word (ON last char, advances from word-end)
+    MoveLeftInLine,  // Move left without crossing line boundaries
+    MoveRightInLine, // Move right without crossing line boundaries
     MoveLineStart,
     MoveLineEnd,
     MoveLineUp,
@@ -309,7 +312,8 @@ pub enum Action {
     SelectToParagraphDown, // Jump to next empty line with selection
     SelectWordLeft,
     SelectWordRight,
-    SelectWordEnd, // Select to end of current word
+    SelectWordEnd,   // Select to end of current word
+    ViSelectWordEnd, // Vim 'e' selection - select to end of word (ON last char)
     SelectLineStart,
     SelectLineEnd,
     SelectDocumentStart,
@@ -335,6 +339,7 @@ pub enum Action {
     DeleteLine,
     DeleteToLineEnd,
     DeleteToLineStart,
+    DeleteViWordEnd, // Delete from cursor to end of word (vim de)
     TransposeChars,
     OpenLine,
     DuplicateLine,
@@ -356,6 +361,7 @@ pub enum Action {
     YankWordBackward,
     YankToLineEnd,
     YankToLineStart,
+    YankViWordEnd, // Yank from cursor to end of word (vim ye)
 
     // Multi-cursor
     AddCursorAbove,
@@ -391,6 +397,7 @@ pub enum Action {
     SmartHome,
     DedentSelection,
     ToggleComment,
+    DabbrevExpand,
     ToggleFold,
 
     // Bookmarks
@@ -433,13 +440,14 @@ pub enum Action {
     ShowStatusLog,
     ShowLspStatus,
     ClearWarnings,
-    CommandPalette, // TODO: Consider dropping this now that we have QuickOpen
+    CommandPalette, // Alias for QuickOpen — kept for keymap/plugin compatibility
     /// Quick Open - unified prompt with prefix-based provider routing
     QuickOpen,
     ToggleLineWrap,
+    ToggleCurrentLineHighlight,
     ToggleReadOnly,
-    ToggleComposeMode,
-    SetComposeWidth,
+    TogglePageView,
+    SetPageWidth,
     InspectThemeAtCursor,
     SelectTheme,
     SelectKeybindingMap,
@@ -524,6 +532,8 @@ pub enum Action {
     ToggleTabBar,
     // Status bar visibility
     ToggleStatusBar,
+    // Prompt line visibility
+    TogglePromptLine,
     // Scrollbar visibility
     ToggleVerticalScrollbar,
     ToggleHorizontalScrollbar,
@@ -621,6 +631,7 @@ pub enum Action {
     SettingsHelp,        // Show settings help overlay
     SettingsIncrement,   // Increment number value or next dropdown option
     SettingsDecrement,   // Decrement number value or previous dropdown option
+    SettingsInherit,     // Set nullable setting to null (inherit value)
 
     // Terminal operations
     OpenTerminal,          // Open a new terminal in the current split
@@ -637,6 +648,7 @@ pub enum Action {
     // Case conversion
     ToUpperCase, // Convert selection to uppercase
     ToLowerCase, // Convert selection to lowercase
+    ToggleCase,  // Toggle case of character under cursor (vim ~)
     SortLines,   // Sort selected lines alphabetically
 
     // Input calibration
@@ -662,14 +674,16 @@ pub enum Action {
 /// bodies. This is needed so that macro hygiene allows the custom body expressions to reference
 /// the function parameter (both the definition and usage share the call-site span).
 ///
-/// Three categories of action mappings:
+/// Four categories of action mappings:
 /// - `simple`: `"name" => Variant` — no args needed
+/// - `alias`: `"name" => Variant` — like simple, but only for from_str (not to_action_str)
 /// - `with_char`: `"name" => Variant` — passes through `with_char(args, ...)` for char-arg actions
 /// - `custom`: `"name" => { body }` — arbitrary expression using `$args_name` for complex arg parsing
 macro_rules! define_action_str_mapping {
     (
         $args_name:ident;
         simple { $($s_name:literal => $s_variant:ident),* $(,)? }
+        alias { $($a_name:literal => $a_variant:ident),* $(,)? }
         with_char { $($c_name:literal => $c_variant:ident),* $(,)? }
         custom { $($x_name:literal => $x_variant:ident : $x_body:expr),* $(,)? }
     ) => {
@@ -677,9 +691,12 @@ macro_rules! define_action_str_mapping {
         pub fn from_str(s: &str, $args_name: &HashMap<String, serde_json::Value>) -> Option<Self> {
             Some(match s {
                 $($s_name => Self::$s_variant,)*
+                $($a_name => Self::$a_variant,)*
                 $($c_name => return Self::with_char($args_name, Self::$c_variant),)*
                 $($x_name => $x_body,)*
-                _ => return None,
+                // Unrecognized action names are treated as plugin actions, allowing
+                // keybindings for plugin-registered commands to load from config.
+                _ => Self::PluginAction(s.to_string()),
             })
         }
 
@@ -699,6 +716,7 @@ macro_rules! define_action_str_mapping {
         pub fn all_action_names() -> Vec<String> {
             let mut names = vec![
                 $($s_name.to_string(),)*
+                $($a_name.to_string(),)*
                 $($c_name.to_string(),)*
                 $($x_name.to_string(),)*
             ];
@@ -733,6 +751,9 @@ impl Action {
             "move_word_left" => MoveWordLeft,
             "move_word_right" => MoveWordRight,
             "move_word_end" => MoveWordEnd,
+            "vi_move_word_end" => ViMoveWordEnd,
+            "move_left_in_line" => MoveLeftInLine,
+            "move_right_in_line" => MoveRightInLine,
             "move_line_start" => MoveLineStart,
             "move_line_end" => MoveLineEnd,
             "move_line_up" => MoveLineUp,
@@ -751,6 +772,7 @@ impl Action {
             "select_word_left" => SelectWordLeft,
             "select_word_right" => SelectWordRight,
             "select_word_end" => SelectWordEnd,
+            "vi_select_word_end" => ViSelectWordEnd,
             "select_line_start" => SelectLineStart,
             "select_line_end" => SelectLineEnd,
             "select_document_start" => SelectDocumentStart,
@@ -774,6 +796,7 @@ impl Action {
             "delete_line" => DeleteLine,
             "delete_to_line_end" => DeleteToLineEnd,
             "delete_to_line_start" => DeleteToLineStart,
+            "delete_vi_word_end" => DeleteViWordEnd,
             "transpose_chars" => TransposeChars,
             "open_line" => OpenLine,
             "duplicate_line" => DuplicateLine,
@@ -788,6 +811,7 @@ impl Action {
             "yank_word_backward" => YankWordBackward,
             "yank_to_line_end" => YankToLineEnd,
             "yank_to_line_start" => YankToLineStart,
+            "yank_vi_word_end" => YankViWordEnd,
 
             "add_cursor_above" => AddCursorAbove,
             "add_cursor_below" => AddCursorBelow,
@@ -818,6 +842,7 @@ impl Action {
             "smart_home" => SmartHome,
             "dedent_selection" => DedentSelection,
             "toggle_comment" => ToggleComment,
+            "dabbrev_expand" => DabbrevExpand,
             "toggle_fold" => ToggleFold,
 
             "list_bookmarks" => ListBookmarks,
@@ -851,9 +876,10 @@ impl Action {
             "command_palette" => CommandPalette,
             "quick_open" => QuickOpen,
             "toggle_line_wrap" => ToggleLineWrap,
+            "toggle_current_line_highlight" => ToggleCurrentLineHighlight,
             "toggle_read_only" => ToggleReadOnly,
-            "toggle_compose_mode" => ToggleComposeMode,
-            "set_compose_width" => SetComposeWidth,
+            "toggle_page_view" => TogglePageView,
+            "set_page_width" => SetPageWidth,
 
             "next_buffer" => NextBuffer,
             "prev_buffer" => PrevBuffer,
@@ -916,6 +942,7 @@ impl Action {
             "toggle_menu_bar" => ToggleMenuBar,
             "toggle_tab_bar" => ToggleTabBar,
             "toggle_status_bar" => ToggleStatusBar,
+            "toggle_prompt_line" => TogglePromptLine,
             "toggle_vertical_scrollbar" => ToggleVerticalScrollbar,
             "toggle_horizontal_scrollbar" => ToggleHorizontalScrollbar,
             "focus_file_explorer" => FocusFileExplorer,
@@ -1005,6 +1032,7 @@ impl Action {
 
             "to_upper_case" => ToUpperCase,
             "to_lower_case" => ToLowerCase,
+            "toggle_case" => ToggleCase,
             "sort_lines" => SortLines,
 
             "calibrate_input" => CalibrateInput,
@@ -1024,6 +1052,11 @@ impl Action {
             "settings_help" => SettingsHelp,
             "settings_increment" => SettingsIncrement,
             "settings_decrement" => SettingsDecrement,
+            "settings_inherit" => SettingsInherit,
+        }
+        alias {
+            "toggle_compose_mode" => TogglePageView,
+            "set_compose_width" => SetPageWidth,
         }
         with_char {
             "insert_char" => InsertChar,
@@ -1068,6 +1101,9 @@ impl Action {
                 | Action::MoveWordLeft
                 | Action::MoveWordRight
                 | Action::MoveWordEnd
+                | Action::ViMoveWordEnd
+                | Action::MoveLeftInLine
+                | Action::MoveRightInLine
                 | Action::MoveLineStart
                 | Action::MoveLineEnd
                 | Action::MovePageUp
@@ -1084,6 +1120,7 @@ impl Action {
                 | Action::SelectWordLeft
                 | Action::SelectWordRight
                 | Action::SelectWordEnd
+                | Action::ViSelectWordEnd
                 | Action::SelectLineStart
                 | Action::SelectLineEnd
                 | Action::SelectDocumentStart
@@ -1139,6 +1176,7 @@ impl Action {
                 | Action::DeleteLine
                 | Action::DeleteToLineEnd
                 | Action::DeleteToLineStart
+                | Action::DeleteViWordEnd
                 | Action::TransposeChars
                 | Action::OpenLine
                 | Action::DuplicateLine
@@ -1912,6 +1950,9 @@ impl KeybindingResolver {
             Action::MoveWordLeft => t!("action.move_word_left"),
             Action::MoveWordRight => t!("action.move_word_right"),
             Action::MoveWordEnd => t!("action.move_word_end"),
+            Action::ViMoveWordEnd => t!("action.move_word_end"),
+            Action::MoveLeftInLine => t!("action.move_left"),
+            Action::MoveRightInLine => t!("action.move_right"),
             Action::MoveLineStart => t!("action.move_line_start"),
             Action::MoveLineEnd => t!("action.move_line_end"),
             Action::MoveLineUp => t!("action.move_line_up"),
@@ -1929,6 +1970,7 @@ impl KeybindingResolver {
             Action::SelectWordLeft => t!("action.select_word_left"),
             Action::SelectWordRight => t!("action.select_word_right"),
             Action::SelectWordEnd => t!("action.select_word_end"),
+            Action::ViSelectWordEnd => t!("action.select_word_end"),
             Action::SelectLineStart => t!("action.select_line_start"),
             Action::SelectLineEnd => t!("action.select_line_end"),
             Action::SelectDocumentStart => t!("action.select_document_start"),
@@ -1950,6 +1992,7 @@ impl KeybindingResolver {
             Action::DeleteLine => t!("action.delete_line"),
             Action::DeleteToLineEnd => t!("action.delete_to_line_end"),
             Action::DeleteToLineStart => t!("action.delete_to_line_start"),
+            Action::DeleteViWordEnd => t!("action.delete_word_forward"),
             Action::TransposeChars => t!("action.transpose_chars"),
             Action::OpenLine => t!("action.open_line"),
             Action::DuplicateLine => t!("action.duplicate_line"),
@@ -1964,6 +2007,7 @@ impl KeybindingResolver {
             Action::YankWordBackward => t!("action.yank_word_backward"),
             Action::YankToLineEnd => t!("action.yank_to_line_end"),
             Action::YankToLineStart => t!("action.yank_to_line_start"),
+            Action::YankViWordEnd => t!("action.yank_word_forward"),
             Action::AddCursorAbove => t!("action.add_cursor_above"),
             Action::AddCursorBelow => t!("action.add_cursor_below"),
             Action::AddCursorNextMatch => t!("action.add_cursor_next_match"),
@@ -1991,6 +2035,7 @@ impl KeybindingResolver {
             Action::SmartHome => t!("action.smart_home"),
             Action::DedentSelection => t!("action.dedent_selection"),
             Action::ToggleComment => t!("action.toggle_comment"),
+            Action::DabbrevExpand => std::borrow::Cow::Borrowed("Expand abbreviation (dabbrev)"),
             Action::ToggleFold => t!("action.toggle_fold"),
             Action::SetBookmark(c) => t!("action.set_bookmark", key = c),
             Action::JumpToBookmark(c) => t!("action.jump_to_bookmark", key = c),
@@ -2025,9 +2070,10 @@ impl KeybindingResolver {
             Action::QuickOpen => t!("action.quick_open"),
             Action::InspectThemeAtCursor => t!("action.inspect_theme_at_cursor"),
             Action::ToggleLineWrap => t!("action.toggle_line_wrap"),
+            Action::ToggleCurrentLineHighlight => t!("action.toggle_current_line_highlight"),
             Action::ToggleReadOnly => t!("action.toggle_read_only"),
-            Action::ToggleComposeMode => t!("action.toggle_compose_mode"),
-            Action::SetComposeWidth => t!("action.set_compose_width"),
+            Action::TogglePageView => t!("action.toggle_page_view"),
+            Action::SetPageWidth => t!("action.set_page_width"),
             Action::NextBuffer => t!("action.next_buffer"),
             Action::PrevBuffer => t!("action.prev_buffer"),
             Action::NavigateBack => t!("action.navigate_back"),
@@ -2085,6 +2131,7 @@ impl KeybindingResolver {
             Action::ToggleMenuBar => t!("action.toggle_menu_bar"),
             Action::ToggleTabBar => t!("action.toggle_tab_bar"),
             Action::ToggleStatusBar => t!("action.toggle_status_bar"),
+            Action::TogglePromptLine => t!("action.toggle_prompt_line"),
             Action::ToggleVerticalScrollbar => t!("action.toggle_vertical_scrollbar"),
             Action::ToggleHorizontalScrollbar => t!("action.toggle_horizontal_scrollbar"),
             Action::FocusFileExplorer => t!("action.focus_file_explorer"),
@@ -2177,10 +2224,12 @@ impl KeybindingResolver {
             Action::SettingsHelp => t!("action.settings_help"),
             Action::SettingsIncrement => t!("action.settings_increment"),
             Action::SettingsDecrement => t!("action.settings_decrement"),
+            Action::SettingsInherit => t!("action.settings_inherit"),
             Action::ShellCommand => t!("action.shell_command"),
             Action::ShellCommandReplace => t!("action.shell_command_replace"),
             Action::ToUpperCase => t!("action.to_uppercase"),
             Action::ToLowerCase => t!("action.to_lowercase"),
+            Action::ToggleCase => t!("action.to_uppercase"),
             Action::SortLines => t!("action.sort_lines"),
             Action::CalibrateInput => t!("action.calibrate_input"),
             Action::EventDebug => t!("action.event_debug"),
@@ -2399,7 +2448,11 @@ mod tests {
         let args = HashMap::new();
         assert_eq!(Action::from_str("move_left", &args), Some(Action::MoveLeft));
         assert_eq!(Action::from_str("save", &args), Some(Action::Save));
-        assert_eq!(Action::from_str("unknown", &args), None);
+        // Unknown action names are treated as plugin actions
+        assert_eq!(
+            Action::from_str("unknown", &args),
+            Some(Action::PluginAction("unknown".to_string()))
+        );
 
         // Test new context-specific actions
         assert_eq!(
@@ -2607,6 +2660,33 @@ mod tests {
         assert!(!resolver.default_bindings[&KeyContext::Popup].is_empty());
         assert!(!resolver.default_bindings[&KeyContext::FileExplorer].is_empty());
         assert!(!resolver.default_bindings[&KeyContext::Menu].is_empty());
+    }
+
+    /// Validate that every action name in every built-in keymap resolves to a
+    /// known built-in action, not a `PluginAction`.  This catches typos like
+    /// `"prompt_delete_to_end"` (should be `"prompt_delete_to_line_end"`).
+    #[test]
+    fn test_all_builtin_keymaps_have_valid_action_names() {
+        let known_actions: std::collections::HashSet<String> =
+            Action::all_action_names().into_iter().collect();
+
+        let config = Config::default();
+
+        for map_name in crate::config::KeybindingMapName::BUILTIN_OPTIONS {
+            let bindings = config.resolve_keymap(map_name);
+            for binding in &bindings {
+                assert!(
+                    known_actions.contains(&binding.action),
+                    "Keymap '{}' contains unknown action '{}' (key: '{}', when: {:?}). \
+                     This will be treated as a plugin action at runtime. \
+                     Check for typos in the keymap JSON file.",
+                    map_name,
+                    binding.action,
+                    binding.key,
+                    binding.when,
+                );
+            }
+        }
     }
 
     #[test]

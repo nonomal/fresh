@@ -20,17 +20,16 @@ use crate::common::harness::EditorTestHarness;
     ignore = "FakeLspServer uses a Bash script which is not available on Windows"
 )]
 fn test_lsp_env_vars_passed_to_server() -> anyhow::Result<()> {
-    let _fake_server = FakeLspServer::spawn_env_echo()?;
-
     let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn_env_echo(temp_dir.path())?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn example_function() {}\n")?;
 
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::env_echo_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::env_echo_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -43,7 +42,11 @@ fn test_lsp_env_vars_passed_to_server() -> anyhow::Result<()> {
                 "hello_from_config".to_string(),
             )]),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(

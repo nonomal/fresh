@@ -525,6 +525,24 @@ type InlineOverlay = {
 	*/
 	properties?: Record<string, any>;
 };
+type GrammarInfoSnapshot = {
+	/**
+	* The grammar name as used in config files (case-insensitive matching)
+	*/
+	name: string;
+	/**
+	* Where this grammar was loaded from (e.g. "built-in", "plugin (myplugin)")
+	*/
+	source: string;
+	/**
+	* File extensions associated with this grammar
+	*/
+	file_extensions: Array<string>;
+	/**
+	* Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+	*/
+	short_name: string | null;
+};
 type BackgroundProcessResult = {
 	/**
 	* Unique process ID for later reference
@@ -539,7 +557,6 @@ type BackgroundProcessResult = {
 type BufferSavedDiff = {
 	equal: boolean;
 	byte_ranges: Array<[number, number]>;
-	line_ranges: Array<[number, number]> | null;
 };
 type CreateVirtualBufferInExistingSplitOptions = {
 	/**
@@ -813,6 +830,10 @@ interface EditorAPI {
 	* List all open buffers - returns array of BufferInfo objects
 	*/
 	listBuffers(): BufferInfo[];
+	/**
+	* List all available grammars with source info - returns array of GrammarInfo objects
+	*/
+	listGrammars(): GrammarInfoSnapshot[];
 	debug(msg: string): void;
 	info(msg: string): void;
 	warn(msg: string): void;
@@ -1031,6 +1052,31 @@ interface EditorAPI {
 	*/
 	readDir(path: string): DirEntry[];
 	/**
+	* Create a directory (and all parent directories) recursively.
+	* Returns true if the directory was created or already exists.
+	*/
+	createDir(path: string): boolean;
+	/**
+	* Remove a file or directory by moving it to the OS trash/recycle bin.
+	* For safety, the path must be under the OS temp directory or the Fresh
+	* config directory. Returns true on success.
+	*/
+	removePath(path: string): boolean;
+	/**
+	* Rename/move a file or directory. Returns true on success.
+	* Falls back to copy then trash for cross-filesystem moves.
+	*/
+	renamePath(from: string, to: string): boolean;
+	/**
+	* Copy a file or directory recursively to a new location.
+	* Returns true on success.
+	*/
+	copyPath(from: string, to: string): boolean;
+	/**
+	* Get the OS temporary directory path.
+	*/
+	getTempDir(): string;
+	/**
 	* Get current config as JS object
 	*/
 	getConfig(): unknown;
@@ -1070,6 +1116,11 @@ interface EditorAPI {
 	* Returns a Promise that resolves when the grammar rebuild completes.
 	*/
 	reloadGrammars(): Promise<void>;
+	/**
+	* Get the directory where this plugin's files are stored.
+	* For package plugins this is `<plugins_dir>/packages/<plugin_name>/`.
+	*/
+	getPluginDir(): string;
 	/**
 	* Get config directory path
 	*/

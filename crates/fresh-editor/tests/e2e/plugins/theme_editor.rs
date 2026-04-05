@@ -881,11 +881,16 @@ fn test_comments_appear_before_fields() {
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // Wait for the picker panel to show the field path (plugin may need extra render cycles)
+    // Wait for the picker panel to show the field path (plugin may need extra render cycles).
+    // On macOS the long temp-dir path can push "editor.fg"/"editor.bg" off the right panel
+    // header, so also match the selected-field indicator (▸) next to the short field name.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.bg") || screen.contains("editor.fg")
+            screen.contains("editor.bg")
+                || screen.contains("editor.fg")
+                || screen.contains("\u{25B8} bg")
+                || screen.contains("\u{25B8} fg")
         })
         .unwrap();
 }
@@ -1977,17 +1982,14 @@ fn test_builtin_theme_requires_save_as() {
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
         .unwrap();
-    harness.process_async_and_render().unwrap();
 
-    // Should show Save As prompt or message about requiring Save As
-    let screen = harness.screen_to_string();
-    let requires_save_as = screen.contains("Save theme as") || screen.contains("save as");
-
-    assert!(
-        requires_save_as,
-        "Builtin theme should require Save As. Screen:\n{}",
-        screen
-    );
+    // Wait for Save As prompt to appear (async plugin handler)
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("Save theme as") || screen.contains("save as")
+        })
+        .unwrap();
 }
 
 /// Test that color swatches are displayed next to color values
@@ -2501,11 +2503,16 @@ fn test_inspect_theme_at_cursor_opens_theme_editor() {
     harness.render().unwrap();
 
     // Wait for the theme editor to open and auto-navigate to the editor field
-    // (the resolved key will be editor.fg or editor.bg, so "Editor" section expands)
+    // (the resolved key will be editor.fg or editor.bg, so "Editor" section expands).
+    // On macOS the long temp-dir path can push "editor.fg"/"editor.bg" off the right
+    // panel header, so also match the selected-field indicator (▸) next to the field name.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2558,7 +2565,10 @@ fn test_inspect_theme_at_cursor_multiple_rounds() {
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2589,7 +2599,10 @@ fn test_inspect_theme_at_cursor_multiple_rounds() {
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2618,7 +2631,10 @@ fn test_inspect_theme_at_cursor_multiple_rounds() {
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2995,6 +3011,7 @@ fn test_issue_1180_save_theme_creates_themes_directory() {
 #[test]
 fn test_inspect_after_saving_custom_theme() {
     init_tracing_from_env();
+    fresh::services::signal_handler::install_signal_handlers();
 
     let context_temp = tempfile::TempDir::new().unwrap();
     let dir_context = DirectoryContext::for_testing(context_temp.path());
@@ -3022,6 +3039,7 @@ fn test_inspect_after_saving_custom_theme() {
 
     harness.open_file(&test_file).unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] file opened, starting step 1");
 
     // === Step 1: Open theme editor, select builtin, edit a color, save as custom ===
 
@@ -3036,10 +3054,12 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for 'Select theme to edit'");
     harness
         .wait_until(|h| h.screen_to_string().contains("Select theme to edit"))
         .unwrap();
 
+    tracing::warn!("[test] typing 'light' and pressing Enter");
     harness.type_text("light").unwrap();
     harness.render().unwrap();
     harness
@@ -3047,6 +3067,7 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for Theme Editor tab");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
@@ -3055,6 +3076,7 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
 
     // Expand Editor section and navigate to the first color field (bg)
+    tracing::warn!("[test] expanding Editor section");
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
@@ -3067,9 +3089,11 @@ fn test_inspect_after_saving_custom_theme() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] waiting for '#' (color edit field)");
     harness
         .wait_until(|h| h.screen_to_string().contains("#"))
         .unwrap();
+    tracing::warn!("[test] typing color #FF0000");
     harness
         .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
         .unwrap();
@@ -3080,15 +3104,18 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for Theme Editor after color edit");
     harness
         .wait_until(|h| h.screen_to_string().contains("Theme Editor"))
         .unwrap();
 
     // Save as "light_custom" (with underscore to test normalization)
+    tracing::warn!("[test] pressing Ctrl+S to save");
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
         .unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] waiting for 'Save theme as' dialog");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
@@ -3096,6 +3123,7 @@ fn test_inspect_after_saving_custom_theme() {
         })
         .unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] typing 'light_custom' and pressing Enter");
     harness.type_text("light_custom").unwrap();
     harness.render().unwrap();
     harness
@@ -3103,6 +3131,7 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for saved/applied confirmation");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
@@ -3111,14 +3140,17 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
 
     // === Step 2: Close theme editor via Escape ===
+    tracing::warn!("[test] step 2: closing theme editor via Escape");
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for 'Hello world' (main editor)");
     harness
         .wait_until(|h| h.screen_to_string().contains("Hello world"))
         .unwrap();
 
     // === Step 3: Inspect Theme at Cursor — should work with the custom theme ===
+    tracing::warn!("[test] step 3: opening Inspect Theme at Cursor");
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
@@ -3130,11 +3162,19 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
-    // Wait for theme editor to reopen and auto-navigate to editor fields
+    // Wait for theme editor to reopen and auto-navigate to editor fields.
+    // The full qualified name (editor.fg / editor.bg) appears in the right panel
+    // header, but on macOS the long temp-dir path in the left header can push it
+    // off-screen.  Fall back to checking for the selected-field indicator (▸)
+    // next to the short field name in the tree panel.
+    tracing::warn!("[test] waiting for editor.fg/editor.bg fields");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -3434,4 +3474,156 @@ fn test_theme_editor_page_up_page_down() {
     );
 
     harness.assert_no_plugin_errors();
+}
+
+/// Test that named color swatches in the theme editor use the native ANSI
+/// color (e.g. Color::Yellow) rather than an RGB approximation.
+///
+/// BUG: When a theme field uses a named color like "Yellow", the swatch (██)
+/// in the theme editor was rendered as Color::Rgb(255, 255, 0) instead of
+/// Color::Yellow. This is wrong because the actual theme renders Color::Yellow
+/// as ANSI color 3 (via crossterm), which terminals display as a different
+/// shade than RGB(255, 255, 0). The swatch should use the native ANSI color
+/// so it matches what the user actually sees.
+#[test]
+fn test_named_color_swatch_uses_native_ansi_color() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    // Create a theme with a named color "Yellow" for tab_active_fg.
+    // The swatch should render as Color::Yellow (native ANSI),
+    // not Color::Rgb(255, 255, 0).
+    let themes_dir = project_root.join("themes");
+    fs::create_dir(&themes_dir).unwrap();
+    let test_theme = r#"{
+        "name": "dark",
+        "editor": {
+            "bg": [30, 30, 30],
+            "fg": [212, 212, 212]
+        },
+        "ui": {
+            "tab_active_fg": "Yellow",
+            "tab_active_bg": [0, 0, 200]
+        },
+        "search": {},
+        "diagnostic": {},
+        "syntax": {}
+    }"#;
+    fs::write(themes_dir.join("dark.json"), test_theme).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, Default::default(), project_root)
+            .unwrap();
+    harness.render().unwrap();
+
+    // Open theme editor
+    open_theme_editor(&mut harness);
+
+    // Wait for the theme editor to fully display
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Theme Editor"))
+        .unwrap();
+
+    // The "ui" section is collapsed by default. Navigate down until the
+    // selection indicator (▸) is on the UI Elements section header.
+    // After each Down key, wait for the screen to actually change before
+    // checking and sending the next key. Without this wait, the plugin's
+    // async key processing can batch multiple keys, causing the selection
+    // to skip positions and miss the UI Elements line entirely.
+    let selection_indicator = '\u{25B8}'; // ▸
+    let mut found_ui_section = false;
+    for _ in 0..50 {
+        let screen_before = harness.screen_to_string();
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        // Wait for the screen to reflect the key press before proceeding
+        harness
+            .wait_until(|h| h.screen_to_string() != screen_before)
+            .unwrap();
+        let screen = harness.screen_to_string();
+        // Check if the selected line (containing ▸) is the collapsed UI section
+        if screen
+            .lines()
+            .any(|l| l.contains(selection_indicator) && (l.contains("> UI") || l.contains("> ui")))
+        {
+            found_ui_section = true;
+            break;
+        }
+    }
+
+    let screen_before_expand = harness.screen_to_string();
+    assert!(
+        found_ui_section,
+        "Should have found UI section header. Screen:\n{}",
+        screen_before_expand
+    );
+
+    // Expand the UI section
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Navigate down to tab_active_fg within the expanded UI section.
+    // The UI section has many fields from the schema, so we need enough presses.
+    // Wait for each key to take effect (same reason as above: async batching).
+    for _ in 0..80 {
+        let screen_before = harness.screen_to_string();
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        harness
+            .wait_until(|h| h.screen_to_string() != screen_before)
+            .unwrap();
+        let screen = harness.screen_to_string();
+        // Stop when the selected line contains tab_active_fg
+        if screen
+            .lines()
+            .any(|l| l.contains(selection_indicator) && l.contains("tab_active_fg"))
+        {
+            break;
+        }
+    }
+
+    // Move selection away so the tab_active_fg row renders without selection
+    // highlight (which changes bg color and breaks swatch detection where fg==bg).
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // Wait for the tab_active_fg swatch to render with the correct native ANSI
+    // Yellow color. On slow CI the plugin may not have finished painting yet.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            let lines: Vec<&str> = screen.lines().collect();
+            let Some(row) = lines
+                .iter()
+                .position(|l| l.contains("tab_active_fg") && l.contains("██"))
+            else {
+                return false;
+            };
+            find_swatch_color(h, row as u16) == Some(Color::Yellow)
+        })
+        .unwrap();
+}
+
+/// Find the fg color of the swatch (██) on a given screen row.
+/// Scans the left panel area (columns 0-37) for cells where fg == bg,
+/// which indicates a color swatch.
+fn find_swatch_color(harness: &EditorTestHarness, row: u16) -> Option<Color> {
+    for col in 0..38 {
+        if let Some(cell_text) = harness.get_cell(col, row) {
+            if cell_text == "█" {
+                if let Some(style) = harness.get_cell_style(col, row) {
+                    // Swatch cells have fg == bg (same color)
+                    if style.fg.is_some() && style.fg == style.bg {
+                        return style.fg;
+                    }
+                }
+            }
+        }
+    }
+    None
 }

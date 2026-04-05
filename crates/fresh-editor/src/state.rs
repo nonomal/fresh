@@ -8,7 +8,7 @@ use crate::model::event::{
     PopupPositionData,
 };
 use crate::model::filesystem::FileSystem;
-use crate::model::marker::MarkerList;
+use crate::model::marker::{MarkerId, MarkerList};
 use crate::primitives::detected_language::DetectedLanguage;
 use crate::primitives::grammar::GrammarRegistry;
 use crate::primitives::highlight_engine::HighlightEngine;
@@ -32,13 +32,50 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// A marker whose position was displaced by a deletion.
+/// Stored in LogEntry (for single edits) or Event::BulkEdit (for bulk edits).
+/// On undo, the marker is restored to its exact original position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DisplacedMarker {
+    /// Marker from the main marker_list (virtual text, overlays)
+    Main { id: u64, position: usize },
+    /// Marker from margins.indicator_markers (breakpoints, line indicators)
+    Margin { id: u64, position: usize },
+}
+
+impl DisplacedMarker {
+    /// Encode as (u64, usize) for compact storage. Uses high bit to tag source.
+    pub fn encode(&self) -> (u64, usize) {
+        match self {
+            Self::Main { id, position } => (*id, *position),
+            Self::Margin { id, position } => (*id | (1u64 << 63), *position),
+        }
+    }
+
+    /// Decode from (u64, usize) compact representation.
+    pub fn decode(tagged_id: u64, position: usize) -> Self {
+        if (tagged_id >> 63) == 1 {
+            Self::Margin {
+                id: tagged_id & !(1u64 << 63),
+                position,
+            }
+        } else {
+            Self::Main {
+                id: tagged_id,
+                position,
+            }
+        }
+    }
+}
+
 /// Display mode for a buffer
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMode {
     /// Plain source rendering
     Source,
-    /// Semi-WYSIWYG compose rendering
-    Compose,
+    /// Document-style page view with centered content, concealed markers,
+    /// and plugin-driven word wrapping (previously called "compose mode")
+    PageView,
 }
 
 /// Per-buffer user settings that should be preserved across file reloads (auto-revert).
@@ -73,6 +110,10 @@ pub struct BufferSettings {
     /// Whether to surround selected text with matching pairs when typing a delimiter.
     /// Set based on global + language config.
     pub auto_surround: bool,
+
+    /// Extra characters (beyond alphanumeric + `_`) considered part of
+    /// identifiers for this language. Used by completion providers.
+    pub word_characters: String,
 }
 
 impl Default for BufferSettings {
@@ -83,6 +124,7 @@ impl Default for BufferSettings {
             tab_size: 4,
             auto_close: true,
             auto_surround: true,
+            word_characters: String::new(),
         }
     }
 }
@@ -334,7 +376,9 @@ impl EditorState {
         // Insert text into buffer
         self.buffer.insert(position, text);
 
-        // Invalidate highlight cache for edited range
+        // Notify highlighter of the insert (adjusts checkpoint marker positions)
+        // and invalidate span cache for the edited range.
+        self.highlighter.notify_insert(position, text.len());
         self.highlighter
             .invalidate_range(position..position + text.len());
 
@@ -393,7 +437,9 @@ impl EditorState {
         // Delete from buffer
         self.buffer.delete(range.clone());
 
-        // Invalidate highlight cache for edited range
+        // Notify highlighter of the delete (adjusts checkpoint marker positions)
+        // and invalidate span cache for the edited range.
+        self.highlighter.notify_delete(range.start, len);
         self.highlighter.invalidate_range(range.clone());
 
         // Note: reference_highlight_overlay uses markers that auto-adjust,
@@ -589,7 +635,7 @@ impl EditorState {
 
             Event::ShowPopup { popup } => {
                 let popup_obj = convert_popup_data_to_popup(popup);
-                self.popups.show(popup_obj);
+                self.popups.show_or_replace(popup_obj);
             }
 
             Event::HidePopup => {
@@ -684,16 +730,69 @@ impl EditorState {
             Event::BulkEdit {
                 new_snapshot,
                 new_cursors,
+                edits,
+                displaced_markers,
                 ..
             } => {
                 // Restore the target buffer state (piece tree + buffers) for this event.
-                // - For original application: this is set after apply_events_as_bulk_edit
                 // - For undo: snapshots are swapped, so new_snapshot is the original state
                 // - For redo: new_snapshot is the state after edits
                 // Restoring buffers alongside the tree is critical because
                 // consolidate_after_save() can replace buffers between snapshot and restore.
                 if let Some(snapshot) = new_snapshot {
                     self.buffer.restore_buffer_state(snapshot);
+                }
+
+                // Replay marker adjustments from the edit list.
+                // For redo: same adjustments as the forward path.
+                // For undo: inverse() has swapped del/ins, so adjustments are reversed.
+                // Edits are in descending position order — process as-is so later
+                // positions are adjusted first (no cascading shift errors).
+                //
+                // For replacements (del > 0 AND ins > 0 at same position), we only
+                // adjust for the net delta to avoid the marker-at-boundary problem
+                // where sequential delete+insert pushes markers incorrectly.
+                for &(pos, del_len, ins_len) in edits {
+                    if del_len > 0 && ins_len > 0 {
+                        // Replacement: adjust by net delta only
+                        if ins_len > del_len {
+                            let net = ins_len - del_len;
+                            self.marker_list.adjust_for_insert(pos, net);
+                            self.margins.adjust_for_insert(pos, net);
+                        } else if del_len > ins_len {
+                            let net = del_len - ins_len;
+                            self.marker_list.adjust_for_delete(pos, net);
+                            self.margins.adjust_for_delete(pos, net);
+                        }
+                        // If equal: net delta 0, no adjustment needed
+                    } else if del_len > 0 {
+                        self.marker_list.adjust_for_delete(pos, del_len);
+                        self.margins.adjust_for_delete(pos, del_len);
+                    } else if ins_len > 0 {
+                        self.marker_list.adjust_for_insert(pos, ins_len);
+                        self.margins.adjust_for_insert(pos, ins_len);
+                    }
+                }
+
+                // Restore displaced markers to their original positions.
+                // This fixes markers that were inside a deleted range and collapsed
+                // to the deletion boundary — they're now moved back to their exact
+                // original positions after the text has been restored by undo.
+                if !displaced_markers.is_empty() {
+                    self.restore_displaced_markers(displaced_markers);
+                }
+
+                // Clear ephemeral decorations — their source systems will re-push
+                // correct positions after the edit notification.
+                self.virtual_texts.clear(&mut self.marker_list);
+
+                use crate::view::overlay::OverlayNamespace;
+                let namespaces = ["lsp-diagnostic", "reference-highlight", "bracket-highlight"];
+                for ns in &namespaces {
+                    self.overlays.clear_namespace(
+                        &OverlayNamespace::from_string(ns.to_string()),
+                        &mut self.marker_list,
+                    );
                 }
 
                 // Update cursor positions
@@ -714,6 +813,67 @@ impl EditorState {
                     Some(pos) => crate::model::buffer::LineNumber::Absolute(pos.line),
                     None => crate::model::buffer::LineNumber::Absolute(0),
                 };
+            }
+        }
+    }
+
+    /// Capture positions of markers strictly inside a deleted range.
+    /// Call this BEFORE applying the delete. Returns encoded displaced markers.
+    pub fn capture_displaced_markers(&self, range: &Range<usize>) -> Vec<(u64, usize)> {
+        let mut displaced = Vec::new();
+        if range.is_empty() {
+            return displaced;
+        }
+        for (marker_id, start, _end) in self.marker_list.query_range(range.start, range.end) {
+            if start > range.start && start < range.end {
+                displaced.push(
+                    DisplacedMarker::Main {
+                        id: marker_id.0,
+                        position: start,
+                    }
+                    .encode(),
+                );
+            }
+        }
+        for (marker_id, start, _end) in self.margins.query_indicator_range(range.start, range.end) {
+            if start > range.start && start < range.end {
+                displaced.push(
+                    DisplacedMarker::Margin {
+                        id: marker_id.0,
+                        position: start,
+                    }
+                    .encode(),
+                );
+            }
+        }
+        displaced
+    }
+
+    /// Capture displaced markers for multiple delete ranges (BulkEdit).
+    pub fn capture_displaced_markers_bulk(
+        &self,
+        edits: &[(usize, usize, String)],
+    ) -> Vec<(u64, usize)> {
+        let mut displaced = Vec::new();
+        for (pos, del_len, _text) in edits {
+            if *del_len > 0 {
+                displaced.extend(self.capture_displaced_markers(&(*pos..*pos + *del_len)));
+            }
+        }
+        displaced
+    }
+
+    /// Restore displaced markers to their exact original positions.
+    pub fn restore_displaced_markers(&mut self, displaced: &[(u64, usize)]) {
+        for &(tagged_id, original_pos) in displaced {
+            let dm = DisplacedMarker::decode(tagged_id, original_pos);
+            match dm {
+                DisplacedMarker::Main { id, position } => {
+                    self.marker_list.set_position(MarkerId(id), position);
+                }
+                DisplacedMarker::Margin { id, position } => {
+                    self.margins.set_indicator_position(MarkerId(id), position);
+                }
             }
         }
     }
@@ -757,22 +917,31 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
             color: Color::Rgb(color.0, color.1, color.2),
         },
         EventOverlayFace::Style { options } => {
+            use crate::view::theme::named_color_from_str;
             use ratatui::style::Modifier;
 
-            // Build fallback style from RGB values
+            // Build fallback style from RGB values or named colors
             let mut style = Style::default();
 
-            // Extract foreground color (RGB fallback or default white)
+            // Extract foreground color (RGB, named color, or default white)
             if let Some(ref fg) = options.fg {
                 if let Some((r, g, b)) = fg.as_rgb() {
                     style = style.fg(Color::Rgb(r, g, b));
+                } else if let Some(key) = fg.as_theme_key() {
+                    if let Some(color) = named_color_from_str(key) {
+                        style = style.fg(color);
+                    }
                 }
             }
 
-            // Extract background color (RGB fallback)
+            // Extract background color (RGB, named color, or fallback)
             if let Some(ref bg) = options.bg {
                 if let Some((r, g, b)) = bg.as_rgb() {
                     style = style.bg(Color::Rgb(r, g, b));
+                } else if let Some(key) = bg.as_theme_key() {
+                    if let Some(color) = named_color_from_str(key) {
+                        style = style.bg(color);
+                    }
                 }
             }
 
@@ -794,16 +963,18 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
                 style = style.add_modifier(modifiers);
             }
 
-            // Extract theme keys
+            // Extract theme keys (exclude recognized named colors, already resolved above)
             let fg_theme = options
                 .fg
                 .as_ref()
                 .and_then(|c| c.as_theme_key())
+                .filter(|key| named_color_from_str(key).is_none())
                 .map(String::from);
             let bg_theme = options
                 .bg
                 .as_ref()
                 .and_then(|c| c.as_theme_key())
+                .filter(|key| named_color_from_str(key).is_none())
                 .map(String::from);
 
             // If theme keys are provided, use ThemedStyle for runtime resolution
@@ -821,7 +992,7 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
 }
 
 /// Convert popup data to the actual popup object
-fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
+pub(crate) fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
     let content = match &data.content {
         crate::model::event::PopupContentData::Text(lines) => PopupContent::Text(lines.clone()),
         crate::model::event::PopupContentData::List { items, selected } => PopupContent::List {
@@ -868,6 +1039,7 @@ fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
         background_style: Style::default().bg(Color::Rgb(30, 30, 30)),
         scroll_offset: 0,
         text_selection: None,
+        accept_key_hint: None,
     }
 }
 

@@ -22,7 +22,7 @@ use crate::common::harness::EditorTestHarness;
 /// - Pull diagnostics (`textDocument/diagnostic`) return empty initially
 /// - After didChange: sends `workspace/diagnostic/refresh` then `publishDiagnostics`
 ///   with empty diagnostics (clearing the errors)
-fn create_ra_replay_server_script() -> std::path::PathBuf {
+fn create_ra_replay_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     // The publishDiagnostics payload is taken verbatim from the recording,
     // with the URI made dynamic (replaced at runtime with the actual file URI).
     let script = r##"#!/bin/bash
@@ -138,8 +138,10 @@ while true; do
             break
             ;;
         *)
-            # Respond to any other request with null result
-            if [ -n "$msg_id" ]; then
+            # Only respond to requests (which have both a method and an id).
+            # Skip responses (no method) — these are replies to our
+            # workspace/diagnostic/refresh server→client requests.
+            if [ -n "$method" ] && [ -n "$msg_id" ]; then
                 send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
             fi
             ;;
@@ -149,7 +151,7 @@ done
 echo "SERVER: exiting" >> "$LOG_FILE"
 "##;
 
-    let script_path = std::env::temp_dir().join("fake_ra_replay_server.sh");
+    let script_path = dir.join("fake_ra_replay_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write RA replay server script");
 
     #[cfg(unix)]
@@ -184,9 +186,8 @@ fn test_rust_analyzer_push_diagnostics_displayed() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_replay_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_replay_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_replay_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -197,7 +198,7 @@ fn test_rust_analyzer_push_diagnostics_displayed() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -206,7 +207,11 @@ fn test_rust_analyzer_push_diagnostics_displayed() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -274,9 +279,8 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_replay_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_replay_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_clear_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -287,7 +291,7 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -296,7 +300,11 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -327,7 +335,13 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
     harness.type_text("fn main() {\n    let x: i32 = 42;\n    println!(\"{}\", x);\n}\n")?;
     harness.render()?;
 
-    // Wait for the server to receive didChange and send cleared diagnostics
+    // Wait for the server to actually receive the didChange before expecting its response
+    harness.wait_until(|_| {
+        let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log.contains("ACTION: didChange")
+    })?;
+
+    // Wait for the server to send cleared diagnostics
     harness.wait_until(|_| {
         let log = std::fs::read_to_string(&log_file).unwrap_or_default();
         log.contains("SENT: publishDiagnostics with 0 diagnostics")
@@ -368,14 +382,13 @@ fn test_rust_analyzer_diagnostics_cleared_after_fix() -> anyhow::Result<()> {
 /// saves. Diagnostic state only changes on `didSave` events (matching how
 /// cargo check runs on save in real rust-analyzer):
 /// - After didOpen: sends initial error diagnostics (E0308)
-/// - After didChange: sends workspace/diagnostic/refresh only (no new push
-///   diagnostics — the errors come from cargo check, not live analysis)
+/// - After didChange: no diagnostics (cargo check only runs on save)
 /// - After didSave #1: re-sends error diagnostics (cargo check confirms error)
 /// - After didSave #2: sends cleared diagnostics (error was fixed before save)
 ///
 /// The diagnostic content uses actual rust-analyzer E0308 formatting recorded
 /// from rust-analyzer v1.92.0.
-fn create_ra_edit_save_server_script() -> std::path::PathBuf {
+fn create_ra_edit_save_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r##"#!/bin/bash
 
 # Fake LSP server for edit/save/edit/save flow testing
@@ -440,17 +453,15 @@ while true; do
             DID_OPEN_URI=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
             VERSION=1
             echo "ACTION: didOpen uri=$DID_OPEN_URI" >> "$LOG_FILE"
-            sleep 0.1
             send_error_diagnostics
             echo "SENT: publishDiagnostics with errors (initial)" >> "$LOG_FILE"
             ;;
         "textDocument/didChange")
             VERSION=$((VERSION + 1))
             echo "ACTION: didChange version=$VERSION" >> "$LOG_FILE"
-            # Like real RA: didChange triggers a workspace/diagnostic/refresh
-            # but does NOT trigger new publishDiagnostics (cargo check only runs on save)
-            send_message '{"jsonrpc":"2.0","id":3000,"method":"workspace/diagnostic/refresh","params":{}}'
-            echo "SENT: workspace/diagnostic/refresh (post-change)" >> "$LOG_FILE"
+            # No publishDiagnostics on didChange — cargo check only runs on save.
+            # (Avoids generating a workspace/diagnostic/refresh round-trip for
+            # every character typed, which overwhelms the slow dd-based reader.)
             ;;
         "textDocument/didSave")
             SAVE_COUNT=$((SAVE_COUNT + 1))
@@ -459,7 +470,6 @@ while true; do
             # On save, cargo check reruns and sends fresh diagnostics
             send_message '{"jsonrpc":"2.0","id":4000,"method":"workspace/diagnostic/refresh","params":{}}'
             echo "SENT: workspace/diagnostic/refresh (post-save)" >> "$LOG_FILE"
-            sleep 0.1
             # Save #1: error still present → re-send error diagnostics
             # Save #2: error was fixed → send cleared diagnostics
             if [ $SAVE_COUNT -le 1 ]; then
@@ -485,7 +495,10 @@ while true; do
             break
             ;;
         *)
-            if [ -n "$msg_id" ]; then
+            # Only respond to requests (which have both a method and an id).
+            # Skip responses (no method) — these are replies to our
+            # workspace/diagnostic/refresh server→client requests.
+            if [ -n "$method" ] && [ -n "$msg_id" ]; then
                 send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
             fi
             ;;
@@ -494,7 +507,7 @@ done
 echo "SERVER: exiting" >> "$LOG_FILE"
 "##;
 
-    let script_path = std::env::temp_dir().join("fake_ra_edit_save_server.sh");
+    let script_path = dir.join("fake_ra_edit_save_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write RA edit/save server script");
 
     #[cfg(unix)]
@@ -528,9 +541,8 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_edit_save_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_edit_save_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_edit_save_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -541,7 +553,7 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -550,7 +562,11 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -583,11 +599,7 @@ fn test_edit_save_edit_save_diagnostic_flow() -> anyhow::Result<()> {
     })?;
 
     // Diagnostics should persist (no cargo check has rerun, old diagnostics still active)
-    harness.process_async_and_render()?;
-    assert!(
-        harness.screen_to_string().contains("E:1"),
-        "Expected diagnostics to persist after editing (before save)"
-    );
+    harness.wait_until(|h| h.screen_to_string().contains("E:1"))?;
     eprintln!("[TEST] Step 2: After edit, diagnostics still visible (E:1)");
 
     // === Step 3: Save (cargo check reruns, error still present) ===
@@ -676,9 +688,8 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_ra_replay_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_ra_replay_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("ra_refresh_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(
@@ -689,7 +700,7 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -698,7 +709,11 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -750,11 +765,11 @@ fn test_workspace_diagnostic_refresh_handled() -> anyhow::Result<()> {
 /// Meanwhile, the editor continues sending didChange with newer versions.
 /// The editor should drop these stale diagnostics because the version is older
 /// than the current document version.
-fn create_stale_diagnostics_server_script() -> std::path::PathBuf {
+fn create_stale_diagnostics_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r##"#!/bin/bash
 
-# Fake LSP server that sends delayed, stale diagnostics
-# Simulates a slow LSP server responding to intermediate typing states
+# Fake LSP server that sends stale diagnostics
+# On the 2nd didChange, sends diagnostics tagged with the 1st didChange's version
 LOG_FILE="${1:-/tmp/fake_stale_diag_log.txt}"
 > "$LOG_FILE"
 
@@ -811,18 +826,20 @@ while true; do
             VERSION=$((VERSION + 1))
             echo "ACTION: didChange count=$CHANGE_COUNT version=$VERSION" >> "$LOG_FILE"
 
-            # On the first didChange (simulating "import " with no module name),
-            # delay and then send diagnostics with THIS version (which will be stale
-            # by the time they arrive because the editor keeps typing)
+            # On the first didChange, record the version as stale.
             if [ $CHANGE_COUNT -eq 1 ]; then
                 STALE_VERSION=$VERSION
-                echo "QUEUED: stale diagnostics for version=$STALE_VERSION (will delay)" >> "$LOG_FILE"
-                # Send stale diagnostics after a delay (in background)
-                (
-                    sleep 0.5
-                    send_message '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$DID_OPEN_URI"'","diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":7}},"severity":1,"code":"E999","source":"test","message":"STALE: Expected module name after import"}],"version":'"$STALE_VERSION"'}}'
-                    echo "SENT: stale publishDiagnostics version=$STALE_VERSION (delayed)" >> "$LOG_FILE"
-                ) &
+                echo "RECORDED: stale version=$STALE_VERSION" >> "$LOG_FILE"
+            fi
+
+            # On the second didChange, send diagnostics tagged with the stale
+            # version from the first change.  By now the document version is
+            # higher, so the editor should drop these as outdated.  Sending
+            # synchronously avoids the concurrent-stdout-write race that the
+            # previous background-subshell approach suffered from.
+            if [ $CHANGE_COUNT -eq 2 ]; then
+                send_message '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$DID_OPEN_URI"'","diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":7}},"severity":1,"code":"E999","source":"test","message":"STALE: Expected module name after import"}],"version":'"$STALE_VERSION"'}}'
+                echo "SENT: stale publishDiagnostics version=$STALE_VERSION" >> "$LOG_FILE"
             fi
             ;;
         "textDocument/diagnostic")
@@ -839,7 +856,10 @@ while true; do
             break
             ;;
         *)
-            if [ -n "$msg_id" ]; then
+            # Only respond to requests (which have both a method and an id).
+            # Skip responses (no method) — these are replies to our
+            # server→client requests.
+            if [ -n "$method" ] && [ -n "$msg_id" ]; then
                 send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
             fi
             ;;
@@ -848,7 +868,7 @@ done
 echo "SERVER: exiting" >> "$LOG_FILE"
 "##;
 
-    let script_path = std::env::temp_dir().join("fake_stale_diag_server.sh");
+    let script_path = dir.join("fake_stale_diag_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write stale diagnostics server script");
 
     #[cfg(unix)]
@@ -866,15 +886,15 @@ echo "SERVER: exiting" >> "$LOG_FILE"
 
 /// Test that stale diagnostics are dropped during rapid typing.
 ///
-/// Scenario: User types "import os" in a Python file. The LSP server is slow and
-/// sends diagnostics for "import " (version 2, missing module name) after the user
-/// has already typed "import os" (version 3+). The editor should drop the stale
+/// Scenario: User types "import os" in a Python file. The LSP server sends
+/// diagnostics tagged with version 2 (from the first didChange) while the editor
+/// has already moved on to version 3+. The editor should drop the stale
 /// diagnostics because version 2 < current version 3+.
 ///
 /// The fake server:
-/// 1. On first didChange: delays 500ms, then sends error diagnostics with version 2
-/// 2. Meanwhile the editor sends more didChange events (version 3, 4, ...)
-/// 3. When the delayed diagnostics arrive, they should be dropped (version 2 < current)
+/// 1. On 1st didChange: records the version (2) as stale
+/// 2. On 2nd didChange: sends error diagnostics with stale version 2
+/// 3. By then the editor's document version is 3+, so diagnostics are dropped
 /// 4. The screen should NOT show "E:1" because the stale diagnostics were filtered
 #[test]
 #[cfg_attr(target_os = "windows", ignore)]
@@ -883,9 +903,8 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_stale_diagnostics_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_stale_diagnostics_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("stale_diag_log.txt");
     let test_file = temp_dir.path().join("test.py");
     std::fs::write(&test_file, "")?;
@@ -893,7 +912,7 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "python".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -902,7 +921,11 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -923,9 +946,8 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
     })?;
 
     // Type rapidly: "import os" — each character triggers a didChange.
-    // The first didChange (after "i") triggers the server to queue stale
-    // diagnostics with version 2, delayed by 500ms.
-    // By the time those arrive, we'll have typed more characters (version 3+).
+    // On the 2nd didChange, the server sends diagnostics tagged with the
+    // 1st didChange's version, which is already stale.
     harness.type_text("import os")?;
     harness.render()?;
 
@@ -935,8 +957,7 @@ fn test_stale_diagnostics_dropped_during_rapid_typing() -> anyhow::Result<()> {
         log.contains("SENT: stale publishDiagnostics")
     })?;
 
-    // Give the editor a moment to process all async messages
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Process the stale diagnostics message that was already sent
     harness.process_async_and_render()?;
 
     let screen = harness.screen_to_string();

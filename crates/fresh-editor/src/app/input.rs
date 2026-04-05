@@ -109,13 +109,11 @@ impl Editor {
             context = self.get_key_context();
         }
 
-        // Only check buffer mode keybindings if we're not in a higher-priority context
-        // (Menu, Prompt, Popup should take precedence over mode bindings)
-        let should_check_mode_bindings = matches!(
-            context,
-            crate::input::keybindings::KeyContext::Normal
-                | crate::input::keybindings::KeyContext::FileExplorer
-        );
+        // Only check buffer mode keybindings when the editor buffer has focus.
+        // FileExplorer, Menu, Prompt, Popup contexts should not trigger mode bindings
+        // (e.g. markdown-source's Enter handler should not fire while the explorer is focused).
+        let should_check_mode_bindings =
+            matches!(context, crate::input::keybindings::KeyContext::Normal);
 
         if should_check_mode_bindings {
             // effective_mode() returns buffer-local mode if present, else global mode.
@@ -127,9 +125,13 @@ impl Editor {
                 let key_event = crossterm::event::KeyEvent::new(code, modifiers);
 
                 // Mode chord resolution (via KeybindingResolver)
-                let chord_result =
-                    self.keybindings
-                        .resolve_chord(&self.chord_state, &key_event, mode_ctx.clone());
+                let (chord_result, resolved_action) = {
+                    let keybindings = self.keybindings.read().unwrap();
+                    let chord_result =
+                        keybindings.resolve_chord(&self.chord_state, &key_event, mode_ctx.clone());
+                    let resolved = keybindings.resolve(&key_event, mode_ctx);
+                    (chord_result, resolved)
+                };
                 match chord_result {
                     crate::input::keybindings::ChordResolution::Complete(action) => {
                         tracing::debug!("Mode chord resolved to action: {:?}", action);
@@ -150,9 +152,8 @@ impl Editor {
                 }
 
                 // Mode single-key resolution (custom > keymap > plugin defaults)
-                let resolved = self.keybindings.resolve(&key_event, mode_ctx);
-                if resolved != Action::None {
-                    return self.handle_action(resolved);
+                if resolved_action != Action::None {
+                    return self.handle_action(resolved_action);
                 }
             }
 
@@ -198,9 +199,13 @@ impl Editor {
 
         // Check for chord sequence matches first
         let key_event = crossterm::event::KeyEvent::new(code, modifiers);
-        let chord_result =
-            self.keybindings
-                .resolve_chord(&self.chord_state, &key_event, context.clone());
+        let (chord_result, action) = {
+            let keybindings = self.keybindings.read().unwrap();
+            let chord_result =
+                keybindings.resolve_chord(&self.chord_state, &key_event, context.clone());
+            let action = keybindings.resolve(&key_event, context.clone());
+            (chord_result, action)
+        };
 
         match chord_result {
             crate::input::keybindings::ChordResolution::Complete(action) => {
@@ -224,9 +229,7 @@ impl Editor {
             }
         }
 
-        // Regular single-key resolution
-        let action = self.keybindings.resolve(&key_event, context.clone());
-
+        // Regular single-key resolution (already resolved above)
         tracing::trace!("Context: {:?} -> Action: {:?}", context, action);
 
         // Cancel pending LSP requests on user actions (except LSP actions themselves)
@@ -259,6 +262,11 @@ impl Editor {
         // Record action to macro if recording
         self.record_macro_action(&action);
 
+        // Reset dabbrev cycling session on any non-dabbrev action.
+        if !matches!(action, Action::DabbrevExpand) {
+            self.reset_dabbrev_state();
+        }
+
         match action {
             Action::Quit => self.quit(),
             Action::ForceQuit => {
@@ -282,8 +290,9 @@ impl Editor {
                         t!("file.file_changed_prompt").to_string(),
                         PromptType::ConfirmSaveConflict,
                     );
-                } else {
-                    self.save()?;
+                } else if let Err(e) = self.save() {
+                    let msg = format!("{}", e);
+                    self.status_message = Some(t!("file.save_failed", error = &msg).to_string());
                 }
             }
             Action::SaveAs => {
@@ -448,6 +457,7 @@ impl Editor {
             Action::YankWordBackward => self.yank_word_backward(),
             Action::YankToLineEnd => self.yank_to_line_end(),
             Action::YankToLineStart => self.yank_to_line_start(),
+            Action::YankViWordEnd => self.yank_vi_word_end(),
             Action::Undo => {
                 self.handle_undo();
             }
@@ -473,42 +483,15 @@ impl Editor {
                 self.clear_warnings();
             }
             Action::CommandPalette => {
-                // Toggle command palette: close if already open, otherwise open it
+                // CommandPalette now delegates to QuickOpen (which starts with ">" prefix
+                // for command mode). Toggle if already open.
                 if let Some(prompt) = &self.prompt {
-                    if prompt.prompt_type == PromptType::Command {
+                    if prompt.prompt_type == PromptType::QuickOpen {
                         self.cancel_prompt();
                         return Ok(());
                     }
                 }
-
-                // Use the current context for filtering commands
-                let active_buffer_mode = self
-                    .buffer_metadata
-                    .get(&self.active_buffer())
-                    .and_then(|m| m.virtual_mode());
-                let has_lsp_config = {
-                    let language = self
-                        .buffers
-                        .get(&self.active_buffer())
-                        .map(|s| s.language.as_str());
-                    language
-                        .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
-                        .is_some()
-                };
-                let suggestions = self.command_registry.read().unwrap().filter(
-                    "",
-                    self.key_context.clone(),
-                    &self.keybindings,
-                    self.has_active_selection(),
-                    &self.active_custom_contexts,
-                    active_buffer_mode,
-                    has_lsp_config,
-                );
-                self.start_prompt_with_suggestions(
-                    t!("file.command_prompt").to_string(),
-                    PromptType::Command,
-                    suggestions,
-                );
+                self.start_quick_open();
             }
             Action::QuickOpen => {
                 // Toggle Quick Open: close if already open, otherwise open it
@@ -525,10 +508,21 @@ impl Editor {
             Action::ToggleLineWrap => {
                 self.config.editor.line_wrap = !self.config.editor.line_wrap;
 
-                // Update all viewports to reflect the new line wrap setting
-                for view_state in self.split_view_states.values_mut() {
-                    view_state.viewport.line_wrap_enabled = self.config.editor.line_wrap;
-                    view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                // Update all viewports to reflect the new line wrap setting,
+                // respecting per-language overrides
+                let leaf_ids: Vec<_> = self.split_view_states.keys().copied().collect();
+                for leaf_id in leaf_ids {
+                    let buffer_id = self
+                        .split_manager
+                        .get_buffer_id(leaf_id.into())
+                        .unwrap_or(BufferId(0));
+                    let effective_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+                    let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
+                    if let Some(view_state) = self.split_view_states.get_mut(&leaf_id) {
+                        view_state.viewport.line_wrap_enabled = effective_wrap;
+                        view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                        view_state.viewport.wrap_column = wrap_column;
+                    }
                 }
 
                 let state = if self.config.editor.line_wrap {
@@ -537,6 +531,28 @@ impl Editor {
                     t!("view.state_disabled").to_string()
                 };
                 self.set_status_message(t!("view.line_wrap_state", state = state).to_string());
+            }
+            Action::ToggleCurrentLineHighlight => {
+                self.config.editor.highlight_current_line =
+                    !self.config.editor.highlight_current_line;
+
+                // Update all splits
+                let leaf_ids: Vec<_> = self.split_view_states.keys().copied().collect();
+                for leaf_id in leaf_ids {
+                    if let Some(view_state) = self.split_view_states.get_mut(&leaf_id) {
+                        view_state.highlight_current_line =
+                            self.config.editor.highlight_current_line;
+                    }
+                }
+
+                let state = if self.config.editor.highlight_current_line {
+                    t!("view.state_enabled").to_string()
+                } else {
+                    t!("view.state_disabled").to_string()
+                };
+                self.set_status_message(
+                    t!("view.current_line_highlight_state", state = state).to_string(),
+                );
             }
             Action::ToggleReadOnly => {
                 let buffer_id = self.active_buffer();
@@ -554,10 +570,10 @@ impl Editor {
                 };
                 self.set_status_message(t!("view.read_only_state", state = state_str).to_string());
             }
-            Action::ToggleComposeMode => {
-                self.handle_toggle_compose_mode();
+            Action::TogglePageView => {
+                self.handle_toggle_page_view();
             }
-            Action::SetComposeWidth => {
+            Action::SetPageWidth => {
                 let active_split = self.split_manager.active_split();
                 let current = self
                     .split_view_states
@@ -565,8 +581,8 @@ impl Editor {
                     .and_then(|v| v.compose_width.map(|w| w.to_string()))
                     .unwrap_or_default();
                 self.start_prompt_with_initial_text(
-                    "Compose width (empty = viewport): ".to_string(),
-                    PromptType::SetComposeWidth,
+                    "Page width (empty = viewport): ".to_string(),
+                    PromptType::SetPageWidth,
                     current,
                 );
             }
@@ -597,6 +613,9 @@ impl Editor {
             }
             Action::LspCompletion => {
                 self.request_completion();
+            }
+            Action::DabbrevExpand => {
+                self.dabbrev_expand();
             }
             Action::LspGotoDefinition => {
                 self.request_goto_definition()?;
@@ -740,6 +759,7 @@ impl Editor {
             Action::ToggleMenuBar => self.toggle_menu_bar(),
             Action::ToggleTabBar => self.toggle_tab_bar(),
             Action::ToggleStatusBar => self.toggle_status_bar(),
+            Action::TogglePromptLine => self.toggle_prompt_line(),
             Action::ToggleVerticalScrollbar => self.toggle_vertical_scrollbar(),
             Action::ToggleHorizontalScrollbar => self.toggle_horizontal_scrollbar(),
             Action::ToggleLineNumbers => self.toggle_line_numbers(),
@@ -866,7 +886,9 @@ impl Editor {
                 }
             }
             Action::MenuOpen(menu_name) => {
-                self.handle_menu_open(&menu_name);
+                if self.config.editor.menu_bar_mnemonics {
+                    self.handle_menu_open(&menu_name);
+                }
             }
 
             Action::SwitchKeybindingMap(map_name) => {
@@ -880,7 +902,7 @@ impl Editor {
                     self.config.active_keybinding_map = map_name.clone().into();
 
                     // Reload the keybinding resolver with the new map
-                    self.keybindings =
+                    *self.keybindings.write().unwrap() =
                         crate::input::keybindings::KeybindingResolver::new(&self.config);
 
                     self.set_status_message(
@@ -1250,6 +1272,11 @@ impl Editor {
                     state.reset_current_to_default();
                 }
             }
+            Action::SettingsInherit => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.set_current_to_null();
+                }
+            }
             Action::SettingsToggleFocus => {
                 if let Some(ref mut state) = self.settings_state {
                     state.toggle_focus();
@@ -1437,10 +1464,11 @@ impl Editor {
             }
         }
 
-        // Otherwise, scroll the editor in the active split
-        // Use SplitViewState's viewport (View events go to SplitViewState, not EditorState)
-        let active_split = self.split_manager.active_split();
-        let buffer_id = self.active_buffer();
+        // Scroll the split under the mouse pointer (not necessarily the focused split).
+        // Fall back to the active split if the pointer isn't over any split area.
+        let (target_split, buffer_id) = self
+            .split_at_position(col, row)
+            .unwrap_or_else(|| (self.split_manager.active_split(), self.active_buffer()));
 
         // Check if this is a composite buffer - if so, use composite scroll
         if self.is_composite_buffer(buffer_id) {
@@ -1451,7 +1479,7 @@ impl Editor {
                 .unwrap_or(0);
             if let Some(view_state) = self
                 .composite_view_states
-                .get_mut(&(active_split, buffer_id))
+                .get_mut(&(target_split, buffer_id))
             {
                 view_state.scroll(delta as isize, max_row);
                 tracing::trace!(
@@ -1466,13 +1494,13 @@ impl Editor {
         // Get view_transform tokens from SplitViewState (if any)
         let view_transform_tokens = self
             .split_view_states
-            .get(&active_split)
+            .get(&target_split)
             .and_then(|vs| vs.view_transform.as_ref())
             .map(|vt| vt.tokens.clone());
 
         // Get mutable references to both buffer state and view state
         let state = self.buffers.get_mut(&buffer_id);
-        let view_state = self.split_view_states.get_mut(&active_split);
+        let view_state = self.split_view_states.get_mut(&target_split);
 
         if let (Some(state), Some(view_state)) = (state, view_state) {
             let buffer = &mut state.buffer;
@@ -1536,13 +1564,16 @@ impl Editor {
     /// Handle horizontal scroll (Shift+ScrollWheel or native ScrollLeft/ScrollRight)
     pub(super) fn handle_horizontal_scroll(
         &mut self,
-        _col: u16,
-        _row: u16,
+        col: u16,
+        row: u16,
         delta: i32,
     ) -> AnyhowResult<()> {
-        let active_split = self.split_manager.active_split();
+        let target_split = self
+            .split_at_position(col, row)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| self.split_manager.active_split());
 
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
+        if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             // Don't scroll horizontally when line wrap is enabled
             if view_state.viewport.line_wrap_enabled {
                 return Ok(());
@@ -2169,6 +2200,7 @@ impl Editor {
     /// Calculate scroll position for visual-row-aware scrollbar drag.
     /// The thumb follows the mouse position, accounting for where on the thumb the user clicked.
     /// Returns (byte_position, view_line_offset) for proper positioning within wrapped lines.
+    #[allow(clippy::too_many_arguments)]
     fn calculate_scrollbar_drag_relative_visual(
         buffer: &mut crate::model::buffer::Buffer,
         current_row: u16,
@@ -2279,6 +2311,7 @@ impl Editor {
     /// applied here when converting screen coordinates.
     ///
     /// Returns None if the position cannot be determined (e.g., click in gutter for click handler)
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn screen_to_buffer_position(
         col: u16,
         row: u16,
@@ -2971,7 +3004,24 @@ impl Editor {
 
     /// Start the language selection prompt
     fn start_set_language_prompt(&mut self) {
+        use crate::input::commands::CommandSource;
+
         let current_language = self.active_state().language.clone();
+
+        // Build a reverse map from syntect display name -> (config key, source label)
+        // so we can show extra columns in the language selector popup.
+        let mut syntax_to_config: std::collections::HashMap<String, (String, &str)> =
+            std::collections::HashMap::new();
+        for (lang_id, lang_config) in &self.config.languages {
+            if let Some(syntax) = self
+                .grammar_registry
+                .find_syntax_for_lang_config(lang_config)
+            {
+                syntax_to_config
+                    .entry(syntax.name.clone())
+                    .or_insert((lang_id.clone(), "config"));
+            }
+        }
 
         // Build suggestions from all available syntect syntaxes + Plain Text option
         let mut suggestions: Vec<crate::input::commands::Suggestion> = vec![
@@ -2985,42 +3035,93 @@ impl Editor {
                 },
                 value: Some("Plain Text".to_string()),
                 disabled: false,
-                keybinding: None,
-                source: None,
+                keybinding: Some("text".to_string()),
+                source: Some(CommandSource::Builtin),
             },
         ];
 
-        // Add all available syntaxes from the grammar registry (100+ languages)
-        let mut syntax_names: Vec<&str> = self.grammar_registry.available_syntaxes();
-        // Sort alphabetically for easier navigation
-        syntax_names.sort_unstable_by_key(|a| a.to_lowercase());
+        // Entries: (display_name, config_key, source, value_for_selection)
+        // display_name = syntect syntax name or config lang_id
+        // config_key = the key from config.json languages section (if any)
+        // source = "config" or "builtin"
+        struct LangEntry {
+            display_name: String,
+            config_key: String,
+            source: &'static str,
+        }
 
-        let mut current_index_found = None;
-        for syntax_name in syntax_names {
-            // Skip "Plain Text" as we already added it at the top
+        let mut entries: Vec<LangEntry> = Vec::new();
+
+        // Add all available syntaxes from the grammar registry
+        for syntax_name in self.grammar_registry.available_syntaxes() {
             if syntax_name == "Plain Text" {
                 continue;
             }
-            // Resolve the syntect display name to the canonical config language
-            // ID so we can compare against state.language (which is always a
-            // config key, e.g. "rust" not "Rust").
-            let is_current = self
-                .resolve_language_id(syntax_name)
-                .is_some_and(|id| id == current_language);
+            let (config_key, source) = syntax_to_config
+                .get(syntax_name)
+                .map(|(k, s)| (k.clone(), *s))
+                .unwrap_or_else(|| (syntax_name.to_lowercase(), "builtin"));
+            entries.push(LangEntry {
+                display_name: syntax_name.to_string(),
+                config_key,
+                source,
+            });
+        }
+
+        // Add user-configured languages that don't have a matching syntect grammar
+        let entry_names_lower: std::collections::HashSet<String> = entries
+            .iter()
+            .map(|e| e.display_name.to_lowercase())
+            .collect();
+        for (lang_id, lang_config) in &self.config.languages {
+            let has_grammar = !lang_config.grammar.is_empty()
+                && self
+                    .grammar_registry
+                    .find_syntax_by_name(&lang_config.grammar)
+                    .is_some();
+            if !has_grammar && !entry_names_lower.contains(&lang_id.to_lowercase()) {
+                entries.push(LangEntry {
+                    display_name: lang_id.clone(),
+                    config_key: lang_id.clone(),
+                    source: "config",
+                });
+            }
+        }
+
+        // Sort alphabetically for easier navigation
+        entries.sort_unstable_by(|a, b| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        });
+
+        let mut current_index_found = None;
+        for entry in &entries {
+            let is_current =
+                entry.config_key == current_language || entry.display_name == current_language;
             if is_current {
                 current_index_found = Some(suggestions.len());
             }
+
+            let description = if is_current {
+                format!("{} (current)", entry.config_key)
+            } else {
+                entry.config_key.clone()
+            };
+
+            let source = if entry.source == "config" {
+                Some(CommandSource::Plugin("config".to_string()))
+            } else {
+                Some(CommandSource::Builtin)
+            };
+
             suggestions.push(crate::input::commands::Suggestion {
-                text: syntax_name.to_string(),
-                description: if is_current {
-                    Some("current".to_string())
-                } else {
-                    None
-                },
-                value: Some(syntax_name.to_string()),
+                text: entry.display_name.clone(),
+                description: Some(description),
+                value: Some(entry.display_name.clone()),
                 disabled: false,
                 keybinding: None,
-                source: None,
+                source,
             });
         }
 
@@ -3045,28 +3146,33 @@ impl Editor {
     /// Start the theme selection prompt with available themes
     fn start_select_theme_prompt(&mut self) {
         let available_themes = self.theme_registry.list();
-        let current_theme_name = &self.theme.name;
+        let current_theme_key = &self.config.theme.0;
 
-        // Find the index of the current theme
+        // Find the index of the current theme (match by key first, then name)
         let current_index = available_themes
             .iter()
-            .position(|info| info.name == *current_theme_name)
+            .position(|info| info.key == *current_theme_key)
+            .or_else(|| {
+                let normalized = crate::view::theme::normalize_theme_name(current_theme_key);
+                available_themes.iter().position(|info| {
+                    crate::view::theme::normalize_theme_name(&info.name) == normalized
+                })
+            })
             .unwrap_or(0);
 
         let suggestions: Vec<crate::input::commands::Suggestion> = available_themes
             .iter()
             .map(|info| {
-                let is_current = info.name == *current_theme_name;
-                let description = match (is_current, info.pack.is_empty()) {
-                    (true, true) => Some("(current)".to_string()),
-                    (true, false) => Some(format!("{} (current)", info.pack)),
-                    (false, true) => None,
-                    (false, false) => Some(info.pack.clone()),
+                let is_current = Some(info) == available_themes.get(current_index);
+                let description = if is_current {
+                    Some(format!("{} (current)", info.key))
+                } else {
+                    Some(info.key.clone())
                 };
                 crate::input::commands::Suggestion {
                     text: info.name.clone(),
                     description,
-                    value: Some(info.name.clone()),
+                    value: Some(info.key.clone()),
                     disabled: false,
                     keybinding: None,
                     source: None,
@@ -3077,7 +3183,7 @@ impl Editor {
         self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
             "Select theme: ".to_string(),
             PromptType::SelectTheme {
-                original_theme: current_theme_name.clone(),
+                original_theme: current_theme_key.clone(),
             },
             suggestions,
         ));
@@ -3085,27 +3191,39 @@ impl Editor {
         if let Some(prompt) = self.prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
                 prompt.selected_suggestion = Some(current_index);
-                // Also set input to match selected theme
-                prompt.input = current_theme_name.to_string();
+                // Set input to match selected theme key
+                if let Some(suggestion) = prompt.suggestions.get(current_index) {
+                    prompt.input = suggestion.get_value().to_string();
+                } else {
+                    prompt.input = current_theme_key.to_string();
+                }
                 prompt.cursor_pos = prompt.input.len();
             }
         }
     }
 
-    /// Apply a theme by name and persist it to config
-    pub(super) fn apply_theme(&mut self, theme_name: &str) {
-        if !theme_name.is_empty() {
-            if let Some(theme) = self.theme_registry.get_cloned(theme_name) {
+    /// Apply a theme by key (or name for backward compat) and persist to config
+    pub(super) fn apply_theme(&mut self, key_or_name: &str) {
+        if !key_or_name.is_empty() {
+            if let Some(theme) = self.theme_registry.get_cloned(key_or_name) {
                 self.theme = theme;
 
                 // Set terminal cursor color to match theme
                 self.theme.set_terminal_cursor_color();
 
-                // Update the config in memory using the normalized registry key,
-                // not the JSON name field, so that the config value can be looked
-                // up in the registry on restart (fixes #1001).
-                let normalized = crate::view::theme::normalize_theme_name(theme_name);
-                self.config.theme = normalized.into();
+                // Re-apply all overlays so colors match the new theme
+                // (diagnostic and semantic token overlays bake RGB at creation time).
+                self.reapply_all_overlays();
+
+                // Resolve to the canonical registry key so that subsequent
+                // lookups (plugins, restart) use the exact key, not a name
+                // that might be ambiguous.
+                let resolved = self
+                    .theme_registry
+                    .resolve_key(key_or_name)
+                    .unwrap_or(key_or_name)
+                    .to_string();
+                self.config.theme = resolved.into();
 
                 // Persist to config file
                 self.save_theme_to_config();
@@ -3114,18 +3232,64 @@ impl Editor {
                     t!("view.theme_changed", theme = self.theme.name.clone()).to_string(),
                 );
             } else {
-                self.set_status_message(format!("Theme '{}' not found", theme_name));
+                self.set_status_message(format!("Theme '{}' not found", key_or_name));
             }
         }
     }
 
-    /// Preview a theme by name (without persisting to config)
+    /// Re-apply all stored diagnostics and semantic tokens with the current
+    /// theme colors. Both overlay types bake RGB values at creation time, so
+    /// they must be rebuilt when the theme changes.
+    fn reapply_all_overlays(&mut self) {
+        // --- Diagnostics ---
+        crate::services::lsp::diagnostics::invalidate_cache_all();
+        let entries: Vec<(String, Vec<lsp_types::Diagnostic>)> = self
+            .stored_diagnostics
+            .iter()
+            .map(|(uri, diags)| (uri.clone(), diags.clone()))
+            .collect();
+        for (uri, diagnostics) in entries {
+            if let Some(buffer_id) = self.find_buffer_by_uri(&uri) {
+                if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                    crate::services::lsp::diagnostics::apply_diagnostics_to_state_cached(
+                        state,
+                        &diagnostics,
+                        &self.theme,
+                    );
+                }
+            }
+        }
+
+        // --- Semantic tokens ---
+        let buffer_ids: Vec<_> = self.buffers.keys().cloned().collect();
+        for buffer_id in buffer_ids {
+            let tokens = self
+                .buffers
+                .get(&buffer_id)
+                .and_then(|s| s.semantic_tokens.as_ref())
+                .map(|store| store.tokens.clone());
+            if let Some(tokens) = tokens {
+                if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                    crate::services::lsp::semantic_tokens::apply_semantic_tokens_to_state(
+                        state,
+                        &tokens,
+                        &self.theme,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Preview a theme by key or name (without persisting to config)
     /// Used for live preview when navigating theme selection
-    pub(super) fn preview_theme(&mut self, theme_name: &str) {
-        if !theme_name.is_empty() && theme_name != self.theme.name {
-            if let Some(theme) = self.theme_registry.get_cloned(theme_name) {
-                self.theme = theme;
-                self.theme.set_terminal_cursor_color();
+    pub(super) fn preview_theme(&mut self, key_or_name: &str) {
+        if !key_or_name.is_empty() {
+            if let Some(theme) = self.theme_registry.get_cloned(key_or_name) {
+                if theme.name != self.theme.name {
+                    self.theme = theme;
+                    self.theme.set_terminal_cursor_color();
+                    self.reapply_all_overlays();
+                }
             }
         }
     }
@@ -3248,7 +3412,8 @@ impl Editor {
             self.config.active_keybinding_map = map_name.to_string().into();
 
             // Reload the keybinding resolver with the new map
-            self.keybindings = crate::input::keybindings::KeybindingResolver::new(&self.config);
+            *self.keybindings.write().unwrap() =
+                crate::input::keybindings::KeybindingResolver::new(&self.config);
 
             // Persist to config file
             self.save_keybinding_map_to_config();
@@ -3785,8 +3950,7 @@ impl Editor {
             } else {
                 // Single cursor - apply normally
                 for event in events {
-                    self.active_event_log_mut().append(event.clone());
-                    self.apply_event_to_active_buffer(&event);
+                    self.log_and_apply_event(&event);
                     self.track_cursor_movement(&event);
                 }
             }

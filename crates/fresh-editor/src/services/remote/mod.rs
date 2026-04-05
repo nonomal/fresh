@@ -17,10 +17,14 @@ pub use channel::TEST_RECV_DELAY_US;
 /// Re-export for integration tests - spawns a local agent without SSH
 #[doc(hidden)]
 pub use connection::spawn_local_agent;
+/// Spawns a local agent and returns raw reader/writer for reconnection testing.
+#[doc(hidden)]
+pub use connection::spawn_local_agent_transport;
 /// Like `spawn_local_agent` but with a custom data channel capacity.
 #[doc(hidden)]
 pub use connection::spawn_local_agent_with_capacity;
-pub use connection::{ConnectionParams, SshConnection};
+pub use connection::{spawn_reconnect_task, spawn_reconnect_task_with, ReconnectConfig};
+pub use connection::{ConnectionParams, SshConnection, SshError};
 pub use filesystem::RemoteFileSystem;
 pub use protocol::{
     decode_base64, encode_base64, ls_params, read_params, stat_params, sudo_write_params,

@@ -64,6 +64,14 @@ const state: ViState = {
   visualBlockAnchor: null,
 };
 
+// Safe getBufferText that clamps end to buffer length
+async function safeGetBufferText(bufferId: number, start: number, end: number): Promise<string | null> {
+  const bufLen = editor.getBufferLength(bufferId);
+  const clampedEnd = Math.min(end, bufLen);
+  if (clampedEnd <= start) return null;
+  return editor.getBufferText(bufferId, start, clampedEnd);
+}
+
 // Mode indicator for status bar
 function getModeIndicator(mode: ViMode): string {
   const countPrefix = state.count !== null ? `${state.count} ` : "";
@@ -179,7 +187,11 @@ function getCount(): number {
 // Returns the count (defaults to 1)
 function consumeCount(): number {
   const count = state.count ?? 1;
-  state.count = null;
+  if (state.count !== null) {
+    state.count = null;
+    // Update status to clear the count display
+    editor.setStatus(getModeIndicator(state.mode));
+  }
   return count;
 }
 
@@ -212,6 +224,7 @@ const motionToSelection: Record<string, string> = {
   move_down: "select_down",
   move_word_left: "select_word_left",
   move_word_right: "select_word_right",
+  vi_move_word_end: "vi_select_word_end",
   move_line_start: "select_line_start",
   move_line_end: "select_line_end",
   move_document_start: "select_document_start",
@@ -227,6 +240,7 @@ const atomicOperatorActions: OperatorMotionMap = {
     // Delete operators
     move_word_right: "delete_word_forward",
     move_word_left: "delete_word_backward",
+    vi_move_word_end: "delete_vi_word_end",
     move_line_end: "delete_to_line_end",
     move_line_start: "delete_to_line_start",
   },
@@ -234,6 +248,7 @@ const atomicOperatorActions: OperatorMotionMap = {
     // Yank operators
     move_word_right: "yank_word_forward",
     move_word_left: "yank_word_backward",
+    vi_move_word_end: "yank_vi_word_end",
     move_line_end: "yank_to_line_end",
     move_line_start: "yank_to_line_start",
   },
@@ -325,7 +340,8 @@ function handleMotionWithOperator(motionAction: string): void {
 
 // Navigation (all support count prefix, e.g., 5j moves down 5 lines)
 function vi_left() : void {
-  executeWithCount("move_left");
+  // h — line-bounded move left (vim doesn't wrap across lines)
+  executeWithCount("move_left_in_line");
 }
 registerHandler("vi_left", vi_left);
 
@@ -340,7 +356,8 @@ function vi_up() : void {
 registerHandler("vi_up", vi_up);
 
 function vi_right() : void {
-  executeWithCount("move_right");
+  // l — line-bounded move right (vim doesn't wrap across lines)
+  executeWithCount("move_right_in_line");
 }
 registerHandler("vi_right", vi_right);
 
@@ -355,12 +372,8 @@ function vi_word_back() : void {
 registerHandler("vi_word_back", vi_word_back);
 
 function vi_word_end() : void {
-  // Move to end of word - for count, repeat the whole operation
-  const count = consumeCount();
-  for (let i = 0; i < count; i++) {
-    editor.executeAction("move_word_right");
-    editor.executeAction("move_left");
-  }
+  // Vim 'e' motion — uses native vi_move_word_end action
+  executeWithCount("vi_move_word_end");
 }
 registerHandler("vi_word_end", vi_word_end);
 
@@ -373,13 +386,36 @@ registerHandler("vi_line_start", vi_line_start);
 function vi_line_end() : void {
   consumeCount(); // Count doesn't apply to line end
   editor.executeAction("move_line_end");
+  // In vim normal mode, cursor should be ON the last char, not past it
+  // move_line_end goes past the last char; move_left corrects this
+  editor.executeAction("move_left");
 }
 registerHandler("vi_line_end", vi_line_end);
 
-function vi_first_non_blank() : void {
+async function vi_first_non_blank() : Promise<void> {
   consumeCount(); // Count doesn't apply
-  editor.executeAction("move_line_start");
-  // TODO: skip whitespace
+  // Get line start position directly (avoids stale snapshot from executeAction)
+  const line = editor.getCursorLine();
+  const bufferId = editor.getActiveBufferId();
+  const lineStart = await editor.getLineStartPosition(line);
+  if (lineStart === null) {
+    editor.executeAction("move_line_start");
+    return;
+  }
+  const text = await safeGetBufferText(bufferId, lineStart, lineStart + 200);
+  if (text) {
+    let offset = 0;
+    while (offset < text.length && (text[offset] === ' ' || text[offset] === '\t')) {
+      offset++;
+    }
+    if (offset < text.length && text[offset] !== '\n' && text[offset] !== '\r') {
+      editor.setBufferCursor(bufferId, lineStart + offset);
+    } else {
+      editor.setBufferCursor(bufferId, lineStart);
+    }
+  } else {
+    editor.executeAction("move_line_start");
+  }
 }
 registerHandler("vi_first_non_blank", vi_first_non_blank);
 
@@ -390,8 +426,22 @@ function vi_doc_start() : void {
 registerHandler("vi_doc_start", vi_doc_start);
 
 function vi_doc_end() : void {
-  consumeCount(); // Count doesn't apply
-  editor.executeAction("move_document_end");
+  const count = state.count;
+  consumeCount();
+  if (count !== null) {
+    // nG = go to line n (1-indexed; goto_line expects 0-indexed internally)
+    // Use setBufferCursor to move to line start via getLineStartPosition
+    const line = count - 1; // Convert to 0-indexed
+    editor.getLineStartPosition(line).then((pos) => {
+      if (pos !== null) {
+        editor.setBufferCursor(editor.getActiveBufferId(), pos);
+      }
+    });
+  } else {
+    editor.executeAction("move_document_end");
+  }
+  // Update status to clear any count display
+  editor.setStatus(getModeIndicator(state.mode));
 }
 registerHandler("vi_doc_end", vi_doc_end);
 
@@ -489,13 +539,10 @@ registerHandler("vi_delete_line", vi_delete_line);
 function vi_change_line() : void {
   const count = consumeCount();
   state.lastChange = { type: "line-op", action: "change_line", count };
+  // Select from line start to line end, then cut (avoids stale snapshot issue)
   editor.executeAction("move_line_start");
-  const start = editor.getCursorPosition();
-  editor.executeAction("move_line_end");
-  const end = editor.getCursorPosition();
-  if (start !== null && end !== null) {
-    editor.deleteRange(editor.getActiveBufferId(), start, end);
-  }
+  editor.executeAction("select_line_end");
+  editor.executeAction("cut");
   switchMode("insert");
 }
 registerHandler("vi_change_line", vi_change_line);
@@ -535,10 +582,26 @@ function vi_delete_char_before() : void {
 registerHandler("vi_delete_char_before", vi_delete_char_before);
 
 function vi_replace_char() : void {
-  // TODO: implement character replacement (need to read next char)
-  editor.setStatus(editor.t("status.replace_not_implemented"));
+  // Enter replace-char mode to read the replacement character
+  state.mode = "find-char"; // Reuse find-char mode mechanism
+  editor.setEditorMode("vi-replace-char");
+  editor.setStatus("-- REPLACE CHAR --");
 }
 registerHandler("vi_replace_char", vi_replace_char);
+
+// Handler for replacement character input
+async function vi_replace_char_handler(char: string): Promise<void> {
+  const count = consumeCount();
+  // Replace character(s) under cursor without moving
+  for (let i = 0; i < count; i++) {
+    editor.executeAction("delete_forward");
+    editor.insertAtCursor(char);
+  }
+  // Move cursor back to stay on the replaced char (vim behavior)
+  editor.executeAction("move_left");
+  switchMode("normal");
+}
+registerHandler("vi_replace_char_handler", vi_replace_char_handler);
 
 // Substitute (delete char and enter insert mode)
 function vi_substitute() : void {
@@ -553,27 +616,19 @@ function vi_substitute() : void {
 }
 registerHandler("vi_substitute", vi_substitute);
 
-// Delete to end of line
+// Delete to end of line (D)
 function vi_delete_to_end() : void {
   state.lastChange = { type: "operator-motion", operator: "d", motion: "move_line_end" };
-  const start = editor.getCursorPosition();
-  editor.executeAction("move_line_end");
-  const end = editor.getCursorPosition();
-  if (start !== null && end !== null && end > start) {
-    editor.deleteRange(editor.getActiveBufferId(), start, end);
-  }
+  // Use the atomic delete_to_line_end action to avoid stale snapshot issues
+  editor.executeAction("delete_to_line_end");
 }
 registerHandler("vi_delete_to_end", vi_delete_to_end);
 
-// Change to end of line
+// Change to end of line (C)
 function vi_change_to_end() : void {
   state.lastChange = { type: "operator-motion", operator: "c", motion: "move_line_end" };
-  const start = editor.getCursorPosition();
-  editor.executeAction("move_line_end");
-  const end = editor.getCursorPosition();
-  if (start !== null && end !== null && end > start) {
-    editor.deleteRange(editor.getActiveBufferId(), start, end);
-  }
+  // Use the atomic delete_to_line_end action to avoid stale snapshot issues
+  editor.executeAction("delete_to_line_end");
   switchMode("insert");
 }
 registerHandler("vi_change_to_end", vi_change_to_end);
@@ -665,14 +720,10 @@ async function vi_repeat() : Promise<void> {
           editor.executeAction("delete_line");
         }
       } else if (change.action === "change_line") {
-        // Change line: delete line content and insert text
+        // Change line: select line content, cut, insert text
         editor.executeAction("move_line_start");
-        const start = editor.getCursorPosition();
-        editor.executeAction("move_line_end");
-        const end = editor.getCursorPosition();
-        if (start !== null && end !== null) {
-          editor.deleteRange(editor.getActiveBufferId(), start, end);
-        }
+        editor.executeAction("select_line_end");
+        editor.executeAction("cut");
         if (change.insertedText) {
           editor.insertAtCursor(change.insertedText);
         }
@@ -721,13 +772,21 @@ async function vi_repeat() : Promise<void> {
 }
 registerHandler("vi_repeat", vi_repeat);
 
-// Join lines
+// Join lines — delete newline at end of current line and insert a space
 function vi_join() : void {
   editor.executeAction("move_line_end");
+  // Delete the newline character
   editor.executeAction("delete_forward");
-  editor.executeAction("insert_text_at_cursor");
+  // Insert a space between the joined content
+  editor.insertAtCursor(" ");
 }
 registerHandler("vi_join", vi_join);
+
+// Toggle case (~) — uses native toggle_case action
+function vi_toggle_case() : void {
+  executeWithCount("toggle_case");
+}
+registerHandler("vi_toggle_case", vi_toggle_case);
 
 // Search
 function vi_search_forward() : void {
@@ -822,7 +881,9 @@ registerHandler("vi_op_digit_0_or_line_start", vi_op_digit_0_or_line_start);
 // Enter character-wise visual mode
 function vi_visual_char() : void {
   state.visualAnchor = editor.getCursorPosition();
-  // Select current character to start visual selection
+  // Select the character under cursor to establish the anchor.
+  // This moves cursor one position right (the selection end), which is
+  // standard visual mode behavior — the first char is part of the selection.
   editor.executeAction("select_right");
   switchMode("visual");
 }
@@ -831,8 +892,7 @@ registerHandler("vi_visual_char", vi_visual_char);
 // Enter line-wise visual mode
 function vi_visual_line() : void {
   state.visualAnchor = editor.getCursorPosition();
-  // Select current line
-  editor.executeAction("move_line_start");
+  // Select full line including newline (select_line selects and moves to next line)
   editor.executeAction("select_line");
   switchMode("visual-line");
 }
@@ -989,6 +1049,7 @@ function vi_vis_word_back() : void {
 registerHandler("vi_vis_word_back", vi_vis_word_back);
 
 function vi_vis_word_end() : void {
+  // Extend selection to end of word
   const count = consumeCount();
   for (let i = 0; i < count; i++) {
     editor.executeAction("select_word_right");
@@ -1557,6 +1618,13 @@ function vi_op_word_back(): void {
 }
 registerHandler("vi_op_word_back", vi_op_word_back);
 
+// Operator-pending e (word end) - select to word end, then apply operator
+// Operator-pending e (word end) — uses native vi_move_word_end motion
+function vi_op_word_end(): void {
+  handleMotionWithOperator("vi_move_word_end");
+}
+registerHandler("vi_op_word_end", vi_op_word_end);
+
 function vi_op_line_start(): void {
   handleMotionWithOperator("move_line_start");
 }
@@ -1680,6 +1748,7 @@ editor.defineMode("vi-normal", [
 
   // Other
   ["J", "vi_join"],
+  ["~", "vi_toggle_case"],
 
   // Command mode
   [":", "vi_command_mode"],
@@ -1829,6 +1898,24 @@ registerHandler("vi_fc_9", vi_fc_9);
 async function vi_fc_space(): Promise<void> { return vi_find_char_handler(" "); }
 registerHandler("vi_fc_space", vi_fc_space);
 
+// Punctuation character handlers for find-char mode
+const punctuationChars: [string, string][] = [
+  ["!", "excl"], ["@", "at"], ["#", "hash"], ["$", "dollar"], ["%", "percent"],
+  ["^", "caret"], ["&", "amp"], ["*", "star"], ["(", "lparen"], [")", "rparen"],
+  ["-", "minus"], ["_", "underscore"], ["=", "equals"], ["+", "plus"],
+  ["[", "lbracket"], ["]", "rbracket"], ["{", "lbrace"], ["}", "rbrace"],
+  ["\\", "backslash"], ["|", "pipe"], [";", "semi"], [":", "colon"],
+  ["'", "squote"], ["\"", "dquote"], [",", "comma"], [".", "dot"],
+  ["<", "lt"], [">", "gt"], ["/", "slash"], ["?", "question"], ["`", "backtick"],
+  ["~", "tilde"],
+];
+
+for (const [char, name] of punctuationChars) {
+  const handlerName = `vi_fc_p_${name}`;
+  const handler = async (): Promise<void> => { return vi_find_char_handler(char); };
+  registerHandler(handlerName, handler);
+}
+
 // Define vi-find-char mode with all the character bindings
 editor.defineMode("vi-find-char", [
   ["Escape", "vi_find_char_cancel"],
@@ -1851,8 +1938,56 @@ editor.defineMode("vi-find-char", [
   ["0", "vi_fc_0"], ["1", "vi_fc_1"], ["2", "vi_fc_2"], ["3", "vi_fc_3"],
   ["4", "vi_fc_4"], ["5", "vi_fc_5"], ["6", "vi_fc_6"], ["7", "vi_fc_7"],
   ["8", "vi_fc_8"], ["9", "vi_fc_9"],
-  // Common punctuation
+  // Space and punctuation
   ["Space", "vi_fc_space"],
+  ["!", "vi_fc_p_excl"], ["@", "vi_fc_p_at"], ["#", "vi_fc_p_hash"],
+  ["$", "vi_fc_p_dollar"], ["%", "vi_fc_p_percent"], ["^", "vi_fc_p_caret"],
+  ["&", "vi_fc_p_amp"], ["*", "vi_fc_p_star"], ["(", "vi_fc_p_lparen"],
+  [")", "vi_fc_p_rparen"], ["-", "vi_fc_p_minus"], ["_", "vi_fc_p_underscore"],
+  ["=", "vi_fc_p_equals"], ["+", "vi_fc_p_plus"], ["[", "vi_fc_p_lbracket"],
+  ["]", "vi_fc_p_rbracket"], ["{", "vi_fc_p_lbrace"], ["}", "vi_fc_p_rbrace"],
+  ["\\", "vi_fc_p_backslash"], ["|", "vi_fc_p_pipe"], [";", "vi_fc_p_semi"],
+  [":", "vi_fc_p_colon"], ["'", "vi_fc_p_squote"], ["\"", "vi_fc_p_dquote"],
+  [",", "vi_fc_p_comma"], [".", "vi_fc_p_dot"], ["<", "vi_fc_p_lt"],
+  [">", "vi_fc_p_gt"], ["/", "vi_fc_p_slash"], ["?", "vi_fc_p_question"],
+  ["`", "vi_fc_p_backtick"], ["~", "vi_fc_p_tilde"],
+], true);
+
+// Define vi-replace-char mode — reuses find-char handlers but calls vi_replace_char_handler
+// We create replace-char specific handlers that delegate to the replace handler
+const rcHandlers: [string, string][] = [];
+for (const c of "abcdefghijklmnopqrstuvwxyz") {
+  const name = `vi_rc_${c}`;
+  const handler = async (): Promise<void> => { return vi_replace_char_handler(c); };
+  registerHandler(name, handler);
+  rcHandlers.push([c, name]);
+}
+for (const c of "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+  const name = `vi_rc_${c}`;
+  const handler = async (): Promise<void> => { return vi_replace_char_handler(c); };
+  registerHandler(name, handler);
+  rcHandlers.push([c, name]);
+}
+for (const c of "0123456789") {
+  const name = `vi_rc_d${c}`;
+  const handler = async (): Promise<void> => { return vi_replace_char_handler(c); };
+  registerHandler(name, handler);
+  rcHandlers.push([c, name]);
+}
+// Space and common punctuation for replace-char mode
+const rcSpaceHandler = async (): Promise<void> => { return vi_replace_char_handler(" "); };
+registerHandler("vi_rc_space", rcSpaceHandler);
+for (const [char, pname] of punctuationChars) {
+  const name = `vi_rc_p_${pname}`;
+  const handler = async (): Promise<void> => { return vi_replace_char_handler(char); };
+  registerHandler(name, handler);
+}
+
+editor.defineMode("vi-replace-char", [
+  ["Escape", "vi_find_char_cancel"],
+  ...rcHandlers.map(([key, name]): [string, string] => [key, name]),
+  ["Space", "vi_rc_space"],
+  ...punctuationChars.map(([char, pname]): [string, string] => [char, `vi_rc_p_${pname}`]),
 ], true);
 
 // Define vi-operator-pending mode
@@ -1876,6 +2011,7 @@ editor.defineMode("vi-operator-pending", [
   ["l", "vi_op_right"],
   ["w", "vi_op_word"],
   ["b", "vi_op_word_back"],
+  ["e", "vi_op_word_end"],
   ["$", "vi_op_line_end"],
   ["g g", "vi_op_doc_start"],
   ["G", "vi_op_doc_end"],
@@ -1948,8 +2084,9 @@ editor.defineMode("vi-visual", [
   ["g g", "vi_vis_doc_start"],
   ["G", "vi_vis_doc_end"],
 
-  // Switch to line mode
+  // Switch visual sub-modes
   ["V", "vi_visual_toggle_line"],
+  ["C-v", "vi_visual_block"],  // Switch to block mode
 
   // Operators
   ["d", "vi_vis_delete"],
@@ -1986,8 +2123,9 @@ editor.defineMode("vi-visual-line", [
   ["g g", "vi_vis_doc_start"],
   ["G", "vi_vis_doc_end"],
 
-  // Switch to char mode
+  // Switch visual sub-modes
   ["v", "vi_visual_toggle_line"],
+  ["C-v", "vi_visual_block"],  // Switch to block mode
 
   // Operators
   ["d", "vi_vis_delete"],

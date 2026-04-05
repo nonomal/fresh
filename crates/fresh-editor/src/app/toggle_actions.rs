@@ -6,6 +6,7 @@
 //! - Reset buffer settings
 //! - Config dump, save, and reload
 
+use crate::types::LspServerConfig;
 use rust_i18n::t;
 
 use crate::config::Config;
@@ -105,6 +106,22 @@ impl Editor {
         self.status_bar_visible
     }
 
+    /// Toggle prompt line visibility
+    pub fn toggle_prompt_line(&mut self) {
+        self.prompt_line_visible = !self.prompt_line_visible;
+        let status = if self.prompt_line_visible {
+            t!("toggle.prompt_line_shown")
+        } else {
+            t!("toggle.prompt_line_hidden")
+        };
+        self.set_status_message(status.to_string());
+    }
+
+    /// Get prompt line visibility
+    pub fn prompt_line_visible(&self) -> bool {
+        self.prompt_line_visible
+    }
+
     /// Toggle vertical scrollbar visibility
     pub fn toggle_vertical_scrollbar(&mut self) {
         self.config.editor.show_vertical_scrollbar = !self.config.editor.show_vertical_scrollbar;
@@ -136,6 +153,7 @@ impl Editor {
         // Determine settings from config using buffer's stored language
         let mut whitespace = WhitespaceVisibility::from_editor_config(&self.config.editor);
         let mut auto_close = self.config.editor.auto_close;
+        let mut word_characters = String::new();
         let (tab_size, use_tabs) = if let Some(state) = self.buffers.get(&buffer_id) {
             let language = &state.language;
             if let Some(lang_config) = self.config.languages.get(language) {
@@ -147,15 +165,18 @@ impl Editor {
                         auto_close = lang_auto_close;
                     }
                 }
+                if let Some(ref wc) = lang_config.word_characters {
+                    word_characters = wc.clone();
+                }
                 (
                     lang_config.tab_size.unwrap_or(self.config.editor.tab_size),
-                    lang_config.use_tabs,
+                    lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs),
                 )
             } else {
-                (self.config.editor.tab_size, false)
+                (self.config.editor.tab_size, self.config.editor.use_tabs)
             }
         } else {
-            (self.config.editor.tab_size, false)
+            (self.config.editor.tab_size, self.config.editor.use_tabs)
         };
 
         // Apply settings to buffer
@@ -164,6 +185,7 @@ impl Editor {
             state.buffer_settings.use_tabs = use_tabs;
             state.buffer_settings.auto_close = auto_close;
             state.buffer_settings.whitespace = whitespace;
+            state.buffer_settings.word_characters = word_characters;
         }
 
         self.set_status_message(t!("toggle.buffer_settings_reset").to_string());
@@ -194,6 +216,9 @@ impl Editor {
     }
 
     /// Toggle mouse hover for LSP on/off
+    ///
+    /// On Windows, this also switches the mouse tracking mode: mode 1003
+    /// (all motion) when enabled, mode 1002 (cell motion) when disabled.
     pub fn toggle_mouse_hover(&mut self) {
         self.config.editor.mouse_hover_enabled = !self.config.editor.mouse_hover_enabled;
 
@@ -204,6 +229,19 @@ impl Editor {
             self.mouse_state.lsp_hover_state = None;
             self.mouse_state.lsp_hover_request_sent = false;
             self.set_status_message(t!("toggle.mouse_hover_disabled").to_string());
+        }
+
+        // On Windows, switch mouse tracking mode to match
+        #[cfg(windows)]
+        {
+            let mode = if self.config.editor.mouse_hover_enabled {
+                fresh_winterm::MouseMode::AllMotion
+            } else {
+                fresh_winterm::MouseMode::CellMotion
+            };
+            if let Err(e) = fresh_winterm::set_mouse_mode(mode) {
+                tracing::error!("Failed to switch mouse mode: {}", e);
+            }
         }
     }
 
@@ -322,7 +360,7 @@ impl Editor {
         }
 
         // Always reload keybindings (complex types don't implement PartialEq)
-        self.keybindings = KeybindingResolver::new(&self.config);
+        *self.keybindings.write().unwrap() = KeybindingResolver::new(&self.config);
 
         // Update clipboard configuration
         self.clipboard.apply_config(&self.config.clipboard);
@@ -331,11 +369,25 @@ impl Editor {
         self.menu_bar_visible = self.config.editor.show_menu_bar;
         self.tab_bar_visible = self.config.editor.show_tab_bar;
         self.status_bar_visible = self.config.editor.show_status_bar;
+        self.prompt_line_visible = self.config.editor.show_prompt_line;
 
         // Update LSP configs
         if let Some(ref mut lsp) = self.lsp {
-            for (language, lsp_config) in &self.config.lsp {
-                lsp.set_language_config(language.clone(), lsp_config.clone());
+            for (language, lsp_configs) in &self.config.lsp {
+                lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
+            }
+            // Append enabled universal LSP servers to every configured language
+            let universal_servers: Vec<LspServerConfig> = self
+                .config
+                .universal_lsp
+                .values()
+                .flat_map(|lc| lc.as_slice().to_vec())
+                .filter(|c| c.enabled)
+                .collect();
+            if !universal_servers.is_empty() {
+                for language in lsp.configured_languages() {
+                    lsp.append_language_configs(language, universal_servers.clone());
+                }
             }
         }
 
@@ -357,7 +409,7 @@ impl Editor {
         use crate::view::theme::ThemeLoader;
 
         let theme_loader = ThemeLoader::new(self.dir_context.themes_dir());
-        self.theme_registry = theme_loader.load_all();
+        self.theme_registry = theme_loader.load_all(&[]);
 
         // Update shared theme cache for plugin access
         *self.theme_cache.write().unwrap() = self.theme_registry.to_json_map();

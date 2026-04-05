@@ -339,6 +339,14 @@ impl Editor {
                 // Single click on add-new activates immediately
                 self.settings_activate_current();
             }
+            SettingsHit::ControlInherit(idx) => {
+                // Click on [Inherit] button - set value to null (inherited)
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.set_current_to_null();
+                }
+            }
             SettingsHit::LayerButton => {
                 if let Some(ref mut state) = self.settings_state {
                     state.cycle_target_layer();
@@ -358,6 +366,11 @@ impl Editor {
             SettingsHit::ResetButton => {
                 if let Some(ref mut state) = self.settings_state {
                     state.reset_current_to_default();
+                }
+            }
+            SettingsHit::ClearCategoryButton => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.clear_current_category();
                 }
             }
             SettingsHit::EditButton => {

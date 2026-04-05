@@ -6,8 +6,11 @@
 // Re-export the type from the shared types module
 pub use crate::types::ProcessLimits;
 
-use std::fs;
 use std::io;
+
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 
 impl ProcessLimits {
@@ -24,21 +27,21 @@ impl ProcessLimits {
     ///
     /// On Linux, tries user-delegated cgroups v2, otherwise falls back to setrlimit.
     /// Memory and CPU limits are handled independently.
-    pub fn apply_to_command(&self, cmd: &mut tokio::process::Command) -> io::Result<()> {
+    pub fn apply_to_command(&self, _cmd: &mut tokio::process::Command) -> io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
 
         #[cfg(target_os = "linux")]
         {
-            self.apply_linux_limits(cmd)
+            self.apply_linux_limits(_cmd)
         }
 
         #[cfg(not(target_os = "linux"))]
         {
             // TODO: Implement for macOS using setrlimit
             // TODO: Implement for Windows using Job Objects
-            tracing::warn!("Process resource limits are not yet implemented for this platform");
+            tracing::info!("Process resource limits are not yet implemented for this platform");
             Ok(())
         }
     }
@@ -318,7 +321,7 @@ fn apply_memory_limit_setrlimit(bytes: u64) -> io::Result<()> {
     // Set RLIMIT_AS (address space / virtual memory limit)
     // On 32-bit platforms, rlim_t is u32, so we need to convert carefully.
     // If bytes exceeds what rlim_t can represent, clamp to rlim_t::MAX.
-    let limit = bytes.min(nix::libc::rlim_t::MAX) as nix::libc::rlim_t;
+    let limit = bytes as nix::libc::rlim_t;
     setrlimit(Resource::RLIMIT_AS, limit, limit)
         .map_err(|e| io::Error::other(format!("setrlimit AS failed: {}", e)))
 }

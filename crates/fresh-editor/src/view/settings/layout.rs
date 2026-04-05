@@ -27,6 +27,8 @@ pub struct SettingsLayout {
     pub cancel_button: Option<Rect>,
     /// Reset button area
     pub reset_button: Option<Rect>,
+    /// Clear category button area (shown in page header for nullable categories)
+    pub clear_category_button: Option<Rect>,
     /// Settings panel area (for scroll hit testing)
     pub settings_panel_area: Option<Rect>,
     /// Scrollbar area (for drag detection)
@@ -59,6 +61,8 @@ pub struct ItemLayout {
     pub area: Rect,
     /// Control-specific layout info
     pub control: ControlLayoutInfo,
+    /// Area of the [Inherit] button (only for nullable, explicitly-set items)
+    pub inherit_button: Option<Rect>,
 }
 
 impl SettingsLayout {
@@ -74,6 +78,7 @@ impl SettingsLayout {
             save_button: None,
             cancel_button: None,
             reset_button: None,
+            clear_category_button: None,
             settings_panel_area: None,
             scrollbar_area: None,
             search_scrollbar_area: None,
@@ -87,12 +92,20 @@ impl SettingsLayout {
     }
 
     /// Add a setting item to the layout
-    pub fn add_item(&mut self, index: usize, path: String, area: Rect, control: ControlLayoutInfo) {
+    pub fn add_item(
+        &mut self,
+        index: usize,
+        path: String,
+        area: Rect,
+        control: ControlLayoutInfo,
+        inherit_button: Option<Rect>,
+    ) {
         self.items.push(ItemLayout {
             index,
             path,
             area,
             control,
+            inherit_button,
         });
     }
 
@@ -138,6 +151,11 @@ impl SettingsLayout {
                 return Some(SettingsHit::ResetButton);
             }
         }
+        if let Some(ref clear_cat) = self.clear_category_button {
+            if point_in_rect(*clear_cat, x, y) {
+                return Some(SettingsHit::ClearCategoryButton);
+            }
+        }
 
         // Check categories
         for (index, area) in &self.categories {
@@ -170,6 +188,13 @@ impl SettingsLayout {
         // Check setting items
         for item in &self.items {
             if point_in_rect(item.area, x, y) {
+                // Check inherit button first (highest priority within item)
+                if let Some(ref inherit_area) = item.inherit_button {
+                    if point_in_rect(*inherit_area, x, y) {
+                        return Some(SettingsHit::ControlInherit(item.index));
+                    }
+                }
+
                 // Check specific control areas
                 match &item.control {
                     ControlLayoutInfo::Toggle(toggle_area) => {
@@ -216,9 +241,12 @@ impl SettingsLayout {
                         }
                     }
                     ControlLayoutInfo::TextList { rows } => {
-                        for (row_idx, row_area) in rows.iter().enumerate() {
-                            if point_in_rect(*row_area, x, y) {
-                                return Some(SettingsHit::ControlTextListRow(item.index, row_idx));
+                        for &(data_idx, row_area) in rows.iter() {
+                            if point_in_rect(row_area, x, y) {
+                                return Some(SettingsHit::ControlTextListRow(
+                                    item.index,
+                                    data_idx.unwrap_or(usize::MAX),
+                                ));
                             }
                         }
                     }
@@ -232,16 +260,16 @@ impl SettingsLayout {
                                 return Some(SettingsHit::ControlMapAddNew(item.index));
                             }
                         }
-                        for (row_idx, row_area) in entry_rows.iter().enumerate() {
-                            if point_in_rect(*row_area, x, y) {
-                                return Some(SettingsHit::ControlMapRow(item.index, row_idx));
+                        for &(data_idx, row_area) in entry_rows.iter() {
+                            if point_in_rect(row_area, x, y) {
+                                return Some(SettingsHit::ControlMapRow(item.index, data_idx));
                             }
                         }
                     }
                     ControlLayoutInfo::ObjectArray { entry_rows } => {
-                        for (row_idx, row_area) in entry_rows.iter().enumerate() {
-                            if point_in_rect(*row_area, x, y) {
-                                return Some(SettingsHit::ControlMapRow(item.index, row_idx));
+                        for &(data_idx, row_area) in entry_rows.iter() {
+                            if point_in_rect(row_area, x, y) {
+                                return Some(SettingsHit::ControlMapRow(item.index, data_idx));
                             }
                         }
                     }
@@ -306,6 +334,8 @@ pub enum SettingsHit {
     ControlMapRow(usize, usize),
     /// Click on map add-new row (item_idx)
     ControlMapAddNew(usize),
+    /// Click on inherit button (item_idx) - unset a nullable value
+    ControlInherit(usize),
     /// Click on layer button
     LayerButton,
     /// Click on edit config file button
@@ -316,6 +346,8 @@ pub enum SettingsHit {
     CancelButton,
     /// Click on reset button
     ResetButton,
+    /// Click on clear category button (for nullable categories)
+    ClearCategoryButton,
     /// Click on settings panel scrollbar
     Scrollbar,
     /// Click on settings panel (scrollable area)
@@ -384,6 +416,7 @@ mod tests {
             "/test".to_string(),
             Rect::new(35, 10, 50, 2),
             ControlLayoutInfo::Toggle(Rect::new(37, 11, 15, 1)),
+            None,
         );
 
         // Click on toggle control

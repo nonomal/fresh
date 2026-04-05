@@ -23,6 +23,51 @@ use super::help;
 use super::Editor;
 
 impl Editor {
+    /// Resolve the effective line_wrap setting for a buffer, considering language overrides.
+    ///
+    /// Returns the language-specific `line_wrap` if set, otherwise the global `editor.line_wrap`.
+    pub(super) fn resolve_line_wrap_for_buffer(&self, buffer_id: BufferId) -> bool {
+        if let Some(state) = self.buffers.get(&buffer_id) {
+            if let Some(lang_config) = self.config.languages.get(&state.language) {
+                if let Some(line_wrap) = lang_config.line_wrap {
+                    return line_wrap;
+                }
+            }
+        }
+        self.config.editor.line_wrap
+    }
+
+    /// Resolve page view settings for a buffer from its language config.
+    ///
+    /// Returns `Some((page_width))` if page_view is enabled for this buffer's language,
+    /// `None` otherwise.
+    pub(super) fn resolve_page_view_for_buffer(
+        &self,
+        buffer_id: BufferId,
+    ) -> Option<Option<usize>> {
+        let state = self.buffers.get(&buffer_id)?;
+        let lang_config = self.config.languages.get(&state.language)?;
+        if lang_config.page_view == Some(true) {
+            Some(lang_config.page_width.or(self.config.editor.page_width))
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the effective wrap_column for a buffer, considering language overrides.
+    ///
+    /// Returns the language-specific `wrap_column` if set, otherwise the global `editor.wrap_column`.
+    pub(super) fn resolve_wrap_column_for_buffer(&self, buffer_id: BufferId) -> Option<usize> {
+        if let Some(state) = self.buffers.get(&buffer_id) {
+            if let Some(lang_config) = self.config.languages.get(&state.language) {
+                if lang_config.wrap_column.is_some() {
+                    return lang_config.wrap_column;
+                }
+            }
+        }
+        self.config.editor.wrap_column
+    }
+
     /// Get the preferred split for opening a file.
     /// If the active split has no label, use it (normal case).
     /// Otherwise find an unlabeled leaf so files don't open in labeled splits (e.g., sidebars).
@@ -117,6 +162,17 @@ impl Editor {
     ///
     /// If the file doesn't exist, creates an unsaved buffer with that filename.
     pub fn open_file_no_focus(&mut self, path: &Path) -> anyhow::Result<BufferId> {
+        // Fail fast if the remote connection is down — don't attempt I/O that
+        // would either timeout or return confusing errors.
+        if !self.filesystem.is_remote_connected() {
+            anyhow::bail!(
+                "Cannot open file: remote connection lost ({})",
+                self.filesystem
+                    .remote_connection_info()
+                    .unwrap_or("unknown host")
+            );
+        }
+
         // Resolve relative paths against appropriate base directory
         // For remote mode, use the remote home directory; for local, use working_dir
         let base_dir = if self.filesystem.remote_connection_info().is_some() {
@@ -225,11 +281,13 @@ impl Editor {
                 self.config.editor.large_file_threshold_bytes as usize,
                 Arc::clone(&self.filesystem),
             )?;
-            let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-                &display_path,
-                &self.grammar_registry,
-                &self.config.languages,
-            );
+            let detected =
+                crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                    &display_path,
+                    &self.grammar_registry,
+                    &self.config.languages,
+                    self.config.default_language.as_deref(),
+                );
             EditorState::from_buffer_with_language(buffer, detected)
         } else {
             // File doesn't exist - create empty buffer with the file path set
@@ -258,7 +316,8 @@ impl Editor {
         state.buffer_settings.auto_surround = self.config.editor.auto_surround;
         if let Some(lang_config) = self.config.languages.get(&state.language) {
             whitespace = whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
-            state.buffer_settings.use_tabs = lang_config.use_tabs;
+            state.buffer_settings.use_tabs =
+                lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs);
             // Use language-specific tab_size if set, otherwise fall back to global
             state.buffer_settings.tab_size =
                 lang_config.tab_size.unwrap_or(self.config.editor.tab_size);
@@ -276,6 +335,7 @@ impl Editor {
             }
         } else {
             state.buffer_settings.tab_size = self.config.editor.tab_size;
+            state.buffer_settings.use_tabs = self.config.editor.use_tabs;
         }
         state.buffer_settings.whitespace = whitespace;
 
@@ -289,8 +349,11 @@ impl Editor {
             .insert(buffer_id, crate::model::event::EventLog::new());
 
         // Create metadata for this buffer
-        let mut metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let mut metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
 
         // Mark binary files in metadata and disable LSP
         if is_binary {
@@ -300,12 +363,8 @@ impl Editor {
         }
 
         // Check if the file is read-only on disk (filesystem permissions)
-        if file_exists && !metadata.read_only {
-            if let Ok(file_meta) = self.filesystem.metadata(path) {
-                if file_meta.is_readonly {
-                    metadata.read_only = true;
-                }
-            }
+        if file_exists && !metadata.read_only && !self.filesystem.is_writable(path) {
+            metadata.read_only = true;
         }
 
         // Mark read-only files (library, binary, or filesystem-readonly) as editing-disabled
@@ -326,16 +385,25 @@ impl Editor {
         // Add buffer to the preferred split's tabs (but don't switch to it)
         // Uses preferred_split_for_file() to avoid opening in labeled splits (e.g., sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
+        let page_view = self.resolve_page_view_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             // Initialize per-buffer view state for the new buffer with config defaults
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
+            // Auto-activate page view if configured for this language
+            if let Some(page_width) = page_view {
+                buf_state.activate_page_view(page_width);
+            }
         }
 
         // Restore global file state (scroll/cursor position) if available
@@ -411,11 +479,13 @@ impl Editor {
             self.config.editor.large_file_threshold_bytes as usize,
             Arc::clone(&self.local_filesystem),
         )?;
-        let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-            &display_path,
-            &self.grammar_registry,
-            &self.config.languages,
-        );
+        let detected =
+            crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                &display_path,
+                &self.grammar_registry,
+                &self.config.languages,
+                self.config.default_language.as_deref(),
+            );
         let state = EditorState::from_buffer_with_language(buffer, detected);
 
         self.buffers.insert(buffer_id, state);
@@ -423,19 +493,26 @@ impl Editor {
             .insert(buffer_id, crate::model::event::EventLog::new());
 
         // Create metadata
-        let metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
         self.buffer_metadata.insert(buffer_id, metadata);
 
         // Add to preferred split's tabs (avoids labeled splits like sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -507,11 +584,13 @@ impl Editor {
         )?;
         // Create editor state with the buffer
         // Use display_path for language detection (glob patterns match user-visible paths)
-        let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-            &display_path,
-            &self.grammar_registry,
-            &self.config.languages,
-        );
+        let detected =
+            crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                &display_path,
+                &self.grammar_registry,
+                &self.config.languages,
+                self.config.default_language.as_deref(),
+            );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
 
@@ -523,19 +602,26 @@ impl Editor {
         self.event_logs
             .insert(buffer_id, crate::model::event::EventLog::new());
 
-        let metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
         self.buffer_metadata.insert(buffer_id, metadata);
 
         // Add to preferred split's tabs (avoids labeled splits like sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -643,11 +729,13 @@ impl Editor {
         )?;
         // Create editor state with the buffer
         // Use display_path for language detection (glob patterns match user-visible paths)
-        let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-            &display_path,
-            &self.grammar_registry,
-            &self.config.languages,
-        );
+        let detected =
+            crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                &display_path,
+                &self.grammar_registry,
+                &self.config.languages,
+                self.config.default_language.as_deref(),
+            );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
 
@@ -659,19 +747,26 @@ impl Editor {
         self.event_logs
             .insert(buffer_id, crate::model::event::EventLog::new());
 
-        let metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
         self.buffer_metadata.insert(buffer_id, metadata);
 
         // Add to preferred split's tabs (avoids labeled splits like sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -999,11 +1094,15 @@ impl Editor {
         // Must happen AFTER set_active_buffer, because switch_buffer creates
         // the new BufferViewState with defaults (show_line_numbers=true).
         let active_split = self.split_manager.active_split();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -1100,13 +1199,17 @@ impl Editor {
 
         // Add buffer to the active split's tabs
         let active_split = self.split_manager.active_split();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -1276,13 +1379,17 @@ impl Editor {
 
         // Add buffer to the active split's open_buffers (tabs)
         let active_split = self.split_manager.active_split();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         } else {
@@ -1291,8 +1398,10 @@ impl Editor {
                 SplitViewState::with_buffer(self.terminal_width, self.terminal_height, buffer_id);
             view_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
             self.split_view_states.insert(active_split, view_state);
@@ -1443,7 +1552,7 @@ impl Editor {
         }
 
         // Get all keybindings
-        let bindings = self.keybindings.get_all_bindings();
+        let bindings = self.keybindings.read().unwrap().get_all_bindings();
 
         // Format the keybindings as readable text
         let mut content = String::from("Keyboard Shortcuts\n");
@@ -2382,16 +2491,20 @@ impl Editor {
     /// Force check the mouse hover timer (for testing)
     /// This bypasses the normal 500ms delay
     pub fn force_check_mouse_hover(&mut self) -> bool {
-        // Temporarily mark the hover as ready by checking if state exists
         if let Some((byte_pos, _, screen_x, screen_y)) = self.mouse_state.lsp_hover_state {
             if !self.mouse_state.lsp_hover_request_sent {
-                self.mouse_state.lsp_hover_request_sent = true;
                 self.mouse_hover_screen_position = Some((screen_x, screen_y));
-                if let Err(e) = self.request_hover_at_position(byte_pos) {
-                    tracing::debug!("Failed to request hover: {}", e);
-                    return false;
+                match self.request_hover_at_position(byte_pos) {
+                    Ok(true) => {
+                        self.mouse_state.lsp_hover_request_sent = true;
+                        return true;
+                    }
+                    Ok(false) => return false, // no server ready, retry later
+                    Err(e) => {
+                        tracing::debug!("Failed to request hover: {}", e);
+                        return false;
+                    }
                 }
-                return true;
             }
         }
         false
@@ -2409,6 +2522,7 @@ impl Editor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn queue_file_open(
         &mut self,
         path: PathBuf,

@@ -29,18 +29,44 @@ include!(concat!(env!("OUT_DIR"), "/builtin_themes.rs"));
 /// Information about an available theme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeInfo {
-    /// Theme name (e.g., "dark", "nord")
+    /// Theme display name (e.g., "dark", "adwaita-dark")
     pub name: String,
     /// Pack name (subdirectory path, empty for root themes)
     pub pack: String,
+    /// Unique key used as the registry identifier.
+    ///
+    /// Derivation priority:
+    /// 1. Package themes: `{repository_url}#{theme_name}`
+    /// 2. User-saved themes (theme editor): `file://{absolute_path}`
+    /// 3. Loose user themes: `{pack}/{name}` or just `{name}` if pack is empty
+    /// 4. Builtins: just the name
+    pub key: String,
 }
 
 impl ThemeInfo {
-    /// Create a new ThemeInfo
+    /// Create a new ThemeInfo. The key defaults to `pack/name` (or just `name`
+    /// when pack is empty).
     pub fn new(name: impl Into<String>, pack: impl Into<String>) -> Self {
+        let name = name.into();
+        let pack = pack.into();
+        let key = if pack.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", pack, name)
+        };
+        Self { name, pack, key }
+    }
+
+    /// Create a ThemeInfo with an explicit key (e.g. a repository URL).
+    pub fn with_key(
+        name: impl Into<String>,
+        pack: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             pack: pack.into(),
+            key: key.into(),
         }
     }
 
@@ -129,6 +155,31 @@ impl From<ColorDef> for Color {
                 _ => Color::White, // Default fallback
             },
         }
+    }
+}
+
+/// Convert a named color string (e.g. "Yellow", "Red") to a ratatui Color.
+/// Returns None if the string is not a recognized named color.
+pub fn named_color_from_str(name: &str) -> Option<Color> {
+    match name {
+        "Black" => Some(Color::Black),
+        "Red" => Some(Color::Red),
+        "Green" => Some(Color::Green),
+        "Yellow" => Some(Color::Yellow),
+        "Blue" => Some(Color::Blue),
+        "Magenta" => Some(Color::Magenta),
+        "Cyan" => Some(Color::Cyan),
+        "Gray" => Some(Color::Gray),
+        "DarkGray" => Some(Color::DarkGray),
+        "LightRed" => Some(Color::LightRed),
+        "LightGreen" => Some(Color::LightGreen),
+        "LightYellow" => Some(Color::LightYellow),
+        "LightBlue" => Some(Color::LightBlue),
+        "LightMagenta" => Some(Color::LightMagenta),
+        "LightCyan" => Some(Color::LightCyan),
+        "White" => Some(Color::White),
+        "Default" | "Reset" => Some(Color::Reset),
+        _ => None,
     }
 }
 
@@ -768,6 +819,12 @@ pub struct SyntaxColors {
     /// Operators (+, -, =, etc.)
     #[serde(default = "default_syntax_operator")]
     pub operator: ColorDef,
+    /// Punctuation brackets ({, }, (, ), [, ])
+    #[serde(default = "default_syntax_punctuation_bracket")]
+    pub punctuation_bracket: ColorDef,
+    /// Punctuation delimiters (;, ,, .)
+    #[serde(default = "default_syntax_punctuation_delimiter")]
+    pub punctuation_delimiter: ColorDef,
 }
 
 // Default syntax colors (VSCode Dark+ inspired)
@@ -794,6 +851,12 @@ fn default_syntax_constant() -> ColorDef {
 }
 fn default_syntax_operator() -> ColorDef {
     ColorDef::Rgb(212, 212, 212)
+}
+fn default_syntax_punctuation_bracket() -> ColorDef {
+    ColorDef::Rgb(212, 212, 212) // default foreground — brackets blend with text
+}
+fn default_syntax_punctuation_delimiter() -> ColorDef {
+    ColorDef::Rgb(212, 212, 212) // default foreground — delimiters blend with text
 }
 
 /// Comprehensive theme structure with all UI colors
@@ -939,6 +1002,8 @@ pub struct Theme {
     pub syntax_variable: Color,
     pub syntax_constant: Color,
     pub syntax_operator: Color,
+    pub syntax_punctuation_bracket: Color,
+    pub syntax_punctuation_delimiter: Color,
 }
 
 impl From<ThemeFile> for Theme {
@@ -1042,6 +1107,8 @@ impl From<ThemeFile> for Theme {
             syntax_variable: file.syntax.variable.into(),
             syntax_constant: file.syntax.constant.into(),
             syntax_operator: file.syntax.operator.into(),
+            syntax_punctuation_bracket: file.syntax.punctuation_bracket.into(),
+            syntax_punctuation_delimiter: file.syntax.punctuation_delimiter.into(),
         }
     }
 }
@@ -1153,12 +1220,31 @@ impl From<Theme> for ThemeFile {
                 variable: theme.syntax_variable.into(),
                 constant: theme.syntax_constant.into(),
                 operator: theme.syntax_operator.into(),
+                punctuation_bracket: theme.syntax_punctuation_bracket.into(),
+                punctuation_delimiter: theme.syntax_punctuation_delimiter.into(),
             },
         }
     }
 }
 
 impl Theme {
+    /// Returns `true` when the theme has a light background.
+    ///
+    /// Uses the relative luminance of `editor_bg` (perceived brightness).
+    /// A threshold of 0.5 separates dark from light; for `Color::Reset` or
+    /// unresolvable colors, falls back to `false` (dark).
+    pub fn is_light(&self) -> bool {
+        if let Some((r, g, b)) = color_to_rgb(self.editor_bg) {
+            // sRGB relative luminance (ITU-R BT.709)
+            let lum = 0.2126 * (r as f64 / 255.0)
+                + 0.7152 * (g as f64 / 255.0)
+                + 0.0722 * (b as f64 / 255.0);
+            lum > 0.5
+        } else {
+            false
+        }
+    }
+
     /// Load a builtin theme by name (no I/O, uses embedded JSON).
     pub fn load_builtin(name: &str) -> Option<Self> {
         BUILTIN_THEMES
@@ -1248,6 +1334,8 @@ impl Theme {
                 "variable" => Some(self.syntax_variable),
                 "constant" => Some(self.syntax_constant),
                 "operator" => Some(self.syntax_operator),
+                "punctuation_bracket" => Some(self.syntax_punctuation_bracket),
+                "punctuation_delimiter" => Some(self.syntax_punctuation_delimiter),
                 _ => None,
             },
             "diagnostic" => match field {

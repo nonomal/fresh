@@ -7,7 +7,7 @@ use super::entry_dialog::EntryDialogState;
 use super::items::{control_to_value, SettingControl, SettingItem, SettingsPage};
 use super::layout::SettingsHit;
 use super::schema::{parse_schema, SettingCategory, SettingSchema};
-use super::search::{search_settings, SearchResult};
+use super::search::{search_settings, DeepMatch, SearchResult};
 use crate::config::Config;
 use crate::config_io::ConfigLayer;
 use crate::view::controls::FocusState;
@@ -413,6 +413,22 @@ impl SettingsState {
         }
     }
 
+    /// Move selection down by a page (viewport height worth of items)
+    pub fn select_next_page(&mut self) {
+        let page_size = self.scroll_panel.viewport_height().max(1);
+        for _ in 0..page_size {
+            self.select_next();
+        }
+    }
+
+    /// Move selection up by a page (viewport height worth of items)
+    pub fn select_prev_page(&mut self) {
+        let page_size = self.scroll_panel.viewport_height().max(1);
+        for _ in 0..page_size {
+            self.select_prev();
+        }
+    }
+
     /// Switch focus between panels: Categories -> Settings -> Footer -> Categories
     pub fn toggle_focus(&mut self) {
         let old_panel = self.focus_panel();
@@ -649,6 +665,82 @@ impl SettingsState {
         }
     }
 
+    /// Set the current nullable setting to null (inherit value).
+    ///
+    /// This explicitly sets the value to null in the current layer,
+    /// indicating that the setting should be inherited rather than overridden.
+    /// Only applies to nullable settings that are not currently null.
+    pub fn set_current_to_null(&mut self) {
+        let target_layer = self.target_layer;
+        let change_info = self.current_item().and_then(|item| {
+            if !item.nullable || item.is_null || item.read_only {
+                return None;
+            }
+            Some(item.path.clone())
+        });
+
+        if let Some(path) = change_info {
+            // Set value to null (not a deletion — this is an explicit null value)
+            self.pending_changes
+                .insert(path.clone(), serde_json::Value::Null);
+            self.pending_deletions.remove(&path);
+
+            // Update the item's visual state
+            if let Some(item) = self.current_item_mut() {
+                item.is_null = true;
+                item.modified = true;
+                item.layer_source = target_layer;
+            }
+        }
+    }
+
+    /// Clear a nullable category by setting its path to null and updating all items.
+    ///
+    /// This sets the category's root path (e.g., `/fallback`) to null in the target layer,
+    /// effectively removing the entire section. All items within the category are marked
+    /// as null/inherited.
+    pub fn clear_current_category(&mut self) {
+        let target_layer = self.target_layer;
+        let page = match self.current_page() {
+            Some(p) if p.nullable => p,
+            _ => return,
+        };
+        let page_path = page.path.clone();
+
+        // Set the category root to null
+        self.pending_changes
+            .insert(page_path.clone(), serde_json::Value::Null);
+
+        // Also remove any pending changes/deletions for child paths
+        let prefix = format!("{}/", page_path);
+        self.pending_changes
+            .retain(|path, _| !path.starts_with(&prefix));
+        self.pending_deletions
+            .retain(|path| !path.starts_with(&prefix));
+
+        // Update all items on the current page to reflect null/inherited state
+        if let Some(page) = self.current_page_mut() {
+            for item in &mut page.items {
+                if item.nullable {
+                    item.is_null = true;
+                    item.modified = false;
+                    item.layer_source = target_layer;
+                }
+            }
+        }
+    }
+
+    /// Check if any items in the current nullable category have non-null values.
+    pub fn current_category_has_values(&self) -> bool {
+        match self.current_page() {
+            Some(page) if page.nullable => {
+                page.items.iter().any(|item| !item.is_null && item.nullable)
+                    || page.items.iter().any(|item| item.modified)
+            }
+            _ => false,
+        }
+    }
+
     /// Handle a value change from user interaction
     pub fn on_value_changed(&mut self) {
         // Capture target_layer before any borrows
@@ -669,6 +761,7 @@ impl SettingsState {
             if let Some(item) = self.current_item_mut() {
                 item.modified = true; // New semantic: value is now defined in target layer
                 item.layer_source = target_layer; // Value now comes from target layer
+                item.is_null = false; // Explicit value clears the inherited state
             }
             self.set_pending_change(&path, value);
         }
@@ -833,14 +926,15 @@ impl SettingsState {
     /// Jump to the currently selected search result
     pub fn jump_to_search_result(&mut self) {
         // Extract values first to avoid borrow issues
-        let Some(&SearchResult {
-            page_index,
-            item_index,
-            ..
-        }) = self.search_results.get(self.selected_search_result)
+        let Some(result) = self
+            .search_results
+            .get(self.selected_search_result)
+            .cloned()
         else {
             return;
         };
+        let page_index = result.page_index;
+        let item_index = result.item_index;
 
         // Unfocus old item first
         self.update_control_focus(false);
@@ -856,9 +950,38 @@ impl SettingsState {
         }
         self.sub_focus = None;
         self.init_map_focus(true);
+
+        // Navigate into the deep match target if present
+        if let Some(ref deep_match) = result.deep_match {
+            self.jump_to_deep_match(deep_match);
+        }
+
         self.update_control_focus(true); // Focus the new item
         self.ensure_visible();
         self.cancel_search();
+    }
+
+    /// Navigate into a composite control to focus a specific deep match
+    fn jump_to_deep_match(&mut self, deep_match: &DeepMatch) {
+        match deep_match {
+            DeepMatch::MapKey { entry_index, .. } | DeepMatch::MapValue { entry_index, .. } => {
+                if let Some(item) = self.current_item_mut() {
+                    if let SettingControl::Map(ref mut map_state) = item.control {
+                        map_state.focused_entry = Some(*entry_index);
+                    }
+                }
+                self.update_map_sub_focus();
+            }
+            DeepMatch::TextListItem { item_index, .. } => {
+                if let Some(item) = self.current_item_mut() {
+                    if let SettingControl::TextList(ref mut list_state) = item.control {
+                        list_state.focused_item = Some(*item_index);
+                    }
+                }
+                // Update sub_focus for TextList
+                self.sub_focus = Some(1 + *item_index);
+            }
+        }
     }
 
     /// Get the currently selected search result
@@ -1200,9 +1323,19 @@ impl SettingsState {
 
         if is_nested {
             // Nested dialog - update the parent dialog's ObjectArray item
-            // Extract the array field name from the path (last segment)
-            let array_field = array_path.rsplit('/').next().unwrap_or("").to_string();
-            let item_path = format!("/{}", array_field);
+            // Extract the item path within the parent dialog by removing the parent's
+            // map_path prefix. For example, if array_path is "/lsp/" and the parent's
+            // map_path is "/lsp", the item path should be "" (the root value item).
+            let parent_map_path = self
+                .entry_dialog_stack
+                .last()
+                .map(|p| p.map_path.as_str())
+                .unwrap_or("");
+            let item_path = array_path
+                .strip_prefix(parent_map_path)
+                .unwrap_or(&array_path)
+                .trim_end_matches('/')
+                .to_string();
 
             // Find and update the ObjectArray in the parent dialog
             if let Some(parent) = self.entry_dialog_stack.last_mut() {

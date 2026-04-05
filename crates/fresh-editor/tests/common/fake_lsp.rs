@@ -20,7 +20,7 @@ impl FakeLspServer {
     ///
     /// The server will listen on stdin/stdout and respond to LSP requests.
     /// It uses a Bash script that acts as a simple JSON-RPC server.
-    pub fn spawn() -> anyhow::Result<Self> {
+    pub fn spawn(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that acts as a fake LSP server
@@ -31,21 +31,22 @@ impl FakeLspServer {
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -53,7 +54,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -133,7 +134,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server.sh");
+        let script_path = dir.join("fake_lsp_server.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -158,7 +159,10 @@ done
     }
 
     /// Spawn a fake LSP server that delays semantic token responses.
-    pub fn spawn_with_semantic_tokens_delay(delay_ms: u64) -> anyhow::Result<Self> {
+    pub fn spawn_with_semantic_tokens_delay(
+        dir: &std::path::Path,
+        delay_ms: u64,
+    ) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
         let delay_secs = (delay_ms as f64) / 1000.0;
 
@@ -169,27 +173,25 @@ DELAY={delay}
 
 # Function to read a message
 read_message() {{
-    # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${{line//$'\r'/}}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${{line#Content-Length:}}"
+                content_length="${{content_length// /}}"
+                ;;
+        esac
     done
 
-    # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }}
 
-# Function to send a message
 send_message() {{
     local message="$1"
     local length=${{#message}}
@@ -264,7 +266,7 @@ done
             delay = delay_secs
         );
 
-        let script_path = Self::semantic_tokens_delay_script_path();
+        let script_path = Self::semantic_tokens_delay_script_path(dir);
         std::fs::write(&script_path, script)?;
 
         #[cfg(unix)]
@@ -283,7 +285,7 @@ done
     }
 
     /// Spawn a fake LSP server that supports range semantic tokens only.
-    pub fn spawn_with_semantic_tokens_range_only() -> anyhow::Result<Self> {
+    pub fn spawn_with_semantic_tokens_range_only(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         let script = r#"#!/bin/bash
@@ -292,21 +294,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -314,7 +317,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -380,7 +383,7 @@ esac
 done
 "#;
 
-        let script_path = Self::semantic_tokens_range_only_script_path();
+        let script_path = Self::semantic_tokens_range_only_script_path(dir);
         std::fs::write(&script_path, script)?;
 
         #[cfg(unix)]
@@ -399,18 +402,18 @@ done
     }
 
     /// Path to the semantic tokens delay script.
-    pub fn semantic_tokens_delay_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_semantic_tokens_delay.sh")
+    pub fn semantic_tokens_delay_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_semantic_tokens_delay.sh")
     }
 
     /// Path to the semantic tokens range-only script.
-    pub fn semantic_tokens_range_only_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_semantic_tokens_range_only.sh")
+    pub fn semantic_tokens_range_only_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_semantic_tokens_range_only.sh")
     }
 
     /// Get the path to the fake LSP server script
-    pub fn script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server.sh")
+    pub fn script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server.sh")
     }
 
     /// Spawn a blocking fake LSP server that never responds to requests
@@ -420,7 +423,7 @@ done
     /// but then blocks forever on all other requests without responding.
     /// This is useful for testing that the editor UI remains responsive even
     /// when the LSP server is completely stuck.
-    pub fn spawn_blocking() -> anyhow::Result<Self> {
+    pub fn spawn_blocking(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that acts as a fake LSP server that blocks forever
@@ -430,21 +433,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -452,7 +456,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -488,7 +492,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_blocking.sh");
+        let script_path = dir.join("fake_lsp_server_blocking.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -509,15 +513,18 @@ done
     }
 
     /// Get the path to the blocking fake LSP server script
-    pub fn blocking_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_blocking.sh")
+    pub fn blocking_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_blocking.sh")
     }
 
     /// Spawn a fake LSP server that generates many diagnostics
     ///
     /// This version responds to didChange notifications with a large number of diagnostics
     /// across many lines. This is useful for testing performance with many diagnostics.
-    pub fn spawn_many_diagnostics(diagnostic_count: usize) -> anyhow::Result<Self> {
+    pub fn spawn_many_diagnostics(
+        dir: &std::path::Path,
+        diagnostic_count: usize,
+    ) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Generate JSON for many diagnostics
@@ -543,27 +550,25 @@ done
 
 # Function to read a message
 read_message() {{
-    # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${{line//$'\r'/}}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${{line#Content-Length:}}"
+                content_length="${{content_length// /}}"
+                ;;
+        esac
     done
 
-    # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }}
 
-# Function to send a message
 send_message() {{
     local message="$1"
     local length=${{#message}}
@@ -604,7 +609,7 @@ done
         );
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_many_diags.sh");
+        let script_path = dir.join("fake_lsp_server_many_diags.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -625,15 +630,15 @@ done
     }
 
     /// Get the path to the many-diagnostics fake LSP server script
-    pub fn many_diagnostics_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_many_diags.sh")
+    pub fn many_diagnostics_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_many_diags.sh")
     }
 
     /// Spawn a fake LSP server that sends progress notifications
     ///
     /// This version sends progress notifications (begin, report, end) after initialization.
     /// This is useful for testing LSP progress display in the status bar.
-    pub fn spawn_with_progress() -> anyhow::Result<Self> {
+    pub fn spawn_with_progress(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that sends progress notifications
@@ -643,21 +648,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -665,7 +671,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -721,7 +727,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_progress.sh");
+        let script_path = dir.join("fake_lsp_server_progress.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -742,8 +748,8 @@ done
     }
 
     /// Get the path to the progress fake LSP server script
-    pub fn progress_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_progress.sh")
+    pub fn progress_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_progress.sh")
     }
 
     /// Spawn a fake LSP server that crashes after initialization
@@ -751,7 +757,7 @@ done
     /// This version initializes successfully but then crashes (exits with non-zero)
     /// after receiving any subsequent request. This is useful for testing LSP server
     /// crash detection and auto-restart functionality.
-    pub fn spawn_crashing() -> anyhow::Result<Self> {
+    pub fn spawn_crashing(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that crashes after init
@@ -761,21 +767,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -783,7 +790,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Track whether we've initialized
@@ -826,7 +833,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_crashing.sh");
+        let script_path = dir.join("fake_lsp_server_crashing.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -847,8 +854,8 @@ done
     }
 
     /// Get the path to the crashing fake LSP server script
-    pub fn crashing_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_crashing.sh")
+    pub fn crashing_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_crashing.sh")
     }
 
     /// Spawn a fake LSP server that supports pull diagnostics (textDocument/diagnostic)
@@ -857,7 +864,7 @@ done
     /// It also tracks result_id for incremental updates and returns "unchanged" responses
     /// when the same result_id is passed. This is useful for testing LSP 3.17+ pull
     /// diagnostics functionality.
-    pub fn spawn_with_pull_diagnostics() -> anyhow::Result<Self> {
+    pub fn spawn_with_pull_diagnostics(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that supports pull diagnostics
@@ -867,21 +874,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -889,7 +897,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Track result_id for incremental updates
@@ -960,7 +968,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_pull_diag.sh");
+        let script_path = dir.join("fake_lsp_server_pull_diag.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -981,15 +989,15 @@ done
     }
 
     /// Get the path to the pull diagnostics fake LSP server script
-    pub fn pull_diagnostics_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_pull_diag.sh")
+    pub fn pull_diagnostics_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_pull_diag.sh")
     }
 
     /// Spawn a fake LSP server that supports inlay hints (textDocument/inlayHint)
     ///
     /// This version responds to textDocument/inlayHint requests with sample hints.
     /// This is useful for testing LSP 3.17+ inlay hints functionality.
-    pub fn spawn_with_inlay_hints() -> anyhow::Result<Self> {
+    pub fn spawn_with_inlay_hints(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that supports inlay hints
@@ -999,21 +1007,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -1021,7 +1030,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -1063,7 +1072,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_inlay_hints.sh");
+        let script_path = dir.join("fake_lsp_server_inlay_hints.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -1084,15 +1093,15 @@ done
     }
 
     /// Get the path to the inlay hints fake LSP server script
-    pub fn inlay_hints_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_inlay_hints.sh")
+    pub fn inlay_hints_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_inlay_hints.sh")
     }
 
     /// Spawn a fake LSP server that logs all received methods to a file
     ///
     /// This variant logs each method name to a log file, which can be used
     /// to verify the order of LSP messages (e.g., that didOpen is sent before hover).
-    pub fn spawn_with_logging() -> anyhow::Result<Self> {
+    pub fn spawn_with_logging(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that logs all methods to a file
@@ -1106,23 +1115,26 @@ LOG_FILE="${1:-/tmp/fake_lsp_log.txt}"
 
 # Function to read a message
 read_message() {
-    # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
+    while IFS= read -r line; do
+        # Strip carriage return (LSP uses CRLF line endings)
+        line="${line%$'\r'}"
         # Empty line marks end of headers
-        if [ -z "$key" ]; then
+        if [ -z "$line" ]; then
             break
         fi
+        # Parse "Key: Value" header
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -1130,7 +1142,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -1170,7 +1182,7 @@ case "$method" in
         uri=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
         send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"uri":"'$uri'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":10}}}}'
         ;;
-    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didSave")
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didSave"|"textDocument/didClose"|"initialized")
         # Notifications - no response needed
         ;;
     "textDocument/diagnostic")
@@ -1179,16 +1191,25 @@ case "$method" in
     "textDocument/inlayHint")
         send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
         ;;
+    "$/cancelRequest")
+        # Cancel notifications - no response needed
+        ;;
     "shutdown")
         send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
         break
+        ;;
+    *)
+        # Respond to any unhandled requests to prevent pending request buildup
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        fi
         ;;
 esac
 done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_logging.sh");
+        let script_path = dir.join("fake_lsp_server_logging.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -1209,8 +1230,8 @@ done
     }
 
     /// Get the path to the logging fake LSP server script
-    pub fn logging_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_logging.sh")
+    pub fn logging_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_logging.sh")
     }
 
     /// Get the default log file path used by the logging server
@@ -1223,7 +1244,7 @@ done
     /// This simulates LSP servers like pyrefly that don't return the hover range.
     /// Used to test that hover popup doesn't move/duplicate when LSP doesn't
     /// provide symbol range information.
-    pub fn spawn_without_range() -> anyhow::Result<Self> {
+    pub fn spawn_without_range(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Create a Bash script that acts as a fake LSP server WITHOUT hover range
@@ -1233,21 +1254,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -1255,7 +1277,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -1298,7 +1320,7 @@ done
 "#;
 
         // Write script to a temporary file
-        let script_path = std::env::temp_dir().join("fake_lsp_server_no_range.sh");
+        let script_path = dir.join("fake_lsp_server_no_range.sh");
         std::fs::write(&script_path, script)?;
 
         // Make it executable
@@ -1319,8 +1341,8 @@ done
     }
 
     /// Get the path to the no-range fake LSP server script
-    pub fn no_range_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_no_range.sh")
+    pub fn no_range_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_no_range.sh")
     }
 
     /// Spawn a fake LSP server that supports folding ranges.
@@ -1328,7 +1350,7 @@ done
     /// Based on the standard fake LSP script with `foldingRangeProvider` added
     /// to the capabilities and a handler for `textDocument/foldingRange` that
     /// returns a single range covering lines 10..30.
-    pub fn spawn_with_folding_ranges() -> anyhow::Result<Self> {
+    pub fn spawn_with_folding_ranges(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Same as the standard script but with foldingRangeProvider in capabilities
@@ -1339,21 +1361,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -1361,7 +1384,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -1430,7 +1453,7 @@ esac
 done
 "#;
 
-        let script_path = Self::folding_ranges_script_path();
+        let script_path = Self::folding_ranges_script_path(dir);
         std::fs::write(&script_path, script)?;
 
         #[cfg(unix)]
@@ -1449,8 +1472,8 @@ done
     }
 
     /// Get the path to the folding ranges fake LSP server script
-    pub fn folding_ranges_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_folding_ranges.sh")
+    pub fn folding_ranges_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_folding_ranges.sh")
     }
 
     /// Spawn a fake LSP server that echoes an environment variable in hover responses.
@@ -1461,7 +1484,7 @@ done
     ///
     /// Based on the standard fake LSP script but with the hover response
     /// modified to include the env var value.
-    pub fn spawn_env_echo() -> anyhow::Result<Self> {
+    pub fn spawn_env_echo(dir: &std::path::Path) -> anyhow::Result<Self> {
         let (stop_tx, stop_rx) = mpsc::channel();
 
         // Same as the standard script, but hover returns the env var value
@@ -1471,21 +1494,22 @@ done
 read_message() {
     # Read headers
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        # Empty line marks end of headers
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
             break
         fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
     # Read content
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -1493,7 +1517,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Read env var value at startup
@@ -1563,7 +1587,7 @@ esac
 done
 "#;
 
-        let script_path = Self::env_echo_script_path();
+        let script_path = Self::env_echo_script_path(dir);
         std::fs::write(&script_path, script)?;
 
         #[cfg(unix)]
@@ -1582,8 +1606,519 @@ done
     }
 
     /// Get the path to the env echo fake LSP server script
-    pub fn env_echo_script_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("fake_lsp_server_env_echo.sh")
+    pub fn env_echo_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_env_echo.sh")
+    }
+
+    /// Spawn a fake LSP server that does NOT support semantic tokens at all.
+    /// Used to reproduce multi-LSP capability mismatch bugs.
+    pub fn spawn_no_semantic_tokens(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+# Function to read a message
+read_message() {
+    # Read headers
+    local content_length=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
+            break
+        fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
+    done
+
+    # Read content
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
+    fi
+}
+
+# Function to send a message
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+# Main loop
+while true; do
+    # Read incoming message
+    msg=$(read_message)
+
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    # Extract method from JSON
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+case "$method" in
+    "initialize")
+        # No semanticTokensProvider in capabilities
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"completionProvider":{"triggerCharacters":[".",":",":"]},"definitionProvider":true,"hoverProvider":true,"textDocumentSync":1}}}'
+        ;;
+    "textDocument/hover")
+        line=$(echo "$msg" | grep -o '"line":[0-9]*' | head -1 | cut -d':' -f2)
+        char=$(echo "$msg" | grep -o '"character":[0-9]*' | head -1 | cut -d':' -f2)
+        end_char=$((char + 10))
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"contents":{"kind":"markdown","value":"No semantic tokens server"},"range":{"start":{"line":'$line',"character":'$char'},"end":{"line":'$line',"character":'$end_char'}}}}'
+        ;;
+    "textDocument/completion")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[]}}'
+        ;;
+    "textDocument/didOpen")
+        ;;
+    "textDocument/didClose")
+        ;;
+    "textDocument/didChange")
+        ;;
+    "textDocument/didSave")
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::no_semantic_tokens_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Path to the no-semantic-tokens script.
+    pub fn no_semantic_tokens_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_no_semantic_tokens.sh")
+    }
+
+    /// Spawn a fake LSP server that supports code actions.
+    ///
+    /// This variant advertises `codeActionProvider` capability and responds to
+    /// `textDocument/codeAction` requests with sample code actions.
+    pub fn spawn_with_code_actions(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+# Function to read a message
+read_message() {
+    # Read headers
+    local content_length=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
+            break
+        fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
+    done
+
+    # Read content
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
+    fi
+}
+
+# Function to send a message
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+# Main loop
+while true; do
+    # Read incoming message
+    msg=$(read_message)
+
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    # Extract method from JSON
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+case "$method" in
+    "initialize")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"textDocumentSync":1,"codeActionProvider":true}}}'
+        ;;
+    "textDocument/codeAction")
+        uri=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[{"title":"Extract function","kind":"refactor.extract","edit":{"changes":{}}},{"title":"Inline variable","kind":"refactor.inline","edit":{"changes":{}}},{"title":"Add missing import","kind":"quickfix","edit":{"changes":{"'$uri'":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"use std::io;\n"}]}}}]}'
+        ;;
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didClose"|"initialized")
+        # Notifications — no response needed
+        ;;
+    "textDocument/diagnostic")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[],"resultId":null}}'
+        ;;
+    "textDocument/inlayHint")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/foldingRange")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/documentSymbol")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "$/cancelRequest")
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        # Respond to any unknown request so the client doesn't block
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::code_actions_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Get the path to the code actions fake LSP server script
+    pub fn code_actions_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_code_actions.sh")
+    }
+
+    /// Spawn a second fake LSP server that returns different code actions.
+    /// Used to test that code actions from multiple servers are merged into
+    /// a single popup.
+    pub fn spawn_with_code_actions_b(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+# Function to read a message
+read_message() {
+    local content_length=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
+            break
+        fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
+    done
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then break; fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+case "$method" in
+    "initialize")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"textDocumentSync":1,"codeActionProvider":true}}}'
+        ;;
+    "textDocument/codeAction")
+        uri=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[{"title":"Format imports","kind":"source.organizeImports","edit":{"changes":{}}},{"title":"Convert to arrow function","kind":"refactor.rewrite","edit":{"changes":{}}}]}'
+        ;;
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didClose"|"initialized")
+        ;;
+    "textDocument/diagnostic")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[],"resultId":null}}'
+        ;;
+    "textDocument/inlayHint")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/foldingRange")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/documentSymbol")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "$/cancelRequest")
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::code_actions_b_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Get the path to the second code actions fake LSP server script
+    pub fn code_actions_b_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_code_actions_b.sh")
+    }
+
+    /// Spawn a fake LSP server that returns completion items.
+    /// Unlike the default `spawn()`, this does NOT declare semanticTokensProvider.
+    pub fn spawn_with_completions_a(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+read_message() {
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then break; fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+case "$method" in
+    "initialize")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"completionProvider":{"triggerCharacters":["."]},"textDocumentSync":1}}}'
+        ;;
+    "textDocument/completion")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[{"label":"test_function","kind":3,"insertText":"test_function"},{"label":"test_variable","kind":6,"insertText":"test_variable"},{"label":"test_struct","kind":22,"insertText":"test_struct"}]}}'
+        ;;
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didClose")
+        ;;
+    "textDocument/diagnostic")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[],"resultId":null}}'
+        ;;
+    "textDocument/inlayHint")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/foldingRange")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/documentSymbol")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"error":{"code":-32601,"message":"Method not found"}}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::completions_a_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Get the path to the completions A fake LSP server script
+    pub fn completions_a_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_completions_a.sh")
+    }
+
+    /// Spawn a second fake LSP server that returns different completion items.
+    /// Used to test that completions from multiple servers are merged into
+    /// a single popup without stacking.
+    pub fn spawn_with_completions_b(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+read_message() {
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then break; fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+case "$method" in
+    "initialize")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"completionProvider":{"triggerCharacters":[".",":",":"]},"textDocumentSync":1}}}'
+        ;;
+    "textDocument/completion")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[{"label":"test_helper","kind":3,"detail":"fn test_helper()","insertText":"test_helper"},{"label":"test_mock","kind":6,"detail":"let test_mock","insertText":"test_mock"}]}}'
+        ;;
+    "textDocument/didOpen")
+        uri=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+        send_message '{"jsonrpc":"2.0","method":"textDocument/clangd.fileStatus","params":{"uri":"'$uri'","status":"ready"}}'
+        ;;
+    "textDocument/didChange"|"textDocument/didClose"|"textDocument/didSave")
+        ;;
+    "textDocument/diagnostic")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"items":[],"resultId":null}}'
+        ;;
+    "textDocument/inlayHint")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/foldingRange")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "textDocument/documentSymbol")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"error":{"code":-32601,"message":"Method not found"}}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::completions_b_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Get the path to the second completions fake LSP server script
+    pub fn completions_b_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_completions_b.sh")
     }
 
     /// Stop the server
@@ -1607,14 +2142,16 @@ mod tests {
 
     #[test]
     fn test_fake_lsp_server_creation() {
-        let server = FakeLspServer::spawn();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let server = FakeLspServer::spawn(temp_dir.path());
         assert!(server.is_ok());
     }
 
     #[test]
     fn test_script_path_exists() {
-        let _server = FakeLspServer::spawn().unwrap();
-        let path = FakeLspServer::script_path();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _server = FakeLspServer::spawn(temp_dir.path()).unwrap();
+        let path = FakeLspServer::script_path(temp_dir.path());
         assert!(path.exists());
     }
 }

@@ -204,6 +204,9 @@ pub struct Popup {
 
     /// Text selection for copy/paste (None if no selection)
     pub text_selection: Option<PopupTextSelection>,
+
+    /// Key hint shown right-aligned on the selected item (e.g. "(Tab)")
+    pub accept_key_hint: Option<String>,
 }
 
 impl Popup {
@@ -223,6 +226,7 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
         }
     }
 
@@ -250,6 +254,7 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
         }
     }
 
@@ -269,6 +274,7 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
         }
     }
 
@@ -353,6 +359,24 @@ impl Popup {
                 }
             }
         }
+    }
+
+    /// Select a specific item by index. Returns true if the index was valid.
+    pub fn select_index(&mut self, index: usize) -> bool {
+        let visible = self.visible_height();
+        if let PopupContent::List { items, selected } = &mut self.content {
+            if index < items.len() {
+                *selected = index;
+                // Adjust scroll to keep selection visible
+                if *selected >= self.scroll_offset + visible {
+                    self.scroll_offset = (*selected + 1).saturating_sub(visible);
+                } else if *selected < self.scroll_offset {
+                    self.scroll_offset = *selected;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Scroll down by one page
@@ -1089,6 +1113,30 @@ impl Popup {
                             ));
                         }
 
+                        // Add right-aligned accept key hint on the selected item
+                        if is_selected {
+                            if let Some(ref hint) = self.accept_key_hint {
+                                let hint_text = format!("({})", hint);
+                                // Calculate used width
+                                let used_width: usize = spans
+                                    .iter()
+                                    .map(|s| {
+                                        unicode_width::UnicodeWidthStr::width(s.content.as_ref())
+                                    })
+                                    .sum();
+                                let available = content_area.width as usize;
+                                let hint_len = hint_text.len();
+                                if used_width + hint_len + 1 < available {
+                                    let padding = available - used_width - hint_len;
+                                    spans.push(Span::raw(" ".repeat(padding)));
+                                    spans.push(Span::styled(
+                                        hint_text,
+                                        Style::default().fg(theme.help_separator_fg),
+                                    ));
+                                }
+                            }
+                        }
+
                         // Row style (background only, no underline)
                         let row_style = if is_selected {
                             Style::default().bg(theme.popup_selection_bg)
@@ -1152,6 +1200,17 @@ impl PopupManager {
     /// Show a popup (adds to top of stack)
     pub fn show(&mut self, popup: Popup) {
         self.popups.push(popup);
+    }
+
+    /// Show a popup, replacing any existing popup of the same kind.
+    /// If a popup with the same `PopupKind` already exists in the stack,
+    /// it is replaced in-place. Otherwise the new popup is pushed on top.
+    pub fn show_or_replace(&mut self, popup: Popup) {
+        if let Some(pos) = self.popups.iter().position(|p| p.kind == popup.kind) {
+            self.popups[pos] = popup;
+        } else {
+            self.popups.push(popup);
+        }
     }
 
     /// Hide the topmost popup

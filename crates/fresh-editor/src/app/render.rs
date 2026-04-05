@@ -2,6 +2,11 @@ use super::*;
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
 
+enum SearchDirection {
+    Forward,
+    Backward,
+}
+
 impl Editor {
     /// Render the editor to the terminal
     pub fn render(&mut self, frame: &mut Frame) {
@@ -11,6 +16,9 @@ impl Editor {
         // Save frame dimensions for recompute_layout (used by macro replay)
         self.cached_layout.last_frame_width = size.width;
         self.cached_layout.last_frame_height = size.height;
+
+        // Reset per-cell theme key map for this frame
+        self.cached_layout.reset_cell_theme_map();
 
         // For scroll sync groups, we need to update the active split's viewport position BEFORE
         // calling sync_scroll_groups, so that the sync reads the correct position.
@@ -131,7 +139,11 @@ impl Editor {
                 },
             ), // Status bar (hidden when toggled off or with popups)
             Constraint::Length(if show_search_options { 1 } else { 0 }),   // Search options bar
-            Constraint::Length(1), // Prompt line (always reserved)
+            Constraint::Length(if self.prompt_line_visible || self.prompt.is_some() {
+                1
+            } else {
+                0
+            }), // Prompt line (auto-hidden when no prompt active)
         ];
 
         let main_chunks = Layout::default()
@@ -173,7 +185,13 @@ impl Editor {
             editor_content_area = horizontal_chunks[1];
 
             // Get remote connection info before mutable borrow of file_explorer
-            let remote_connection = self.remote_connection_info().map(|s| s.to_string());
+            let remote_connection = self.remote_connection_info().map(|conn| {
+                if self.filesystem.is_remote_connected() {
+                    conn.to_string()
+                } else {
+                    format!("{} (Disconnected)", conn)
+                }
+            });
 
             // Render file explorer (only if we have it - during sync we just keep the area reserved)
             if let Some(ref mut explorer) = self.file_explorer {
@@ -195,6 +213,7 @@ impl Editor {
                     &self.mouse_state.hover_target,
                     Some(HoverTarget::FileExplorerCloseButton)
                 );
+                let keybindings = self.keybindings.read().unwrap();
                 FileExplorerRenderer::render(
                     explorer,
                     frame,
@@ -202,7 +221,7 @@ impl Editor {
                     is_focused,
                     &files_with_unsaved_changes,
                     &self.file_explorer_decoration_cache,
-                    &self.keybindings,
+                    &keybindings,
                     self.key_context.clone(),
                     &self.theme,
                     close_button_hovered,
@@ -371,7 +390,7 @@ impl Editor {
         }
 
         // Render editor content (same for both layouts)
-        let lsp_waiting = self.pending_completion_request.is_some()
+        let lsp_waiting = !self.pending_completion_requests.is_empty()
             || self.pending_goto_definition_request.is_some();
 
         // Hide the hardware cursor when menu is open, file explorer is focused, terminal mode,
@@ -444,11 +463,14 @@ impl Editor {
             self.config.editor.relative_line_numbers,
             self.tab_bar_visible,
             self.config.editor.use_terminal_bg,
-            self.session_mode || !self.config.editor.cursor_style.is_block(),
+            self.session_mode || !self.software_cursor_only,
             self.software_cursor_only,
             self.config.editor.show_vertical_scrollbar,
             self.config.editor.show_horizontal_scrollbar,
             self.config.editor.diagnostics_inline_text,
+            self.config.editor.show_tilde,
+            &mut self.cached_layout.cell_theme_map,
+            size.width,
         );
 
         drop(_content_span);
@@ -556,7 +578,7 @@ impl Editor {
         let prompt = self.prompt.clone();
         let lsp_status = self.lsp_status.clone();
         let theme = self.theme.clone();
-        let keybindings_cloned = self.keybindings.clone(); // Clone the keybindings
+        let keybindings_cloned = self.keybindings.read().unwrap().clone(); // Clone the keybindings
         let chord_state_cloned = self.chord_state.clone(); // Clone the chord state
 
         // Get update availability info
@@ -589,7 +611,13 @@ impl Editor {
             };
 
             // Get remote connection info if editing remote files
-            let remote_connection = self.remote_connection_info().map(|s| s.to_string());
+            let remote_connection = self.remote_connection_info().map(|conn| {
+                if self.filesystem.is_remote_connected() {
+                    conn.to_string()
+                } else {
+                    format!("{} (Disconnected)", conn)
+                }
+            });
 
             // Get session name for display (only in session mode)
             let session_name = self.session_name().map(|s| s.to_string());
@@ -947,14 +975,16 @@ impl Editor {
         }
 
         if self.menu_bar_visible {
+            let keybindings = self.keybindings.read().unwrap();
             self.cached_layout.menu_layout = Some(crate::view::ui::MenuRenderer::render(
                 frame,
                 menu_bar_area,
                 &self.menus,
                 &self.menu_state,
-                &self.keybindings,
+                &keybindings,
                 &self.theme,
                 self.mouse_state.hover_target.as_ref(),
+                self.config.editor.menu_bar_mnemonics,
             ));
         } else {
             self.cached_layout.menu_layout = None;
@@ -964,6 +994,9 @@ impl Editor {
         if let Some(ref menu) = self.tab_context_menu {
             self.render_tab_context_menu(frame, menu);
         }
+
+        // Record non-editor region theme keys for the theme inspector
+        self.record_non_editor_theme_regions();
 
         // Render theme info popup (Ctrl+Right-Click)
         self.render_theme_info_popup(frame);
@@ -1083,13 +1116,14 @@ impl Editor {
                 width,
                 height: max_height,
             };
+            let keybindings = self.keybindings.read().unwrap();
             self.file_browser_layout = crate::view::ui::FileBrowserRenderer::render(
                 frame,
                 popup_area,
                 file_open_state,
                 &self.theme,
                 &self.mouse_state.hover_target,
-                Some(&self.keybindings),
+                Some(&*keybindings),
             );
             return;
         }
@@ -1663,6 +1697,12 @@ impl Editor {
             return false;
         };
 
+        // Get file path from active buffer for workspace root detection
+        let file_path = self
+            .buffer_metadata
+            .get(&self.active_buffer())
+            .and_then(|meta| meta.file_path().cloned());
+
         match action {
             "allow_once" => {
                 // Spawn the LSP server just this once (don't add to always-allowed)
@@ -1670,7 +1710,7 @@ impl Editor {
                     // Temporarily allow this language for spawning
                     lsp.allow_language(&language);
                     // Use force_spawn since user explicitly confirmed
-                    if lsp.force_spawn(&language).is_some() {
+                    if lsp.force_spawn(&language, file_path.as_deref()).is_some() {
                         tracing::info!("LSP server for {} started (allowed once)", language);
                         self.set_status_message(
                             t!("lsp.server_started", language = language).to_string(),
@@ -1689,7 +1729,7 @@ impl Editor {
                 if let Some(lsp) = &mut self.lsp {
                     lsp.allow_language(&language);
                     // Use force_spawn since user explicitly confirmed
-                    if lsp.force_spawn(&language).is_some() {
+                    if lsp.force_spawn(&language, file_path.as_deref()).is_some() {
                         tracing::info!("LSP server for {} started (always allowed)", language);
                         self.set_status_message(
                             t!("lsp.server_started_auto", language = language).to_string(),
@@ -1736,6 +1776,9 @@ impl Editor {
             tracing::debug!("notify_lsp_current_file_opened: LSP disabled for this buffer");
             return;
         }
+
+        // Get file path for LSP spawn
+        let file_path = metadata.file_path().cloned();
 
         // Get the URI (computed once in with_file)
         let uri = match metadata.file_uri() {
@@ -1784,46 +1827,65 @@ impl Editor {
             return;
         };
 
-        // Send didOpen to LSP (use force_spawn since this is called after user confirmation)
+        // Send didOpen to all LSP handles (use force_spawn to ensure they're started)
         if let Some(lsp) = &mut self.lsp {
-            if let Some(client) = lsp.force_spawn(language) {
-                tracing::info!("Sending didOpen to newly started LSP for: {}", uri.as_str());
-                if let Err(e) = client.did_open(uri.clone(), text, file_language) {
-                    tracing::warn!("Failed to send didOpen to LSP: {}", e);
-                } else {
+            // force_spawn starts all servers for this language
+            if lsp.force_spawn(language, file_path.as_deref()).is_some() {
+                tracing::info!("Sending didOpen to LSP servers for: {}", uri.as_str());
+                let mut any_opened = false;
+                for sh in lsp.get_handles_mut(language) {
+                    if let Err(e) =
+                        sh.handle
+                            .did_open(uri.clone(), text.clone(), file_language.clone())
+                    {
+                        tracing::warn!("Failed to send didOpen to '{}': {}", sh.name, e);
+                    } else {
+                        any_opened = true;
+                    }
+                }
+
+                if any_opened {
                     tracing::info!("Successfully sent didOpen to LSP after confirmation");
 
-                    // Request pull diagnostics
-                    let previous_result_id = self.diagnostic_result_ids.get(uri.as_str()).cloned();
-                    let request_id = self.next_lsp_request_id;
-                    self.next_lsp_request_id += 1;
-
-                    if let Err(e) =
-                        client.document_diagnostic(request_id, uri.clone(), previous_result_id)
-                    {
-                        tracing::debug!(
-                            "Failed to request pull diagnostics (server may not support): {}",
-                            e
-                        );
-                    }
-
-                    // Request inlay hints if enabled
-                    if self.config.editor.enable_inlay_hints {
+                    // Request pull diagnostics from primary handle
+                    if let Some(handle) = lsp.get_handle_mut(language) {
+                        let previous_result_id =
+                            self.diagnostic_result_ids.get(uri.as_str()).cloned();
                         let request_id = self.next_lsp_request_id;
                         self.next_lsp_request_id += 1;
-                        self.pending_inlay_hints_request = Some(request_id);
-
-                        let last_line = line_count.saturating_sub(1) as u32;
-                        let last_char = 10000u32;
 
                         if let Err(e) =
-                            client.inlay_hints(request_id, uri.clone(), 0, 0, last_line, last_char)
+                            handle.document_diagnostic(request_id, uri.clone(), previous_result_id)
                         {
                             tracing::debug!(
-                                "Failed to request inlay hints (server may not support): {}",
+                                "Failed to request pull diagnostics (server may not support): {}",
                                 e
                             );
-                            self.pending_inlay_hints_request = None;
+                        }
+
+                        // Request inlay hints if enabled
+                        if self.config.editor.enable_inlay_hints {
+                            let request_id = self.next_lsp_request_id;
+                            self.next_lsp_request_id += 1;
+                            self.pending_inlay_hints_request = Some(request_id);
+
+                            let last_line = line_count.saturating_sub(1) as u32;
+                            let last_char = 10000u32;
+
+                            if let Err(e) = handle.inlay_hints(
+                                request_id,
+                                uri.clone(),
+                                0,
+                                0,
+                                last_line,
+                                last_char,
+                            ) {
+                                tracing::debug!(
+                                    "Failed to request inlay hints (server may not support): {}",
+                                    e
+                                );
+                                self.pending_inlay_hints_request = None;
+                            }
                         }
                     }
                 }
@@ -2038,6 +2100,9 @@ impl Editor {
             return;
         }
 
+        // Get file path for LSP spawn
+        let file_path = metadata.file_path().cloned();
+
         // Get the URI
         let uri = match metadata.file_uri() {
             Some(u) => u.clone(),
@@ -2078,22 +2143,26 @@ impl Editor {
         // Only send didSave if LSP is already running (respect auto_start setting)
         if let Some(lsp) = &mut self.lsp {
             use crate::services::lsp::manager::LspSpawnResult;
-            if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
+            if lsp.try_spawn(&language, file_path.as_deref()) != LspSpawnResult::Spawned {
                 tracing::debug!(
                     "notify_lsp_save: LSP not running for {} (auto_start disabled)",
                     language
                 );
                 return;
             }
-            if let Some(client) = lsp.get_handle_mut(&language) {
-                // Send didSave with the full text content
-                if let Err(e) = client.did_save(uri, Some(full_text)) {
-                    tracing::warn!("Failed to send didSave to LSP: {}", e);
+            // Broadcast didSave to all handles for this language
+            let mut any_sent = false;
+            for sh in lsp.get_handles_mut(&language) {
+                if let Err(e) = sh.handle.did_save(uri.clone(), Some(full_text.clone())) {
+                    tracing::warn!("Failed to send didSave to '{}': {}", sh.name, e);
                 } else {
-                    tracing::info!("Successfully sent didSave to LSP");
+                    any_sent = true;
                 }
+            }
+            if any_sent {
+                tracing::info!("Successfully sent didSave to LSP");
             } else {
-                tracing::warn!("notify_lsp_save: failed to get LSP client for {}", language);
+                tracing::warn!("notify_lsp_save: no LSP handles for {}", language);
             }
         } else {
             tracing::debug!("notify_lsp_save: no LSP manager available");
@@ -2483,6 +2552,24 @@ impl Editor {
     ///
     /// Matches are capped at `MAX_SEARCH_MATCHES` to bound memory usage,
     /// and overlays are only created for the visible viewport.
+    /// Move the primary cursor to `position`, clear its selection anchor,
+    /// update the cached line number (used by the status bar), and scroll
+    /// the active split so the cursor is visible.
+    fn move_cursor_to_match(&mut self, position: usize) {
+        let active_split = self.split_manager.active_split();
+        let active_buffer = self.active_buffer();
+        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
+            view_state.cursors.primary_mut().position = position;
+            view_state.cursors.primary_mut().anchor = None;
+            let state = self.buffers.get_mut(&active_buffer).unwrap();
+            if let Some(pos) = state.buffer.offset_to_position(position) {
+                state.primary_cursor_line_number =
+                    crate::model::buffer::LineNumber::Absolute(pos.line);
+            }
+            view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
+        }
+    }
+
     pub(super) fn perform_search(&mut self, query: &str) {
         if query.is_empty() {
             self.search_state = None;
@@ -2585,16 +2672,7 @@ impl Editor {
 
         // Move cursor to the first match
         let match_pos = matches[current_match_index];
-        {
-            let active_split = self.split_manager.active_split();
-            let active_buffer = self.active_buffer();
-            if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                view_state.cursors.primary_mut().position = match_pos;
-                view_state.cursors.primary_mut().anchor = None;
-                let state = self.buffers.get_mut(&active_buffer).unwrap();
-                view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-            }
-        }
+        self.move_cursor_to_match(match_pos);
 
         let num_matches = matches.len();
 
@@ -2822,7 +2900,23 @@ impl Editor {
     /// is used directly and viewport overlays are refreshed after the cursor
     /// moves.
     pub(super) fn find_next(&mut self) {
-        // For small files, try overlay-based positions first (auto-updated)
+        self.find_match_in_direction(SearchDirection::Forward);
+    }
+
+    /// Find the previous match.
+    ///
+    /// For small files, overlay markers are used as the source of truth
+    /// (they auto-track buffer edits).  For large files, `search_state.matches`
+    /// is used directly and viewport overlays are refreshed.
+    pub(super) fn find_previous(&mut self) {
+        self.find_match_in_direction(SearchDirection::Backward);
+    }
+
+    /// Navigate to the next or previous search match relative to the current
+    /// cursor position. This matches standard editor behavior (VS Code,
+    /// IntelliJ, etc.) where find always searches from the cursor, not from
+    /// a stored match index.
+    fn find_match_in_direction(&mut self, direction: SearchDirection) {
         let overlay_positions = self.get_search_match_positions();
         let is_large = self.active_state().buffer.is_large_file();
 
@@ -2841,102 +2935,72 @@ impl Editor {
                 return;
             }
 
-            let current_index = search_state.current_match_index.unwrap_or(0);
-            let next_index = if current_index + 1 < match_positions.len() {
-                current_index + 1
-            } else if search_state.wrap_search {
-                0 // Wrap to beginning
-            } else {
-                self.set_status_message(t!("search.no_matches").to_string());
-                return;
+            let cursor_pos = {
+                let active_split = self.split_manager.active_split();
+                self.split_view_states
+                    .get(&active_split)
+                    .map(|vs| vs.cursors.primary().position)
+                    .unwrap_or(0)
             };
 
-            search_state.current_match_index = Some(next_index);
-            let match_pos = match_positions[next_index];
+            let target_index = match direction {
+                SearchDirection::Forward => {
+                    // First match strictly after the cursor position.
+                    let idx = match match_positions.binary_search(&(cursor_pos + 1)) {
+                        Ok(i) | Err(i) => {
+                            if i < match_positions.len() {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    match idx {
+                        Some(i) => i,
+                        None if search_state.wrap_search => 0,
+                        None => {
+                            self.set_status_message(t!("search.no_matches").to_string());
+                            return;
+                        }
+                    }
+                }
+                SearchDirection::Backward => {
+                    // Last match strictly before the cursor position.
+                    let idx = if cursor_pos == 0 {
+                        None
+                    } else {
+                        match match_positions.binary_search(&(cursor_pos - 1)) {
+                            Ok(i) => Some(i),
+                            Err(i) => {
+                                if i > 0 {
+                                    Some(i - 1)
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    match idx {
+                        Some(i) => i,
+                        None if search_state.wrap_search => match_positions.len() - 1,
+                        None => {
+                            self.set_status_message(t!("search.no_matches").to_string());
+                            return;
+                        }
+                    }
+                }
+            };
+
+            search_state.current_match_index = Some(target_index);
+            let match_pos = match_positions[target_index];
             let matches_len = match_positions.len();
 
-            {
-                let active_split = self.split_manager.active_split();
-                let active_buffer = self.active_buffer();
-                if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                    view_state.cursors.primary_mut().position = match_pos;
-                    view_state.cursors.primary_mut().anchor = None;
-                    let state = self.buffers.get_mut(&active_buffer).unwrap();
-                    view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-                }
-            }
+            self.move_cursor_to_match(match_pos);
 
             self.set_status_message(
                 t!(
                     "search.match_of",
-                    current = next_index + 1,
-                    total = matches_len
-                )
-                .to_string(),
-            );
-
-            if is_large {
-                self.refresh_search_overlays();
-            }
-        } else {
-            let find_key = self
-                .get_keybinding_for_action("find")
-                .unwrap_or_else(|| "Ctrl+F".to_string());
-            self.set_status_message(t!("search.no_active", find_key = find_key).to_string());
-        }
-    }
-
-    /// Find the previous match.
-    ///
-    /// For small files, overlay markers are used as the source of truth
-    /// (they auto-track buffer edits).  For large files, `search_state.matches`
-    /// is used directly and viewport overlays are refreshed.
-    pub(super) fn find_previous(&mut self) {
-        let overlay_positions = self.get_search_match_positions();
-        let is_large = self.active_state().buffer.is_large_file();
-
-        if let Some(ref mut search_state) = self.search_state {
-            let use_overlays =
-                !is_large && !overlay_positions.is_empty() && search_state.search_range.is_none();
-            let match_positions: &[usize] = if use_overlays {
-                &overlay_positions
-            } else {
-                &search_state.matches
-            };
-
-            if match_positions.is_empty() {
-                return;
-            }
-
-            let current_index = search_state.current_match_index.unwrap_or(0);
-            let prev_index = if current_index > 0 {
-                current_index - 1
-            } else if search_state.wrap_search {
-                match_positions.len() - 1 // Wrap to end
-            } else {
-                self.set_status_message(t!("search.no_matches").to_string());
-                return;
-            };
-
-            search_state.current_match_index = Some(prev_index);
-            let match_pos = match_positions[prev_index];
-            let matches_len = match_positions.len();
-
-            {
-                let active_split = self.split_manager.active_split();
-                let active_buffer = self.active_buffer();
-                if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                    view_state.cursors.primary_mut().position = match_pos;
-                    view_state.cursors.primary_mut().anchor = None;
-                    let state = self.buffers.get_mut(&active_buffer).unwrap();
-                    view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-                }
-            }
-
-            self.set_status_message(
-                t!(
-                    "search.match_of",
-                    current = prev_index + 1,
+                    current = target_index + 1,
                     total = matches_len
                 )
                 .to_string(),
@@ -3326,15 +3390,7 @@ impl Editor {
         });
 
         // Move cursor to first match
-        let active_split = self.split_manager.active_split();
-        let active_buffer = self.active_buffer();
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-            view_state.cursors.primary_mut().position = first_match_pos;
-            view_state.cursors.primary_mut().anchor = None;
-            // Ensure cursor is visible
-            let state = self.buffers.get_mut(&active_buffer).unwrap();
-            view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-        }
+        self.move_cursor_to_match(first_match_pos);
 
         // Show the query-replace prompt
         self.prompt = Some(Prompt::new(
@@ -3638,16 +3694,7 @@ impl Editor {
 
     /// Move cursor to the current match in interactive replace
     pub(super) fn move_to_current_match(&mut self, ir_state: &InteractiveReplaceState) {
-        let match_pos = ir_state.current_match_pos;
-        let active_split = self.split_manager.active_split();
-        let active_buffer = self.active_buffer();
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-            view_state.cursors.primary_mut().position = match_pos;
-            view_state.cursors.primary_mut().anchor = None;
-            // Ensure cursor is visible
-            let state = self.buffers.get_mut(&active_buffer).unwrap();
-            view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-        }
+        self.move_cursor_to_match(ir_state.current_match_pos);
 
         // Update the prompt message (show [Wrapped] if we've wrapped around)
         let msg = if ir_state.has_wrapped {
@@ -4011,28 +4058,81 @@ impl Editor {
         }
 
         let ch = bytes[0] as char;
-        let (opening, closing, forward) = match ch {
-            '(' => ('(', ')', true),
-            ')' => ('(', ')', false),
-            '[' => ('[', ']', true),
-            ']' => ('[', ']', false),
-            '{' => ('{', '}', true),
-            '}' => ('{', '}', false),
-            '<' => ('<', '>', true),
-            '>' => ('<', '>', false),
-            _ => {
-                self.set_status_message(t!("diagnostics.bracket_none").to_string());
-                return;
-            }
+
+        // All supported bracket pairs
+        const BRACKET_PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+
+        let bracket_info = match ch {
+            '(' => Some(('(', ')', true)),
+            ')' => Some(('(', ')', false)),
+            '[' => Some(('[', ']', true)),
+            ']' => Some(('[', ']', false)),
+            '{' => Some(('{', '}', true)),
+            '}' => Some(('{', '}', false)),
+            '<' => Some(('<', '>', true)),
+            '>' => Some(('<', '>', false)),
+            _ => None,
         };
 
-        // Find matching bracket
+        // Limit searches to avoid O(n) scans on huge files.
+        use crate::view::bracket_highlight_overlay::MAX_BRACKET_SEARCH_BYTES;
+
+        // If cursor is not on a bracket, search backward for the nearest
+        // enclosing opening bracket, then jump to its matching close.
+        let (opening, closing, search_start, forward) =
+            if let Some((opening, closing, forward)) = bracket_info {
+                (opening, closing, pos, forward)
+            } else {
+                // Search backward from cursor to find enclosing opening bracket.
+                // Track depth per bracket type to handle nesting correctly.
+                let mut depths: Vec<i32> = vec![0; BRACKET_PAIRS.len()];
+                let mut found = None;
+                let search_limit = pos.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
+                let mut search_pos = pos.saturating_sub(1);
+                loop {
+                    let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
+                    if !b.is_empty() {
+                        let c = b[0] as char;
+                        for (i, &(open, close)) in BRACKET_PAIRS.iter().enumerate() {
+                            if c == close {
+                                depths[i] += 1;
+                            } else if c == open {
+                                if depths[i] > 0 {
+                                    depths[i] -= 1;
+                                } else {
+                                    // Found an unmatched opening bracket — this encloses us
+                                    found = Some((open, close, search_pos));
+                                    break;
+                                }
+                            }
+                        }
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                    if search_pos <= search_limit {
+                        break;
+                    }
+                    search_pos -= 1;
+                }
+
+                if let Some((opening, closing, bracket_pos)) = found {
+                    // Jump forward from the enclosing opening bracket to its match
+                    (opening, closing, bracket_pos, true)
+                } else {
+                    self.set_status_message(t!("diagnostics.bracket_none").to_string());
+                    return;
+                }
+            };
+
+        // Find matching bracket (bounded to MAX_BRACKET_SEARCH_BYTES)
         let buffer_len = state.buffer.len();
         let mut depth = 1;
         let matching_pos = if forward {
-            let mut search_pos = pos + 1;
+            let search_limit = (search_start + 1 + MAX_BRACKET_SEARCH_BYTES).min(buffer_len);
+            let mut search_pos = search_start + 1;
             let mut found = None;
-            while search_pos < buffer_len && depth > 0 {
+            while search_pos < search_limit && depth > 0 {
                 let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
                 if !b.is_empty() {
                     let c = b[0] as char;
@@ -4049,7 +4149,8 @@ impl Editor {
             }
             found
         } else {
-            let mut search_pos = pos.saturating_sub(1);
+            let search_limit = search_start.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
+            let mut search_pos = search_start.saturating_sub(1);
             let mut found = None;
             loop {
                 let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
@@ -4065,7 +4166,7 @@ impl Editor {
                         }
                     }
                 }
-                if search_pos == 0 {
+                if search_pos <= search_limit {
                     break;
                 }
                 search_pos -= 1;
@@ -4342,7 +4443,7 @@ impl Editor {
             Constraint::Min(0),
             Constraint::Length(if self.status_bar_visible { 1 } else { 0 }), // status bar
             Constraint::Length(0), // search options (doesn't matter for layout)
-            Constraint::Length(1), // prompt line
+            Constraint::Length(if self.prompt_line_visible { 1 } else { 0 }), // prompt line
         ];
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -4380,12 +4481,13 @@ impl Editor {
             self.config.editor.highlight_context_bytes,
             self.config.editor.relative_line_numbers,
             self.config.editor.use_terminal_bg,
-            self.session_mode || !self.config.editor.cursor_style.is_block(),
+            self.session_mode || !self.software_cursor_only,
             self.software_cursor_only,
             self.tab_bar_visible,
             self.config.editor.show_vertical_scrollbar,
             self.config.editor.show_horizontal_scrollbar,
             self.config.editor.diagnostics_inline_text,
+            self.config.editor.show_tilde,
         );
 
         self.cached_layout.view_line_mappings = view_line_mappings;

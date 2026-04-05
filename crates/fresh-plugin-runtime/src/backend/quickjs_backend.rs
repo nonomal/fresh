@@ -89,8 +89,8 @@
 use anyhow::{anyhow, Result};
 use fresh_core::api::{
     ActionSpec, BufferInfo, CompositeHunk, CreateCompositeBufferOptions, EditorStateSnapshot,
-    JsCallbackId, LanguagePackConfig, LspServerPackConfig, OverlayOptions, PluginCommand,
-    PluginResponse,
+    GrammarInfoSnapshot, JsCallbackId, LanguagePackConfig, LspServerPackConfig, OverlayOptions,
+    PluginCommand, PluginResponse,
 };
 use fresh_core::command::Command;
 use fresh_core::overlay::OverlayNamespace;
@@ -108,7 +108,25 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, RwLock};
 
+/// Recursively copy a directory and all its contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Convert a QuickJS Value to serde_json::Value
+#[allow(clippy::only_used_in_recursion)]
 fn js_to_json(ctx: &rquickjs::Ctx<'_>, val: Value<'_>) -> serde_json::Value {
     use rquickjs::Type;
     match val.type_of() {
@@ -649,6 +667,18 @@ pub struct JsEditorApi {
     plugin_tracked_state: Rc<RefCell<HashMap<String, PluginTrackedState>>>,
     #[qjs(skip_trace)]
     async_resource_owners: AsyncResourceOwners,
+    /// Tracks command name → owning plugin name (first-writer-wins collision detection)
+    #[qjs(skip_trace)]
+    registered_command_names: Rc<RefCell<HashMap<String, String>>>,
+    /// Tracks grammar language → owning plugin name (first-writer-wins collision detection)
+    #[qjs(skip_trace)]
+    registered_grammar_languages: Rc<RefCell<HashMap<String, String>>>,
+    /// Tracks language config language → owning plugin name (first-writer-wins collision detection)
+    #[qjs(skip_trace)]
+    registered_language_configs: Rc<RefCell<HashMap<String, String>>>,
+    /// Tracks LSP server language → owning plugin name (first-writer-wins collision detection)
+    #[qjs(skip_trace)]
+    registered_lsp_servers: Rc<RefCell<HashMap<String, String>>>,
     pub plugin_name: String,
 }
 
@@ -688,6 +718,18 @@ impl JsEditorApi {
             Vec::new()
         };
         rquickjs_serde::to_value(ctx, &buffers)
+            .map_err(|e| rquickjs::Error::new_from_js_message("serialize", "", &e.to_string()))
+    }
+
+    /// List all available grammars with source info - returns array of GrammarInfo objects
+    #[plugin_api(ts_return = "GrammarInfoSnapshot[]")]
+    pub fn list_grammars<'js>(&self, ctx: rquickjs::Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let grammars: Vec<GrammarInfoSnapshot> = if let Ok(s) = self.state_snapshot.read() {
+            s.available_grammars.clone()
+        } else {
+            Vec::new()
+        };
+        rquickjs_serde::to_value(ctx, &grammars)
             .map_err(|e| rquickjs::Error::new_from_js_message("serialize", "", &e.to_string()))
     }
 
@@ -757,7 +799,7 @@ impl JsEditorApi {
     /// editor modes.
     pub fn register_command<'js>(
         &self,
-        _ctx: rquickjs::Ctx<'js>,
+        ctx: rquickjs::Ctx<'js>,
         name: String,
         description: String,
         handler_name: String,
@@ -782,6 +824,36 @@ impl JsEditorApi {
             name,
             handler_name
         );
+
+        // First-writer-wins: check if another plugin already registered this command name
+        // Names starting with '%' are per-plugin i18n keys (e.g. "%cmd.reload") that resolve
+        // to different display strings per plugin, so they are scoped by plugin name.
+        let tracking_key = if name.starts_with('%') {
+            format!("{}:{}", plugin_name, name)
+        } else {
+            name.clone()
+        };
+        {
+            let names = self.registered_command_names.borrow();
+            if let Some(existing_plugin) = names.get(&tracking_key) {
+                if existing_plugin != &plugin_name {
+                    let msg = format!(
+                        "Command '{}' already registered by plugin '{}'",
+                        name, existing_plugin
+                    );
+                    tracing::warn!("registerCommand collision: {}", msg);
+                    return Err(
+                        ctx.throw(rquickjs::String::from_str(ctx.clone(), &msg)?.into_value())
+                    );
+                }
+                // Same plugin re-registering its own command is allowed (hot-reload)
+            }
+        }
+
+        // Record ownership
+        self.registered_command_names
+            .borrow_mut()
+            .insert(tracking_key, plugin_name.clone());
 
         // Store action handler mapping with its plugin name
         self.registered_actions.borrow_mut().insert(
@@ -809,6 +881,16 @@ impl JsEditorApi {
 
     /// Unregister a command by name
     pub fn unregister_command(&self, name: String) -> bool {
+        // Clear ownership tracking so another plugin can register this name
+        // Use same scoping logic as register_command for %-prefixed i18n keys
+        let tracking_key = if name.starts_with('%') {
+            format!("{}:{}", self.plugin_name, name)
+        } else {
+            name.clone()
+        };
+        self.registered_command_names
+            .borrow_mut()
+            .remove(&tracking_key);
         self.command_sender
             .send(PluginCommand::UnregisterCommand { name })
             .is_ok()
@@ -1334,9 +1416,7 @@ impl JsEditorApi {
     /// Handles percent-decoding and Windows drive letters.
     /// Returns an empty string if the URI is not a valid file URI.
     pub fn file_uri_to_path(&self, uri: String) -> String {
-        url::Url::parse(&uri)
-            .ok()
-            .and_then(|u| u.to_file_path().ok())
+        fresh_core::file_uri::file_uri_to_path(&uri)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default()
     }
@@ -1345,9 +1425,7 @@ impl JsEditorApi {
     /// Handles Windows drive letters and special characters.
     /// Returns an empty string if the path cannot be converted.
     pub fn path_to_file_uri(&self, path: String) -> String {
-        url::Url::from_file_path(&path)
-            .map(|u| u.to_string())
-            .unwrap_or_default()
+        fresh_core::file_uri::path_to_file_uri(std::path::Path::new(&path)).unwrap_or_default()
     }
 
     /// Get the UTF-8 byte length of a JavaScript string.
@@ -1377,10 +1455,8 @@ impl JsEditorApi {
     pub fn write_file(&self, path: String, content: String) -> bool {
         let p = Path::new(&path);
         if let Some(parent) = p.parent() {
-            if !parent.exists() {
-                if std::fs::create_dir_all(parent).is_err() {
-                    return false;
-                }
+            if !parent.exists() && std::fs::create_dir_all(parent).is_err() {
+                return false;
             }
         }
         std::fs::write(p, content).is_ok()
@@ -1415,6 +1491,112 @@ impl JsEditorApi {
 
         rquickjs_serde::to_value(ctx, &entries)
             .map_err(|e| rquickjs::Error::new_from_js_message("serialize", "", &e.to_string()))
+    }
+
+    /// Create a directory (and all parent directories) recursively.
+    /// Returns true if the directory was created or already exists.
+    pub fn create_dir(&self, path: String) -> bool {
+        let p = Path::new(&path);
+        if p.is_dir() {
+            return true;
+        }
+        std::fs::create_dir_all(p).is_ok()
+    }
+
+    /// Remove a file or directory by moving it to the OS trash/recycle bin.
+    /// For safety, the path must be under the OS temp directory or the Fresh
+    /// config directory. Returns true on success.
+    pub fn remove_path(&self, path: String) -> bool {
+        let target = match Path::new(&path).canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false, // path doesn't exist or can't be resolved
+        };
+
+        // Canonicalize allowed roots too, so that path prefix comparisons are
+        // consistent.  On Windows, `Path::canonicalize` returns extended-length
+        // UNC paths (e.g. `\\?\C:\...`) while `std::env::temp_dir()` and the
+        // config dir may use regular paths.  Without canonicalizing the roots
+        // the `starts_with` check would always fail on Windows.
+        let temp_dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let config_dir = self
+            .services
+            .config_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| self.services.config_dir());
+
+        // Verify the path is under an allowed root (temp or config dir)
+        let allowed = target.starts_with(&temp_dir) || target.starts_with(&config_dir);
+        if !allowed {
+            tracing::warn!(
+                "removePath refused: {:?} is not under temp dir ({:?}) or config dir ({:?})",
+                target,
+                temp_dir,
+                config_dir
+            );
+            return false;
+        }
+
+        // Don't allow removing the root directories themselves
+        if target == temp_dir || target == config_dir {
+            tracing::warn!(
+                "removePath refused: cannot remove root directory {:?}",
+                target
+            );
+            return false;
+        }
+
+        match trash::delete(&target) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("removePath trash failed for {:?}: {}", target, e);
+                false
+            }
+        }
+    }
+
+    /// Rename/move a file or directory. Returns true on success.
+    /// Falls back to copy then trash for cross-filesystem moves.
+    pub fn rename_path(&self, from: String, to: String) -> bool {
+        // Try direct rename first (works for same-filesystem moves)
+        if std::fs::rename(&from, &to).is_ok() {
+            return true;
+        }
+        // Cross-filesystem fallback: copy then trash the original
+        let from_path = Path::new(&from);
+        let copied = if from_path.is_dir() {
+            copy_dir_recursive(from_path, Path::new(&to)).is_ok()
+        } else {
+            std::fs::copy(&from, &to).is_ok()
+        };
+        if copied {
+            return trash::delete(from_path).is_ok();
+        }
+        false
+    }
+
+    /// Copy a file or directory recursively to a new location.
+    /// Returns true on success.
+    pub fn copy_path(&self, from: String, to: String) -> bool {
+        let from_path = Path::new(&from);
+        let to_path = Path::new(&to);
+        if from_path.is_dir() {
+            copy_dir_recursive(from_path, to_path).is_ok()
+        } else {
+            // Ensure parent directory exists
+            if let Some(parent) = to_path.parent() {
+                if !parent.exists() && std::fs::create_dir_all(parent).is_err() {
+                    return false;
+                }
+            }
+            std::fs::copy(from_path, to_path).is_ok()
+        }
+    }
+
+    /// Get the OS temporary directory path.
+    pub fn get_temp_dir(&self) -> String {
+        std::env::temp_dir().to_string_lossy().to_string()
     }
 
     // === Config ===
@@ -1465,33 +1647,107 @@ impl JsEditorApi {
 
     /// Register a TextMate grammar file for a language
     /// The grammar will be pending until reload_grammars() is called
-    pub fn register_grammar(
+    pub fn register_grammar<'js>(
         &self,
+        ctx: rquickjs::Ctx<'js>,
         language: String,
         grammar_path: String,
         extensions: Vec<String>,
-    ) -> bool {
-        self.command_sender
+    ) -> rquickjs::Result<bool> {
+        // First-writer-wins: check if another plugin already registered a grammar for this language
+        {
+            let langs = self.registered_grammar_languages.borrow();
+            if let Some(existing_plugin) = langs.get(&language) {
+                if existing_plugin != &self.plugin_name {
+                    let msg = format!(
+                        "Grammar for language '{}' already registered by plugin '{}'",
+                        language, existing_plugin
+                    );
+                    tracing::warn!("registerGrammar collision: {}", msg);
+                    return Err(
+                        ctx.throw(rquickjs::String::from_str(ctx.clone(), &msg)?.into_value())
+                    );
+                }
+            }
+        }
+        self.registered_grammar_languages
+            .borrow_mut()
+            .insert(language.clone(), self.plugin_name.clone());
+
+        Ok(self
+            .command_sender
             .send(PluginCommand::RegisterGrammar {
                 language,
                 grammar_path,
                 extensions,
             })
-            .is_ok()
+            .is_ok())
     }
 
     /// Register language configuration (comment prefix, indentation, formatter)
-    pub fn register_language_config(&self, language: String, config: LanguagePackConfig) -> bool {
-        self.command_sender
+    pub fn register_language_config<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+        language: String,
+        config: LanguagePackConfig,
+    ) -> rquickjs::Result<bool> {
+        // First-writer-wins
+        {
+            let langs = self.registered_language_configs.borrow();
+            if let Some(existing_plugin) = langs.get(&language) {
+                if existing_plugin != &self.plugin_name {
+                    let msg = format!(
+                        "Language config for '{}' already registered by plugin '{}'",
+                        language, existing_plugin
+                    );
+                    tracing::warn!("registerLanguageConfig collision: {}", msg);
+                    return Err(
+                        ctx.throw(rquickjs::String::from_str(ctx.clone(), &msg)?.into_value())
+                    );
+                }
+            }
+        }
+        self.registered_language_configs
+            .borrow_mut()
+            .insert(language.clone(), self.plugin_name.clone());
+
+        Ok(self
+            .command_sender
             .send(PluginCommand::RegisterLanguageConfig { language, config })
-            .is_ok()
+            .is_ok())
     }
 
     /// Register an LSP server for a language
-    pub fn register_lsp_server(&self, language: String, config: LspServerPackConfig) -> bool {
-        self.command_sender
+    pub fn register_lsp_server<'js>(
+        &self,
+        ctx: rquickjs::Ctx<'js>,
+        language: String,
+        config: LspServerPackConfig,
+    ) -> rquickjs::Result<bool> {
+        // First-writer-wins
+        {
+            let langs = self.registered_lsp_servers.borrow();
+            if let Some(existing_plugin) = langs.get(&language) {
+                if existing_plugin != &self.plugin_name {
+                    let msg = format!(
+                        "LSP server for language '{}' already registered by plugin '{}'",
+                        language, existing_plugin
+                    );
+                    tracing::warn!("registerLspServer collision: {}", msg);
+                    return Err(
+                        ctx.throw(rquickjs::String::from_str(ctx.clone(), &msg)?.into_value())
+                    );
+                }
+            }
+        }
+        self.registered_lsp_servers
+            .borrow_mut()
+            .insert(language.clone(), self.plugin_name.clone());
+
+        Ok(self
+            .command_sender
             .send(PluginCommand::RegisterLspServer { language, config })
-            .is_ok()
+            .is_ok())
     }
 
     /// Reload the grammar registry to apply registered grammars (async)
@@ -1513,6 +1769,17 @@ impl JsEditorApi {
             callback_id: fresh_core::api::JsCallbackId::new(id),
         });
         id
+    }
+
+    /// Get the directory where this plugin's files are stored.
+    /// For package plugins this is `<plugins_dir>/packages/<plugin_name>/`.
+    pub fn get_plugin_dir(&self) -> String {
+        self.services
+            .plugins_dir()
+            .join("packages")
+            .join(&self.plugin_name)
+            .to_string_lossy()
+            .to_string()
     }
 
     /// Get config directory path
@@ -3800,6 +4067,14 @@ pub struct QuickJsBackend {
     /// Shared map of request_id → plugin_name for async resource creations.
     /// Used by PluginThreadHandle to track buffer/terminal IDs when responses arrive.
     async_resource_owners: AsyncResourceOwners,
+    /// Tracks command name → owning plugin name (first-writer-wins collision detection)
+    registered_command_names: Rc<RefCell<HashMap<String, String>>>,
+    /// Tracks grammar language → owning plugin name (first-writer-wins)
+    registered_grammar_languages: Rc<RefCell<HashMap<String, String>>>,
+    /// Tracks language config language → owning plugin name (first-writer-wins)
+    registered_language_configs: Rc<RefCell<HashMap<String, String>>>,
+    /// Tracks LSP server language → owning plugin name (first-writer-wins)
+    registered_lsp_servers: Rc<RefCell<HashMap<String, String>>>,
 }
 
 impl QuickJsBackend {
@@ -3889,6 +4164,10 @@ impl QuickJsBackend {
         let next_request_id = Rc::new(RefCell::new(1u64));
         let callback_contexts = Rc::new(RefCell::new(HashMap::new()));
         let plugin_tracked_state = Rc::new(RefCell::new(HashMap::new()));
+        let registered_command_names = Rc::new(RefCell::new(HashMap::new()));
+        let registered_grammar_languages = Rc::new(RefCell::new(HashMap::new()));
+        let registered_language_configs = Rc::new(RefCell::new(HashMap::new()));
+        let registered_lsp_servers = Rc::new(RefCell::new(HashMap::new()));
 
         let backend = Self {
             runtime,
@@ -3904,6 +4183,10 @@ impl QuickJsBackend {
             services,
             plugin_tracked_state,
             async_resource_owners,
+            registered_command_names,
+            registered_grammar_languages,
+            registered_language_configs,
+            registered_lsp_servers,
         };
 
         // Initialize main context (for internal utilities if needed)
@@ -3920,6 +4203,10 @@ impl QuickJsBackend {
         let event_handlers = Rc::clone(&self.event_handlers);
         let registered_actions = Rc::clone(&self.registered_actions);
         let next_request_id = Rc::clone(&self.next_request_id);
+        let registered_command_names = Rc::clone(&self.registered_command_names);
+        let registered_grammar_languages = Rc::clone(&self.registered_grammar_languages);
+        let registered_language_configs = Rc::clone(&self.registered_language_configs);
+        let registered_lsp_servers = Rc::clone(&self.registered_lsp_servers);
 
         context.with(|ctx| {
             let globals = ctx.globals();
@@ -3939,6 +4226,10 @@ impl QuickJsBackend {
                 services: self.services.clone(),
                 plugin_tracked_state: Rc::clone(&self.plugin_tracked_state),
                 async_resource_owners: Arc::clone(&self.async_resource_owners),
+                registered_command_names: Rc::clone(&registered_command_names),
+                registered_grammar_languages: Rc::clone(&registered_grammar_languages),
+                registered_language_configs: Rc::clone(&registered_language_configs),
+                registered_lsp_servers: Rc::clone(&registered_lsp_servers),
                 plugin_name: plugin_name.to_string(),
             };
             let editor = rquickjs::Class::<JsEditorApi>::instance(ctx.clone(), js_api)?;
@@ -4204,7 +4495,7 @@ impl QuickJsBackend {
     }
 
     /// Execute JavaScript code in the context
-    fn execute_js(&mut self, code: &str, source_name: &str) -> Result<()> {
+    pub(crate) fn execute_js(&mut self, code: &str, source_name: &str) -> Result<()> {
         // Extract plugin name from path (filename without extension)
         let plugin_name = Path::new(source_name)
             .file_stem()
@@ -4461,6 +4752,20 @@ impl QuickJsBackend {
         if let Ok(mut owners) = self.async_resource_owners.lock() {
             owners.retain(|_, name| name != plugin_name);
         }
+
+        // Clear collision tracking maps so another plugin can re-register these names
+        self.registered_command_names
+            .borrow_mut()
+            .retain(|_, pname| pname != plugin_name);
+        self.registered_grammar_languages
+            .borrow_mut()
+            .retain(|_, pname| pname != plugin_name);
+        self.registered_language_configs
+            .borrow_mut()
+            .retain(|_, pname| pname != plugin_name);
+        self.registered_lsp_servers
+            .borrow_mut()
+            .retain(|_, pname| pname != plugin_name);
 
         tracing::debug!(
             "cleanup_plugin: cleaned up runtime state for plugin '{}'",
@@ -7420,5 +7725,189 @@ mod tests {
                     "Plugin B should see its own value, not plugin A's"
                 );
             });
+    }
+
+    #[test]
+    fn test_register_command_collision_different_plugins() {
+        let (mut backend, _rx) = create_test_backend();
+
+        // Plugin A registers a command
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerA = function() { };
+            editor.registerCommand("My Command", "From A", "handlerA", null);
+        "#,
+                "plugin_a.js",
+            )
+            .unwrap();
+
+        // Plugin B tries to register the same command name — should throw
+        let result = backend.execute_js(
+            r#"
+            const editor = getEditor();
+            globalThis.handlerB = function() { };
+            editor.registerCommand("My Command", "From B", "handlerB", null);
+        "#,
+            "plugin_b.js",
+        );
+
+        assert!(
+            result.is_err(),
+            "Second plugin registering the same command name should fail"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already registered"),
+            "Error should mention collision: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_register_command_same_plugin_allowed() {
+        let (mut backend, _rx) = create_test_backend();
+
+        // Plugin A registers a command, then re-registers it (hot-reload)
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handler1 = function() { };
+            editor.registerCommand("My Command", "Version 1", "handler1", null);
+            globalThis.handler2 = function() { };
+            editor.registerCommand("My Command", "Version 2", "handler2", null);
+        "#,
+                "plugin_a.js",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_register_command_after_unregister() {
+        let (mut backend, _rx) = create_test_backend();
+
+        // Plugin A registers then unregisters
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerA = function() { };
+            editor.registerCommand("My Command", "From A", "handlerA", null);
+            editor.unregisterCommand("My Command");
+        "#,
+                "plugin_a.js",
+            )
+            .unwrap();
+
+        // Plugin B can now register the same name
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerB = function() { };
+            editor.registerCommand("My Command", "From B", "handlerB", null);
+        "#,
+                "plugin_b.js",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_register_command_collision_caught_in_try_catch() {
+        let (mut backend, _rx) = create_test_backend();
+
+        // Plugin A registers a command
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerA = function() { };
+            editor.registerCommand("My Command", "From A", "handlerA", null);
+        "#,
+                "plugin_a.js",
+            )
+            .unwrap();
+
+        // Plugin B catches the collision error gracefully
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerB = function() { };
+            let caught = false;
+            try {
+                editor.registerCommand("My Command", "From B", "handlerB", null);
+            } catch (e) {
+                caught = true;
+            }
+            if (!caught) throw new Error("Expected collision error");
+        "#,
+                "plugin_b.js",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_register_command_i18n_key_no_collision_across_plugins() {
+        let (mut backend, _rx) = create_test_backend();
+
+        // Plugin A registers a %-prefixed i18n command
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerA = function() { };
+            editor.registerCommand("%cmd.reload", "Reload A", "handlerA", null);
+        "#,
+                "plugin_a.js",
+            )
+            .unwrap();
+
+        // Plugin B registers the same %-prefixed i18n key — should NOT collide
+        // because %-prefixed names are scoped per plugin
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerB = function() { };
+            editor.registerCommand("%cmd.reload", "Reload B", "handlerB", null);
+        "#,
+                "plugin_b.js",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_register_command_non_i18n_still_collides() {
+        let (mut backend, _rx) = create_test_backend();
+
+        // Plugin A registers a plain (non-%) command
+        backend
+            .execute_js(
+                r#"
+            const editor = getEditor();
+            globalThis.handlerA = function() { };
+            editor.registerCommand("My Reload", "Reload A", "handlerA", null);
+        "#,
+                "plugin_a.js",
+            )
+            .unwrap();
+
+        // Plugin B tries the same plain name — should collide
+        let result = backend.execute_js(
+            r#"
+            const editor = getEditor();
+            globalThis.handlerB = function() { };
+            editor.registerCommand("My Reload", "Reload B", "handlerB", null);
+        "#,
+            "plugin_b.js",
+        );
+
+        assert!(
+            result.is_err(),
+            "Non-%-prefixed names should still collide across plugins"
+        );
     }
 }

@@ -43,7 +43,7 @@ fn open_search_replace_via_palette(harness: &mut EditorTestHarness) {
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
-    harness.render().unwrap();
+    harness.wait_for_prompt().unwrap();
 
     harness.type_text("Search and Replace").unwrap();
 
@@ -180,15 +180,18 @@ fn test_search_replace_toggle_selection() {
     open_search_replace_via_palette(&mut harness);
     enter_search_and_replace(&mut harness, "apple", "pear");
 
-    // Wait for results panel with checkboxes
+    // Wait for results panel with checkboxes AND for focus to stabilize on
+    // the matches panel.  After rerunSearch() completes, a .then() callback
+    // sets focusPanel="matches" and re-renders.  wait_until_stable ensures
+    // that extra render cycle has settled before we send navigation keys.
     harness
-        .wait_until(|h| {
+        .wait_until_stable(|h| {
             let s = h.screen_to_string();
             s.contains("[v]") && s.contains("only.txt")
         })
         .unwrap();
 
-    // Focus starts on matches panel at index 0 (first file node).
+    // Focus is now on matches panel at index 0 (first file node).
     // Navigate down to the first match row (child of the file node).
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
@@ -355,8 +358,13 @@ fn test_search_replace_executes_replacement() {
     open_search_replace_via_palette(&mut harness);
     enter_search_and_replace(&mut harness, "hello", "goodbye");
 
+    // Wait for search results to be populated AND for the panel focus to
+    // stabilize before sending Alt+Enter.
     harness
-        .wait_until(|h| h.screen_to_string().contains("[v]"))
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("matches") && s.contains("[v]")
+        })
         .unwrap();
 
     // Press Alt+Enter to execute Replace All
@@ -423,8 +431,13 @@ fn test_search_replace_delete_pattern() {
         .unwrap();
     harness.render().unwrap();
 
+    // Wait for search results to be populated AND for the panel focus to
+    // stabilize before sending Alt+Enter.
     harness
-        .wait_until(|h| h.screen_to_string().contains("[v]"))
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("matches") && s.contains("[v]")
+        })
         .unwrap();
 
     // Alt+Enter to execute Replace All
@@ -446,9 +459,19 @@ fn test_search_replace_delete_pattern() {
 #[test]
 fn test_search_replace_multiple_matches_same_line() {
     init_tracing_from_env();
+
+    let start = std::time::Instant::now();
+    let elapsed = || format!("{:.1}s", start.elapsed().as_secs_f64());
+
+    eprintln!(
+        "[DEBUG {}] test_search_replace_multiple_matches_same_line: starting",
+        elapsed()
+    );
+
     let (_temp_dir, project_root) = setup_search_replace_project();
 
     fs::write(project_root.join("multi.txt"), "aa bb aa cc aa\nno match\n").unwrap();
+    eprintln!("[DEBUG {}] project set up at {:?}", elapsed(), project_root);
 
     let start_file = project_root.join("multi.txt");
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -460,22 +483,147 @@ fn test_search_replace_multiple_matches_same_line() {
     .unwrap();
     harness.open_file(&start_file).unwrap();
     harness.render().unwrap();
+    eprintln!("[DEBUG {}] file opened and initial render done", elapsed());
+    eprintln!(
+        "[DEBUG {}] screen after open:\n{}",
+        elapsed(),
+        harness.screen_to_string()
+    );
 
-    open_search_replace_via_palette(&mut harness);
-    enter_search_and_replace(&mut harness, "aa", "ZZ");
+    // --- Open command palette ---
+    eprintln!("[DEBUG {}] opening command palette (Ctrl+P)", elapsed());
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    eprintln!("[DEBUG {}] command palette prompt is active", elapsed());
+
+    harness.type_text("Search and Replace").unwrap();
+    eprintln!(
+        "[DEBUG {}] typed 'Search and Replace' into palette",
+        elapsed()
+    );
 
     harness
-        .wait_until(|h| h.screen_to_string().contains("[v]"))
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("Search and Replace") || s.contains("Search & Replace")
+        })
         .unwrap();
+    eprintln!(
+        "[DEBUG {}] palette shows Search and Replace option",
+        elapsed()
+    );
+    eprintln!(
+        "[DEBUG {}] screen:\n{}",
+        elapsed(),
+        harness.screen_to_string()
+    );
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    eprintln!("[DEBUG {}] pressed Enter on palette item", elapsed());
+
+    // --- Enter search and replace terms ---
+    eprintln!("[DEBUG {}] waiting for Search: field", elapsed());
+    {
+        let mut wait_iters = 0u64;
+        harness
+            .wait_until(|h| {
+                wait_iters += 1;
+                if wait_iters % 20 == 0 {
+                    eprintln!(
+                        "[DEBUG wait_until Search:] iteration {}, screen:\n{}",
+                        wait_iters,
+                        h.screen_to_string()
+                    );
+                }
+                h.screen_to_string().contains("Search:")
+            })
+            .unwrap();
+    }
+    eprintln!("[DEBUG {}] Search: field visible", elapsed());
+
+    harness.type_text("aa").unwrap();
+    harness.render().unwrap();
+    eprintln!("[DEBUG {}] typed search term 'aa'", elapsed());
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    eprintln!(
+        "[DEBUG {}] pressed Enter to move to replace field",
+        elapsed()
+    );
+
+    harness.type_text("ZZ").unwrap();
+    harness.render().unwrap();
+    eprintln!("[DEBUG {}] typed replace term 'ZZ'", elapsed());
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    eprintln!(
+        "[DEBUG {}] pressed Enter to confirm and run search",
+        elapsed()
+    );
+    eprintln!(
+        "[DEBUG {}] screen after search submitted:\n{}",
+        elapsed(),
+        harness.screen_to_string()
+    );
+
+    // Wait for search results to be populated AND for the panel focus to
+    // stabilize.  After rerunSearch() completes, a .then() callback sets
+    // focusPanel="matches" and re-renders.  wait_until_stable ensures that
+    // extra render cycle has settled before we send Alt+Enter.
+    eprintln!(
+        "[DEBUG {}] waiting for search results (matches + [v]) and stability",
+        elapsed()
+    );
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("matches") && s.contains("[v]")
+        })
+        .unwrap();
+    eprintln!("[DEBUG {}] search results populated and stable", elapsed());
+    eprintln!(
+        "[DEBUG {}] screen:\n{}",
+        elapsed(),
+        harness.screen_to_string()
+    );
 
     // Alt+Enter to execute Replace All
+    eprintln!("[DEBUG {}] pressing Alt+Enter to Replace All", elapsed());
     harness.send_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
+    eprintln!("[DEBUG {}] Alt+Enter sent", elapsed());
 
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Replaced"))
-        .unwrap();
+    eprintln!("[DEBUG {}] waiting for 'Replaced' confirmation", elapsed());
+    {
+        let mut wait_iters = 0u64;
+        harness
+            .wait_until(|h| {
+                wait_iters += 1;
+                if wait_iters % 20 == 0 {
+                    eprintln!(
+                        "[DEBUG wait_until Replaced] iteration {}, screen:\n{}",
+                        wait_iters,
+                        h.screen_to_string()
+                    );
+                }
+                h.screen_to_string().contains("Replaced")
+            })
+            .unwrap();
+    }
+    eprintln!("[DEBUG {}] replacement confirmed", elapsed());
 
     let content = fs::read_to_string(project_root.join("multi.txt")).unwrap();
+    eprintln!("[DEBUG {}] multi.txt content: {:?}", elapsed(), content);
     assert!(
         content.contains("ZZ bb ZZ cc ZZ"),
         "All occurrences on the line should be replaced. Got:\n{}",
@@ -486,4 +634,5 @@ fn test_search_replace_multiple_matches_same_line() {
         "No 'aa' should remain. Got:\n{}",
         content
     );
+    eprintln!("[DEBUG {}] test PASSED", elapsed());
 }

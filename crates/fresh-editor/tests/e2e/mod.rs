@@ -48,6 +48,7 @@ pub mod lifecycle;
 pub mod line_number_bugs;
 pub mod line_wrap_scroll_bugs;
 pub mod line_wrapping;
+pub mod memory_scroll_leak;
 pub mod live_grep;
 pub mod locale;
 pub mod lsp;

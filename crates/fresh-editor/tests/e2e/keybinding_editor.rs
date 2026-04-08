@@ -2020,3 +2020,32 @@ fn test_escape_still_closes_dialog_without_capture_mode() {
     harness.assert_screen_not_contains("Add Keybinding");
     harness.assert_screen_contains("Keybinding Editor");
 }
+
+/// Test that pressing a key (e.g. arrow) in the key field does NOT record it
+/// unless the user has entered capture mode with Enter first.
+#[test]
+fn test_key_not_recorded_without_capture_mode() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Add Keybinding");
+
+    // Press Down arrow directly WITHOUT entering capture mode
+    harness
+        .send_key(KeyCode::Down, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // The key field should still be empty — the arrow should NOT have been recorded
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("\u{2193}"),
+        "Down arrow should NOT be recorded without entering capture mode first.\nScreen:\n{}",
+        screen
+    );
+}

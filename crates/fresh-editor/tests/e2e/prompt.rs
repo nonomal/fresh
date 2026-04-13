@@ -554,7 +554,7 @@ fn test_save_as_relative_path() {
     eprintln!("[TEST] Test completed successfully");
 }
 
-/// Test Save As creates parent directories if needed
+/// Test Save As prompts to create parent directories if needed
 #[test]
 fn test_save_as_nested_path() {
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -581,10 +581,9 @@ fn test_save_as_nested_path() {
     // Wait for the Save As prompt to appear
     harness.wait_for_screen_contains("Save as:").unwrap();
 
-    // Type nested path (parent dir doesn't exist yet)
+    // Type nested relative path (parent dir doesn't exist yet)
     let nested_path = project_dir.join("subdir").join("nested.txt");
-    let nested_path_str = nested_path.to_str().unwrap();
-    harness.type_text(nested_path_str).unwrap();
+    harness.type_text("subdir/nested.txt").unwrap();
 
     // Confirm
     harness
@@ -592,12 +591,25 @@ fn test_save_as_nested_path() {
         .unwrap();
     harness.render().unwrap();
 
-    // Note: This test verifies the error case since we don't auto-create parent dirs
-    // The file won't be created because the parent directory doesn't exist
-    // This documents current behavior - if we want to auto-create dirs, update this test
-    if !nested_path.exists() {
-        harness.assert_screen_contains("Error saving file");
-    }
+    // Should prompt to create the missing directory
+    // (check for "does not exist" which appears in the prompt text;
+    // use a wide terminal to avoid truncation of long macOS temp paths)
+    harness.assert_screen_contains("does not exist");
+
+    // Confirm directory creation
+    harness.type_text("c").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // File should be saved successfully
+    harness.wait_for_screen_contains("Saved").unwrap();
+    assert!(nested_path.exists(), "Nested file should be created");
+    assert_eq!(
+        std::fs::read_to_string(&nested_path).unwrap(),
+        "Nested file content"
+    );
 }
 
 /// Test Save As prompts for confirmation when overwriting an existing file

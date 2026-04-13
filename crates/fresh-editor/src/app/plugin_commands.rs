@@ -40,74 +40,6 @@ fn make_search_opts(
     }
 }
 
-/// Recursively walk `dir` via the `FileSystem` trait, collecting file paths.
-/// Skips hidden entries (dot-prefixed) and common non-source directories.
-fn walk_files_recursive(
-    fs: &dyn crate::model::filesystem::FileSystem,
-    dir: &std::path::Path,
-    out: &mut Vec<std::path::PathBuf>,
-) {
-    let entries = match fs.read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
-        // Skip hidden files/dirs
-        if entry.name.starts_with('.') {
-            continue;
-        }
-        match entry.entry_type {
-            crate::model::filesystem::EntryType::File => {
-                out.push(entry.path);
-            }
-            crate::model::filesystem::EntryType::Directory => {
-                if !IGNORED_DIRS.contains(&entry.name.as_str()) {
-                    walk_files_recursive(fs, &entry.path, out);
-                }
-            }
-            _ => {} // skip symlinks etc. for now
-        }
-    }
-}
-
-/// Streaming variant: recursively walks and sends each file path via callback.
-/// Returns early if `cancel` is set or callback returns false (receiver dropped).
-fn walk_files_streaming(
-    fs: &dyn crate::model::filesystem::FileSystem,
-    dir: &std::path::Path,
-    cancel: &std::sync::atomic::AtomicBool,
-    send: &mut dyn FnMut(std::path::PathBuf) -> bool,
-) {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let entries = match fs.read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        if entry.name.starts_with('.') {
-            continue;
-        }
-        match entry.entry_type {
-            crate::model::filesystem::EntryType::File => {
-                if !send(entry.path) {
-                    return;
-                }
-            }
-            crate::model::filesystem::EntryType::Directory => {
-                if !IGNORED_DIRS.contains(&entry.name.as_str()) {
-                    walk_files_streaming(fs, &entry.path, cancel, send);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 impl Editor {
     // ==================== Menu Helpers ====================
 
@@ -668,9 +600,26 @@ impl Editor {
     }
 
     /// Handle SetBufferCursor command
+    ///
+    /// Walks both the main split tree (`split_manager.splits_for_buffer`) AND
+    /// the inner leaves of all grouped subtrees stored in `grouped_subtrees`,
+    /// mirroring `handle_scroll_buffer_to_line` — buffer-group panel buffers
+    /// are not represented in `split_manager`'s tree, so the basic lookup
+    /// returns nothing for them.
     pub(super) fn handle_set_buffer_cursor(&mut self, buffer_id: BufferId, position: usize) {
-        // Find all splits that display this buffer and update their view states
-        let splits = self.split_manager.splits_for_buffer(buffer_id);
+        // Find all splits that display this buffer (main tree + grouped subtrees).
+        let mut splits: Vec<crate::app::LeafId> = self.split_manager.splits_for_buffer(buffer_id);
+        for node in self.grouped_subtrees.values() {
+            if let crate::view::split::SplitNode::Grouped { layout, .. } = node {
+                for inner_leaf in layout.leaf_split_ids() {
+                    if let Some(vs) = self.split_view_states.get(&inner_leaf) {
+                        if vs.active_buffer == buffer_id && !splits.contains(&inner_leaf) {
+                            splits.push(inner_leaf);
+                        }
+                    }
+                }
+            }
+        }
         let active_split = self.split_manager.active_split();
 
         tracing::debug!(
@@ -910,8 +859,7 @@ impl Editor {
 
             // Apply events
             for event in events {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
         }
     }
@@ -949,6 +897,11 @@ impl Editor {
         let buffer_len = state.buffer.len();
         let clamped_position = final_position.min(buffer_len);
 
+        // Update the cached line number so the status bar shows the correct
+        // position. Without this, the status bar reads a stale value from
+        // state.primary_cursor_line_number which was set before the jump.
+        state.primary_cursor_line_number = crate::model::buffer::LineNumber::Absolute(target_line);
+
         // Update cursors (now in SplitViewState)
         let cursors = self.active_cursors_mut();
         cursors.primary_mut().position = clamped_position;
@@ -970,7 +923,7 @@ impl Editor {
         line: Option<usize>,
         column: Option<usize>,
     ) -> AnyhowResult<()> {
-        // Open the file
+        // Open the file (may switch to an already-open buffer)
         if let Err(e) = self.open_file(&path) {
             tracing::error!("Failed to open file from plugin: {}", e);
             return Ok(());
@@ -1019,14 +972,39 @@ impl Editor {
         }
     }
 
-    /// Handle ShowBuffer command
+    /// Handle ShowBuffer command.
+    ///
+    /// If `buffer_id` belongs to a buffer group (i.e., it's one of the group's
+    /// panel buffers), this activates the group's tab and focuses that panel
+    /// instead of clobbering the current split's leaf with the panel buffer —
+    /// which would bypass the group-tab dispatch path and break rendering.
     pub(super) fn handle_show_buffer(&mut self, buffer_id: BufferId) {
-        if self.buffers.contains_key(&buffer_id) {
-            self.set_active_buffer(buffer_id);
-            tracing::info!("Switched to buffer {:?}", buffer_id);
-        } else {
+        if !self.buffers.contains_key(&buffer_id) {
             tracing::warn!("Buffer {:?} not found", buffer_id);
+            return;
         }
+
+        // If this buffer belongs to a group, route through the group's tab.
+        if let Some(&group_id) = self.buffer_to_group.get(&buffer_id) {
+            // Find the panel name for this buffer in the group, then focus it.
+            let panel_name = self.buffer_groups.get(&group_id).and_then(|g| {
+                g.panel_buffers
+                    .iter()
+                    .find_map(|(name, &bid)| (bid == buffer_id).then(|| name.clone()))
+            });
+            if let Some(panel_name) = panel_name {
+                self.focus_panel(group_id.0, panel_name);
+                tracing::info!(
+                    "Switched to group panel buffer {:?} via group {:?}",
+                    buffer_id,
+                    group_id
+                );
+                return;
+            }
+        }
+
+        self.set_active_buffer(buffer_id);
+        tracing::info!("Switched to buffer {:?}", buffer_id);
     }
 
     /// Handle CloseBuffer command
@@ -1067,7 +1045,7 @@ impl Editor {
     pub(super) fn handle_set_view_mode(&mut self, buffer_id: BufferId, mode: &str) {
         use crate::state::ViewMode;
         let view_mode = match mode {
-            "compose" => ViewMode::Compose,
+            "page_view" | "compose" => ViewMode::PageView,
             _ => ViewMode::Source,
         };
         // Set on the specified buffer's per-split view state.
@@ -1487,7 +1465,10 @@ impl Editor {
             .with_plugin_name(plugin_name);
 
         // Clear any existing plugin defaults for this mode before re-registering
-        self.keybindings.clear_plugin_defaults_for_mode(&name);
+        self.keybindings
+            .write()
+            .unwrap()
+            .clear_plugin_defaults_for_mode(&name);
 
         let mode_context = KeyContext::Mode(name.clone());
 
@@ -1501,7 +1482,7 @@ impl Editor {
                 if let Some((code, modifiers)) = parse_key_string(key_str) {
                     let action = Action::from_str(command, &std::collections::HashMap::new())
                         .unwrap_or_else(|| Action::PluginAction(command.clone()));
-                    self.keybindings.load_plugin_default(
+                    self.keybindings.write().unwrap().load_plugin_default(
                         mode_context.clone(),
                         code,
                         modifiers,
@@ -1529,7 +1510,7 @@ impl Editor {
                     tracing::debug!("Adding chord binding: {:?} -> {}", sequence, command);
                     let action = Action::from_str(command, &std::collections::HashMap::new())
                         .unwrap_or_else(|| Action::PluginAction(command.clone()));
-                    self.keybindings.load_plugin_chord_default(
+                    self.keybindings.write().unwrap().load_plugin_chord_default(
                         mode_context.clone(),
                         sequence,
                         action,
@@ -1550,10 +1531,11 @@ impl Editor {
                         .keybinding_labels
                         .retain(|k, _| !k.ends_with(&format!("\0{}", name)));
                     // Add current labels from plugin defaults in KeybindingResolver
+                    let keybindings_read = self.keybindings.read().unwrap();
                     if let Some(mode_bindings) =
-                        self.keybindings.get_plugin_defaults().get(&mode_context)
+                        keybindings_read.get_plugin_defaults().get(&mode_context)
                     {
-                        for ((key_code, modifiers), _action) in mode_bindings {
+                        for (key_code, modifiers) in mode_bindings.keys() {
                             let label =
                                 crate::input::keybindings::format_keybinding(key_code, modifiers);
                             if let Some((_key_str, cmd)) = bindings
@@ -1591,7 +1573,7 @@ impl Editor {
         let error = if let Some(lsp) = self.lsp.as_mut() {
             // Respect auto_start setting for plugin requests
             use crate::services::lsp::manager::LspSpawnResult;
-            if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
+            if lsp.try_spawn(&language, None) != LspSpawnResult::Spawned {
                 Some(format!(
                     "LSP server for '{}' is not running (auto_start disabled)",
                     language
@@ -1650,7 +1632,7 @@ impl Editor {
         let lang_config = crate::config::LanguageConfig {
             comment_prefix: config.comment_prefix,
             auto_indent: config.auto_indent.unwrap_or(true),
-            use_tabs: config.use_tabs.unwrap_or(false),
+            use_tabs: config.use_tabs,
             tab_size: config.tab_size,
             show_whitespace_tabs: config.show_whitespace_tabs.unwrap_or(true),
             formatter: config.formatter.map(|f| crate::config::FormatterConfig {
@@ -1697,7 +1679,10 @@ impl Editor {
             lsp.set_language_config(language.clone(), lsp_config.clone());
         }
         // Also update runtime config
-        self.config.lsp.insert(language.clone(), lsp_config);
+        self.config.lsp.insert(
+            language.clone(),
+            crate::types::LspLanguageConfig::Multi(vec![lsp_config]),
+        );
         tracing::info!("LSP server registered for '{}'", language);
     }
 
@@ -1721,7 +1706,48 @@ impl Editor {
     /// RegisterGrammar+ReloadGrammars pairs result in only one rebuild.
     /// The rebuild happens on a background thread; when complete, a
     /// `GrammarRegistryBuilt` message swaps in the new registry.
+    ///
+    /// On the first call, this triggers the deferred full grammar build
+    /// (user grammars + language packs + any plugin grammars accumulated so far).
     pub(super) fn flush_pending_grammars(&mut self) {
+        // On the first call, start the deferred full grammar build.
+        // This includes any plugin grammars that were registered during init,
+        // so we get everything in a single builder.build() pass.
+        if self.needs_full_grammar_build {
+            self.needs_full_grammar_build = false;
+            self.grammar_reload_pending = false;
+
+            // Drain all pending grammars to include in the initial build
+            let additional: Vec<_> = self
+                .pending_grammars
+                .drain(..)
+                .map(|g| crate::primitives::grammar::GrammarSpec {
+                    language: g.language.clone(),
+                    path: std::path::PathBuf::from(g.grammar_path),
+                    extensions: g.extensions.clone(),
+                })
+                .collect();
+
+            // Update config.languages with the extensions so detect_language() works
+            for crate::primitives::grammar::GrammarSpec {
+                language,
+                extensions,
+                ..
+            } in &additional
+            {
+                let lang_config = self.config.languages.entry(language.clone()).or_default();
+                for ext in extensions {
+                    if !lang_config.extensions.contains(ext) {
+                        lang_config.extensions.push(ext.clone());
+                    }
+                }
+            }
+
+            let callback_ids: Vec<_> = self.pending_grammar_callbacks.drain(..).collect();
+            self.start_background_grammar_build(additional, callback_ids);
+            return;
+        }
+
         if !self.grammar_reload_pending {
             return;
         }
@@ -1743,26 +1769,73 @@ impl Editor {
             return;
         }
 
+        // Deduplicate: skip grammars whose extensions are all already mapped
+        // in the current registry (meaning the grammar was already loaded by
+        // for_editor or a previous build).
+        let pending_before = self.pending_grammars.len();
+        self.pending_grammars.retain(|g| {
+            // Check if ALL extensions for this grammar are already mapped
+            let all_mapped = !g.extensions.is_empty()
+                && g.extensions
+                    .iter()
+                    .all(|ext| self.grammar_registry.user_extensions().contains_key(ext));
+            if all_mapped {
+                tracing::debug!(
+                    "Skipping already-loaded grammar '{}' (extensions {:?} already mapped)",
+                    g.language,
+                    g.extensions
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if pending_before != self.pending_grammars.len() {
+            tracing::info!(
+                "Deduplicated pending grammars: {} -> {}",
+                pending_before,
+                self.pending_grammars.len()
+            );
+        }
+
+        if self.pending_grammars.is_empty() {
+            tracing::info!(
+                "All pending grammars already loaded, resolving callbacks without rebuild"
+            );
+            // Resolve callbacks immediately — no rebuild needed
+            #[cfg(feature = "plugins")]
+            for cb_id in self.pending_grammar_callbacks.drain(..) {
+                self.plugin_manager
+                    .resolve_callback(cb_id, "null".to_string());
+            }
+            #[cfg(not(feature = "plugins"))]
+            self.pending_grammar_callbacks.clear();
+            return;
+        }
+
         tracing::info!(
             "Flushing {} pending grammars via background rebuild",
             self.pending_grammars.len()
         );
 
         // Collect pending grammars
-        let additional: Vec<_> = self
+        let additional: Vec<crate::primitives::grammar::GrammarSpec> = self
             .pending_grammars
             .drain(..)
-            .map(|g| {
-                (
-                    g.language.clone(),
-                    PathBuf::from(g.grammar_path),
-                    g.extensions.clone(),
-                )
+            .map(|g| crate::primitives::grammar::GrammarSpec {
+                language: g.language.clone(),
+                path: PathBuf::from(g.grammar_path),
+                extensions: g.extensions.clone(),
             })
             .collect();
 
         // Update config.languages with the extensions so detect_language() works
-        for (language, _path, extensions) in &additional {
+        for crate::primitives::grammar::GrammarSpec {
+            language,
+            extensions,
+            ..
+        } in &additional
+        {
             let lang_config = self.config.languages.entry(language.clone()).or_default();
             for ext in extensions {
                 if !lang_config.extensions.contains(ext) {
@@ -1855,8 +1928,17 @@ impl Editor {
 
         // Collect all project files via FileSystem trait (works for both local and remote)
         let cwd = self.working_dir.clone();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
-        walk_files_recursive(&*self.filesystem, &cwd, &mut file_paths);
+        if let Err(e) =
+            self.filesystem
+                .walk_files(&cwd, IGNORED_DIRS, &cancel, &mut |path, _rel| {
+                    file_paths.push(path.to_path_buf());
+                    true
+                })
+        {
+            tracing::warn!("walk_files failed: {}", e);
+        }
 
         // Search each file: open buffers via piece tree, others via fs.search_file
         for file_path in &file_paths {
@@ -1939,6 +2021,7 @@ impl Editor {
     /// - Spawns a tokio task that walks the directory tree and fans out file searches
     /// - Each file's matches are sent back immediately via AsyncBridge
     /// - Supports cancellation via AtomicBool when a new search starts
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_grep_project_streaming(
         &mut self,
         pattern: String,
@@ -2036,10 +2119,17 @@ impl Editor {
                 );
                 let mut file_count = 0usize;
 
-                walk_files_streaming(&*filesystem_walker, &cwd, &cancel_walker, &mut |path| {
-                    file_count += 1;
-                    path_tx.blocking_send(path).is_ok()
-                });
+                if let Err(e) = filesystem_walker.walk_files(
+                    &cwd,
+                    IGNORED_DIRS,
+                    &cancel_walker,
+                    &mut |path, _rel| {
+                        file_count += 1;
+                        path_tx.blocking_send(path.to_path_buf()).is_ok()
+                    },
+                ) {
+                    tracing::warn!("GrepStreaming walk_files failed: {}", e);
+                }
 
                 tracing::info!(
                     "GrepStreaming walker: done, sent {} files (search_id={})",

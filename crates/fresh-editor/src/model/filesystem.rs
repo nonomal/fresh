@@ -217,7 +217,11 @@ impl FilePermissions {
         self.mode
     }
 
-    /// Check if readonly
+    /// Check if no write bits are set at all (any user).
+    ///
+    /// NOTE: On Unix, this only checks whether the mode has zero write bits.
+    /// It does NOT check whether the *current user* can write. For that,
+    /// use [`is_readonly_for_user`] with the appropriate uid/gid.
     pub fn is_readonly(&self) -> bool {
         #[cfg(unix)]
         {
@@ -227,6 +231,31 @@ impl FilePermissions {
         {
             self.readonly
         }
+    }
+
+    /// Check if the file is read-only for a specific user identified by
+    /// `user_uid` and a set of group IDs the user belongs to.
+    ///
+    /// On non-Unix platforms, falls back to the simple readonly flag.
+    #[cfg(unix)]
+    pub fn is_readonly_for_user(
+        &self,
+        user_uid: u32,
+        file_uid: u32,
+        file_gid: u32,
+        user_groups: &[u32],
+    ) -> bool {
+        // root can write to anything
+        if user_uid == 0 {
+            return false;
+        }
+        if user_uid == file_uid {
+            return self.mode & 0o200 == 0;
+        }
+        if user_groups.contains(&file_gid) {
+            return self.mode & 0o020 == 0;
+        }
+        self.mode & 0o002 == 0
     }
 }
 
@@ -506,6 +535,17 @@ pub trait FileSystem: Send + Sync {
     /// Check if path is a file
     fn is_file(&self, path: &Path) -> io::Result<bool>;
 
+    /// Check if the current user has write permission to the given path.
+    ///
+    /// On Unix, this considers file ownership, group membership (including
+    /// supplementary groups), and the relevant permission bits. On other
+    /// platforms it falls back to the standard readonly check.
+    ///
+    /// Returns `false` if the path doesn't exist or metadata can't be read.
+    fn is_writable(&self, path: &Path) -> bool {
+        self.metadata(path).map(|m| !m.is_readonly).unwrap_or(false)
+    }
+
     /// Set file permissions
     fn set_permissions(&self, path: &Path, permissions: &FilePermissions) -> io::Result<()>;
 
@@ -589,6 +629,15 @@ pub trait FileSystem: Send + Sync {
         None
     }
 
+    /// Check if a remote filesystem is currently connected.
+    ///
+    /// Returns `true` for local filesystems (always "connected") and for
+    /// remote filesystems with a healthy connection. Returns `false` when
+    /// the remote connection has been lost (e.g., timeout, SSH disconnect).
+    fn is_remote_connected(&self) -> bool {
+        true
+    }
+
     /// Get the home directory for this filesystem
     ///
     /// For local filesystems, returns the local home directory.
@@ -634,6 +683,40 @@ pub trait FileSystem: Send + Sync {
     /// - `gid`: Owner group ID
     fn sudo_write(&self, path: &Path, data: &[u8], mode: u32, uid: u32, gid: u32)
         -> io::Result<()>;
+
+    // ========================================================================
+    // Directory Walking
+    // ========================================================================
+
+    /// Recursively walk a directory tree, invoking `on_file` for each file.
+    ///
+    /// Skips hidden entries (dot-prefixed names) and directories whose
+    /// basename appears in `skip_dirs`.  The walk stops early when:
+    /// - `on_file` returns `false` (caller reached its limit), or
+    /// - `cancel` is set to `true` (e.g. user closed the dialog).
+    ///
+    /// `on_file` receives `(absolute_path, path_relative_to_root)`.
+    ///
+    /// `skip_dirs` entries are **basenames** matched at every depth
+    /// (e.g. `"node_modules"` skips every `node_modules` directory in the
+    /// tree).
+    ///
+    /// // TODO: support .gitignore-style glob patterns in addition to
+    /// // basename matching, so callers can express richer ignore rules
+    /// // (e.g. `build/`, `*.o`, `vendor/**`).
+    ///
+    /// Each implementation must walk the filesystem it owns.  Local
+    /// implementations should iterate `std::fs::read_dir` lazily (not
+    /// collect into a Vec) so memory stays O(tree depth).  Remote
+    /// implementations should walk server-side and stream results back
+    /// via the channel, avoiding per-directory round-trips.
+    fn walk_files(
+        &self,
+        root: &Path,
+        skip_dirs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_file: &mut dyn FnMut(&Path, &str) -> bool,
+    ) -> io::Result<()>;
 }
 
 // ============================================================================
@@ -898,19 +981,51 @@ impl StdFileSystem {
             .is_some_and(|n| n.starts_with('.'))
     }
 
+    /// Get the current user's effective UID and all group IDs (primary + supplementary).
+    #[cfg(unix)]
+    pub fn current_user_groups() -> (u32, Vec<u32>) {
+        // SAFETY: these libc calls are always safe and have no failure modes
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        let mut groups = vec![egid];
+
+        // Get supplementary groups
+        let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if ngroups > 0 {
+            let mut sup_groups = vec![0 as libc::gid_t; ngroups as usize];
+            let n = unsafe { libc::getgroups(ngroups, sup_groups.as_mut_ptr()) };
+            if n > 0 {
+                sup_groups.truncate(n as usize);
+                for g in sup_groups {
+                    if g != egid {
+                        groups.push(g);
+                    }
+                }
+            }
+        }
+
+        (euid, groups)
+    }
+
     /// Build FileMetadata from std::fs::Metadata
     fn build_metadata(path: &Path, meta: &std::fs::Metadata) -> FileMetadata {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let file_uid = meta.uid();
+            let file_gid = meta.gid();
+            let permissions = FilePermissions::from_std(meta.permissions());
+            let (euid, user_groups) = Self::current_user_groups();
+            let is_readonly =
+                permissions.is_readonly_for_user(euid, file_uid, file_gid, &user_groups);
             FileMetadata {
                 size: meta.len(),
                 modified: meta.modified().ok(),
-                permissions: Some(FilePermissions::from_std(meta.permissions())),
+                permissions: Some(permissions),
                 is_hidden: Self::is_hidden(path),
-                is_readonly: meta.permissions().readonly(),
-                uid: Some(meta.uid()),
-                gid: Some(meta.gid()),
+                is_readonly,
+                uid: Some(file_uid),
+                gid: Some(file_gid),
             }
         }
         #[cfg(not(unix))]
@@ -929,7 +1044,9 @@ impl StdFileSystem {
 impl FileSystem for StdFileSystem {
     // File Content Operations
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        let data = std::fs::read(path)?;
+        crate::services::counters::global().inc_disk_bytes_read(data.len() as u64);
+        Ok(data)
     }
 
     fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -937,6 +1054,7 @@ impl FileSystem for StdFileSystem {
         file.seek(io::SeekFrom::Start(offset))?;
         let mut buffer = vec![0u8; len];
         file.read_exact(&mut buffer)?;
+        crate::services::counters::global().inc_disk_bytes_read(len as u64);
         Ok(buffer)
     }
 
@@ -1152,6 +1270,64 @@ impl FileSystem for StdFileSystem {
     ) -> io::Result<Vec<SearchMatch>> {
         default_search_file(self, path, pattern, opts, cursor)
     }
+
+    fn walk_files(
+        &self,
+        root: &Path,
+        skip_dirs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_file: &mut dyn FnMut(&Path, &str) -> bool,
+    ) -> io::Result<()> {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            // Use std::fs::read_dir iterator directly — NOT self.read_dir()
+            // which collects into a Vec.  This keeps memory O(1) per directory
+            // even for directories with millions of entries.
+            let iter = match std::fs::read_dir(&dir) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+
+            for entry in iter {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+
+                // Skip hidden entries
+                if name_str.starts_with('.') {
+                    continue;
+                }
+
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let path = entry.path();
+
+                if ft.is_file() {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !on_file(&path, &rel_str) {
+                            return Ok(());
+                        }
+                    }
+                } else if ft.is_dir() && !skip_dirs.contains(&name_str.as_ref()) {
+                    stack.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1280,6 +1456,16 @@ impl FileSystem for NoopFileSystem {
         _mode: u32,
         _uid: u32,
         _gid: u32,
+    ) -> io::Result<()> {
+        Self::unsupported()
+    }
+
+    fn walk_files(
+        &self,
+        _root: &Path,
+        _skip_dirs: &[&str],
+        _cancel: &std::sync::atomic::AtomicBool,
+        _on_file: &mut dyn FnMut(&Path, &str) -> bool,
     ) -> io::Result<()> {
         Self::unsupported()
     }
@@ -1785,5 +1971,231 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].context, "CCC");
         assert_eq!(matches[0].line, 3);
+    }
+
+    // ====================================================================
+    // walk_files tests
+    // ====================================================================
+
+    /// Helper: create a directory tree for walk_files tests.
+    /// Returns the tempdir (must be kept alive for the duration of the test).
+    fn make_walk_tree() -> tempfile::TempDir {
+        let fs = StdFileSystem;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // root/
+        //   a.txt
+        //   b.txt
+        //   sub/
+        //     c.txt
+        //     deep/
+        //       d.txt
+        //   .hidden_dir/
+        //     secret.txt
+        //   .hidden_file
+        //   node_modules/
+        //     pkg.json
+        //   target/
+        //     debug.o
+        fs.write_file(&root.join("a.txt"), b"a").unwrap();
+        fs.write_file(&root.join("b.txt"), b"b").unwrap();
+        fs.create_dir_all(&root.join("sub/deep")).unwrap();
+        fs.write_file(&root.join("sub/c.txt"), b"c").unwrap();
+        fs.write_file(&root.join("sub/deep/d.txt"), b"d").unwrap();
+        fs.create_dir_all(&root.join(".hidden_dir")).unwrap();
+        fs.write_file(&root.join(".hidden_dir/secret.txt"), b"s")
+            .unwrap();
+        fs.write_file(&root.join(".hidden_file"), b"h").unwrap();
+        fs.create_dir_all(&root.join("node_modules")).unwrap();
+        fs.write_file(&root.join("node_modules/pkg.json"), b"{}")
+            .unwrap();
+        fs.create_dir_all(&root.join("target")).unwrap();
+        fs.write_file(&root.join("target/debug.o"), b"elf").unwrap();
+
+        tmp
+    }
+
+    #[test]
+    fn test_walk_files_std_basic() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        found.sort();
+        assert_eq!(found, vec!["a.txt", "b.txt", "sub/c.txt", "sub/deep/d.txt"]);
+    }
+
+    #[test]
+    fn test_walk_files_std_skips_hidden() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(tmp.path(), &[], &cancel, &mut |_path, rel| {
+            found.push(rel.to_string());
+            true
+        })
+        .unwrap();
+
+        // Hidden files/dirs should be excluded, but node_modules and target
+        // are NOT skipped (empty skip list)
+        assert!(!found.iter().any(|f| f.contains(".hidden")));
+        assert!(found.iter().any(|f| f.contains("node_modules")));
+        assert!(found.iter().any(|f| f.contains("target")));
+    }
+
+    #[test]
+    fn test_walk_files_std_skip_dirs() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target", "deep"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        found.sort();
+        // "deep" dir is also skipped, so d.txt should not appear
+        assert_eq!(found, vec!["a.txt", "b.txt", "sub/c.txt"]);
+    }
+
+    #[test]
+    fn test_walk_files_std_cancel() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                // Cancel after finding the first file
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 1, "Should stop after cancel is set");
+    }
+
+    #[test]
+    fn test_walk_files_std_on_file_returns_false() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut count = 0usize;
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, _rel| {
+                count += 1;
+                count < 2 // stop after 2 files
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 2, "Should stop when on_file returns false");
+    }
+
+    #[test]
+    fn test_walk_files_std_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(tmp.path(), &[], &cancel, &mut |_path, rel| {
+            found.push(rel.to_string());
+            true
+        })
+        .unwrap();
+
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_walk_files_std_nonexistent_root() {
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        // Non-existent root should not panic, just return Ok with no files
+        let result = fs.walk_files(
+            Path::new("/nonexistent/path/that/does/not/exist"),
+            &[],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_walk_files_std_relative_paths_use_forward_slashes() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        // All paths should use forward slashes (even on Windows)
+        for path in &found {
+            assert!(!path.contains('\\'), "Path should use / not \\: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_walk_files_noop_returns_error() {
+        let fs = NoopFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let result = fs.walk_files(Path::new("/noop/path"), &[], &cancel, &mut |_path, _rel| {
+            true
+        });
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     }
 }

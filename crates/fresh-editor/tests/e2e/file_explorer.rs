@@ -2650,7 +2650,8 @@ fn test_file_explorer_escape_clears_search() {
         "Should still be in FileExplorer context after Escape"
     );
 
-    // Press Escape again - should still stay in file explorer (no focus change)
+    // Press Escape again - should now exit file explorer focus to the editor
+    // (Escape with no active search transfers focus)
     harness
         .send_key(KeyCode::Esc, KeyModifiers::empty())
         .unwrap();
@@ -2659,9 +2660,9 @@ fn test_file_explorer_escape_clears_search() {
     assert!(
         matches!(
             harness.editor().get_key_context(),
-            fresh::input::keybindings::KeyContext::FileExplorer
+            fresh::input::keybindings::KeyContext::Normal
         ),
-        "Should remain in FileExplorer context after second Escape"
+        "Should exit FileExplorer context on second Escape (no search to clear)"
     );
 }
 
@@ -2904,5 +2905,143 @@ fn test_file_explorer_border_drag_resizes() {
         "Border should have moved roughly {} columns, but moved {}",
         drag_delta,
         actual_delta
+    );
+}
+
+/// Test that clicking a markdown file in the file explorer keeps focus on the explorer,
+/// so pressing Enter does NOT modify the buffer.
+/// Reproduces bug: clicking a .md file in the explorer and pressing Enter leaks
+/// the keypress into the buffer (inserts a newline) even though the explorer should
+/// have focus. This appears to be related to the markdown source plugin.
+#[test]
+fn test_file_explorer_click_markdown_enter_does_not_modify_buffer() {
+    let mut harness = EditorTestHarness::with_temp_project(80, 24).unwrap();
+    let project_dir = harness.project_dir().unwrap();
+
+    let test_content = "hello";
+    fs::write(project_dir.join("readme.md"), test_content).unwrap();
+
+    // Open file explorer with Ctrl+E (focuses the explorer)
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    // Wait for the file to appear in the tree
+    harness.wait_for_file_explorer_item("readme.md").unwrap();
+
+    // Find the file's position on screen so we can click it
+    harness.render().unwrap();
+    let (click_col, click_row) = harness
+        .find_text_on_screen("readme.md")
+        .expect("readme.md should be visible in the file explorer");
+
+    // Click on the file in the explorer — this opens it but focus should stay on explorer
+    harness.mouse_click(click_col, click_row).unwrap();
+    harness.render().unwrap();
+
+    // Wait for the file to be opened in a buffer
+    harness
+        .wait_until(|h| h.screen_to_string().contains("hello"))
+        .unwrap();
+
+    // Focus is on the file explorer. Pressing Enter should NOT modify the buffer.
+    // Bug: for markdown files, Enter leaks through and inserts a newline.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        content, "hello",
+        "After clicking a markdown file in the explorer, Enter should not modify the buffer \
+         (focus should be on the explorer). But buffer content changed to {:?} — \
+         the keypress leaked into the buffer.",
+        content
+    );
+}
+
+/// Test that git status markers clear after an external commit.
+/// The editor polls `.git/index` mtime and refreshes decorations automatically.
+/// Regression test for https://github.com/sinelaw/fresh/issues/1431
+#[test]
+#[cfg_attr(windows, ignore)]
+fn test_file_explorer_git_markers_clear_after_external_commit() {
+    use std::process::Command;
+
+    let repo = GitTestRepo::new();
+    repo.setup_git_explorer_plugin();
+    repo.create_file("file1.txt", "hello");
+    repo.create_file("file2.txt", "world");
+    repo.git_add_all();
+    repo.git_commit("Initial commit");
+
+    // Create working-copy modifications so "M" markers appear
+    fs::write(repo.path.join("file1.txt"), "modified").unwrap();
+    fs::write(repo.path.join("file2.txt"), "also modified").unwrap();
+
+    let mut harness = EditorTestHarness::with_working_dir(120, 40, repo.path.clone()).unwrap();
+
+    harness.editor_mut().toggle_file_explorer();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    // Wait for "M" markers to appear on modified files
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen
+                .lines()
+                .any(|line| line.contains("file1.txt") && line.contains("M"))
+        })
+        .unwrap();
+
+    // Ensure initial .git/index mtime is recorded by the file tree poller
+    harness.advance_time(std::time::Duration::from_secs(5));
+    harness.editor_mut().poll_file_tree_changes();
+
+    // Wait for filesystem mtime granularity (1 second) so the commit
+    // produces a different .git/index mtime than what was already recorded.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Commit all changes externally (simulating a user running git in another terminal)
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo.path)
+        .output()
+        .expect("git add failed");
+    Command::new("git")
+        .args(["commit", "-m", "commit changes"])
+        .current_dir(&repo.path)
+        .output()
+        .expect("git commit failed");
+
+    // Advance time past poll interval — poll_file_tree_changes now also
+    // checks .git/index mtime and fires the plugin hook on change.
+    harness.advance_time(std::time::Duration::from_secs(5));
+
+    // wait_until drives the editor tick loop; the integrated git index
+    // check inside poll_file_tree_changes detects the mtime change.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            !screen
+                .lines()
+                .any(|line| line.contains("file1.txt") && line.contains("M"))
+        })
+        .unwrap();
+
+    // Also verify file2 has no marker
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen
+            .lines()
+            .any(|line| line.contains("file2.txt") && line.contains("M")),
+        "file2.txt should not have an M marker after external commit"
     );
 }

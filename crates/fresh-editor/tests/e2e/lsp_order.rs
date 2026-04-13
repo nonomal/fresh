@@ -21,13 +21,13 @@ fn test_did_open_sent_before_hover() -> anyhow::Result<()> {
 
     eprintln!("[TEST] Starting test_did_open_sent_before_hover");
 
-    // Spawn fake LSP server with logging
-    eprintln!("[TEST] Spawning fake LSP server");
-    let _fake_server = FakeLspServer::spawn_with_logging()?;
-    eprintln!("[TEST] Fake LSP server spawned");
-
     // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    // Spawn fake LSP server with logging
+    eprintln!("[TEST] Spawning fake LSP server");
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+    eprintln!("[TEST] Fake LSP server spawned");
 
     // Create unique log file for this test in the per-test temp directory
     let log_file = temp_dir.path().join("lsp_order_test_log.txt");
@@ -41,8 +41,8 @@ fn test_did_open_sent_before_hover() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::logging_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
@@ -52,16 +52,24 @@ fn test_did_open_sent_before_hover() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
-    // Create harness with config
+    // Create harness with empty plugins dir to prevent loading embedded
+    // plugins (unnecessary for this test and improves isolation/speed).
+    // Embedded plugins may send additional LSP requests that the fake
+    // bash script doesn't handle, causing pending request buildup.
     eprintln!("[TEST] Creating editor harness");
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    let mut harness = EditorTestHarness::create(
         120,
         30,
-        config,
-        temp_dir.path().to_path_buf(),
+        crate::common::harness::HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
     )?;
     eprintln!("[TEST] Editor harness created");
 

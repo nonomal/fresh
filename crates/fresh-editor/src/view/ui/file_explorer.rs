@@ -123,8 +123,20 @@ impl FileExplorerRenderer {
             format!(" File Explorer{} ", keybinding_suffix)
         };
 
-        // Title style: inverted colors (dark on light) when focused using theme colors
-        let (title_style, border_style) = if is_focused {
+        // Title style: use warning colors when remote is disconnected,
+        // otherwise inverted colors (dark on light) when focused.
+        let remote_disconnected = remote_connection
+            .map(|c| c.contains("(Disconnected)"))
+            .unwrap_or(false);
+        let (title_style, border_style) = if remote_disconnected {
+            (
+                Style::default()
+                    .fg(theme.status_error_indicator_fg)
+                    .bg(theme.status_error_indicator_bg)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.status_error_indicator_bg),
+            )
+        } else if is_focused {
             (
                 Style::default()
                     .fg(theme.editor_bg)
@@ -223,7 +235,7 @@ impl FileExplorerRenderer {
 
         // Calculate the left side width for padding calculation
         let indent_width = indent * 2;
-        let indicator_width = if node.is_dir() { 2 } else { 2 }; // "▼ " or "  "
+        let indicator_width = 2; // "▼ " or "  "
         let name_width = str_width(&node.entry.name);
         let left_side_width = indent_width + indicator_width + name_width;
 
@@ -309,10 +321,10 @@ impl FileExplorerRenderer {
             Some(("●".to_string(), theme.diagnostic_warning_fg))
         } else if let Some(decoration) = direct_decoration {
             let symbol = Self::decoration_symbol(&decoration.symbol);
-            Some((symbol, Self::decoration_color(decoration)))
+            Some((symbol, Self::decoration_color(decoration, theme)))
         } else {
             bubbled_decoration
-                .map(|decoration| ("●".to_string(), Self::decoration_color(decoration)))
+                .map(|decoration| ("●".to_string(), Self::decoration_color(decoration, theme)))
         };
 
         // Calculate right-side content width
@@ -361,9 +373,16 @@ impl FileExplorerRenderer {
             .unwrap_or_else(|| " ".to_string())
     }
 
-    fn decoration_color(decoration: &crate::view::file_tree::FileExplorerDecoration) -> Color {
-        let [r, g, b] = decoration.color;
-        Color::Rgb(r, g, b)
+    fn decoration_color(
+        decoration: &crate::view::file_tree::FileExplorerDecoration,
+        theme: &Theme,
+    ) -> Color {
+        match &decoration.color {
+            fresh_core::api::OverlayColorSpec::Rgb(r, g, b) => Color::Rgb(*r, *g, *b),
+            fresh_core::api::OverlayColorSpec::ThemeKey(key) => {
+                theme.resolve_theme_key(key).unwrap_or(theme.editor_fg)
+            }
+        }
     }
 
     /// Render a file/directory name with matched characters highlighted

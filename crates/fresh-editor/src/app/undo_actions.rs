@@ -25,10 +25,21 @@ impl Editor {
             events.len()
         );
 
-        // Apply all inverse events collected during undo
-        for event in &events {
+        // Apply all inverse events collected during undo.
+        // Each event may carry displaced markers that need restoration after apply.
+        for (event, displaced_markers) in &events {
             tracing::debug!("Undo applying event: {:?}", event);
             self.apply_event_to_active_buffer(event);
+
+            // Restore displaced markers from LogEntry (for single Delete events).
+            // Skip for BulkEdit — they handle displaced markers internally
+            // in state.apply(BulkEdit) via the Event's own displaced_markers field.
+            if !displaced_markers.is_empty()
+                && !matches!(event, crate::model::event::Event::BulkEdit { .. })
+            {
+                self.active_state_mut()
+                    .restore_displaced_markers(displaced_markers);
+            }
         }
 
         // Update modified status based on event log position

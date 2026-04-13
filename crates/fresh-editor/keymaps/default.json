@@ -752,7 +752,7 @@
     },
     {
       "key": ".",
-      "modifiers": ["ctrl"],
+      "modifiers": ["alt"],
       "action": "lsp_code_actions",
       "args": {},
       "when": "normal"
@@ -1382,6 +1382,13 @@
       "when": "settings"
     },
     {
+      "key": "Delete",
+      "modifiers": [],
+      "action": "settings_inherit",
+      "args": {},
+      "when": "settings"
+    },
+    {
       "comment": "File Explorer context",
       "key": "Up",
       "modifiers": [],
@@ -1585,6 +1592,54 @@
       "action": "terminal_paste",
       "args": {},
       "when": "terminal"
+    },
+    {
+      "comment": "Composite buffer context - Close view (q)",
+      "key": "q",
+      "modifiers": [],
+      "action": "close",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Close view (Esc)",
+      "key": "Escape",
+      "modifiers": [],
+      "action": "close",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Next hunk (n)",
+      "key": "n",
+      "modifiers": [],
+      "action": "composite_next_hunk",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Previous hunk (p)",
+      "key": "p",
+      "modifiers": [],
+      "action": "composite_prev_hunk",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Next hunk (])",
+      "key": "]",
+      "modifiers": [],
+      "action": "composite_next_hunk",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Previous hunk ([)",
+      "key": "[",
+      "modifiers": [],
+      "action": "composite_prev_hunk",
+      "args": {},
+      "when": "compositeBuffer"
     }
   ]
 }

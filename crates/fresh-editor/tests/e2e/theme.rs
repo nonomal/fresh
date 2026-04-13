@@ -67,12 +67,12 @@ fn test_theme_loading_from_config_high_contrast() {
     let theme = harness.editor().theme();
     assert_eq!(theme.name, "high-contrast");
 
-    // Verify some high-contrast theme colors (from Theme::high_contrast() Rust fallback)
-    assert_eq!(theme.editor_bg, Color::Black);
-    assert_eq!(theme.editor_fg, Color::White);
-    assert_eq!(theme.cursor, Color::White);
-    assert_eq!(theme.tab_active_fg, Color::Black);
-    assert_eq!(theme.tab_active_bg, Color::Yellow);
+    // Verify some high-contrast theme colors (explicit RGB values)
+    assert_eq!(theme.editor_bg, Color::Rgb(0, 0, 0));
+    assert_eq!(theme.editor_fg, Color::Rgb(255, 255, 255));
+    assert_eq!(theme.cursor, Color::Rgb(255, 255, 255));
+    assert_eq!(theme.tab_active_fg, Color::Rgb(0, 0, 0));
+    assert_eq!(theme.tab_active_bg, Color::Rgb(255, 255, 0));
 }
 
 #[test]
@@ -245,10 +245,10 @@ fn test_theme_selection_colors() {
     assert_ne!(dark_theme.selection_bg, light_theme.selection_bg);
 
     // Dark theme has a darker selection background
-    assert_eq!(dark_theme.selection_bg, Color::Rgb(38, 79, 120));
+    assert_eq!(dark_theme.selection_bg, Color::Rgb(50, 50, 60));
 
     // Light theme has a lighter selection background
-    assert_eq!(light_theme.selection_bg, Color::Rgb(173, 214, 255));
+    assert_eq!(light_theme.selection_bg, Color::Rgb(225, 232, 242));
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn test_issue_1001_theme_persists_after_restart_with_name_mismatch() {
     let default_bg = default_style.and_then(|s| s.bg);
     assert_eq!(
         default_bg,
-        Some(Color::Black),
+        Some(Color::Rgb(0, 0, 0)),
         "Editor should start with high-contrast theme (black background)"
     );
 
@@ -417,9 +417,8 @@ fn test_issue_1001_theme_persists_after_restart_with_name_mismatch() {
         applied_bg
     );
 
-    // Verify the config file was persisted with the NORMALIZED name.
-    // This is the core assertion: the config must contain "catppuccin-mocha"
-    // (the registry key), NOT "Catppuccin Mocha" (the JSON name field).
+    // Verify the config file was persisted with the theme key.
+    // The key for user themes is a file:// URL pointing to the theme file.
     let config_path = temp_dir.path().join("config").join("config.json");
     let saved_config = fs::read_to_string(&config_path).unwrap();
     let saved_json: serde_json::Value = serde_json::from_str(&saved_config).unwrap();
@@ -428,11 +427,12 @@ fn test_issue_1001_theme_persists_after_restart_with_name_mismatch() {
         .get("theme")
         .and_then(|t| t.as_str())
         .unwrap_or("");
-    assert_eq!(
-        saved_theme, "catppuccin-mocha",
-        "BUG #1001: Config should contain normalized theme name 'catppuccin-mocha', \
-         not the JSON name field. Got: '{}'. Config content: {}",
-        saved_theme, saved_config
+    assert!(
+        saved_theme.contains("catppuccin-mocha"),
+        "Config should contain a key referencing 'catppuccin-mocha', \
+         not the raw JSON name field 'Catppuccin Mocha'. Got: '{}'. Config content: {}",
+        saved_theme,
+        saved_config
     );
 
     // Drop the first harness (simulates closing the editor)
@@ -537,6 +537,248 @@ fn test_issue_1001_config_with_spaces_in_theme_name_loads_correctly() {
          which suggests fallback to high-contrast (black).",
         bg
     );
+
+    drop(temp_dir);
+}
+
+/// Create a minimal fake LSP server that sends a diagnostic on didOpen.
+///
+/// Sends a single ERROR diagnostic covering `"hello"` (line 1, chars 17–24)
+/// in the test file `fn main() { let x: i32 = "hello"; }`.
+fn create_diagnostic_lsp_script(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = r##"#!/bin/bash
+LOG="${1:-/dev/null}"
+> "$LOG"
+
+read_message() {
+    local cl=0
+    while IFS=: read -r k v; do
+        k=$(echo "$k" | tr -d '\r\n')
+        v=$(echo "$v" | tr -d '\r\n ')
+        [ "$k" = "Content-Length" ] && cl=$v
+        [ -z "$k" ] && break
+    done
+    [ $cl -gt 0 ] && dd bs=1 count=$cl 2>/dev/null
+}
+
+send_message() {
+    local m="$1"
+    printf "Content-Length: ${#m}\r\n\r\n%s" "$m"
+}
+
+while true; do
+    msg=$(read_message)
+    [ -z "$msg" ] && break
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+    echo "RECV: $method" >> "$LOG"
+
+    case "$method" in
+        "initialize")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":{"capabilities":{"textDocumentSync":{"openClose":true,"change":2}}}}'
+            ;;
+        "textDocument/didOpen")
+            URI=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo "SENT: diag" >> "$LOG"
+            send_message '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$URI"'","diagnostics":[{"range":{"start":{"line":1,"character":17},"end":{"line":1,"character":24}},"severity":1,"message":"type error"}]}}'
+            ;;
+        "shutdown")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
+            break
+            ;;
+        *)
+            [ -n "$method" ] && [ -n "$msg_id" ] && \
+                send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
+            ;;
+    esac
+done
+"##;
+    let path = dir.join("diag_lsp.sh");
+    fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = fs::metadata(&path).unwrap().permissions();
+        p.set_mode(0o755);
+        fs::set_permissions(&path, p).unwrap();
+    }
+    path
+}
+
+/// Diagnostic overlay colors must update when the theme changes.
+///
+/// Diagnostic overlays bake the theme's `diagnostic_error_bg` as an RGB value
+/// at creation time. When the user switches themes, `apply_theme` must
+/// re-apply all stored diagnostics with the new theme colors.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Bash-based fake LSP
+fn test_diagnostic_overlay_colors_update_on_theme_change() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let script = create_diagnostic_lsp_script(temp_dir.path());
+    let log_file = temp_dir.path().join("diag_log.txt");
+
+    let test_file = temp_dir.path().join("test.rs");
+    fs::write(
+        &test_file,
+        "fn main() {\n    let x: i32 = \"hello\";\n    println!(\"{}\", x);\n}\n",
+    )?;
+
+    let mut config = Config::default();
+    config.theme = "dark".into();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: script.to_string_lossy().to_string(),
+            args: vec![log_file.to_string_lossy().to_string()],
+            enabled: true,
+            auto_start: true,
+            process_limits: Default::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    // Open file → triggers didOpen → fake LSP sends diagnostic
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for diagnostic to arrive (status bar shows "E:1")
+    harness.wait_until(|h| h.screen_to_string().contains("E:1"))?;
+    harness.render()?;
+
+    // Find the diagnostic text on screen and verify bg is dark theme's error bg
+    let dark_error_bg = Color::Rgb(60, 20, 20);
+    let pos = harness
+        .find_text_on_screen("hello")
+        .expect("'hello' should be visible on screen");
+    let style = harness
+        .get_cell_style(pos.0, pos.1)
+        .expect("cell should have a style");
+    assert_eq!(
+        style.bg,
+        Some(dark_error_bg),
+        "With dark theme, diagnostic bg should be {:?}, got {:?}",
+        dark_error_bg,
+        style.bg,
+    );
+
+    // Switch to light theme via command palette
+    harness.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)?;
+    harness.wait_for_prompt()?;
+    harness.type_text("Select Theme")?;
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.wait_for_screen_contains("Select theme")?;
+
+    // Clear pre-filled input and type "light"
+    for _ in 0..20 {
+        harness.send_key(KeyCode::Backspace, KeyModifiers::NONE)?;
+    }
+    harness.type_text("light")?;
+    harness.render()?;
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.wait_for_prompt_closed()?;
+    harness.render()?;
+
+    // Verify the diagnostic overlay now uses the light theme's error bg
+    let light_error_bg = Color::Rgb(255, 210, 210);
+    let pos = harness
+        .find_text_on_screen("hello")
+        .expect("'hello' should still be visible");
+    let style = harness
+        .get_cell_style(pos.0, pos.1)
+        .expect("cell should have a style");
+    assert_eq!(
+        style.bg,
+        Some(light_error_bg),
+        "After switching to light theme, diagnostic bg should be {:?}, got {:?}",
+        light_error_bg,
+        style.bg,
+    );
+
+    Ok(())
+}
+
+/// Theme selector should display URLs without scheme prefixes (https://, file://).
+///
+/// User themes have `file:///path/to/theme.json` keys. The selector should strip
+/// the `file://` prefix but preserve the leading `/` so it shows `/path/to/theme.json`.
+#[test]
+fn test_theme_selector_strips_url_scheme_from_display() {
+    let temp_dir = TempDir::new().unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    // Install a custom theme so there's a file:// URL in the list
+    let themes_dir = temp_dir.path().join("config").join("themes");
+    fs::create_dir_all(&themes_dir).unwrap();
+    fs::write(
+        themes_dir.join("catppuccin-mocha.json"),
+        custom_catppuccin_theme_json(),
+    )
+    .unwrap();
+
+    let project_root = temp_dir.path().join("project_root");
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+
+    let mut harness = EditorTestHarness::create(
+        120,
+        40,
+        HarnessOptions::new()
+            .with_working_dir(project_root)
+            .with_shared_dir_context(dir_context)
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    harness.render().unwrap();
+
+    // Open command palette and select theme
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Select Theme").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_screen_contains("Select theme").unwrap();
+
+    // Clear input and type catppuccin to filter to the custom theme
+    for _ in 0..20 {
+        harness
+            .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.type_text("catppuccin").unwrap();
+    harness.render().unwrap();
+
+    // The screen should show just the relative filename, not the full path or file:// URL
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("file://"),
+        "Theme selector should not display 'file://' scheme prefix. Screen:\n{}",
+        screen
+    );
+    // Should show just the filename relative to the themes dir
+    assert!(
+        screen.contains("catppuccin-mocha.json"),
+        "Theme selector should show the relative path under themes dir. Screen:\n{}",
+        screen
+    );
+
+    // Dismiss the prompt
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
 
     drop(temp_dir);
 }

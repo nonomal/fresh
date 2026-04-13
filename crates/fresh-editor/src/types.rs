@@ -4,6 +4,7 @@
 //! can import them without pulling in heavy runtime dependencies.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,8 @@ use serde::{Deserialize, Serialize};
 pub mod context_keys {
     pub const LINE_NUMBERS: &str = "line_numbers";
     pub const LINE_WRAP: &str = "line_wrap";
+    pub const PAGE_VIEW: &str = "page_view";
+    /// Backward-compatible alias for PAGE_VIEW
     pub const COMPOSE_MODE: &str = "compose_mode";
     pub const FILE_EXPLORER: &str = "file_explorer";
     pub const MENU_BAR: &str = "menu_bar";
@@ -84,6 +87,163 @@ impl ProcessLimits {
     }
 }
 
+/// LSP features that can be routed to specific servers in a multi-server setup.
+///
+/// Features are classified as either "merged" (results from all servers are combined)
+/// or "exclusive" (first eligible server wins). This classification is used by the
+/// dispatch layer, not by this enum itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LspFeature {
+    /// Diagnostics (merged: combined from all servers)
+    Diagnostics,
+    /// Code completion (merged: combined from all servers)
+    Completion,
+    /// Code actions / quick fixes (merged: combined from all servers)
+    CodeAction,
+    /// Document symbols (merged: combined from all servers)
+    DocumentSymbols,
+    /// Workspace symbols (merged: combined from all servers)
+    WorkspaceSymbols,
+    /// Hover information (exclusive: first eligible server wins)
+    Hover,
+    /// Go to definition, declaration, type definition, implementation (exclusive)
+    Definition,
+    /// Find references (exclusive)
+    References,
+    /// Document formatting and range formatting (exclusive)
+    Format,
+    /// Rename and prepare rename (exclusive)
+    Rename,
+    /// Signature help (exclusive)
+    SignatureHelp,
+    /// Inlay hints (exclusive)
+    InlayHints,
+    /// Folding ranges (exclusive)
+    FoldingRange,
+    /// Semantic tokens (exclusive)
+    SemanticTokens,
+    /// Document highlight (exclusive)
+    DocumentHighlight,
+}
+
+impl LspFeature {
+    /// Whether this feature produces merged results from all eligible servers.
+    /// Merged features send requests to all servers and combine the results.
+    /// Non-merged (exclusive) features use only the first eligible server.
+    pub fn is_merged(&self) -> bool {
+        matches!(
+            self,
+            LspFeature::Diagnostics
+                | LspFeature::Completion
+                | LspFeature::CodeAction
+                | LspFeature::DocumentSymbols
+                | LspFeature::WorkspaceSymbols
+        )
+    }
+}
+
+/// Feature filter for an LSP server, controlling which features it handles.
+///
+/// - `All`: The server handles all features (default).
+/// - `Only(set)`: The server handles only the listed features.
+/// - `Except(set)`: The server handles all features except the listed ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FeatureFilter {
+    #[default]
+    All,
+    Only(HashSet<LspFeature>),
+    Except(HashSet<LspFeature>),
+}
+
+impl FeatureFilter {
+    /// Check if this filter allows a given feature.
+    pub fn allows(&self, feature: LspFeature) -> bool {
+        match self {
+            FeatureFilter::All => true,
+            FeatureFilter::Only(set) => set.contains(&feature),
+            FeatureFilter::Except(set) => !set.contains(&feature),
+        }
+    }
+
+    /// Build a FeatureFilter from the only_features/except_features config fields.
+    pub fn from_config(
+        only: &Option<Vec<LspFeature>>,
+        except: &Option<Vec<LspFeature>>,
+    ) -> FeatureFilter {
+        match (only, except) {
+            (Some(only), _) => FeatureFilter::Only(only.iter().copied().collect()),
+            (_, Some(except)) => FeatureFilter::Except(except.iter().copied().collect()),
+            _ => FeatureFilter::All,
+        }
+    }
+}
+
+/// Wrapper for deserializing a per-language LSP config that can be either
+/// a single server object or an array of server objects.
+///
+/// ```json
+/// { "lsp": { "rust": { "command": "rust-analyzer" } } }          // single
+/// { "lsp": { "python": [{ "command": "pyright" }, { "command": "ruff" }] } }  // multi
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LspLanguageConfig {
+    /// Multiple servers for this language (array form)
+    Multi(Vec<LspServerConfig>),
+    /// A single server for this language (object form)
+    Single(Box<LspServerConfig>),
+}
+
+/// Custom JsonSchema: always advertise the canonical array form so the settings
+/// UI renders a structured array editor. The `#[serde(untagged)]` on the enum
+/// still accepts both single-object and array forms during deserialization.
+impl JsonSchema for LspLanguageConfig {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("LspLanguageConfig")
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "One or more LSP server configs for this language.\nAccepts both a single object and an array for backwards compatibility.",
+            "type": "array",
+            "items": generator.subschema_for::<LspServerConfig>()
+        })
+    }
+}
+
+impl LspLanguageConfig {
+    /// Convert to a Vec of server configs.
+    pub fn into_vec(self) -> Vec<LspServerConfig> {
+        match self {
+            LspLanguageConfig::Single(c) => vec![*c],
+            LspLanguageConfig::Multi(v) => v,
+        }
+    }
+
+    /// Get a reference as a slice of server configs.
+    pub fn as_slice(&self) -> &[LspServerConfig] {
+        match self {
+            LspLanguageConfig::Single(c) => std::slice::from_ref(c.as_ref()),
+            LspLanguageConfig::Multi(v) => v,
+        }
+    }
+
+    /// Get a mutable reference as a slice of server configs.
+    pub fn as_mut_slice(&mut self) -> &mut [LspServerConfig] {
+        match self {
+            LspLanguageConfig::Single(c) => std::slice::from_mut(c),
+            LspLanguageConfig::Multi(v) => v,
+        }
+    }
+}
+
+impl Default for LspLanguageConfig {
+    fn default() -> Self {
+        LspLanguageConfig::Single(Box::default())
+    }
+}
+
 /// LSP server configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[schemars(extend("x-display-field" = "/command"))]
@@ -91,40 +251,78 @@ pub struct LspServerConfig {
     /// Command to spawn the server.
     /// Required when enabled=true, ignored when enabled=false.
     #[serde(default)]
+    #[schemars(extend("x-order" = 1))]
     pub command: String,
-
-    /// Arguments to pass to the server
-    #[serde(default)]
-    pub args: Vec<String>,
 
     /// Whether the server is enabled
     #[serde(default = "default_true")]
+    #[schemars(extend("x-order" = 2))]
     pub enabled: bool,
+
+    /// Display name for this server (e.g., "tsserver", "eslint").
+    /// Defaults to the command basename if not specified.
+    #[serde(default)]
+    #[schemars(extend("x-order" = 3))]
+    pub name: Option<String>,
+
+    /// Arguments to pass to the server
+    #[serde(default)]
+    #[schemars(extend("x-order" = 4))]
+    pub args: Vec<String>,
 
     /// Whether to auto-start this LSP server when opening matching files
     /// If false (default), the server must be started manually via command palette
     #[serde(default)]
+    #[schemars(extend("x-order" = 5))]
     pub auto_start: bool,
 
-    /// Process resource limits (memory and CPU)
+    /// File/directory names to search for when detecting the workspace root.
+    /// The editor walks upward from the opened file's directory looking for
+    /// any of these markers. The first directory containing a match becomes
+    /// the workspace root sent to the LSP server.
+    ///
+    /// If empty, falls back to `[".git"]` as a universal marker.
+    /// If the walk reaches a filesystem boundary without a match, uses the
+    /// file's parent directory (never cwd or $HOME).
     #[serde(default)]
-    pub process_limits: ProcessLimits,
-
-    /// Custom initialization options to send to the server
-    /// These are passed in the `initializationOptions` field of the LSP Initialize request
-    #[serde(default)]
-    pub initialization_options: Option<serde_json::Value>,
+    #[schemars(extend("x-order" = 6))]
+    pub root_markers: Vec<String>,
 
     /// Environment variables to set for the LSP server process.
     /// These are added to (or override) the inherited parent environment.
     #[serde(default)]
+    #[schemars(extend("x-section" = "Advanced", "x-order" = 10))]
     pub env: HashMap<String, String>,
 
     /// Override the LSP languageId sent in textDocument/didOpen based on file extension.
     /// Maps file extension (without dot) to LSP language ID string.
     /// For example: `{"tsx": "typescriptreact", "jsx": "javascriptreact"}`
     #[serde(default)]
+    #[schemars(extend("x-section" = "Advanced", "x-order" = 11))]
     pub language_id_overrides: HashMap<String, String>,
+
+    /// Custom initialization options to send to the server
+    /// These are passed in the `initializationOptions` field of the LSP Initialize request
+    #[serde(default)]
+    #[schemars(extend("x-section" = "Advanced", "x-order" = 12))]
+    pub initialization_options: Option<serde_json::Value>,
+
+    /// Restrict this server to only handle the listed features.
+    /// Mutually exclusive with `except_features`. If neither is set, all features are handled.
+    #[serde(default)]
+    #[schemars(extend("x-section" = "Advanced", "x-order" = 13))]
+    pub only_features: Option<Vec<LspFeature>>,
+
+    /// Exclude the listed features from this server.
+    /// Mutually exclusive with `only_features`. If neither is set, all features are handled.
+    #[serde(default)]
+    #[schemars(extend("x-section" = "Advanced", "x-order" = 14))]
+    pub except_features: Option<Vec<LspFeature>>,
+
+    /// Process resource limits (memory and CPU)
+    #[serde(default)]
+    #[schemars(extend("x-section" = "Advanced", "x-order" = 15))]
+    pub process_limits: ProcessLimits,
 }
 
 impl LspServerConfig {
@@ -132,8 +330,32 @@ impl LspServerConfig {
     ///
     /// This is used when loading configs where fields like `command` may be empty
     /// (serde's default) because they weren't specified in the user's config file.
+    /// Resolve the display name for this server.
+    /// Returns the explicit name if set, otherwise the basename of the command.
+    pub fn display_name(&self) -> String {
+        if let Some(ref name) = self.name {
+            return name.clone();
+        }
+        // Use command basename
+        std::path::Path::new(&self.command)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&self.command)
+            .to_string()
+    }
+
+    /// Build the FeatureFilter for this server config.
+    pub fn feature_filter(&self) -> FeatureFilter {
+        FeatureFilter::from_config(&self.only_features, &self.except_features)
+    }
+
+    /// Merge this config with defaults, using default values for empty/unset fields.
+    ///
+    /// This is used when loading configs where fields like `command` may be empty
+    /// (serde's default) because they weren't specified in the user's config file.
     pub fn merge_with_defaults(self, defaults: &LspServerConfig) -> LspServerConfig {
         LspServerConfig {
+            name: self.name.or_else(|| defaults.name.clone()),
             command: if self.command.is_empty() {
                 defaults.command.clone()
             } else {
@@ -147,6 +369,12 @@ impl LspServerConfig {
             enabled: self.enabled,
             auto_start: self.auto_start,
             process_limits: self.process_limits,
+            only_features: self
+                .only_features
+                .or_else(|| defaults.only_features.clone()),
+            except_features: self
+                .except_features
+                .or_else(|| defaults.except_features.clone()),
             initialization_options: self
                 .initialization_options
                 .or_else(|| defaults.initialization_options.clone()),
@@ -160,6 +388,101 @@ impl LspServerConfig {
                 merged.extend(self.language_id_overrides);
                 merged
             },
+            root_markers: if self.root_markers.is_empty() {
+                defaults.root_markers.clone()
+            } else {
+                self.root_markers
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_lsp_feature_is_merged() {
+        assert!(LspFeature::Diagnostics.is_merged());
+        assert!(LspFeature::Completion.is_merged());
+        assert!(LspFeature::CodeAction.is_merged());
+        assert!(LspFeature::DocumentSymbols.is_merged());
+        assert!(LspFeature::WorkspaceSymbols.is_merged());
+
+        assert!(!LspFeature::Hover.is_merged());
+        assert!(!LspFeature::Definition.is_merged());
+        assert!(!LspFeature::References.is_merged());
+        assert!(!LspFeature::Format.is_merged());
+        assert!(!LspFeature::Rename.is_merged());
+        assert!(!LspFeature::SignatureHelp.is_merged());
+        assert!(!LspFeature::InlayHints.is_merged());
+        assert!(!LspFeature::FoldingRange.is_merged());
+        assert!(!LspFeature::SemanticTokens.is_merged());
+        assert!(!LspFeature::DocumentHighlight.is_merged());
+    }
+
+    #[test]
+    fn test_feature_filter_all() {
+        let filter = FeatureFilter::All;
+        assert!(filter.allows(LspFeature::Hover));
+        assert!(filter.allows(LspFeature::Diagnostics));
+        assert!(filter.allows(LspFeature::Completion));
+        assert!(filter.allows(LspFeature::Rename));
+    }
+
+    #[test]
+    fn test_feature_filter_only() {
+        let mut set = HashSet::new();
+        set.insert(LspFeature::Diagnostics);
+        set.insert(LspFeature::Completion);
+        let filter = FeatureFilter::Only(set);
+
+        assert!(filter.allows(LspFeature::Diagnostics));
+        assert!(filter.allows(LspFeature::Completion));
+        assert!(!filter.allows(LspFeature::Hover));
+        assert!(!filter.allows(LspFeature::Definition));
+    }
+
+    #[test]
+    fn test_feature_filter_except() {
+        let mut set = HashSet::new();
+        set.insert(LspFeature::Format);
+        set.insert(LspFeature::Rename);
+        let filter = FeatureFilter::Except(set);
+
+        assert!(filter.allows(LspFeature::Hover));
+        assert!(filter.allows(LspFeature::Diagnostics));
+        assert!(!filter.allows(LspFeature::Format));
+        assert!(!filter.allows(LspFeature::Rename));
+    }
+
+    #[test]
+    fn test_feature_filter_from_config_none() {
+        let filter = FeatureFilter::from_config(&None, &None);
+        assert!(matches!(filter, FeatureFilter::All));
+    }
+
+    #[test]
+    fn test_feature_filter_from_config_only() {
+        let only = Some(vec![LspFeature::Diagnostics, LspFeature::Completion]);
+        let filter = FeatureFilter::from_config(&only, &None);
+        assert!(filter.allows(LspFeature::Diagnostics));
+        assert!(filter.allows(LspFeature::Completion));
+        assert!(!filter.allows(LspFeature::Hover));
+    }
+
+    #[test]
+    fn test_feature_filter_from_config_except() {
+        let except = Some(vec![LspFeature::Format]);
+        let filter = FeatureFilter::from_config(&None, &except);
+        assert!(filter.allows(LspFeature::Hover));
+        assert!(!filter.allows(LspFeature::Format));
+    }
+
+    #[test]
+    fn test_feature_filter_default() {
+        let filter = FeatureFilter::default();
+        assert!(matches!(filter, FeatureFilter::All));
     }
 }

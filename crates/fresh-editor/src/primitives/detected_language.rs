@@ -37,12 +37,25 @@ impl DetectedLanguage {
     /// 2. Glob pattern match in user config
     /// 3. Extension match in user config
     /// 4. Built-in detection (tree-sitter `Language::from_path` + syntect)
+    /// 5. Fallback config (if set and no other match found)
     pub fn from_path(
         path: &Path,
         registry: &GrammarRegistry,
         languages: &HashMap<String, LanguageConfig>,
     ) -> Self {
-        let highlighter = HighlightEngine::for_file_with_languages(path, registry, languages);
+        Self::from_path_with_fallback(path, registry, languages, None)
+    }
+
+    /// Like `from_path`, but also accepts an optional default language name
+    /// that is applied when no language is detected (#1219).
+    /// The `default_language` must reference a key in the `languages` map.
+    pub fn from_path_with_fallback(
+        path: &Path,
+        registry: &GrammarRegistry,
+        languages: &HashMap<String, LanguageConfig>,
+        default_language: Option<&str>,
+    ) -> Self {
+        let highlighter = HighlightEngine::for_file(path, registry, Some(languages));
         let ts_language = Language::from_path(path);
         // Prefer config-based language name (e.g., "csharp") so it matches
         // the LSP config key. Fall back to tree-sitter name (e.g., "c_sharp")
@@ -59,6 +72,33 @@ impl DetectedLanguage {
             .find_syntax_for_file_with_languages(path, languages)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| name.clone());
+
+        // If no language was detected and a default_language is configured,
+        // look up its grammar for highlighting (#1219)
+        if name == "text" && matches!(highlighter, HighlightEngine::None) {
+            if let Some(lang_key) = default_language {
+                let grammar = languages
+                    .get(lang_key)
+                    .map(|lc| lc.grammar.as_str())
+                    .filter(|g| !g.is_empty())
+                    .unwrap_or(lang_key);
+                let fb_highlighter =
+                    HighlightEngine::for_syntax_name(grammar, registry, ts_language);
+                if !matches!(fb_highlighter, HighlightEngine::None) {
+                    let fb_display = registry
+                        .find_syntax_by_name(grammar)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| grammar.to_string());
+                    return Self {
+                        name,
+                        display_name: fb_display,
+                        highlighter: fb_highlighter,
+                        ts_language,
+                    };
+                }
+            }
+        }
+
         Self {
             name,
             display_name,
@@ -72,7 +112,7 @@ impl DetectedLanguage {
     /// Used by `from_file()` (the legacy constructor) and for virtual buffer names
     /// where user config doesn't apply.
     pub fn from_path_builtin(path: &Path, registry: &GrammarRegistry) -> Self {
-        let highlighter = HighlightEngine::for_file(path, registry);
+        let highlighter = HighlightEngine::for_file(path, registry, None);
         let ts_language = Language::from_path(path);
         let name = ts_language
             .as_ref()
@@ -115,6 +155,18 @@ impl DetectedLanguage {
             })
         } else {
             None
+        }
+    }
+
+    /// Create a DetectedLanguage for a user-configured language that has no
+    /// matching syntect grammar. No syntax highlighting, but the language ID
+    /// is set correctly for config/LSP purposes.
+    pub fn from_config_language(lang_id: &str) -> Self {
+        Self {
+            name: lang_id.to_string(),
+            display_name: lang_id.to_string(),
+            highlighter: HighlightEngine::None,
+            ts_language: None,
         }
     }
 

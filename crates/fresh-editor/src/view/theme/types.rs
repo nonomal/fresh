@@ -29,18 +29,44 @@ include!(concat!(env!("OUT_DIR"), "/builtin_themes.rs"));
 /// Information about an available theme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeInfo {
-    /// Theme name (e.g., "dark", "nord")
+    /// Theme display name (e.g., "dark", "adwaita-dark")
     pub name: String,
     /// Pack name (subdirectory path, empty for root themes)
     pub pack: String,
+    /// Unique key used as the registry identifier.
+    ///
+    /// Derivation priority:
+    /// 1. Package themes: `{repository_url}#{theme_name}`
+    /// 2. User-saved themes (theme editor): `file://{absolute_path}`
+    /// 3. Loose user themes: `{pack}/{name}` or just `{name}` if pack is empty
+    /// 4. Builtins: just the name
+    pub key: String,
 }
 
 impl ThemeInfo {
-    /// Create a new ThemeInfo
+    /// Create a new ThemeInfo. The key defaults to `pack/name` (or just `name`
+    /// when pack is empty).
     pub fn new(name: impl Into<String>, pack: impl Into<String>) -> Self {
+        let name = name.into();
+        let pack = pack.into();
+        let key = if pack.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", pack, name)
+        };
+        Self { name, pack, key }
+    }
+
+    /// Create a ThemeInfo with an explicit key (e.g. a repository URL).
+    pub fn with_key(
+        name: impl Into<String>,
+        pack: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             pack: pack.into(),
+            key: key.into(),
         }
     }
 
@@ -132,6 +158,31 @@ impl From<ColorDef> for Color {
     }
 }
 
+/// Convert a named color string (e.g. "Yellow", "Red") to a ratatui Color.
+/// Returns None if the string is not a recognized named color.
+pub fn named_color_from_str(name: &str) -> Option<Color> {
+    match name {
+        "Black" => Some(Color::Black),
+        "Red" => Some(Color::Red),
+        "Green" => Some(Color::Green),
+        "Yellow" => Some(Color::Yellow),
+        "Blue" => Some(Color::Blue),
+        "Magenta" => Some(Color::Magenta),
+        "Cyan" => Some(Color::Cyan),
+        "Gray" => Some(Color::Gray),
+        "DarkGray" => Some(Color::DarkGray),
+        "LightRed" => Some(Color::LightRed),
+        "LightGreen" => Some(Color::LightGreen),
+        "LightYellow" => Some(Color::LightYellow),
+        "LightBlue" => Some(Color::LightBlue),
+        "LightMagenta" => Some(Color::LightMagenta),
+        "LightCyan" => Some(Color::LightCyan),
+        "White" => Some(Color::White),
+        "Default" | "Reset" => Some(Color::Reset),
+        _ => None,
+    }
+}
+
 impl From<Color> for ColorDef {
     fn from(color: Color) -> Self {
         match color {
@@ -215,6 +266,14 @@ pub struct EditorColors {
     /// Diff removed line background
     #[serde(default = "default_diff_remove_bg")]
     pub diff_remove_bg: ColorDef,
+    /// Diff added word-level highlight background (optional override)
+    /// When not set, computed by brightening diff_add_bg
+    #[serde(default)]
+    pub diff_add_highlight_bg: Option<ColorDef>,
+    /// Diff removed word-level highlight background (optional override)
+    /// When not set, computed by brightening diff_remove_bg
+    #[serde(default)]
+    pub diff_remove_highlight_bg: Option<ColorDef>,
     /// Diff modified line background
     #[serde(default = "default_diff_modify_bg")]
     pub diff_modify_bg: ColorDef,
@@ -459,6 +518,24 @@ pub struct UiColors {
     /// Settings UI selected item foreground (text on selected background)
     #[serde(default = "default_settings_selected_fg")]
     pub settings_selected_fg: ColorDef,
+    /// File status: added file color in file explorer (falls back to diagnostic.info_fg)
+    #[serde(default)]
+    pub file_status_added_fg: Option<ColorDef>,
+    /// File status: modified file color in file explorer (falls back to diagnostic.warning_fg)
+    #[serde(default)]
+    pub file_status_modified_fg: Option<ColorDef>,
+    /// File status: deleted file color in file explorer (falls back to diagnostic.error_fg)
+    #[serde(default)]
+    pub file_status_deleted_fg: Option<ColorDef>,
+    /// File status: renamed file color in file explorer (falls back to diagnostic.info_fg)
+    #[serde(default)]
+    pub file_status_renamed_fg: Option<ColorDef>,
+    /// File status: untracked file color in file explorer (falls back to diagnostic.hint_fg)
+    #[serde(default)]
+    pub file_status_untracked_fg: Option<ColorDef>,
+    /// File status: conflicted file color in file explorer (falls back to diagnostic.error_fg)
+    #[serde(default)]
+    pub file_status_conflicted_fg: Option<ColorDef>,
 }
 
 // Default tab close hover color (for backward compatibility with existing themes)
@@ -666,7 +743,6 @@ fn default_settings_selected_bg() -> ColorDef {
 fn default_settings_selected_fg() -> ColorDef {
     ColorDef::Rgb(255, 255, 255) // White text on selected background
 }
-
 /// Search result highlighting colors
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SearchColors {
@@ -768,6 +844,12 @@ pub struct SyntaxColors {
     /// Operators (+, -, =, etc.)
     #[serde(default = "default_syntax_operator")]
     pub operator: ColorDef,
+    /// Punctuation brackets ({, }, (, ), [, ])
+    #[serde(default = "default_syntax_punctuation_bracket")]
+    pub punctuation_bracket: ColorDef,
+    /// Punctuation delimiters (;, ,, .)
+    #[serde(default = "default_syntax_punctuation_delimiter")]
+    pub punctuation_delimiter: ColorDef,
 }
 
 // Default syntax colors (VSCode Dark+ inspired)
@@ -794,6 +876,12 @@ fn default_syntax_constant() -> ColorDef {
 }
 fn default_syntax_operator() -> ColorDef {
     ColorDef::Rgb(212, 212, 212)
+}
+fn default_syntax_punctuation_bracket() -> ColorDef {
+    ColorDef::Rgb(212, 212, 212) // default foreground — brackets blend with text
+}
+fn default_syntax_punctuation_delimiter() -> ColorDef {
+    ColorDef::Rgb(212, 212, 212) // default foreground — delimiters blend with text
 }
 
 /// Comprehensive theme structure with all UI colors
@@ -916,6 +1004,14 @@ pub struct Theme {
     pub settings_selected_bg: Color,
     pub settings_selected_fg: Color,
 
+    // File status colors (git status indicators in file explorer)
+    pub file_status_added_fg: Color,
+    pub file_status_modified_fg: Color,
+    pub file_status_deleted_fg: Color,
+    pub file_status_renamed_fg: Color,
+    pub file_status_untracked_fg: Color,
+    pub file_status_conflicted_fg: Color,
+
     // Search colors
     pub search_match_bg: Color,
     pub search_match_fg: Color,
@@ -939,6 +1035,8 @@ pub struct Theme {
     pub syntax_variable: Color,
     pub syntax_constant: Color,
     pub syntax_operator: Color,
+    pub syntax_punctuation_bracket: Color,
+    pub syntax_punctuation_delimiter: Color,
 }
 
 impl From<ThemeFile> for Theme {
@@ -958,9 +1056,17 @@ impl From<ThemeFile> for Theme {
             diff_add_bg: file.editor.diff_add_bg.clone().into(),
             diff_remove_bg: file.editor.diff_remove_bg.clone().into(),
             diff_modify_bg: file.editor.diff_modify_bg.into(),
-            // Compute brighter highlight colors from base diff colors
-            diff_add_highlight_bg: brighten_color(file.editor.diff_add_bg.into(), 40),
-            diff_remove_highlight_bg: brighten_color(file.editor.diff_remove_bg.into(), 40),
+            // Use explicit override if provided, otherwise brighten from base
+            diff_add_highlight_bg: file
+                .editor
+                .diff_add_highlight_bg
+                .map(|c| c.into())
+                .unwrap_or_else(|| brighten_color(file.editor.diff_add_bg.into(), 40)),
+            diff_remove_highlight_bg: file
+                .editor
+                .diff_remove_highlight_bg
+                .map(|c| c.into())
+                .unwrap_or_else(|| brighten_color(file.editor.diff_remove_bg.into(), 40)),
             tab_active_fg: file.ui.tab_active_fg.into(),
             tab_active_bg: file.ui.tab_active_bg.into(),
             tab_inactive_fg: file.ui.tab_inactive_fg.into(),
@@ -1024,6 +1130,36 @@ impl From<ThemeFile> for Theme {
             tab_drop_zone_border: file.ui.tab_drop_zone_border.into(),
             settings_selected_bg: file.ui.settings_selected_bg.into(),
             settings_selected_fg: file.ui.settings_selected_fg.into(),
+            file_status_added_fg: file
+                .ui
+                .file_status_added_fg
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.diagnostic.info_fg.clone().into()),
+            file_status_modified_fg: file
+                .ui
+                .file_status_modified_fg
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.diagnostic.warning_fg.clone().into()),
+            file_status_deleted_fg: file
+                .ui
+                .file_status_deleted_fg
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.diagnostic.error_fg.clone().into()),
+            file_status_renamed_fg: file
+                .ui
+                .file_status_renamed_fg
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.diagnostic.info_fg.clone().into()),
+            file_status_untracked_fg: file
+                .ui
+                .file_status_untracked_fg
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.diagnostic.hint_fg.clone().into()),
+            file_status_conflicted_fg: file
+                .ui
+                .file_status_conflicted_fg
+                .map(|c| c.into())
+                .unwrap_or_else(|| file.diagnostic.error_fg.clone().into()),
             search_match_bg: file.search.match_bg.into(),
             search_match_fg: file.search.match_fg.into(),
             diagnostic_error_fg: file.diagnostic.error_fg.into(),
@@ -1042,6 +1178,8 @@ impl From<ThemeFile> for Theme {
             syntax_variable: file.syntax.variable.into(),
             syntax_constant: file.syntax.constant.into(),
             syntax_operator: file.syntax.operator.into(),
+            syntax_punctuation_bracket: file.syntax.punctuation_bracket.into(),
+            syntax_punctuation_delimiter: file.syntax.punctuation_delimiter.into(),
         }
     }
 }
@@ -1061,6 +1199,8 @@ impl From<Theme> for ThemeFile {
                 line_number_bg: theme.line_number_bg.into(),
                 diff_add_bg: theme.diff_add_bg.into(),
                 diff_remove_bg: theme.diff_remove_bg.into(),
+                diff_add_highlight_bg: Some(theme.diff_add_highlight_bg.into()),
+                diff_remove_highlight_bg: Some(theme.diff_remove_highlight_bg.into()),
                 diff_modify_bg: theme.diff_modify_bg.into(),
                 ruler_bg: theme.ruler_bg.into(),
                 whitespace_indicator_fg: theme.whitespace_indicator_fg.into(),
@@ -1129,6 +1269,12 @@ impl From<Theme> for ThemeFile {
                 tab_drop_zone_border: theme.tab_drop_zone_border.into(),
                 settings_selected_bg: theme.settings_selected_bg.into(),
                 settings_selected_fg: theme.settings_selected_fg.into(),
+                file_status_added_fg: Some(theme.file_status_added_fg.into()),
+                file_status_modified_fg: Some(theme.file_status_modified_fg.into()),
+                file_status_deleted_fg: Some(theme.file_status_deleted_fg.into()),
+                file_status_renamed_fg: Some(theme.file_status_renamed_fg.into()),
+                file_status_untracked_fg: Some(theme.file_status_untracked_fg.into()),
+                file_status_conflicted_fg: Some(theme.file_status_conflicted_fg.into()),
             },
             search: SearchColors {
                 match_bg: theme.search_match_bg.into(),
@@ -1153,12 +1299,31 @@ impl From<Theme> for ThemeFile {
                 variable: theme.syntax_variable.into(),
                 constant: theme.syntax_constant.into(),
                 operator: theme.syntax_operator.into(),
+                punctuation_bracket: theme.syntax_punctuation_bracket.into(),
+                punctuation_delimiter: theme.syntax_punctuation_delimiter.into(),
             },
         }
     }
 }
 
 impl Theme {
+    /// Returns `true` when the theme has a light background.
+    ///
+    /// Uses the relative luminance of `editor_bg` (perceived brightness).
+    /// A threshold of 0.5 separates dark from light; for `Color::Reset` or
+    /// unresolvable colors, falls back to `false` (dark).
+    pub fn is_light(&self) -> bool {
+        if let Some((r, g, b)) = color_to_rgb(self.editor_bg) {
+            // sRGB relative luminance (ITU-R BT.709)
+            let lum = 0.2126 * (r as f64 / 255.0)
+                + 0.7152 * (g as f64 / 255.0)
+                + 0.0722 * (b as f64 / 255.0);
+            lum > 0.5
+        } else {
+            false
+        }
+    }
+
     /// Load a builtin theme by name (no I/O, uses embedded JSON).
     pub fn load_builtin(name: &str) -> Option<Self> {
         BUILTIN_THEMES
@@ -1237,6 +1402,12 @@ impl Theme {
                 "split_separator_fg" => Some(self.split_separator_fg),
                 "scrollbar_thumb_fg" => Some(self.scrollbar_thumb_fg),
                 "semantic_highlight_bg" => Some(self.semantic_highlight_bg),
+                "file_status_added_fg" => Some(self.file_status_added_fg),
+                "file_status_modified_fg" => Some(self.file_status_modified_fg),
+                "file_status_deleted_fg" => Some(self.file_status_deleted_fg),
+                "file_status_renamed_fg" => Some(self.file_status_renamed_fg),
+                "file_status_untracked_fg" => Some(self.file_status_untracked_fg),
+                "file_status_conflicted_fg" => Some(self.file_status_conflicted_fg),
                 _ => None,
             },
             "syntax" => match field {
@@ -1248,6 +1419,8 @@ impl Theme {
                 "variable" => Some(self.syntax_variable),
                 "constant" => Some(self.syntax_constant),
                 "operator" => Some(self.syntax_operator),
+                "punctuation_bracket" => Some(self.syntax_punctuation_bracket),
+                "punctuation_delimiter" => Some(self.syntax_punctuation_delimiter),
                 _ => None,
             },
             "diagnostic" => match field {
@@ -1337,5 +1510,114 @@ mod tests {
         // Test that "Reset" also maps to Color::Reset
         let color: Color = ColorDef::Named("Reset".to_string()).into();
         assert_eq!(color, Color::Reset);
+    }
+
+    #[test]
+    fn test_file_status_colors_fall_back_to_diagnostic_colors() {
+        // A theme with NO file_status_* keys should inherit from diagnostic colors
+        let json = r#"{
+            "name": "test-fallback",
+            "editor": {},
+            "ui": {},
+            "search": {},
+            "diagnostic": {
+                "error_fg": [220, 50, 47],
+                "warning_fg": [181, 137, 0],
+                "info_fg": [38, 139, 210],
+                "hint_fg": [101, 123, 131]
+            },
+            "syntax": {}
+        }"#;
+        let theme = Theme::from_json(json).expect("Should parse theme without file_status keys");
+
+        // Verify fallback: added/renamed -> info_fg
+        assert_eq!(theme.file_status_added_fg, Color::Rgb(38, 139, 210));
+        assert_eq!(theme.file_status_renamed_fg, Color::Rgb(38, 139, 210));
+        // modified -> warning_fg
+        assert_eq!(theme.file_status_modified_fg, Color::Rgb(181, 137, 0));
+        // deleted/conflicted -> error_fg
+        assert_eq!(theme.file_status_deleted_fg, Color::Rgb(220, 50, 47));
+        assert_eq!(theme.file_status_conflicted_fg, Color::Rgb(220, 50, 47));
+        // untracked -> hint_fg
+        assert_eq!(theme.file_status_untracked_fg, Color::Rgb(101, 123, 131));
+    }
+
+    #[test]
+    fn test_file_status_colors_explicit_override() {
+        // A theme WITH explicit file_status keys should use those, not the fallback
+        let json = r#"{
+            "name": "test-override",
+            "editor": {},
+            "ui": {
+                "file_status_added_fg": [80, 250, 123],
+                "file_status_modified_fg": [255, 184, 108]
+            },
+            "search": {},
+            "diagnostic": {
+                "info_fg": [38, 139, 210],
+                "warning_fg": [181, 137, 0]
+            },
+            "syntax": {}
+        }"#;
+        let theme = Theme::from_json(json).expect("Should parse theme with file_status overrides");
+
+        // Explicit overrides should win
+        assert_eq!(theme.file_status_added_fg, Color::Rgb(80, 250, 123));
+        assert_eq!(theme.file_status_modified_fg, Color::Rgb(255, 184, 108));
+        // Non-overridden should still fall back
+        assert_eq!(theme.file_status_renamed_fg, Color::Rgb(38, 139, 210));
+    }
+
+    #[test]
+    fn test_file_status_colors_resolve_via_theme_key() {
+        let json = r#"{
+            "name": "test-resolve",
+            "editor": {},
+            "ui": {
+                "file_status_added_fg": [80, 250, 123]
+            },
+            "search": {},
+            "diagnostic": {
+                "warning_fg": [181, 137, 0]
+            },
+            "syntax": {}
+        }"#;
+        let theme = Theme::from_json(json).expect("Should parse theme");
+
+        // Theme key resolution should work for file_status keys
+        assert_eq!(
+            theme.resolve_theme_key("ui.file_status_added_fg"),
+            Some(Color::Rgb(80, 250, 123))
+        );
+        assert_eq!(
+            theme.resolve_theme_key("ui.file_status_modified_fg"),
+            Some(Color::Rgb(181, 137, 0))
+        );
+    }
+
+    #[test]
+    fn test_all_builtin_themes_have_file_status_colors() {
+        // Every builtin theme must produce valid file_status colors (via fallback or explicit)
+        for builtin in BUILTIN_THEMES {
+            let theme = Theme::from_json(builtin.json)
+                .unwrap_or_else(|e| panic!("Theme '{}' failed to parse: {}", builtin.name, e));
+
+            // All six keys must resolve to Some via resolve_theme_key
+            for key in &[
+                "ui.file_status_added_fg",
+                "ui.file_status_modified_fg",
+                "ui.file_status_deleted_fg",
+                "ui.file_status_renamed_fg",
+                "ui.file_status_untracked_fg",
+                "ui.file_status_conflicted_fg",
+            ] {
+                assert!(
+                    theme.resolve_theme_key(key).is_some(),
+                    "Theme '{}' missing resolution for '{}'",
+                    builtin.name,
+                    key
+                );
+            }
+        }
     }
 }

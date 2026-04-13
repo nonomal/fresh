@@ -7,7 +7,7 @@ use super::entry_dialog::EntryDialogState;
 use super::items::{control_to_value, SettingControl, SettingItem, SettingsPage};
 use super::layout::SettingsHit;
 use super::schema::{parse_schema, SettingCategory, SettingSchema};
-use super::search::{search_settings, SearchResult};
+use super::search::{search_settings, DeepMatch, SearchResult};
 use crate::config::Config;
 use crate::config_io::ConfigLayer;
 use crate::view::controls::FocusState;
@@ -294,6 +294,7 @@ impl SettingsState {
             match &mut item.control {
                 SettingControl::Map(ref mut state) => state.focus = focus_state,
                 SettingControl::TextList(ref mut state) => state.focus = focus_state,
+                SettingControl::DualList(ref mut state) => state.focus = focus_state,
                 SettingControl::ObjectArray(ref mut state) => state.focus = focus_state,
                 SettingControl::Toggle(ref mut state) => state.focus = focus_state,
                 SettingControl::Number(ref mut state) => state.focus = focus_state,
@@ -410,6 +411,22 @@ impl SettingsState {
                     self.footer_button_index += 1;
                 }
             }
+        }
+    }
+
+    /// Move selection down by a page (viewport height worth of items)
+    pub fn select_next_page(&mut self) {
+        let page_size = self.scroll_panel.viewport_height().max(1);
+        for _ in 0..page_size {
+            self.select_next();
+        }
+    }
+
+    /// Move selection up by a page (viewport height worth of items)
+    pub fn select_prev_page(&mut self) {
+        let page_size = self.scroll_panel.viewport_height().max(1);
+        for _ in 0..page_size {
+            self.select_prev();
         }
     }
 
@@ -649,6 +666,82 @@ impl SettingsState {
         }
     }
 
+    /// Set the current nullable setting to null (inherit value).
+    ///
+    /// This explicitly sets the value to null in the current layer,
+    /// indicating that the setting should be inherited rather than overridden.
+    /// Only applies to nullable settings that are not currently null.
+    pub fn set_current_to_null(&mut self) {
+        let target_layer = self.target_layer;
+        let change_info = self.current_item().and_then(|item| {
+            if !item.nullable || item.is_null || item.read_only {
+                return None;
+            }
+            Some(item.path.clone())
+        });
+
+        if let Some(path) = change_info {
+            // Set value to null (not a deletion — this is an explicit null value)
+            self.pending_changes
+                .insert(path.clone(), serde_json::Value::Null);
+            self.pending_deletions.remove(&path);
+
+            // Update the item's visual state
+            if let Some(item) = self.current_item_mut() {
+                item.is_null = true;
+                item.modified = true;
+                item.layer_source = target_layer;
+            }
+        }
+    }
+
+    /// Clear a nullable category by setting its path to null and updating all items.
+    ///
+    /// This sets the category's root path (e.g., `/fallback`) to null in the target layer,
+    /// effectively removing the entire section. All items within the category are marked
+    /// as null/inherited.
+    pub fn clear_current_category(&mut self) {
+        let target_layer = self.target_layer;
+        let page = match self.current_page() {
+            Some(p) if p.nullable => p,
+            _ => return,
+        };
+        let page_path = page.path.clone();
+
+        // Set the category root to null
+        self.pending_changes
+            .insert(page_path.clone(), serde_json::Value::Null);
+
+        // Also remove any pending changes/deletions for child paths
+        let prefix = format!("{}/", page_path);
+        self.pending_changes
+            .retain(|path, _| !path.starts_with(&prefix));
+        self.pending_deletions
+            .retain(|path| !path.starts_with(&prefix));
+
+        // Update all items on the current page to reflect null/inherited state
+        if let Some(page) = self.current_page_mut() {
+            for item in &mut page.items {
+                if item.nullable {
+                    item.is_null = true;
+                    item.modified = false;
+                    item.layer_source = target_layer;
+                }
+            }
+        }
+    }
+
+    /// Check if any items in the current nullable category have non-null values.
+    pub fn current_category_has_values(&self) -> bool {
+        match self.current_page() {
+            Some(page) if page.nullable => {
+                page.items.iter().any(|item| !item.is_null && item.nullable)
+                    || page.items.iter().any(|item| item.modified)
+            }
+            _ => false,
+        }
+    }
+
     /// Handle a value change from user interaction
     pub fn on_value_changed(&mut self) {
         // Capture target_layer before any borrows
@@ -669,6 +762,7 @@ impl SettingsState {
             if let Some(item) = self.current_item_mut() {
                 item.modified = true; // New semantic: value is now defined in target layer
                 item.layer_source = target_layer; // Value now comes from target layer
+                item.is_null = false; // Explicit value clears the inherited state
             }
             self.set_pending_change(&path, value);
         }
@@ -695,6 +789,7 @@ impl SettingsState {
                     SettingControl::Dropdown(state) => state.focus = focus,
                     SettingControl::Text(state) => state.focus = focus,
                     SettingControl::TextList(state) => state.focus = focus,
+                    SettingControl::DualList(state) => state.focus = focus,
                     SettingControl::Map(state) => state.focus = focus,
                     SettingControl::ObjectArray(state) => state.focus = focus,
                     SettingControl::Json(state) => state.focus = focus,
@@ -833,14 +928,15 @@ impl SettingsState {
     /// Jump to the currently selected search result
     pub fn jump_to_search_result(&mut self) {
         // Extract values first to avoid borrow issues
-        let Some(&SearchResult {
-            page_index,
-            item_index,
-            ..
-        }) = self.search_results.get(self.selected_search_result)
+        let Some(result) = self
+            .search_results
+            .get(self.selected_search_result)
+            .cloned()
         else {
             return;
         };
+        let page_index = result.page_index;
+        let item_index = result.item_index;
 
         // Unfocus old item first
         self.update_control_focus(false);
@@ -856,9 +952,38 @@ impl SettingsState {
         }
         self.sub_focus = None;
         self.init_map_focus(true);
+
+        // Navigate into the deep match target if present
+        if let Some(ref deep_match) = result.deep_match {
+            self.jump_to_deep_match(deep_match);
+        }
+
         self.update_control_focus(true); // Focus the new item
         self.ensure_visible();
         self.cancel_search();
+    }
+
+    /// Navigate into a composite control to focus a specific deep match
+    fn jump_to_deep_match(&mut self, deep_match: &DeepMatch) {
+        match deep_match {
+            DeepMatch::MapKey { entry_index, .. } | DeepMatch::MapValue { entry_index, .. } => {
+                if let Some(item) = self.current_item_mut() {
+                    if let SettingControl::Map(ref mut map_state) = item.control {
+                        map_state.focused_entry = Some(*entry_index);
+                    }
+                }
+                self.update_map_sub_focus();
+            }
+            DeepMatch::TextListItem { item_index, .. } => {
+                if let Some(item) = self.current_item_mut() {
+                    if let SettingControl::TextList(ref mut list_state) = item.control {
+                        list_state.focused_item = Some(*item_index);
+                    }
+                }
+                // Update sub_focus for TextList
+                self.sub_focus = Some(1 + *item_index);
+            }
+        }
     }
 
     /// Get the currently selected search result
@@ -1022,7 +1147,21 @@ impl SettingsState {
         // Get info from the current dialog's focused field
         let nested_info = self.entry_dialog().and_then(|dialog| {
             let item = dialog.current_item()?;
-            let path = format!("{}/{}", dialog.map_path, item.path.trim_start_matches('/'));
+            // The nested dialog path must root at the current entry's full
+            // path, not just at `map_path`. Otherwise the entry key segment
+            // (e.g. `quicklsp` under `/universal_lsp`) is dropped and the
+            // nested save records a pending change at `/universal_lsp/`,
+            // which eventually writes an empty-string key into the config.
+            let base = dialog.entry_path();
+            let relative = item.path.trim_start_matches('/');
+            let path = if relative.is_empty() {
+                // `is_single_value` dialogs use an empty item path because
+                // the single non-key item IS the entry's value. In that
+                // case the nested dialog lives at the entry path itself.
+                base
+            } else {
+                format!("{}/{}", base, relative)
+            };
 
             match &item.control {
                 SettingControl::Map(map_state) => {
@@ -1199,10 +1338,23 @@ impl SettingsState {
         let is_nested = !self.entry_dialog_stack.is_empty();
 
         if is_nested {
-            // Nested dialog - update the parent dialog's ObjectArray item
-            // Extract the array field name from the path (last segment)
-            let array_field = array_path.rsplit('/').next().unwrap_or("").to_string();
-            let item_path = format!("/{}", array_field);
+            // Nested dialog - update the parent dialog's ObjectArray item.
+            // Extract the item path within the parent dialog by stripping the
+            // parent's full entry path (map_path + "/" + entry_key) from the
+            // nested dialog's array path. For an is_single_value parent (e.g.
+            // a quicklsp entry whose value schema is an array), the inner
+            // ObjectArray item has path "" and the nested dialog lives exactly
+            // at the entry path, so the stripped item path is "".
+            let parent_entry_path = self
+                .entry_dialog_stack
+                .last()
+                .map(|p| p.entry_path())
+                .unwrap_or_default();
+            let item_path = array_path
+                .strip_prefix(parent_entry_path.as_str())
+                .unwrap_or(&array_path)
+                .trim_end_matches('/')
+                .to_string();
 
             // Find and update the ObjectArray in the parent dialog
             if let Some(parent) = self.entry_dialog_stack.last_mut() {
@@ -1345,6 +1497,7 @@ impl SettingsState {
             if matches!(
                 item.control,
                 SettingControl::TextList(_)
+                    | SettingControl::DualList(_)
                     | SettingControl::Text(_)
                     | SettingControl::Map(_)
                     | SettingControl::Json(_)
@@ -1352,19 +1505,30 @@ impl SettingsState {
                 self.editing_text = true;
             }
         }
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::DualList(ref mut dl) = item.control {
+                dl.editing = true;
+            }
+        }
     }
 
     /// Stop text editing mode
     pub fn stop_editing(&mut self) {
         self.editing_text = false;
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::DualList(ref mut dl) = item.control {
+                dl.editing = false;
+            }
+        }
     }
 
-    /// Check if the current item is editable (TextList, Text, Map, or Json)
+    /// Check if the current item is editable (TextList, DualList, Text, Map, or Json)
     pub fn is_editable_control(&self) -> bool {
         self.current_item().is_some_and(|item| {
             matches!(
                 item.control,
                 SettingControl::TextList(_)
+                    | SettingControl::DualList(_)
                     | SettingControl::Text(_)
                     | SettingControl::Map(_)
                     | SettingControl::Json(_)
@@ -1551,6 +1715,81 @@ impl SettingsState {
         }
         // Record the change
         self.on_value_changed();
+    }
+
+    /// Check if currently editing a DualList control
+    pub fn is_editing_dual_list(&self) -> bool {
+        if !self.editing_text {
+            return false;
+        }
+        self.current_item()
+            .map(|item| matches!(&item.control, SettingControl::DualList(_)))
+            .unwrap_or(false)
+    }
+
+    // =========== DualList methods ===========
+
+    /// Access the DualList at `item_idx` in the current page and run `f` on it.
+    /// Returns `None` if the item isn't a DualList or the index is out of bounds.
+    pub fn with_dual_list_mut<R>(
+        &mut self,
+        item_idx: usize,
+        f: impl FnOnce(&mut crate::view::controls::DualListState) -> R,
+    ) -> Option<R> {
+        let page = self.pages.get_mut(self.selected_category)?;
+        let item = page.items.get_mut(item_idx)?;
+        if let SettingControl::DualList(ref mut state) = item.control {
+            Some(f(state))
+        } else {
+            None
+        }
+    }
+
+    /// Access the currently selected DualList and run `f` on it.
+    /// Returns `None` if the current item isn't a DualList.
+    pub fn with_current_dual_list_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::view::controls::DualListState) -> R,
+    ) -> Option<R> {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::DualList(ref mut state) = item.control {
+                return Some(f(state));
+            }
+        }
+        None
+    }
+
+    /// After changing a DualList, refresh the sibling's excluded set.
+    ///
+    /// Assumes the sibling setting lives on the same page as the current item.
+    /// This holds for the current use case (`status_bar.left` and `.right` are both
+    /// flattened into the Editor page under the "Status Bar" section). Cross-category
+    /// siblings would silently no-op until the next `build_pages()`.
+    pub fn refresh_dual_list_sibling(&mut self) {
+        let (new_included, sibling_path) = {
+            let Some(item) = self.current_item() else {
+                return;
+            };
+            let SettingControl::DualList(state) = &item.control else {
+                return;
+            };
+            let Some(ref sib_path) = item.dual_list_sibling else {
+                return;
+            };
+            (state.included.clone(), sib_path.clone())
+        };
+
+        // Find sibling item in same page and update its excluded
+        if let Some(page) = self.pages.get_mut(self.selected_category) {
+            for other in page.items.iter_mut() {
+                if other.path == sibling_path {
+                    if let SettingControl::DualList(ref mut sib_state) = other.control {
+                        sib_state.excluded = new_included;
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     // =========== JSON editing methods ===========
@@ -2080,6 +2319,14 @@ fn update_control_from_value(control: &mut SettingControl, value: &serde_json::V
                     .collect();
             }
         }
+        SettingControl::DualList(state) => {
+            if let Some(arr) = value.as_array() {
+                state.included = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+        }
         SettingControl::Map(state) => {
             if let Some(obj) = value.as_object() {
                 state.entries = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -2453,5 +2700,249 @@ mod tests {
         // Switching layers clears pending changes
         state.cycle_target_layer();
         assert!(!state.has_changes());
+    }
+
+    /// Regression test for the quicklsp settings-save bug.
+    ///
+    /// When editing an existing map entry whose value schema is itself an
+    /// array (the `is_single_value` case — e.g. `universal_lsp.quicklsp`
+    /// where the value schema is `LspLanguageConfig` = array of
+    /// `LspServerConfig`), opening a nested ArrayItem dialog used to
+    /// compute its `map_path` from `parent.map_path + item.path` only —
+    /// dropping the entry key segment whenever `item.path` was `""`.
+    /// The nested dialog's save would then record a pending change at
+    /// `/universal_lsp/`, which downstream wrote an empty-string key
+    /// under `universal_lsp` in the saved config file.
+    ///
+    /// This test exercises the real `open_nested_entry_dialog` + save
+    /// path using a schema shaped like `LspLanguageConfig` and asserts:
+    /// 1. The nested dialog's `map_path` is the full entry path.
+    /// 2. The recorded pending-change path is the full entry path, not
+    ///    `/universal_lsp/` and not any `/universal_lsp/*` path with a
+    ///    trailing slash.
+    #[test]
+    fn nested_array_save_records_full_entry_path() {
+        // EntryDialogState is already re-exported via `use super::*;`.
+        // Pull in SettingType from the sibling schema module explicitly.
+        use crate::view::settings::schema::SettingType;
+
+        let config = test_config();
+        let mut state = SettingsState::new(TEST_SCHEMA, &config).unwrap();
+
+        // LspServerConfig-ish: a single "enabled" boolean field.
+        let item_schema = SettingSchema {
+            path: "/item".to_string(),
+            name: "Server".to_string(),
+            description: None,
+            setting_type: SettingType::Object {
+                properties: vec![SettingSchema {
+                    path: "/enabled".to_string(),
+                    name: "Enabled".to_string(),
+                    description: None,
+                    setting_type: SettingType::Boolean,
+                    default: Some(serde_json::json!(false)),
+                    read_only: false,
+                    section: None,
+                    order: None,
+                    nullable: false,
+                    enum_from: None,
+                    dual_list_sibling: None,
+                }],
+            },
+            default: None,
+            read_only: false,
+            section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
+        };
+
+        // universal_lsp's value schema: ObjectArray of the item schema above.
+        // Note: path is "" just like the real schema parser produces for
+        // `parse_setting("value", "", ...)` — this is what drives the
+        // `is_single_value` code path in EntryDialogState::from_schema.
+        let value_schema = SettingSchema {
+            path: String::new(),
+            name: "value".to_string(),
+            description: None,
+            setting_type: SettingType::ObjectArray {
+                item_schema: Box::new(item_schema.clone()),
+                display_field: None,
+            },
+            default: None,
+            read_only: false,
+            section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
+        };
+
+        // Parent dialog: user is editing the existing "quicklsp" entry
+        // under /universal_lsp. This is the MapEntry dialog the real UI
+        // opens via `open_entry_dialog`.
+        let parent = EntryDialogState::from_schema(
+            "quicklsp".to_string(),
+            &serde_json::json!([{ "enabled": true }]),
+            &value_schema,
+            "/universal_lsp",
+            false, // existing entry
+            false,
+        );
+
+        // Precondition: is_single_value triggers and entry_path is correct.
+        assert!(
+            parent.is_single_value,
+            "array value_schema should trigger is_single_value path"
+        );
+        assert_eq!(parent.entry_path(), "/universal_lsp/quicklsp");
+
+        state.entry_dialog_stack.push(parent);
+
+        // Exercise the REAL open_nested_entry_dialog — this is the code
+        // path that used to produce the wrong path. The outer dialog's
+        // ObjectArray item is already focused with its first entry
+        // selected (init_object_array_focus in from_schema).
+        state.open_nested_entry_dialog();
+
+        // A nested dialog should have been pushed.
+        assert_eq!(
+            state.entry_dialog_stack.len(),
+            2,
+            "open_nested_entry_dialog should have pushed a nested dialog"
+        );
+
+        // CRITICAL (part 1): the nested dialog must root at the full
+        // entry path, not at the parent's map_path alone.
+        let nested_map_path = state
+            .entry_dialog_stack
+            .last()
+            .map(|d| d.map_path.clone())
+            .unwrap();
+        assert_eq!(
+            nested_map_path, "/universal_lsp/quicklsp",
+            "BUG: nested dialog's map_path dropped the 'quicklsp' key segment"
+        );
+
+        // Save the nested dialog via the normal dispatch.
+        state.save_entry_dialog();
+
+        // Nested dialog should be popped, parent still on the stack.
+        assert_eq!(state.entry_dialog_stack.len(), 1);
+
+        // CRITICAL (part 2): the pending change must be rooted at the
+        // full entry path, not at `/universal_lsp/` with a trailing slash.
+        assert!(
+            !state.pending_changes.contains_key("/universal_lsp/"),
+            "regression: pending change recorded under empty-key path /universal_lsp/. \
+             All keys: {:?}",
+            state.pending_changes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !state
+                .pending_changes
+                .keys()
+                .any(|k| k.starts_with("/universal_lsp") && k.ends_with('/')),
+            "no /universal_lsp/* path should end in a trailing slash; got {:?}",
+            state.pending_changes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state
+                .pending_changes
+                .contains_key("/universal_lsp/quicklsp"),
+            "expected pending change at /universal_lsp/quicklsp, got {:?}",
+            state.pending_changes.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_refresh_dual_list_sibling_updates_excluded() {
+        use crate::view::controls::DualListState;
+
+        // Uses the real config schema (which has /editor/status_bar/left and /right
+        // as DualList siblings).
+        let schema = include_str!("../../../plugins/config-schema.json");
+        let config = test_config();
+        let mut state = SettingsState::new(schema, &config).unwrap();
+
+        // Find the Editor page and the status bar left/right items
+        let editor_page_idx = state
+            .pages
+            .iter()
+            .position(|p| p.path == "/editor")
+            .expect("editor page");
+        state.selected_category = editor_page_idx;
+
+        let (left_idx, right_idx) = {
+            let page = &state.pages[editor_page_idx];
+            let l = page
+                .items
+                .iter()
+                .position(|i| i.path == "/editor/status_bar/left")
+                .expect("left item");
+            let r = page
+                .items
+                .iter()
+                .position(|i| i.path == "/editor/status_bar/right")
+                .expect("right item");
+            (l, r)
+        };
+
+        // Sanity: both should be DualList controls
+        assert!(matches!(
+            &state.pages[editor_page_idx].items[left_idx].control,
+            SettingControl::DualList(_)
+        ));
+
+        // Capture the initial left.excluded — should match right's default values.
+        let default_right_items: Vec<String> =
+            match &state.pages[editor_page_idx].items[right_idx].control {
+                SettingControl::DualList(dl) => dl.included.clone(),
+                _ => panic!("right should be DualList"),
+            };
+        let initial_left_excluded: Vec<String> =
+            match &state.pages[editor_page_idx].items[left_idx].control {
+                SettingControl::DualList(dl) => dl.excluded.clone(),
+                _ => panic!("left should be DualList"),
+            };
+        assert_eq!(
+            initial_left_excluded, default_right_items,
+            "left.excluded should mirror right's included on initial build"
+        );
+
+        // Mutate left: add a new element that's not in right
+        let new_element = "{chord}".to_string();
+        state.selected_item = left_idx;
+        state
+            .with_current_dual_list_mut(|dl: &mut DualListState| {
+                if !dl.included.contains(&new_element) {
+                    dl.included.push(new_element.clone());
+                }
+            })
+            .expect("current item is a DualList");
+
+        // Refresh the sibling: right.excluded should now contain the new element
+        state.refresh_dual_list_sibling();
+
+        match &state.pages[editor_page_idx].items[right_idx].control {
+            SettingControl::DualList(dl) => {
+                assert!(
+                    dl.excluded.contains(&new_element),
+                    "right.excluded should be updated to reflect left's new inclusion"
+                );
+            }
+            _ => panic!("right should be DualList"),
+        }
+    }
+
+    #[test]
+    fn test_with_dual_list_mut_returns_none_for_non_dual_list() {
+        let config = test_config();
+        let mut state = SettingsState::new(TEST_SCHEMA, &config).unwrap();
+
+        // TEST_SCHEMA has no DualList items, so all calls should return None
+        let result = state.with_dual_list_mut(0, |_| ());
+        assert!(result.is_none());
     }
 }

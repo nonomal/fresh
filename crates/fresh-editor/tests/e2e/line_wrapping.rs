@@ -1,6 +1,6 @@
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
-use fresh::config::Config;
+use fresh::config::{Config, LanguageConfig};
 
 /// Test basic line wrapping rendering
 #[test]
@@ -2154,5 +2154,301 @@ fn test_add_cursor_below_with_line_wrap_enabled() {
     assert_eq!(
         cursor_count, 2,
         "Should have 2 cursors after add cursor below"
+    );
+}
+
+/// Test per-language line wrap: markdown wraps while global wrapping is disabled
+#[test]
+fn test_per_language_line_wrap_override() {
+    let mut config = Config {
+        editor: fresh::config::EditorConfig {
+            line_wrap: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Enable line_wrap only for markdown
+    config.languages.insert(
+        "markdown".to_string(),
+        LanguageConfig {
+            extensions: vec!["md".to_string(), "markdown".to_string()],
+            line_wrap: Some(true),
+            ..Default::default()
+        },
+    );
+
+    let mut harness = EditorTestHarness::with_config(60, 24, config).unwrap();
+
+    // Create a markdown file with a long line that exceeds 60 cols
+    let long_md = "This is a very long markdown line that should wrap because per-language line_wrap is enabled for markdown even though global wrapping is off.";
+    let fixture = crate::common::fixtures::TestFixture::new("test_wrap.md", long_md).unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // The markdown file should be wrapped: we should see text from the line
+    // appearing on multiple visual lines (i.e., both the beginning and a
+    // portion from mid-line should be visible).
+    assert!(
+        screen.contains("long markdown line") && screen.contains("per-language"),
+        "Markdown file should have line wrapping enabled via per-language config. Screen:\n{}",
+        screen
+    );
+
+    // Buffer content should still be a single line (wrapping is visual only)
+    let content = harness.get_buffer_content().unwrap();
+    assert!(
+        !content.contains('\n'),
+        "Buffer should be a single line (visual wrap only)"
+    );
+}
+
+/// Test per-language line wrap: non-markdown file stays unwrapped when global is off
+#[test]
+fn test_per_language_line_wrap_non_matching_language() {
+    let mut config = Config {
+        editor: fresh::config::EditorConfig {
+            line_wrap: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Enable line_wrap only for markdown
+    config.languages.insert(
+        "markdown".to_string(),
+        LanguageConfig {
+            extensions: vec!["md".to_string()],
+            line_wrap: Some(true),
+            ..Default::default()
+        },
+    );
+
+    let mut harness = EditorTestHarness::with_config(60, 24, config).unwrap();
+
+    // Create a .txt file with a long line
+    let long_txt = "This is a very long plaintext line that should NOT wrap because per-language line_wrap is only enabled for markdown and global wrapping is off.";
+    let fixture = crate::common::fixtures::TestFixture::new("test_nowrap.txt", long_txt).unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // With wrapping off, the text should be truncated at viewport width.
+    // The end of the line should NOT be visible since there's no wrapping.
+    assert!(
+        !screen.contains("global wrapping is off"),
+        "Non-markdown file should NOT wrap when global line_wrap is off. Screen:\n{}",
+        screen
+    );
+}
+
+/// Test wrap_column: text wraps at a specific column, not viewport edge
+#[test]
+fn test_wrap_column_wraps_at_configured_column() {
+    // Use a wide terminal (100 cols) but wrap at column 30
+    let config = Config {
+        editor: fresh::config::EditorConfig {
+            line_wrap: true,
+            wrap_column: Some(30),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+
+    // Type text that's longer than 30 chars but shorter than 100
+    let text = "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH";
+    harness.type_text(text).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // With wrap_column=30 on a 100-col terminal, the text should wrap.
+    // Both the beginning and end of the text should be visible (wrapped).
+    assert!(
+        screen.contains("AAAA") && screen.contains("HHHH"),
+        "Text should wrap at column 30 so both start and end are visible. Screen:\n{}",
+        screen
+    );
+}
+
+/// Test per-language wrap_column: markdown wraps at 40 while global is None
+#[test]
+fn test_per_language_wrap_column() {
+    let mut config = Config {
+        editor: fresh::config::EditorConfig {
+            line_wrap: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    config.languages.insert(
+        "markdown".to_string(),
+        LanguageConfig {
+            extensions: vec!["md".to_string()],
+            wrap_column: Some(30),
+            ..Default::default()
+        },
+    );
+
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+
+    let long_md = "AAAA BBBB CCCC DDDD EEEE FFFF GGGG HHHH IIII JJJJ";
+    let fixture = crate::common::fixtures::TestFixture::new("test_wrap_col.md", long_md).unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // Markdown should wrap at column 30 despite wide terminal.
+    // Both start and end should be visible.
+    assert!(
+        screen.contains("AAAA") && screen.contains("JJJJ"),
+        "Markdown should wrap at column 30. Screen:\n{}",
+        screen
+    );
+}
+
+/// Test per-language page_view auto-activation: markdown opens in page view mode
+#[test]
+fn test_per_language_page_view_auto_activation() {
+    let mut config = Config::default();
+
+    // Enable page_view for markdown with a page_width
+    config.languages.insert(
+        "markdown".to_string(),
+        LanguageConfig {
+            extensions: vec!["md".to_string()],
+            page_view: Some(true),
+            page_width: Some(60),
+            ..Default::default()
+        },
+    );
+
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+
+    let md_content = "# Hello World\n\nSome markdown content here.";
+    let fixture =
+        crate::common::fixtures::TestFixture::new("test_page_view.md", md_content).unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // In page view mode, line numbers should be hidden.
+    // A normal file shows "  1 │" gutter; in page view this disappears.
+    assert!(
+        !screen.contains(" 1 │"),
+        "Page view should hide line numbers for markdown. Screen:\n{}",
+        screen
+    );
+
+    // Content should still be visible
+    assert!(
+        screen.contains("Hello World") || screen.contains("markdown content"),
+        "Markdown content should still be visible in page view. Screen:\n{}",
+        screen
+    );
+}
+
+/// Test page_view does NOT activate for non-matching languages
+#[test]
+fn test_page_view_not_activated_for_other_languages() {
+    let mut config = Config::default();
+
+    // Enable page_view only for markdown
+    config.languages.insert(
+        "markdown".to_string(),
+        LanguageConfig {
+            extensions: vec!["md".to_string()],
+            page_view: Some(true),
+            ..Default::default()
+        },
+    );
+
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+
+    let txt_content = "Just a plain text file.";
+    let fixture =
+        crate::common::fixtures::TestFixture::new("test_no_page_view.txt", txt_content).unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // Non-markdown file should show line numbers (not in page view)
+    assert!(
+        screen.contains(" 1 │") || screen.contains("1 │"),
+        "Non-markdown file should show line numbers (no page view). Screen:\n{}",
+        screen
+    );
+}
+
+/// Test that page view defaults to 80 columns on a wide terminal
+#[test]
+fn test_page_view_default_width_80() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Use a wide terminal so 80-col centering is visible
+    let mut harness = EditorTestHarness::new(160, 24).unwrap();
+
+    // Create a file with content that fits within 80 columns
+    let content = "Hello from page view test";
+    let fixture =
+        crate::common::fixtures::TestFixture::new("test_default_width.txt", content).unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+
+    // Toggle page view on
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("Toggle Page View").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // Find the row containing our content
+    let mut content_row = String::new();
+    let height = 24u16;
+    for y in 0..height {
+        let row = harness.get_row_text(y);
+        if row.contains("Hello from") {
+            content_row = row;
+            break;
+        }
+    }
+    assert!(
+        !content_row.is_empty(),
+        "Should find a row with content\nScreen:\n{}",
+        screen
+    );
+
+    let trimmed = content_row.trim();
+
+    // Content should be at most 80 chars wide
+    assert!(
+        trimmed.len() <= 80,
+        "Page view content should be at most 80 columns wide, got {} chars: '{}'\nScreen:\n{}",
+        trimmed.len(),
+        trimmed,
+        screen
+    );
+
+    // There should be left margin (centering) since terminal is 160 cols
+    let leading_spaces = content_row.len() - content_row.trim_start().len();
+    assert!(
+        leading_spaces >= 30,
+        "Expected centering margin (>=30 cols) on 160-col terminal, got {} leading spaces\nRow: '{}'\nScreen:\n{}",
+        leading_spaces,
+        content_row,
+        screen
     );
 }

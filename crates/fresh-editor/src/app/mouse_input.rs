@@ -214,6 +214,8 @@ impl Editor {
                 self.mouse_state.dragging_text_selection = false;
                 self.mouse_state.drag_selection_split = None;
                 self.mouse_state.drag_selection_anchor = None;
+                self.mouse_state.drag_selection_by_words = false;
+                self.mouse_state.drag_selection_word_end = None;
                 // Clear popup scrollbar drag state
                 self.mouse_state.dragging_popup_scrollbar = None;
                 self.mouse_state.drag_start_popup_scroll = None;
@@ -561,6 +563,17 @@ impl Editor {
     fn update_lsp_hover_state(&mut self, col: u16, row: u16) {
         tracing::trace!(col, row, "update_lsp_hover_state: raw mouse position");
 
+        // Suppress LSP hover when a popup is already visible (e.g. theme info popup,
+        // tab context menu) to avoid hover tooltips overlapping other popups.
+        if self.theme_info_popup.is_some() || self.tab_context_menu.is_some() {
+            if self.mouse_state.lsp_hover_state.is_some() {
+                self.mouse_state.lsp_hover_state = None;
+                self.mouse_state.lsp_hover_request_sent = false;
+                self.dismiss_transient_popups();
+            }
+            return;
+        }
+
         // Check if mouse is over a transient popup - if so, keep hover active
         if self.is_mouse_over_transient_popup(col, row) {
             return;
@@ -728,6 +741,29 @@ impl Editor {
         self.file_browser_layout
             .as_ref()
             .is_some_and(|layout| layout.contains(col, row))
+    }
+
+    /// Find the split whose content or scrollbar area contains (col, row).
+    /// Returns the split id and its buffer id, or None if not over any split.
+    pub(super) fn split_at_position(&self, col: u16, row: u16) -> Option<(LeafId, BufferId)> {
+        for &(split_id, buffer_id, content_rect, scrollbar_rect, _, _) in
+            &self.cached_layout.split_areas
+        {
+            let in_content = col >= content_rect.x
+                && col < content_rect.x + content_rect.width
+                && row >= content_rect.y
+                && row < content_rect.y + content_rect.height;
+            let in_scrollbar = scrollbar_rect.width > 0
+                && scrollbar_rect.height > 0
+                && col >= scrollbar_rect.x
+                && col < scrollbar_rect.x + scrollbar_rect.width
+                && row >= scrollbar_rect.y
+                && row < scrollbar_rect.y + scrollbar_rect.height;
+            if in_content || in_scrollbar {
+                return Some((split_id, buffer_id));
+            }
+        }
+        None
     }
 
     /// Compute what hover target is at the given position
@@ -898,11 +934,11 @@ impl Editor {
 
         for (split_id, tab_layout) in &self.cached_layout.tab_layouts {
             match tab_layout.hit_test(col, row) {
-                Some(TabHit::CloseButton(buffer_id)) => {
-                    return Some(HoverTarget::TabCloseButton(buffer_id, *split_id));
+                Some(TabHit::CloseButton(target)) => {
+                    return Some(HoverTarget::TabCloseButton(target, *split_id));
                 }
-                Some(TabHit::TabName(buffer_id)) => {
-                    return Some(HoverTarget::TabName(buffer_id, *split_id));
+                Some(TabHit::TabName(target)) => {
+                    return Some(HoverTarget::TabName(target, *split_id));
                 }
                 Some(TabHit::ScrollLeft)
                 | Some(TabHit::ScrollRight)
@@ -926,7 +962,7 @@ impl Editor {
                 if is_on_thumb {
                     return Some(HoverTarget::ScrollbarThumb(*split_id));
                 } else {
-                    return Some(HoverTarget::ScrollbarTrack(*split_id));
+                    return Some(HoverTarget::ScrollbarTrack(*split_id, relative_row as u16));
                 }
             }
         }
@@ -1140,6 +1176,23 @@ impl Editor {
 
         // Now select the word under cursor
         self.handle_action(Action::SelectWord)?;
+
+        // Set up drag state so subsequent drag events extend selection word-by-word
+        if let Some(cursor) = self
+            .split_view_states
+            .get(&leaf_id)
+            .map(|vs| vs.cursors.primary())
+        {
+            // Store both edges of the selected word so we can use the appropriate
+            // anchor when dragging forward (use word start) vs backward (use word end).
+            let sel_start = cursor.selection_start();
+            let sel_end = cursor.selection_end();
+            self.mouse_state.dragging_text_selection = true;
+            self.mouse_state.drag_selection_split = Some(split_id);
+            self.mouse_state.drag_selection_anchor = Some(sel_start);
+            self.mouse_state.drag_selection_by_words = true;
+            self.mouse_state.drag_selection_word_end = Some(sel_end);
+        }
 
         Ok(())
     }
@@ -1370,6 +1423,23 @@ impl Editor {
             return Ok(());
         }
 
+        // Check if click is on the popup's close-button overlay ("[×]")
+        // before dispatching to content-area handling.  The overlay sits
+        // on the top border at `popup_rect.x + popup_rect.width - 4 .. -1`
+        // (see `Popup::render_with_hover`).  We iterate top-of-stack first
+        // so nested popups work.
+        for (_popup_idx, popup_rect, _inner, _scroll, _n, _sb, _tl) in
+            self.cached_layout.popup_areas.iter().rev()
+        {
+            if popup_rect.width < 5 {
+                continue;
+            }
+            let cb_x = popup_rect.x + popup_rect.width - 4;
+            if row == popup_rect.y && col >= cb_x && col < cb_x + 3 {
+                return self.handle_action(Action::PopupCancel);
+            }
+        }
+
         // Check if click is on a popup content area (they're rendered on top)
         for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items, _, _) in
             self.cached_layout.popup_areas.iter().rev()
@@ -1571,6 +1641,9 @@ impl Editor {
                 // Click on track - jump to position
                 self.mouse_state.dragging_scrollbar = Some(split_id);
                 self.handle_scrollbar_jump(col, row, split_id, buffer_id, scrollbar_rect)?;
+                // The thumb has now moved to the click position, so update
+                // hover target from track to thumb.
+                self.mouse_state.hover_target = Some(HoverTarget::ScrollbarThumb(split_id));
             }
             return Ok(());
         }
@@ -1743,8 +1816,14 @@ impl Editor {
                 // Start separator drag
                 self.mouse_state.dragging_separator = Some((*split_id, *direction));
                 self.mouse_state.drag_start_position = Some((col, row));
-                // Store the initial ratio
-                if let Some(ratio) = self.split_manager.get_ratio((*split_id).into()) {
+                // Store the initial ratio. The split may live in the main
+                // tree or inside a stashed Grouped subtree (e.g. theme editor
+                // panels), so try both.
+                let ratio = self
+                    .split_manager
+                    .get_ratio((*split_id).into())
+                    .or_else(|| self.grouped_split_ratio(*split_id));
+                if let Some(ratio) = ratio {
                     self.mouse_state.drag_start_ratio = Some(ratio);
                 }
                 return Ok(());
@@ -1832,19 +1911,41 @@ impl Editor {
 
         if let Some((split_id, hit)) = tab_hit {
             match hit {
-                TabHit::CloseButton(buffer_id) => {
-                    self.focus_split(split_id, buffer_id);
-                    self.close_tab_in_split(buffer_id, split_id);
+                TabHit::CloseButton(target) => {
+                    match target {
+                        crate::view::split::TabTarget::Buffer(buffer_id) => {
+                            self.focus_split(split_id, buffer_id);
+                            self.close_tab_in_split(buffer_id, split_id);
+                        }
+                        crate::view::split::TabTarget::Group(group_leaf) => {
+                            self.close_buffer_group_by_leaf(group_leaf);
+                        }
+                    }
                     return Ok(());
                 }
-                TabHit::TabName(buffer_id) => {
-                    self.focus_split(split_id, buffer_id);
-                    // Start potential tab drag (will only become active after moving threshold)
-                    self.mouse_state.dragging_tab = Some(super::types::TabDragState::new(
-                        buffer_id,
-                        split_id,
-                        (col, row),
-                    ));
+                TabHit::TabName(target) => {
+                    match target {
+                        crate::view::split::TabTarget::Buffer(buffer_id) => {
+                            self.focus_split(split_id, buffer_id);
+                            // Clicking a tab is a commitment gesture — the user
+                            // has chosen to work with this tab. Promote it out
+                            // of preview mode so subsequent explorer clicks on
+                            // other files don't replace it.
+                            self.promote_buffer_from_preview(buffer_id);
+                            // Start potential tab drag (will only become active after moving threshold)
+                            self.mouse_state.dragging_tab = Some(super::types::TabDragState::new(
+                                buffer_id,
+                                split_id,
+                                (col, row),
+                            ));
+                        }
+                        crate::view::split::TabTarget::Group(group_leaf) => {
+                            // Activate the group tab: set the active leaf to the
+                            // group's preferred inner leaf so this group is
+                            // rendered and its scrollable panel receives focus.
+                            self.activate_group_tab(group_leaf);
+                        }
+                    }
                     return Ok(());
                 }
                 TabHit::ScrollLeft => {
@@ -2093,6 +2194,7 @@ impl Editor {
     /// Handle text selection drag - extends selection from anchor to current position
     fn handle_text_selection_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
         use crate::model::event::Event;
+        use crate::primitives::word_navigation::{find_word_end, find_word_start};
 
         let Some(split_id) = self.mouse_state.drag_selection_split else {
             return Ok(());
@@ -2164,6 +2266,27 @@ impl Editor {
                 return Ok(());
             };
 
+            // When drag started with double-click, snap to word boundaries.
+            // When dragging forward, anchor at word start and extend to word end.
+            // When dragging backward, anchor at word end and extend to word start,
+            // so the initially double-clicked word stays selected.
+            let (new_position, anchor_position) = if self.mouse_state.drag_selection_by_words {
+                if target_position >= anchor_position {
+                    (
+                        find_word_end(&state.buffer, target_position),
+                        anchor_position,
+                    )
+                } else {
+                    let word_end = self
+                        .mouse_state
+                        .drag_selection_word_end
+                        .unwrap_or(anchor_position);
+                    (find_word_start(&state.buffer, target_position), word_end)
+                }
+            } else {
+                (target_position, anchor_position)
+            };
+
             let (primary_cursor_id, old_position, old_anchor, old_sticky_column) = self
                 .split_view_states
                 .get(&leaf_id)
@@ -2180,13 +2303,13 @@ impl Editor {
 
             let new_sticky_column = state
                 .buffer
-                .offset_to_position(target_position)
+                .offset_to_position(new_position)
                 .map(|pos| pos.column)
                 .unwrap_or(old_sticky_column);
             let event = Event::MoveCursor {
                 cursor_id: primary_cursor_id,
                 old_position,
-                new_position: target_position,
+                new_position,
                 old_anchor,
                 new_anchor: Some(anchor_position), // Keep anchor to maintain selection
                 old_sticky_column,
@@ -2272,8 +2395,15 @@ impl Editor {
             let ratio_delta = delta as f32 / total_size as f32;
             let new_ratio = (start_ratio + ratio_delta).clamp(0.1, 0.9);
 
-            // Update the split ratio
-            self.split_manager.set_ratio(split_id, new_ratio);
+            // Update the split ratio. The container may live in the main
+            // split tree or inside a stashed Grouped subtree (buffer group
+            // panels like the theme editor); try the main tree first and
+            // fall back to the grouped subtrees.
+            if self.split_manager.get_ratio(split_id.into()).is_some() {
+                self.split_manager.set_ratio(split_id, new_ratio);
+            } else {
+                self.set_grouped_split_ratio(split_id, new_ratio);
+            }
         }
 
         Ok(())
@@ -2303,8 +2433,10 @@ impl Editor {
         let tab_hit =
             self.cached_layout.tab_layouts.iter().find_map(
                 |(split_id, tab_layout)| match tab_layout.hit_test(col, row) {
-                    Some(TabHit::TabName(buffer_id) | TabHit::CloseButton(buffer_id)) => {
-                        Some((*split_id, buffer_id))
+                    Some(TabHit::TabName(target) | TabHit::CloseButton(target)) => {
+                        // Context menu only makes sense for buffer tabs; groups are
+                        // plugin-managed and closed via the close button.
+                        target.as_buffer().map(|bid| (*split_id, bid))
                     }
                     _ => None,
                 },

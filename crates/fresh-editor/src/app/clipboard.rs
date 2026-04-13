@@ -13,7 +13,9 @@ use crate::input::multi_cursor::{
 use crate::model::buffer::Buffer;
 use crate::model::cursor::Position2D;
 use crate::model::event::{CursorId, Event};
-use crate::primitives::word_navigation::{find_word_start_left, find_word_start_right};
+use crate::primitives::word_navigation::{
+    find_vi_word_end, find_word_start_left, find_word_start_right,
+};
 
 use super::Editor;
 
@@ -335,28 +337,33 @@ impl Editor {
         use crate::view::prompt::PromptType;
 
         let available_themes = self.theme_registry.list();
-        let current_theme_name = &self.theme.name;
+        let current_theme_key = &self.config.theme.0;
 
-        // Find the index of the current theme
+        // Find the index of the current theme (match by key first, then name)
         let current_index = available_themes
             .iter()
-            .position(|info| info.name == *current_theme_name)
+            .position(|info| info.key == *current_theme_key)
+            .or_else(|| {
+                let normalized = crate::view::theme::normalize_theme_name(current_theme_key);
+                available_themes.iter().position(|info| {
+                    crate::view::theme::normalize_theme_name(&info.name) == normalized
+                })
+            })
             .unwrap_or(0);
 
         let suggestions: Vec<crate::input::commands::Suggestion> = available_themes
             .iter()
             .map(|info| {
-                let is_current = info.name == *current_theme_name;
-                let description = match (is_current, info.pack.is_empty()) {
-                    (true, true) => Some("(current)".to_string()),
-                    (true, false) => Some(format!("{} (current)", info.pack)),
-                    (false, true) => None,
-                    (false, false) => Some(info.pack.clone()),
+                let is_current = Some(info) == available_themes.get(current_index);
+                let description = if is_current {
+                    Some(format!("{} (current)", info.key))
+                } else {
+                    Some(info.key.clone())
                 };
                 crate::input::commands::Suggestion {
                     text: info.name.clone(),
                     description,
-                    value: Some(info.name.clone()),
+                    value: Some(info.key.clone()),
                     disabled: false,
                     keybinding: None,
                     source: None,
@@ -373,7 +380,7 @@ impl Editor {
         if let Some(prompt) = self.prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
                 prompt.selected_suggestion = Some(current_index);
-                prompt.input = current_theme_name.to_string();
+                prompt.input = current_theme_key.to_string();
                 prompt.cursor_pos = prompt.input.len();
             }
         }
@@ -425,8 +432,7 @@ impl Editor {
                     self.active_event_log_mut().append(bulk_edit);
                 }
             } else if let Some(event) = events.into_iter().next() {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
 
             if !deletions.is_empty() {
@@ -484,8 +490,7 @@ impl Editor {
                     self.active_event_log_mut().append(bulk_edit);
                 }
             } else if let Some(event) = events.into_iter().next() {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
 
             if !deletions.is_empty() {
@@ -606,8 +611,7 @@ impl Editor {
                 self.active_event_log_mut().append(bulk_edit);
             }
         } else if let Some(event) = events.into_iter().next() {
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
+            self.log_and_apply_event(&event);
         }
 
         self.status_message = Some(t!("clipboard.pasted").to_string());
@@ -788,6 +792,50 @@ impl Editor {
         }
 
         // Copy text from all ranges
+        let mut text = String::new();
+        let state = self.active_state_mut();
+        for range in ranges {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let range_text = state.get_text_range(range.start, range.end);
+            text.push_str(&range_text);
+        }
+
+        if !text.is_empty() {
+            let len = text.len();
+            self.clipboard.copy(text);
+            self.status_message = Some(t!("clipboard.yanked", count = len).to_string());
+        }
+    }
+
+    /// Yank (copy) from cursor to vim word end (inclusive)
+    pub fn yank_vi_word_end(&mut self) {
+        let cursor_positions: Vec<_> = self
+            .active_cursors()
+            .iter()
+            .map(|(_, c)| c.position)
+            .collect();
+        let ranges: Vec<_> = {
+            let state = self.active_state();
+            cursor_positions
+                .into_iter()
+                .filter_map(|start| {
+                    let word_end = find_vi_word_end(&state.buffer, start);
+                    let end = (word_end + 1).min(state.buffer.len());
+                    if end > start {
+                        Some(start..end)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if ranges.is_empty() {
+            return;
+        }
+
         let mut text = String::new();
         let state = self.active_state_mut();
         for range in ranges {

@@ -47,6 +47,10 @@ pub enum PopupPosition {
     Centered,
     /// Bottom right corner (above status bar)
     BottomRight,
+    /// Anchored above the status bar at a specific column (left-aligned at x).
+    /// Used by the LSP-status popup so it appears directly above the LSP
+    /// segment that opened it.
+    AboveStatusBarAt { x: u16 },
 }
 
 /// Kind of popup - determines input handling behavior
@@ -128,6 +132,8 @@ pub struct PopupListItem {
     pub icon: Option<String>,
     /// User data associated with this item (for completion, etc.)
     pub data: Option<String>,
+    /// If true, item is rendered grayed-out and not selectable.
+    pub disabled: bool,
 }
 
 impl PopupListItem {
@@ -137,6 +143,7 @@ impl PopupListItem {
             detail: None,
             icon: None,
             data: None,
+            disabled: false,
         }
     }
 
@@ -152,6 +159,11 @@ impl PopupListItem {
 
     pub fn with_data(mut self, data: String) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    pub fn disabled(mut self) -> Self {
+        self.disabled = true;
         self
     }
 }
@@ -204,6 +216,9 @@ pub struct Popup {
 
     /// Text selection for copy/paste (None if no selection)
     pub text_selection: Option<PopupTextSelection>,
+
+    /// Key hint shown right-aligned on the selected item (e.g. "(Tab)")
+    pub accept_key_hint: Option<String>,
 }
 
 impl Popup {
@@ -223,6 +238,7 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
         }
     }
 
@@ -250,6 +266,7 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
         }
     }
 
@@ -269,6 +286,7 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
         }
     }
 
@@ -353,6 +371,24 @@ impl Popup {
                 }
             }
         }
+    }
+
+    /// Select a specific item by index. Returns true if the index was valid.
+    pub fn select_index(&mut self, index: usize) -> bool {
+        let visible = self.visible_height();
+        if let PopupContent::List { items, selected } = &mut self.content {
+            if index < items.len() {
+                *selected = index;
+                // Adjust scroll to keep selection visible
+                if *selected >= self.scroll_offset + visible {
+                    self.scroll_offset = (*selected + 1).saturating_sub(visible);
+                } else if *selected < self.scroll_offset {
+                    self.scroll_offset = *selected;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Scroll down by one page
@@ -805,6 +841,38 @@ impl Popup {
                     height,
                 }
             }
+            PopupPosition::AboveStatusBarAt { x } => {
+                let width = self.width.min(terminal_area.width);
+                let height = self
+                    .content_height()
+                    .min(self.max_height)
+                    .min(terminal_area.height);
+                // Align left edge with the given x, but clamp so the popup
+                // stays within the terminal bounds.
+                let x = if x + width > terminal_area.width {
+                    terminal_area.width.saturating_sub(width)
+                } else {
+                    x
+                };
+                // Leave one empty row between the popup's bottom border
+                // and the status bar.  Without this gap, the popup's
+                // bottom border visually touches the LSP indicator it was
+                // opened from, making the indicator harder to read and
+                // obscuring the spinner while progress is in flight.
+                //   - terminal_height - 1 = status bar row
+                //   - terminal_height - 2 = gap row
+                //   - popup bottom ends at terminal_height - 3
+                let y = terminal_area
+                    .height
+                    .saturating_sub(height)
+                    .saturating_sub(2);
+                Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }
+            }
         }
     }
 
@@ -850,6 +918,21 @@ impl Popup {
 
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
+
+        // Close-button overlay on the top border ("[×]", bracketed so the
+        // click target is 3 cells wide and obviously a UI affordance rather
+        // than stray content).  Rendered only for bordered popups that are
+        // big enough to accommodate it without colliding with the title.
+        if self.bordered && area.width >= 5 {
+            let close_x = area.x + area.width - 4;
+            let close_area = Rect {
+                x: close_x,
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new("[×]").style(self.border_style), close_area);
+        }
 
         // Render description if present, and adjust content area
         let content_start_y;
@@ -1073,13 +1156,33 @@ impl Popup {
                             spans.push(Span::raw(format!("{} ", icon)));
                         }
 
-                        // Add main text with underline for clickable items
-                        let text_style = if is_selected {
-                            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                        } else {
-                            Style::default().add_modifier(Modifier::UNDERLINED)
-                        };
-                        spans.push(Span::styled(&item.text, text_style));
+                        // Add main text.  Items are "clickable" when they
+                        // carry a `data` payload and are not disabled — those
+                        // get an underline (like a link) so the user can see
+                        // at a glance which rows act on click.  Header-only
+                        // rows (no data) stay plain; disabled rows are dimmed.
+                        // Leading whitespace is kept separate so the underline
+                        // only sits under the visible text.
+                        let text = &item.text;
+                        let trimmed = text.trim_start();
+                        let indent_len = text.len() - trimmed.len();
+                        if indent_len > 0 {
+                            spans.push(Span::raw(&text[..indent_len]));
+                        }
+                        let is_clickable = item.data.is_some() && !item.disabled;
+                        let mut text_style = Style::default();
+                        if is_selected {
+                            text_style = text_style.add_modifier(Modifier::BOLD);
+                        }
+                        if is_clickable {
+                            text_style = text_style.add_modifier(Modifier::UNDERLINED);
+                        }
+                        if item.disabled {
+                            text_style = text_style
+                                .fg(theme.help_separator_fg)
+                                .add_modifier(Modifier::DIM);
+                        }
+                        spans.push(Span::styled(trimmed, text_style));
 
                         // Add detail if present
                         if let Some(detail) = &item.detail {
@@ -1087,6 +1190,34 @@ impl Popup {
                                 format!(" {}", detail),
                                 Style::default().fg(theme.help_separator_fg),
                             ));
+                        }
+
+                        // Add an empty span without underline so ratatui doesn't
+                        // extend the underline across the remaining row padding.
+                        spans.push(Span::raw(""));
+
+                        // Add right-aligned accept key hint on the selected item
+                        if is_selected {
+                            if let Some(ref hint) = self.accept_key_hint {
+                                let hint_text = format!("({})", hint);
+                                // Calculate used width
+                                let used_width: usize = spans
+                                    .iter()
+                                    .map(|s| {
+                                        unicode_width::UnicodeWidthStr::width(s.content.as_ref())
+                                    })
+                                    .sum();
+                                let available = content_area.width as usize;
+                                let hint_len = hint_text.len();
+                                if used_width + hint_len + 1 < available {
+                                    let padding = available - used_width - hint_len;
+                                    spans.push(Span::raw(" ".repeat(padding)));
+                                    spans.push(Span::styled(
+                                        hint_text,
+                                        Style::default().fg(theme.help_separator_fg),
+                                    ));
+                                }
+                            }
                         }
 
                         // Row style (background only, no underline)
@@ -1152,6 +1283,17 @@ impl PopupManager {
     /// Show a popup (adds to top of stack)
     pub fn show(&mut self, popup: Popup) {
         self.popups.push(popup);
+    }
+
+    /// Show a popup, replacing any existing popup of the same kind.
+    /// If a popup with the same `PopupKind` already exists in the stack,
+    /// it is replaced in-place. Otherwise the new popup is pushed on top.
+    pub fn show_or_replace(&mut self, popup: Popup) {
+        if let Some(pos) = self.popups.iter().position(|p| p.kind == popup.kind) {
+            self.popups[pos] = popup;
+        } else {
+            self.popups.push(popup);
+        }
     }
 
     /// Hide the topmost popup

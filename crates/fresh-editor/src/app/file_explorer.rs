@@ -66,6 +66,15 @@ impl Editor {
             self.key_context = KeyContext::Normal;
             self.set_status_message(t!("explorer.closed").to_string());
         }
+
+        // Notify plugins that the viewport dimensions changed (sidebar affects available width)
+        self.plugin_manager.run_hook(
+            "resize",
+            fresh_core::hooks::HookArgs::Resize {
+                width: self.terminal_width,
+                height: self.terminal_height,
+            },
+        );
     }
 
     pub fn show_file_explorer(&mut self) {
@@ -139,8 +148,13 @@ impl Editor {
     }
 
     pub(crate) fn init_file_explorer(&mut self) {
-        // Use remote home directory if in remote mode, otherwise local working directory
-        let root_path = if self.filesystem.remote_connection_info().is_some() {
+        // Use working directory as root. For remote mode, fall back to the remote
+        // home directory only when working_dir doesn't exist on the remote
+        // filesystem (e.g. when no path was provided and working_dir defaulted
+        // to the local current directory).
+        let root_path = if self.filesystem.remote_connection_info().is_some()
+            && !self.filesystem.is_dir(&self.working_dir).unwrap_or(false)
+        {
             match self.filesystem.home_dir() {
                 Ok(home) => home,
                 Err(e) => {
@@ -353,7 +367,11 @@ impl Editor {
             } else {
                 tracing::info!("[SYNTAX DEBUG] file_explorer opening file: {:?}", path);
                 match self.open_file(&path) {
-                    Ok(_) => {
+                    Ok(id) => {
+                        // Double-click / Enter is the "I mean it" gesture — always
+                        // promote the tab out of preview mode so subsequent clicks
+                        // on *other* files don't replace this one.
+                        self.promote_buffer_from_preview(id);
                         self.set_status_message(
                             t!("explorer.opened_file", name = &name).to_string(),
                         );
@@ -566,7 +584,7 @@ impl Editor {
         let delete_result = if self.filesystem.remote_connection_info().is_some() {
             self.move_to_remote_trash(&path)
         } else {
-            trash::delete(&path).map_err(|e| std::io::Error::other(e))
+            trash::delete(&path).map_err(std::io::Error::other)
         };
 
         match delete_result {
@@ -812,7 +830,12 @@ impl Editor {
     /// Clear the file explorer search
     pub fn file_explorer_search_clear(&mut self) {
         if let Some(explorer) = &mut self.file_explorer {
-            explorer.search_clear();
+            if explorer.is_search_active() {
+                explorer.search_clear();
+            } else {
+                // No active search — Escape transfers focus to the editor
+                self.focus_editor();
+            }
         }
     }
 

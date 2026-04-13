@@ -153,6 +153,12 @@ impl Editor {
         source_split_id: LeafId,
         drop_zone: TabDropZone,
     ) {
+        // Dropping a tab (reorder, move to another split, or create a new
+        // split from it) is an unambiguous commitment gesture — promote any
+        // preview first so a drag never leaves behind stale preview state
+        // anchored to a split that has changed underneath it.
+        self.promote_current_preview();
+
         match drop_zone {
             TabDropZone::TabBar(target_split_id, insert_idx) => {
                 if target_split_id == source_split_id {
@@ -213,13 +219,11 @@ impl Editor {
         split_id: LeafId,
         insert_idx: Option<usize>,
     ) {
+        use crate::view::split::TabTarget;
         if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
+            let target = TabTarget::Buffer(buffer_id);
             // Find current position of the buffer
-            if let Some(current_idx) = view_state
-                .open_buffers
-                .iter()
-                .position(|&id| id == buffer_id)
-            {
+            if let Some(current_idx) = view_state.open_buffers.iter().position(|t| *t == target) {
                 // Remove from current position
                 view_state.open_buffers.remove(current_idx);
 
@@ -232,7 +236,7 @@ impl Editor {
                     target_idx
                 };
                 let final_idx = adjusted_idx.min(view_state.open_buffers.len());
-                view_state.open_buffers.insert(final_idx, buffer_id);
+                view_state.open_buffers.insert(final_idx, target);
             }
         }
     }
@@ -245,20 +249,23 @@ impl Editor {
         target_split_id: LeafId,
         insert_idx: Option<usize>,
     ) {
+        use crate::view::split::TabTarget;
         // Check if source split will be empty after removing this buffer
         let source_becomes_empty = self
             .split_view_states
             .get(&source_split_id)
-            .map(|vs| vs.open_buffers.len() == 1 && vs.open_buffers.contains(&buffer_id))
+            .map(|vs| vs.open_buffers.len() == 1 && vs.has_buffer(buffer_id))
             .unwrap_or(false);
 
         // Remove from source split's tab bar
         if let Some(source_view_state) = self.split_view_states.get_mut(&source_split_id) {
-            source_view_state.open_buffers.retain(|&id| id != buffer_id);
+            source_view_state
+                .open_buffers
+                .retain(|t| *t != TabTarget::Buffer(buffer_id));
 
             // If the source split was showing this buffer, switch to another
             if self.split_manager.get_buffer_id(source_split_id.into()) == Some(buffer_id) {
-                if let Some(&next_buffer) = source_view_state.open_buffers.first() {
+                if let Some(next_buffer) = source_view_state.buffer_tab_ids().next() {
                     self.split_manager
                         .set_split_buffer(source_split_id, next_buffer);
                 }
@@ -268,10 +275,12 @@ impl Editor {
         // Add to target split's tab bar
         if let Some(target_view_state) = self.split_view_states.get_mut(&target_split_id) {
             // Don't add duplicate
-            if !target_view_state.open_buffers.contains(&buffer_id) {
+            if !target_view_state.has_buffer(buffer_id) {
                 let idx = insert_idx.unwrap_or(target_view_state.open_buffers.len());
                 let final_idx = idx.min(target_view_state.open_buffers.len());
-                target_view_state.open_buffers.insert(final_idx, buffer_id);
+                target_view_state
+                    .open_buffers
+                    .insert(final_idx, TabTarget::Buffer(buffer_id));
             }
         }
 
@@ -302,22 +311,25 @@ impl Editor {
         direction: SplitDirection,
         _new_split_first: bool, // If true, new split is placed first (left/top) - TODO: implement
     ) {
+        use crate::view::split::TabTarget;
         // Check if source split will be empty after removing this buffer
         let source_becomes_empty = self
             .split_view_states
             .get(&source_split_id)
-            .map(|vs| vs.open_buffers.len() == 1 && vs.open_buffers.contains(&buffer_id))
+            .map(|vs| vs.open_buffers.len() == 1 && vs.has_buffer(buffer_id))
             .unwrap_or(false);
 
         // Remove from source split's tab bar
         let source_had_buffer =
             if let Some(source_view_state) = self.split_view_states.get_mut(&source_split_id) {
-                let had = source_view_state.open_buffers.contains(&buffer_id);
-                source_view_state.open_buffers.retain(|&id| id != buffer_id);
+                let had = source_view_state.has_buffer(buffer_id);
+                source_view_state
+                    .open_buffers
+                    .retain(|t| *t != TabTarget::Buffer(buffer_id));
 
                 // If the source split was showing this buffer, switch to another
                 if self.split_manager.get_buffer_id(source_split_id.into()) == Some(buffer_id) {
-                    if let Some(&next_buffer) = source_view_state.open_buffers.first() {
+                    if let Some(next_buffer) = source_view_state.buffer_tab_ids().next() {
                         self.split_manager
                             .set_split_buffer(source_split_id, next_buffer);
                     }
@@ -348,8 +360,10 @@ impl Editor {
                     crate::view::split::SplitViewState::with_buffer(width, height, buffer_id);
                 new_view_state.apply_config_defaults(
                     self.config.editor.line_numbers,
-                    self.config.editor.line_wrap,
+                    self.config.editor.highlight_current_line,
+                    self.resolve_line_wrap_for_buffer(buffer_id),
                     self.config.editor.wrap_indent,
+                    self.resolve_wrap_column_for_buffer(buffer_id),
                     self.config.editor.rulers.clone(),
                 );
 

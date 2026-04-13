@@ -1,5 +1,348 @@
 # Release Notes
 
+## 0.2.24
+
+### Improvements
+
+* **Preview Tabs in File Explorer**: Single-clicking a file in the explorer now opens it in an ephemeral "preview" tab that is replaced by the next single-click instead of accumulating tabs (#1403). Preview tabs are promoted to a permanent tab when the user edits the buffer, double-clicks or presses Enter on the file in the explorer, clicks the tab itself, or performs a layout action (split, move tab, close split, focus a different pane). At most one preview tab exists editor-wide, and it's anchored to the split it was opened in — moving focus to another pane commits the previous preview. **Config:** enabled by default; disable via Settings UI (File Explorer -> Preview Tabs or use search).
+
+* **LSP Status Bar Indicator**: Redesigned to a stable-width `LSP (on/off/error)` status indicator with a spinner while a server is starting or working — no more status bar noise as progress messages arrive. Configured-but-dormant servers are now visible as `LSP (off)` so you can see at a glance that an LSP is available to start. Clicking opens a popup with per-server status and live progress under the server name.
+
+* **Diagnostics in Hover Popup**: When the cursor sits on a symbol that also carries an error, warning, or hint, the hover popup prepends the overlapping diagnostic (severity and source like `rustc`/`clippy`/`clangd`) above the hover body.
+
+* **C++ Header Detection**: Added heuristics to assign an `.h` files the C++ rather than C language. You can change it manually by clicking on the language in the status bar.
+
+* **Review Diff**: Clicking a file in the files panel now selects it (previously clicks were ignored), and keyboard navigation auto-scrolls the files panel to keep the selected entry visible.
+
+### Bug Fixes
+
+* Fixed LSP workspace diagnostic refresh and inlay-hint refresh occasionally pulling from buffers of the wrong language (e.g. asking the Rust server about `package.json`, producing `file not found` errors).
+
+## 0.2.23
+
+### Improvements
+
+* **Windows-1251 Encoding**: Added support for Windows-1251 (Cyrillic) encoding for loading and saving Cyrillic-script text files (#1453). Available in the encoding selector; auto-detected for text mixing uppercase and lowercase Cyrillic letters.
+
+* **Theme Editor and Package Manager**: Multi-panel plugin UIs now behave like native splits — per-panel mouse-wheel scrolling and scrollbars, draggable panel dividers, and the theme editor's own colors now use the active theme.
+
+* **File Finder in Command Palette (Ctrl+P)**: Much faster and more responsive on large local and remote trees — file enumeration runs in the background with results streaming in as they're found, typing a path like `etc/hosts` produces instant filesystem-confirmed matches, and ranking now reliably prefers contiguous matches (`results` finds `results.json` first) including multi-term queries that reconstruct a path or identifier (`etc hosts` → `/etc/hosts`, `save file` → `save_file.rs`).
+
+* **Review Diff**: Brought back features that were dropped in the rewrite in version 0.2.22: stage, unstage, and discard individual hunks; jump between hunks with `n`/`p`; leave line comments (`c`) and overall session notes (`N`), edit or delete them with confirmation, see notes in the file list panel, and export your review notes to a markdown file. Redesigned toolbar of styled key hints that adapts to the focused panel.
+
+* **Keybinding Editor**: Special keys like Esc, Tab, and Enter can now be bound — press Enter on the key field to enter capture mode, then the next keypress is recorded as-is (#1501). Fixed parent modal to be dimmed while a sub-dialog is open.
+
+* **Customizable Status Bar**: The left and right sides of the status bar are now configurable via the Settings UI using a new DualList picker (transfer items between Available/Included columns, reorder with arrows). Includes a new `{clock}` element that displays HH:MM with a blinking colon. Thanks @1612elphi!
+
+* **LSP Status Bar Indicator**: Simplified to a single color-coded "LSP" label — clicking LSP in the status bar now opens an interactive popup with per-server status and actions (restart, stop, view log).
+
+* **Universal LSP Servers**: LSP servers configured for all languages are now spawned once per project instead of once per opened language, eliminating duplicate processes.
+
+### Bug Fixes
+
+* **Regression** - Fixed multi-byte UTF-8 characters not being parsed correctly in the input handler, and IME-composed characters delivered as key-up events being ignored on Windows (#1538). Thanks @wellorbetter! Reported by @AugustusZane.
+
+* Fixed blank panels appearing after terminal resize.
+
+* Fixed terminal mode not being exited when the active buffer is switched to a non-terminal.
+
+* Fixed Review Diff hunk navigation (`n`/`p`) not working in the diff panel, files panel not receiving focus on launch, hunk-level comments not displaying (#1503), and deleted-file drill-down crashing.
+
+* Fixed Settings UI section headers being invisible in the high-contrast theme.
+
+* Fixed word wrap producing single-character-per-line output on narrow terminals with deeply indented code — the hanging indent was being double-counted (#1502).
+
+* Fixed LSP completion popup showing duplicate entries when reopened (#1514).
+
+* Fixed LSP `auto_start` being ignored on a per-server basis when multiple servers are configured for one language — opening a file no longer drags in every enabled server, only those individually marked `auto_start`.
+
+* Fixed mouse input issue - mouse state not being restored in the terminal - after leaving Fresh (Windows only, #1530).
+
+
+## 0.2.22
+
+### Features
+
+* **Review Diff Rewrite**: The review diff view has been rewritten with a magit-style split-panel UI. The left panel lists files grouped by staged/unstaged/untracked sections (sorted by category), and the right panel shows the diff for the selected file. Navigate with arrow keys, switch focus between panels with Tab, and drill down into individual files. Hunk navigation jumps between changes with auto-centering. Untracked and newly added files are now shown correctly. Diff colors are now theme-aware with per-theme highlight overrides.
+
+* **Remote Mode**: SSH connections now auto-reconnect in the background with a disconnected indicator in the status bar. Filesystem operations no longer block the event loop. File explorer roots at the provided remote path instead of the home directory. File finder (Ctrl+P) works on remote filesystems. Error messages are cleaner — hints about SSH installation, and a "Connecting via SSH to ..." message on startup.
+
+### Improvements
+
+* **Create Directories on Save**: When saving a file to a path where the parent directory doesn't exist, Fresh now prompts to create the directory instead of failing (#1434).
+
+* **Grammar Short Name Aliases**: Grammars can now be referenced by short names (e.g., `"bash"` instead of `"Bourne Again Shell (bash)"`) in config and the Set Language popup. Packages can declare a `shortName` in their grammar definition.
+
+* **Default Language Setting**: The `default_language` setting replaces the previous `fallback` object. Set it to a language key (e.g., `"bash"`) so unrecognized file types use that language's full configuration (#1219).
+
+* **AutoHotkey Syntax Highlighting**: Built-in grammar for `.ahk` and `.ahk2` files with v1/v2 command coverage.
+
+* **Settings UI**: Added inherit/unset support for nullable settings with an Inherit button and inherited badge. The Delete key now unsets a setting override.
+
+* **Theme Selector**: Installed theme packages now appear correctly even when multiple themes share the same name. The selector strips URL schemes and sizes the name column to content.
+
+* **File Finder (Ctrl+P)**: Fixed showing no files on Windows when git isn't being used.
+
+* **Selection Prompts**: Pre-filled text is now selected so typing immediately replaces it.
+
+* **Theme Fixes**: Fixed low contrast in Nord, Solarized Dark, Light, and Dracula themes. Fixed command palette selected row using wrong foreground color. Syntax highlighting colors are now preserved in text selections.
+
+### Bug Fixes
+
+* Fixed out-of-memory crash caused by an infinite loop in the line-wrapping transform when indentation exceeds half the available width (#1454).
+
+* Fixed `didOpen` notification only being sent to the first LSP server when multiple are configured for a language.
+
+* Fixed status bar line number not updating when stepping through search matches with F3.
+
+* Fixed `.bash_profile` appearing read-only when symlinked to a macOS library path (#1469).
+
+* Fixed session `open-file` command failing when a session exists but its name doesn't match the socket.
+
+* Fixed scrollbar track hover highlighting more than the hovered cell.
+
+* Fixed self-update URL pattern not matching all release URLs.
+
+## 0.2.21
+
+### Features
+
+* **Fast Completions without LSP**: New basic completions providers without language server — buffer-word candidates appear below LSP results in the popup. Also, a new setting (config) controls auto-trigger vs explicit Ctrl+Space (default: explicit). Enter dismisses the popup (Tab accepts). I plan to further improve it (make it more intelligent) in future releases.
+
+* **Current Line Highlighting**: Highlights the cursor line. Enabled by default, togglable from the command palette and Settings UI (caveat: wrapped lines are currently highlighted in their entirety, this should probably be changed to visual lines).
+
+* **LSP Code Actions**: Code action modal now actually works! Select an action by number or up/down arrows and enter (#1405). Supports resolve, execute command, and server-initiated workspace edits (previously dropped silently). File create/rename/delete operations handled. Actions from multiple servers unified into one popup. Default keybinding changed to Alt+. - because Ctrl+. is filtered by many terminals.
+
+* **LSP Completion Resolve and Formatting**: Auto-imports applied on completion accept. Format Buffer falls back to LSP when no external formatter is configured. Also adds range formatting and pre-rename validation.
+
+* **LSP Server Selection for Restart/Stop**: Popup to choose which server to restart/stop individually, or all at once.
+
+* **Grammar Listing**: `fresh --cmd grammar list` and `editor.listGrammars()` plugin API show all available grammars with source and extensions. When specifying a grammar in a `languages` entry in the config, you must currently use a full name from this list - for example "Bourne Again Shell (bash)" rather than "bash". This will be improved once I add grammar aliases.
+
+### Improvements
+
+* **Theme Contrast**: Replaced all named ANSI colors with explicit RGB in built-in themes for deterministic rendering. Improved contrast ratios across both high-contrast and light themes. Diagnostic and semantic overlays now re-apply correctly on theme change, including during live preview.
+
+* **Git Status Marker Refresh**: File explorer markers update on terminal focus gain and by polling for git index changes (#1431).
+
+* **Config-Only Languages**: Custom languages without a built-in grammar (e.g., "fish") appear in the Set Language popup and are detected correctly — no more fallthrough to wrong built-in grammars.
+
+* **Theme Inspector**: Records exact theme keys during rendering instead of reverse-mapping via heuristics. Theme editor Save As improved for built-in themes.
+
+* **LSP Reliability**: Diagnostics cleared on server stop/crash, buffers re-opened on server start, document version checking for workspace edits, LSP notified after undo/redo of bulk edits, pending requests drained on server death to prevent deadlocks, hover suppressed while popups are visible.
+
+### Vim Mode
+
+22 bug fixes: C/D/S/cc, e motion, nG, h/l line clamping, ^, $, J with space, f/t special chars, r replace, ~ toggle case, visual mode entry/switching, count display. Key motions moved from async plugin commands to native Rust actions, eliminating race conditions.
+
+If you use the Vim plugin please drop a note at https://github.com/sinelaw/fresh/discussions/417 - I need feedback on this feature.
+
+### Bug Fixes
+
+* Fixed Ctrl+W panic on accented/multi-byte characters (#1332).
+
+* Fixed LSP diagnostics from stopped servers reappearing from queued messages.
+
+## 0.2.20
+
+### Features
+
+* **Multi-LSP Server Support**: Configure multiple LSP servers per language (e.g., pylsp + pyright for Python). Servers are routed by feature using `only_features`/`except_features` filters, completions are merged from all eligible servers, and diagnostics are tracked per-server. Per-server status is shown in the status bar (#971).
+
+* **Per-Language Editor Settings**: `line_wrap`, `wrap_column`, `page_view`, and `page_width` can now be configured per-language. For example, wrap Markdown at 80 columns while keeping code unwrapped (#1371).
+
+* **Diff Chunk Navigation Plugin**: New built-in plugin for navigating between diff chunks, merging git and saved-diff sources.
+
+### Improvements
+
+* **Faster Startup (~350ms → ~170ms)**: Syntax grammars are pre-compiled at build time, package loading moved from JavaScript to Rust, plugin I/O and transpilation run in parallel, and redundant grammar rebuilds are eliminated. Plugins can now declare dependencies via `import type` from `"fresh:plugin/..."` and are topologically sorted.
+
+* **Settings UI Overhaul**: Modernized visual design with wider modal (160 cols), rounded corner borders, Nerd Font category icons, styled `[✓]` toggles, and reverse-video key hints. Keyboard navigation rewritten: Tab cycles sequentially through all fields and buttons, composite controls (Map, ObjectArray, TextList) support internal navigation, entry dialogs have section headers with explicit field ordering, PageDown/PageUp work in the main panel, and TextList edits auto-accept on navigation. Focus indicator now highlights per-row in composite controls.
+
+* **Settings Deep Search**: Also in the Settings UI: Search now walks into Map entries, TextList items, and nested JSON values. Searching "python" finds the "python" key in language/LSP maps. Results show hierarchical breadcrumbs (e.g., "Languages > python") and auto-focus the matching entry.
+
+* **Per-Language Workspace Root Detection**: New `root_markers` field on LSP server configs. The editor walks upward from the file's directory looking for configured markers (e.g., `Cargo.toml`, `package.json`), replacing the old cwd-based root (#1360).
+
+* **Page View Mode**: "Compose" mode renamed to "Page View". Can now auto-activate per language via `page_view: true` in language config. Old keybinding names continue to work.
+
+* **256-Color Contrast Enforcement**: When running in a 256-color terminal, foreground colors are automatically adjusted to meet WCAG 3.0:1 minimum contrast ratio against their background. Fixes illegible text in Solarized Dark, Nord, Dracula, and light themes under tmux without truecolor.
+
+* **LSP in Library Files**: Files in library paths (site-packages, node_modules, .cargo) now keep LSP enabled for Goto Definition, Hover, and Find References while remaining read-only (#1344).
+
+* **Goto Matching Bracket**: Works inside bracket bodies by searching backward for the nearest enclosing bracket, matching VS Code and JetBrains behavior. All bracket searches are bounded to prevent hangs on huge files (#1258).
+
+* **LSP Head-of-Line Blocking Fix**: LSP notifications (didClose, didChange, shutdown) are no longer blocked behind pending request responses.
+
+* **New Settings**: `show_tilde` to hide EOF tilde markers (#1290), `menu_bar_mnemonics` to disable Alt+key menu shortcuts (#1257).
+
+* **`getPluginDir()` Plugin API**: Plugins can now locate their own package directory to find bundled scripts or install local dependencies.
+
+### Bug Fixes
+
+* Fixed CSI u and xterm modifyOtherKeys key sequences inserted as literal text in terminal session mode (#1113).
+
+* Fixed word selection (Ctrl+W) stopping at accented/Unicode characters (#1332).
+
+* Fixed double-click backward drag losing the initial word selection (#1334).
+
+* Fixed block cursor invisible in zellij due to double cursor-inversion (#1338).
+
+* Fixed cursor visibility and command palette rendering in zellij (#1255).
+
+* Fixed undo incorrectly clearing the modified flag after hot exit recovery, which could cause data loss.
+
+* Fixed bulk edit (e.g., toggle comment) displacing inlay hints on subsequent lines (#1263). Displaced markers are now restored to exact positions on undo.
+
+* Fixed large file syntax highlighting lost when revisiting a file, caused by checkpoint offset drift during partial cache updates.
+
+* Fixed embedded language highlighting (e.g., CSS in HTML) breaking at large file offsets.
+
+* Fixed Enter key leaking into the markdown buffer when the file explorer panel is focused.
+
+* Fixed large file recovery saving the entire file as individual chunks instead of using the recovery format.
+
+* Fixed read-only detection for files not owned by the current user (now checks effective uid/gid instead of file mode bits).
+
+## 0.2.18
+
+### Features
+
+* **Bracketed Paste on Windows & Input Overhaul**: Bracketed paste now works on Windows Terminal (reverted in v0.2.17 due to #1284), and keyboard issues are resolved (#1054). **Mouse hover is disabled by default on Windows** because reliable bracketed paste requires cell-motion tracking; enabling hover switches to all-motion tracking which can insert corrupt text under heavy mouse movement or slow CPU. Re-enable it in Settings UI under Editor → Mouse Hover Enabled. Under the hood, crossterm's Windows input handling is replaced with a new `fresh-winterm` crate using direct VT input reads, with corrupt mouse sequence detection, UTF-16 surrogate handling, and console mode heartbeat to counteract ConPTY drift.
+
+* **30 New Syntax Grammars**: Dockerfile, CMake, INI, SCSS, LESS, PowerShell, Kotlin, Swift, Dart, Elixir, F#, Nix, Terraform/HCL, Protobuf, GraphQL, Julia, Nim, Gleam, V, Solidity, KDL, Nushell, Starlark, Justfile, Earthfile, Go Module, Vue, Svelte, Astro, Hyprlang (#1266). These grammars are preliminary — please report highlighting issues for your language so we can improve them.
+
+* **Broad LSP Support**: Added LSP configs and helper plugins (with install instructions) for Nix, Kotlin, Swift, Scala, Elixir, Erlang, Haskell, OCaml, Clojure, R, Julia, Perl, Nim, Gleam, F#, Dart (#1252), Nushell (#1031), Solidity (#857), Vue, Svelte, Astro, Tailwind CSS, Terraform/HCL, CMake, Protobuf, GraphQL, SQL, Bash, Lua, Ruby, PHP, YAML, TOML, and Typst. LSP integration for these languages is early-stage — feedback from users of these languages is welcome.
+
+* **Deno LSP Auto-Detection**: Automatically detects and uses the Deno language server for JS/TS projects (#1191).
+
+* **`show_prompt_line` Setting**: New config option to auto-hide the prompt line. Applied immediately from Settings UI (#1273).
+
+* **`use_tabs` Setting**: Global `editor.use_tabs` config option for default tab indentation (#1295).
+
+### Improvements
+
+* **Plugin Commands in Keybinding Editor**: Plugin-registered commands are now shown and searchable in the keybinding editor.
+
+* **Theme Editor ANSI Colors**: Named ANSI colors display as "terminal native" instead of misleading RGB values, with correct native color swatches (#1301).
+
+* **Status Bar Language Info**: Shows "[syntax only]" when a language has no LSP config entry.
+
+* **Default Language**: Set `default_language` to a language key (e.g., `"bash"`) so undetected file types use that language's full configuration (#1219). Replaces the previous `fallback` object; the old key is still accepted for backwards compatibility.
+
+* **File Deletion Uses Trash**: `removePath` now uses the system trash instead of permanent deletion.
+
+* **Package Manager Cross-Platform**: Plugin package manager uses cross-platform APIs instead of Unix-specific commands on Windows (#1215).
+
+### Bug Fixes
+
+* Fixed arrow keys not working in `less`/`git log` in the embedded terminal, including `TERM` env var not being set on Unix.
+
+* Fixed Tab key getting trapped in TextList editing mode in Settings UI.
+
+* Fixed `{`, `}`, `;` highlighted as operators instead of punctuation in C/C++ (#1318, #1319).
+
+* Fixed auto-dedent for languages without tree-sitter, e.g. Dart.
+
+* Fixed auto-indent after closing brace in nested C++ blocks.
+
+* Fixed mouse click selecting wrong item in scrolled settings list.
+
+* Fixed keybindings for plugin-registered commands not executing (#1312).
+
+* Fixed Find Next/Find Previous ignoring cursor position (#1305).
+
+* Fixed Tab indent affecting lines outside selection (#1304).
+
+* Fixed Shift+letter keybinding deletion not persisting (#1303).
+
+* Fixed word selection not preserved when dragging after double-click (#1202, #1317).
+
+* Fixed `removePath` failing on Windows due to UNC path mismatch.
+
+* Fixed external files missing from tab bar after session restore.
+
+* Fixed scroll wheel targeting focused split instead of split under pointer (#1270).
+
+* Fixed wrap indent not working with tab indentation (#1283).
+
+* Fixed LSP "no server configured" for Kotlin and 30+ other languages.
+
+* Fixed Diff syntax highlighting scope-to-category mappings.
+
+* Fixed extension mappings for `.cjs`, `.mjs`, `.mts`, `.cts`, `Jenkinsfile`, `Brewfile`.
+
+* Fixed LSP initialization timeout too short (increased from 10s to 60s).
+
+### Internal
+
+* Added syntax highlighting validation suite with 93 fixture files and e2e tests.
+
+* Added e2e tests for Settings UI, keybinding editor, search/replace, and plugin commands.
+
+* Fixed multiple flaky e2e tests (search/replace, plugin uninstall, Settings UI).
+
+* Removed redundant `SIGUSR1` handler; relies on harness signal handler for backtraces.
+
+* Cleaned up completed design docs.
+
+---
+
+## 0.2.17
+
+### Bug Fixes
+
+* **Reverted Windows Bracketed Paste Fix**: Reverted the bracketed paste fix for Windows Terminal (#1218) as it broke mouse input (#1284). The fix enabled `ENABLE_VIRTUAL_TERMINAL_INPUT` which interfered with mouse event handling.
+
+---
+## 0.2.16
+
+### Features
+
+* **Project-Wide Search & Replace**: Search and replace across the entire project. Works reliably with unsaved buffers, large files, and up to 10,000 results. Alt+Enter to replace in project.
+
+* **Hot Exit**: All buffers — including unnamed scratch buffers — persist across sessions automatically. Configurable via `hot_exit` setting (#1148, #1233).
+
+* **Workspace Storage**: Session state always restored on startup, even when opening specific files from CLI. Plugin state also persists across sessions.
+
+### Improvements
+
+* **Keybinding Editor**: Collapsible section headers and plugin mode bindings shown as first-class entries.
+
+* **Markdown Compose Mode**: Easier to discover via global toggle and searchable command palette entries.
+
+* **Tab Naming**: Duplicate tab names are disambiguated with appended numbers.
+
+* **View...Keybinding Style: Menu Checkboxes**: Submenu items now show checkbox indicators for toggled settings.
+
+### Bug Fixes
+
+* Fixed crash when workspace references deleted files (#1278).
+
+* Fixed CapsLock breaking keyboard shortcuts like Ctrl+A, Ctrl+C, etc.
+
+* Fixed bracketed paste not working on Windows Terminal.
+
+* Fixed clipboard not working in client-server session mode.
+
+* Fixed Latin-1 files misdetected as UTF-8 for short files with trailing high bytes.
+
+* Fixed line number bugs: Delete key not updating status bar (#1261), relative line numbers miscounting (#1262).
+
+* Fixed C# LSP not working due to language ID mismatch.
+
+* Fixed remote editing using hardcoded `/tmp` instead of querying the remote system.
+
+* Fixed high memory usage on Windows (#1205).
+
+* Fixed PageUp/PageDown not working in Theme Editor sidebar.
+
+* Fixed unbound keys being swallowed in plugin modes.
+
+### Packaging
+
+* **Linux**: Icons and desktop files added to all packaging methods (deb, rpm, Flatpak, AppImage). Fixed Flatpak AppStream metadata for app stores.
+
+---
 ## 0.2.14
 
 ### Improvements

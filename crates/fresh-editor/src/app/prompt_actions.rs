@@ -25,65 +25,7 @@ pub enum PromptResult {
 }
 
 pub(super) fn parse_path_line_col(input: &str) -> (String, Option<usize>, Option<usize>) {
-    use std::path::{Component, Path};
-
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return (String::new(), None, None);
-    }
-
-    // Check if the path has a Windows drive prefix using std::path
-    let has_prefix = Path::new(trimmed)
-        .components()
-        .next()
-        .map(|c| matches!(c, Component::Prefix(_)))
-        .unwrap_or(false);
-
-    // Calculate where to start looking for :line:col
-    let search_start = if has_prefix {
-        trimmed.find(':').map(|i| i + 1).unwrap_or(0)
-    } else {
-        0
-    };
-
-    let suffix = &trimmed[search_start..];
-    let parts: Vec<&str> = suffix.rsplitn(3, ':').collect();
-
-    match parts.as_slice() {
-        [maybe_col, maybe_line, rest] => {
-            if !rest.is_empty() {
-                if let (Ok(line), Ok(col)) =
-                    (maybe_line.parse::<usize>(), maybe_col.parse::<usize>())
-                {
-                    if line > 0 && col > 0 {
-                        let path_str = if has_prefix {
-                            format!("{}{}", &trimmed[..search_start], rest)
-                        } else {
-                            rest.to_string()
-                        };
-                        return (path_str, Some(line), Some(col));
-                    }
-                }
-            }
-        }
-        [maybe_line, rest] => {
-            if !rest.is_empty() {
-                if let Ok(line) = maybe_line.parse::<usize>() {
-                    if line > 0 {
-                        let path_str = if has_prefix {
-                            format!("{}{}", &trimmed[..search_start], rest)
-                        } else {
-                            rest.to_string()
-                        };
-                        return (path_str, Some(line), None);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    (trimmed.to_string(), None, None)
+    crate::input::quick_open::parse_path_line_col(input)
 }
 
 impl Editor {
@@ -174,22 +116,6 @@ impl Editor {
                     self.perform_replace(&search, &input);
                 }
             }
-            PromptType::Command => {
-                let commands = self.command_registry.read().unwrap().get_all();
-                if let Some(cmd) = commands.iter().find(|c| c.get_localized_name() == input) {
-                    let action = cmd.action.clone();
-                    let cmd_name = cmd.get_localized_name();
-                    self.command_registry
-                        .write()
-                        .unwrap()
-                        .record_usage(&cmd_name);
-                    return PromptResult::ExecuteAction(action);
-                } else {
-                    self.set_status_message(
-                        t!("error.unknown_command", input = &input).to_string(),
-                    );
-                }
-            }
             PromptType::GotoLine => match input.trim().parse::<usize>() {
                 Ok(line_num) if line_num > 0 => {
                     self.goto_line_col(line_num, None);
@@ -265,8 +191,8 @@ impl Editor {
                     self.set_status_message(t!("error.invalid_blend", input = &input).to_string());
                 }
             },
-            PromptType::SetComposeWidth => {
-                self.handle_set_compose_width(&input);
+            PromptType::SetPageWidth => {
+                self.handle_set_page_width(&input);
             }
             PromptType::RecordMacro => {
                 self.handle_register_input(
@@ -398,6 +324,22 @@ impl Editor {
                     self.set_status_message(t!("buffer.save_cancelled").to_string());
                 }
             }
+            PromptType::ConfirmCreateDirectory { path } => {
+                let input_lower = input.trim().to_lowercase();
+                if input_lower == "c" || input_lower == "create" {
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = self.filesystem.create_dir_all(parent) {
+                            self.set_status_message(
+                                t!("file.error_saving", error = e.to_string()).to_string(),
+                            );
+                            return PromptResult::Done;
+                        }
+                    }
+                    self.perform_save_file_as(path);
+                } else {
+                    self.set_status_message(t!("buffer.save_cancelled").to_string());
+                }
+            }
             PromptType::ConfirmCloseBuffer { buffer_id } => {
                 if self.handle_confirm_close_buffer(&input, buffer_id) {
                     return PromptResult::EarlyReturn;
@@ -465,6 +407,9 @@ impl Editor {
             }
             PromptType::StopLspServer => {
                 self.handle_stop_lsp_server(&input);
+            }
+            PromptType::RestartLspServer => {
+                self.handle_restart_lsp_server(&input);
             }
             PromptType::SelectTheme { .. } => {
                 self.apply_theme(input.trim());
@@ -538,6 +483,11 @@ impl Editor {
             normalize_path(&self.working_dir.join(&expanded_path))
         };
 
+        self.save_file_as_with_checks(full_path);
+    }
+
+    /// Check for overwrite/missing directory before saving, prompting if needed.
+    pub(crate) fn save_file_as_with_checks(&mut self, full_path: std::path::PathBuf) {
         // Check if we're saving to a different file that already exists
         let current_file_path = self
             .active_state()
@@ -557,6 +507,22 @@ impl Editor {
                 PromptType::ConfirmOverwriteFile { path: full_path },
             );
             return;
+        }
+
+        // Check if parent directory exists
+        if let Some(parent) = full_path.parent() {
+            if !parent.as_os_str().is_empty() && !self.filesystem.exists(parent) {
+                let dir_name = parent
+                    .strip_prefix(&self.working_dir)
+                    .unwrap_or(parent)
+                    .display()
+                    .to_string();
+                self.start_prompt(
+                    t!("buffer.create_directory_confirm", name = &dir_name).to_string(),
+                    PromptType::ConfirmCreateDirectory { path: full_path },
+                );
+                return;
+            }
         }
 
         // Proceed with save
@@ -583,7 +549,8 @@ impl Editor {
                     after_save_len
                 );
 
-                let metadata = BufferMetadata::with_file(full_path.clone(), &self.working_dir);
+                let metadata =
+                    BufferMetadata::with_file(full_path.clone(), &full_path, &self.working_dir);
                 self.buffer_metadata.insert(self.active_buffer(), metadata);
 
                 // Auto-detect language if it's currently "text"
@@ -664,8 +631,8 @@ impl Editor {
         }
     }
 
-    /// Handle SetComposeWidth prompt confirmation.
-    fn handle_set_compose_width(&mut self, input: &str) {
+    /// Handle SetPageWidth prompt confirmation.
+    fn handle_set_page_width(&mut self, input: &str) {
         let active_split = self.split_manager.active_split();
         let trimmed = input.trim();
 
@@ -673,20 +640,18 @@ impl Editor {
             if let Some(vs) = self.split_view_states.get_mut(&active_split) {
                 vs.compose_width = None;
             }
-            self.set_status_message(t!("settings.compose_width_cleared").to_string());
+            self.set_status_message(t!("settings.page_width_cleared").to_string());
         } else {
             match trimmed.parse::<u16>() {
                 Ok(val) if val > 0 => {
                     if let Some(vs) = self.split_view_states.get_mut(&active_split) {
                         vs.compose_width = Some(val);
                     }
-                    self.set_status_message(
-                        t!("settings.compose_width_set", value = val).to_string(),
-                    );
+                    self.set_status_message(t!("settings.page_width_set", value = val).to_string());
                 }
                 _ => {
                     self.set_status_message(
-                        t!("error.invalid_compose_width", input = input).to_string(),
+                        t!("error.invalid_page_width", input = input).to_string(),
                     );
                 }
             }
@@ -954,18 +919,6 @@ impl Editor {
         }
     }
 
-    /// Resolve a syntect syntax name to the canonical config language ID.
-    ///
-    /// Resolve a syntect syntax display name to its canonical config language ID.
-    /// Delegates to the free function in `detected_language`.
-    pub(crate) fn resolve_language_id(&self, syntax_name: &str) -> Option<String> {
-        crate::primitives::detected_language::resolve_language_id(
-            syntax_name,
-            &self.grammar_registry,
-            &self.config.languages,
-        )
-    }
-
     /// Handle SetLanguage prompt confirmation.
     fn handle_set_language(&mut self, input: &str) {
         use crate::primitives::detected_language::DetectedLanguage;
@@ -997,6 +950,27 @@ impl Editor {
             &self.grammar_registry,
             &self.config.languages,
         ) {
+            let language = detected.name.clone();
+            let buffer_id = self.active_buffer();
+            if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                state.apply_language(detected);
+                self.set_status_message(format!("Language set to {}", trimmed));
+            }
+            #[cfg(feature = "plugins")]
+            self.update_plugin_state_snapshot();
+            self.plugin_manager.run_hook(
+                "language_changed",
+                crate::services::plugins::hooks::HookArgs::LanguageChanged {
+                    buffer_id,
+                    language,
+                },
+            );
+        } else if self.config.languages.contains_key(trimmed) {
+            // Handle user-configured languages without a matching syntect grammar
+            // (e.g. "fish" with grammar "fish" that isn't available in syntect).
+            // These languages won't have syntax highlighting but should still be
+            // selectable so the correct language ID is set for config/LSP purposes.
+            let detected = DetectedLanguage::from_config_language(trimmed);
             let language = detected.name.clone();
             let buffer_id = self.active_buffer();
             if let Some(state) = self.buffers.get_mut(&buffer_id) {
@@ -1132,181 +1106,222 @@ impl Editor {
     }
 
     /// Handle StopLspServer prompt confirmation.
-    fn handle_stop_lsp_server(&mut self, input: &str) {
-        let language = input.trim();
-        if language.is_empty() {
+    ///
+    /// Input format: `"language"` (stops all servers) or `"language/server_name"`
+    /// (stops a specific server).
+    pub fn handle_stop_lsp_server(&mut self, input: &str) {
+        let input = input.trim();
+        if input.is_empty() {
             return;
         }
 
-        if let Some(lsp) = &mut self.lsp {
-            if lsp.shutdown_server(language) {
-                if let Some(lsp_config) = self.config.lsp.get_mut(language) {
-                    lsp_config.auto_start = false;
-                    if let Err(e) = self.save_config() {
-                        tracing::warn!(
-                            "Failed to save config after disabling LSP auto-start: {}",
-                            e
-                        );
-                    } else {
-                        let config_path = self.dir_context.config_path();
-                        self.emit_event(
-                            "config_changed",
-                            serde_json::json!({
-                                "path": config_path.to_string_lossy(),
-                            }),
-                        );
+        // Parse "language/server_name" or just "language"
+        let (language, server_name) = if let Some((lang, name)) = input.split_once('/') {
+            (lang, Some(name))
+        } else {
+            (input, None)
+        };
+
+        let has_server = self
+            .lsp
+            .as_ref()
+            .is_some_and(|lsp| lsp.has_handles(language));
+
+        if !has_server {
+            self.set_status_message(t!("lsp.server_not_found", language = language).to_string());
+            return;
+        }
+
+        // Check how many servers remain for this language after the stop.
+        // If we're stopping a specific server and others remain, we should
+        // only send didClose to that server, not disable LSP for the buffers.
+        let stopping_all = server_name.is_none()
+            || self
+                .lsp
+                .as_ref()
+                .map(|lsp| lsp.handle_count(language) <= 1)
+                .unwrap_or(true);
+
+        if stopping_all {
+            // Send didClose for all buffers of this language BEFORE shutting
+            // down the server, so the notifications reach the still-running
+            // server and its handles are still present. `disable_lsp_for_buffer`
+            // also marks the buffer's metadata as user-disabled and clears
+            // per-URI stored diagnostics, which is what we want when the
+            // user has asked for the server to go away entirely.
+            let buffer_ids: Vec<_> = self
+                .buffers
+                .iter()
+                .filter(|(_, s)| s.language == language)
+                .map(|(id, _)| *id)
+                .collect();
+            for buffer_id in buffer_ids {
+                self.disable_lsp_for_buffer(buffer_id);
+            }
+        } else if let Some(name) = server_name {
+            // Send didClose only to the specific server being stopped.
+            // The shared helper below handles clearing this server's
+            // diagnostics.
+            self.send_did_close_to_server(language, name);
+        }
+
+        // Shutdown + clear lsp_server_statuses + clear diagnostics in one
+        // step. Without the status clear the indicator stayed stuck at
+        // "LSP (on)" after stop (reported 2026-04-13).
+        let stopped = self.stop_lsp_server_and_cleanup(language, server_name);
+
+        if !stopped {
+            self.set_status_message(t!("lsp.server_not_found", language = language).to_string());
+            return;
+        }
+
+        // Update config: disable auto_start for the stopped server(s)
+        if let Some(lsp_configs) = self.config.lsp.get_mut(language) {
+            for c in lsp_configs.as_mut_slice() {
+                if let Some(name) = server_name {
+                    // Only disable auto_start for the specific server
+                    if c.display_name() == name {
+                        c.auto_start = false;
                     }
+                } else {
+                    c.auto_start = false;
                 }
-
-                // Clear diagnostics and overlays for all buffers of this language
-                let buffer_ids: Vec<_> = self
-                    .buffers
-                    .iter()
-                    .filter(|(_, s)| s.language == language)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for buffer_id in buffer_ids {
-                    self.disable_lsp_for_buffer(buffer_id);
-                }
-
-                self.set_status_message(t!("lsp.server_stopped", language = language).to_string());
+            }
+            if let Err(e) = self.save_config() {
+                tracing::warn!(
+                    "Failed to save config after disabling LSP auto-start: {}",
+                    e
+                );
             } else {
-                self.set_status_message(
-                    t!("lsp.server_not_found", language = language).to_string(),
+                let config_path = self.dir_context.config_path();
+                self.emit_event(
+                    "config_changed",
+                    serde_json::json!({
+                        "path": config_path.to_string_lossy(),
+                    }),
                 );
             }
         }
+
+        let display = server_name.unwrap_or(language);
+        self.set_status_message(t!("lsp.server_stopped", language = display).to_string());
     }
 
-    /// Handle Quick Open prompt confirmation based on prefix routing
+    /// Handle RestartLspServer prompt confirmation.
+    ///
+    /// Input format: `"language"` (restarts all enabled servers) or
+    /// `"language/server_name"` (restarts a specific server).
+    pub fn handle_restart_lsp_server(&mut self, input: &str) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+
+        // Parse "language/server_name" or just "language"
+        let (language, server_name) = if let Some((lang, name)) = input.split_once('/') {
+            (lang, Some(name))
+        } else {
+            (input, None)
+        };
+
+        // Get file_path from active buffer for workspace root detection
+        let buffer_id = self.active_buffer();
+        let file_path = self
+            .buffer_metadata
+            .get(&buffer_id)
+            .and_then(|meta| meta.file_path().cloned());
+
+        let (success, message) = if let Some(name) = server_name {
+            // Restart a specific server
+            if let Some(lsp) = self.lsp.as_mut() {
+                lsp.manual_restart_server(language, name, file_path.as_deref())
+            } else {
+                (false, t!("lsp.no_manager").to_string())
+            }
+        } else {
+            // Restart all enabled servers for the language
+            if let Some(lsp) = self.lsp.as_mut() {
+                lsp.manual_restart(language, file_path.as_deref())
+            } else {
+                (false, t!("lsp.no_manager").to_string())
+            }
+        };
+
+        self.status_message = Some(message);
+
+        if success {
+            self.reopen_buffers_for_language(language);
+        }
+    }
+
+    /// Handle Quick Open prompt confirmation by dispatching through the provider registry
     fn handle_quick_open_confirm(
         &mut self,
         input: &str,
         selected_index: Option<usize>,
     ) -> PromptResult {
-        // Determine the mode based on prefix
-        if let Some(query) = input.strip_prefix('>') {
-            // Command mode - find and execute the selected command
-            return self.handle_quick_open_command(query, selected_index);
-        }
+        use crate::input::quick_open::QuickOpenResult;
 
-        if let Some(query) = input.strip_prefix('#') {
-            // Buffer mode - switch to selected buffer
-            return self.handle_quick_open_buffer(query, selected_index);
-        }
-
-        if let Some(line_str) = input.strip_prefix(':') {
-            // Go to line mode
-            if let Ok(line_num) = line_str.parse::<usize>() {
-                if line_num > 0 {
-                    self.goto_line_col(line_num, None);
-                    self.set_status_message(t!("goto.jumped", line = line_num).to_string());
-                } else {
-                    self.set_status_message(t!("goto.line_must_be_positive").to_string());
-                }
-            } else {
-                self.set_status_message(t!("error.invalid_line", input = line_str).to_string());
-            }
-            return PromptResult::Done;
-        }
-
-        // Default: file mode - open the selected file
-        self.handle_quick_open_file(input, selected_index)
-    }
-
-    /// Handle Quick Open command selection
-    fn handle_quick_open_command(
-        &mut self,
-        query: &str,
-        selected_index: Option<usize>,
-    ) -> PromptResult {
-        let suggestions = {
-            let registry = self.command_registry.read().unwrap();
-            let selection_active = self.has_active_selection();
-            let active_buffer_mode = self
-                .buffer_metadata
-                .get(&self.active_buffer())
-                .and_then(|m| m.virtual_mode());
-            let has_lsp_config = {
-                let language = self
-                    .buffers
-                    .get(&self.active_buffer())
-                    .map(|s| s.language.as_str());
-                language
-                    .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
-                    .is_some()
-            };
-
-            registry.filter(
-                query,
-                self.key_context.clone(),
-                &self.keybindings,
-                selection_active,
-                &self.active_custom_contexts,
-                active_buffer_mode,
-                has_lsp_config,
-            )
+        let context = self.build_quick_open_context();
+        let result = if let Some((provider, query)) =
+            self.quick_open_registry.get_provider_for_input(input)
+        {
+            // Resolve the selected suggestion once, so providers don't recompute
+            let suggestions = provider.suggestions(query, &context);
+            let selected = selected_index.and_then(|i| suggestions.get(i));
+            provider.on_select(selected, query, &context)
+        } else {
+            QuickOpenResult::None
         };
 
-        if let Some(idx) = selected_index {
-            if let Some(suggestion) = suggestions.get(idx) {
-                if suggestion.disabled {
-                    self.set_status_message(t!("status.command_not_available").to_string());
-                    return PromptResult::Done;
-                }
-
-                // Find and execute the command
-                let commands = self.command_registry.read().unwrap().get_all();
-                if let Some(cmd) = commands
-                    .iter()
-                    .find(|c| c.get_localized_name() == suggestion.text)
-                {
-                    let action = cmd.action.clone();
-                    let cmd_name = cmd.get_localized_name();
-                    self.command_registry
-                        .write()
-                        .unwrap()
-                        .record_usage(&cmd_name);
-                    return PromptResult::ExecuteAction(action);
-                }
-            }
-        }
-
-        self.set_status_message(t!("status.no_selection").to_string());
-        PromptResult::Done
+        self.execute_quick_open_result(result)
     }
 
-    /// Handle Quick Open buffer selection
-    fn handle_quick_open_buffer(
+    /// Map a QuickOpenResult to a PromptResult, executing any necessary side effects
+    fn execute_quick_open_result(
         &mut self,
-        query: &str,
-        selected_index: Option<usize>,
+        result: crate::input::quick_open::QuickOpenResult,
     ) -> PromptResult {
-        // Regenerate buffer suggestions since prompt was already taken by confirm_prompt
-        let suggestions = self.get_buffer_suggestions(query);
+        use crate::input::quick_open::QuickOpenResult;
 
-        if let Some(idx) = selected_index {
-            if let Some(suggestion) = suggestions.get(idx) {
-                if let Some(value) = &suggestion.value {
-                    if let Ok(buffer_id) = value.parse::<usize>() {
-                        let buffer_id = crate::model::event::BufferId(buffer_id);
-                        if self.buffers.contains_key(&buffer_id) {
-                            self.set_active_buffer(buffer_id);
-                            if let Some(name) = self.active_state().buffer.file_path() {
-                                self.set_status_message(
-                                    t!("buffer.switched", name = name.display().to_string())
-                                        .to_string(),
-                                );
-                            }
-                            return PromptResult::Done;
-                        }
+        match result {
+            QuickOpenResult::ExecuteAction(action) => PromptResult::ExecuteAction(action),
+            QuickOpenResult::OpenFile { path, line, column } => {
+                let expanded_path = expand_tilde(&path);
+                let full_path = if expanded_path.is_absolute() {
+                    expanded_path
+                } else {
+                    self.working_dir.join(&expanded_path)
+                };
+                self.open_file_with_jump(full_path, line, column);
+                PromptResult::Done
+            }
+            QuickOpenResult::ShowBuffer(buffer_id) => {
+                let buffer_id = crate::model::event::BufferId(buffer_id);
+                if self.buffers.contains_key(&buffer_id) {
+                    self.set_active_buffer(buffer_id);
+                    if let Some(name) = self.active_state().buffer.file_path() {
+                        self.set_status_message(
+                            t!("buffer.switched", name = name.display().to_string()).to_string(),
+                        );
                     }
                 }
+                PromptResult::Done
+            }
+            QuickOpenResult::GotoLine(line) => {
+                self.goto_line_col(line, None);
+                self.set_status_message(t!("goto.jumped", line = line).to_string());
+                PromptResult::Done
+            }
+            QuickOpenResult::None => {
+                self.set_status_message(t!("status.no_selection").to_string());
+                PromptResult::Done
+            }
+            QuickOpenResult::Error(msg) => {
+                self.set_status_message(msg);
+                PromptResult::Done
             }
         }
-
-        self.set_status_message(t!("status.no_selection").to_string());
-        PromptResult::Done
     }
 
     fn open_file_with_jump(
@@ -1337,60 +1352,6 @@ impl Editor {
                 }
             }
         }
-    }
-
-    /// Handle Quick Open file selection
-    fn handle_quick_open_file(
-        &mut self,
-        input: &str,
-        selected_index: Option<usize>,
-    ) -> PromptResult {
-        let (path_from_input, line, column) = parse_path_line_col(input);
-        // Regenerate file suggestions using the parsed path (without :line:col suffix)
-        // so that fuzzy matching still works when the user types a jump suffix.
-        let suggestion_input = if path_from_input.is_empty() {
-            input
-        } else {
-            &path_from_input
-        };
-        let suggestions = self.get_file_suggestions(suggestion_input);
-
-        if let Some(idx) = selected_index {
-            if let Some(suggestion) = suggestions.get(idx) {
-                if let Some(path_str) = &suggestion.value {
-                    let path = std::path::PathBuf::from(path_str);
-                    let full_path = if path.is_absolute() {
-                        path
-                    } else {
-                        self.working_dir.join(&path)
-                    };
-
-                    // Record file access for frecency
-                    self.file_provider.record_access(path_str);
-
-                    self.open_file_with_jump(full_path, line, column);
-                    return PromptResult::Done;
-                }
-            }
-        }
-
-        if line.is_some() && !path_from_input.is_empty() {
-            let expanded_path = expand_tilde(&path_from_input);
-            let full_path = if expanded_path.is_absolute() {
-                expanded_path
-            } else {
-                self.working_dir.join(&expanded_path)
-            };
-
-            // Record file access for frecency
-            self.file_provider.record_access(&path_from_input);
-
-            self.open_file_with_jump(full_path, line, column);
-            return PromptResult::Done;
-        }
-
-        self.set_status_message(t!("status.no_selection").to_string());
-        PromptResult::Done
     }
 }
 

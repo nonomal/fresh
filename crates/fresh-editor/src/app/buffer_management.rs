@@ -10,6 +10,7 @@
 
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +24,51 @@ use super::help;
 use super::Editor;
 
 impl Editor {
+    /// Resolve the effective line_wrap setting for a buffer, considering language overrides.
+    ///
+    /// Returns the language-specific `line_wrap` if set, otherwise the global `editor.line_wrap`.
+    pub(super) fn resolve_line_wrap_for_buffer(&self, buffer_id: BufferId) -> bool {
+        if let Some(state) = self.buffers.get(&buffer_id) {
+            if let Some(lang_config) = self.config.languages.get(&state.language) {
+                if let Some(line_wrap) = lang_config.line_wrap {
+                    return line_wrap;
+                }
+            }
+        }
+        self.config.editor.line_wrap
+    }
+
+    /// Resolve page view settings for a buffer from its language config.
+    ///
+    /// Returns `Some((page_width))` if page_view is enabled for this buffer's language,
+    /// `None` otherwise.
+    pub(super) fn resolve_page_view_for_buffer(
+        &self,
+        buffer_id: BufferId,
+    ) -> Option<Option<usize>> {
+        let state = self.buffers.get(&buffer_id)?;
+        let lang_config = self.config.languages.get(&state.language)?;
+        if lang_config.page_view == Some(true) {
+            Some(lang_config.page_width.or(self.config.editor.page_width))
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the effective wrap_column for a buffer, considering language overrides.
+    ///
+    /// Returns the language-specific `wrap_column` if set, otherwise the global `editor.wrap_column`.
+    pub(super) fn resolve_wrap_column_for_buffer(&self, buffer_id: BufferId) -> Option<usize> {
+        if let Some(state) = self.buffers.get(&buffer_id) {
+            if let Some(lang_config) = self.config.languages.get(&state.language) {
+                if lang_config.wrap_column.is_some() {
+                    return lang_config.wrap_column;
+                }
+            }
+        }
+        self.config.editor.wrap_column
+    }
+
     /// Get the preferred split for opening a file.
     /// If the active split has no label, use it (normal case).
     /// Otherwise find an unlabeled leaf so files don't open in labeled splits (e.g., sidebars).
@@ -32,6 +78,186 @@ impl Editor {
             return active;
         }
         self.split_manager.find_unlabeled_leaf().unwrap_or(active)
+    }
+
+    /// Open a file in "preview" (ephemeral) mode and return its buffer ID.
+    ///
+    /// Used for exploratory single-click opens from the file explorer. If the
+    /// `file_explorer.preview_tabs` setting is disabled, this is equivalent to
+    /// `open_file`.
+    ///
+    /// Semantics (see `Editor::preview` for the full invariants):
+    /// - Preview is anchored to a specific split. At most one preview exists
+    ///   editor-wide.
+    /// - If the file is already open (deduped by canonical path, including
+    ///   symlinks and relative paths, by delegating to `open_file_no_focus`),
+    ///   just switch to it. No preview-state changes in either direction.
+    /// - Otherwise, if there's an existing preview in the **same** target
+    ///   split, close it and replace it. If it's in a **different** split,
+    ///   promote it (walking away is commitment) and start a fresh preview
+    ///   in the target split.
+    /// - Skips writing to position history, so a string of exploratory
+    ///   clicks doesn't flood back/forward navigation with stale entries.
+    ///
+    /// TODO(perf): Each preview swap today triggers LSP didClose + didOpen.
+    /// For heavy language servers (rust-analyzer, tsserver) that's wasteful
+    /// on rapid browsing. A future optimization is to keep the LSP session
+    /// for the outgoing buffer until the user commits to the new one.
+    pub fn open_file_preview(&mut self, path: &Path) -> anyhow::Result<BufferId> {
+        // Feature gate — fall back to normal open when preview tabs are off.
+        if !self.config.file_explorer.preview_tabs {
+            return self.open_file(path);
+        }
+
+        // Decide target split up-front. `open_file_no_focus` will target
+        // the same one (it calls `preferred_split_for_file` internally),
+        // so this mirrors its logic. If that invariant ever drifts we'd
+        // open the preview in one split and track it in another.
+        let target_split = self.preferred_split_for_file();
+
+        // Snapshot the buffer IDs that already back a real file, so we can
+        // tell "opened a previously-unknown file" from "switched to one
+        // that was already open". We delegate the symlink/relative-path
+        // dedup to `open_file_no_focus` (which canonicalizes) — any buffer
+        // with a non-empty file path is a candidate match. Note: the
+        // initial empty buffer has a `BufferKind::File` with an empty
+        // `PathBuf`, and we deliberately exclude it here because
+        // `open_file_no_focus` may *repurpose* that buffer (same ID, new
+        // content) for the newly-opened file.
+        let previously_file_backed: HashSet<BufferId> = self
+            .buffers
+            .iter()
+            .filter_map(|(id, state)| {
+                state.buffer.file_path().and_then(|p| {
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(*id)
+                    }
+                })
+            })
+            .collect();
+
+        // Route through `open_file` with position-history suppression.
+        // Using the regular `open_file` path keeps all cross-cutting concerns
+        // (LSP, language detection, split targeting, status message, plugin
+        // hooks) consistent with a normal open.
+        self.suppress_position_history_once = true;
+        let open_result = self.open_file(path);
+        self.suppress_position_history_once = false;
+        let buffer_id = open_result?;
+        let is_new = !previously_file_backed.contains(&buffer_id);
+
+        // Already-open buffer: leave preview state untouched. A previously-
+        // committed tab must not be demoted back to preview, and the existing
+        // preview (if any, in whichever split) is still valid.
+        if !is_new {
+            return Ok(buffer_id);
+        }
+
+        // New buffer. Resolve the existing preview (if any) relative to the
+        // target split.
+        match self.preview.take() {
+            Some((prev_split, old_id)) if prev_split == target_split => {
+                // Same split: close the old preview so the new one takes its
+                // place. If close fails (modified buffer — shouldn't happen
+                // because edits promote, but defend in depth), demote the
+                // orphan to a permanent tab rather than leaving behind an
+                // italic "(preview)" tab that will never be replaced.
+                if let Err(e) = self.close_buffer(old_id) {
+                    tracing::warn!(
+                        "preview: could not replace stale preview buffer {:?}, demoting to permanent: {}",
+                        old_id,
+                        e
+                    );
+                    if let Some(m) = self.buffer_metadata.get_mut(&old_id) {
+                        m.is_preview = false;
+                    }
+                }
+            }
+            Some((_other_split, old_id)) => {
+                // Different split: user walked away from the old preview
+                // before this click. Promote it to permanent — their focus
+                // moving to another split was the commitment signal.
+                if let Some(m) = self.buffer_metadata.get_mut(&old_id) {
+                    m.is_preview = false;
+                }
+            }
+            None => {}
+        }
+
+        // Mark the new buffer as the preview, anchored to its split.
+        if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+            meta.is_preview = true;
+        }
+        self.preview = Some((target_split, buffer_id));
+
+        Ok(buffer_id)
+    }
+
+    /// Promote a specific buffer from preview to permanent, if it was in
+    /// preview mode. No-op if the buffer is not currently a preview.
+    pub(crate) fn promote_buffer_from_preview(&mut self, buffer_id: BufferId) {
+        if let Some(m) = self.buffer_metadata.get_mut(&buffer_id) {
+            m.is_preview = false;
+        }
+        if let Some((_, id)) = self.preview {
+            if id == buffer_id {
+                self.preview = None;
+            }
+        }
+    }
+
+    /// Promote the active buffer from preview to permanent, if applicable.
+    /// Called on any buffer mutation so that touching a preview buffer
+    /// commits it to a permanent tab.
+    pub(crate) fn promote_active_buffer_from_preview(&mut self) {
+        let id = self.active_buffer();
+        self.promote_buffer_from_preview(id);
+    }
+
+    /// Promote the current preview, regardless of which buffer it points at.
+    /// Used before layout changes (split, close-split, move-tab) where the
+    /// preview invariant ("anchored to a specific split") would otherwise
+    /// be broken by the operation itself.
+    pub(crate) fn promote_current_preview(&mut self) {
+        if let Some((_, id)) = self.preview.take() {
+            if let Some(m) = self.buffer_metadata.get_mut(&id) {
+                m.is_preview = false;
+            }
+        }
+    }
+
+    /// Promote the current preview if it belongs to a split other than
+    /// `new_split`. Called from split-focus-change paths so that moving
+    /// focus away from the preview's pane commits it.
+    pub(crate) fn promote_preview_if_not_in_split(&mut self, new_split: LeafId) {
+        if let Some((preview_split, _)) = self.preview {
+            if preview_split != new_split {
+                self.promote_current_preview();
+            }
+        }
+    }
+
+    /// Whether the given buffer is currently in preview (ephemeral) mode.
+    /// Primarily for tests; production code should use `self.preview`.
+    pub fn is_buffer_preview(&self, buffer_id: BufferId) -> bool {
+        self.buffer_metadata
+            .get(&buffer_id)
+            .map(|m| m.is_preview)
+            .unwrap_or(false)
+    }
+
+    /// Number of open buffers (including hidden/virtual buffers).
+    /// Intended for tests that verify preview tabs don't accumulate.
+    pub fn open_buffer_count(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// The (split, buffer) tuple of the current preview tab, if any.
+    /// Intended for tests that verify preview anchoring semantics.
+    pub fn current_preview(&self) -> Option<(LeafId, BufferId)> {
+        self.preview
     }
 
     /// Open a file and return its buffer ID
@@ -55,7 +281,7 @@ impl Editor {
         // For new buffers, record position history before switching
         let is_new_buffer = self.active_buffer() != buffer_id;
 
-        if is_new_buffer {
+        if is_new_buffer && !self.suppress_position_history_once {
             // Save current position before switching to new buffer
             self.position_history.commit_pending_movement();
 
@@ -117,6 +343,17 @@ impl Editor {
     ///
     /// If the file doesn't exist, creates an unsaved buffer with that filename.
     pub fn open_file_no_focus(&mut self, path: &Path) -> anyhow::Result<BufferId> {
+        // Fail fast if the remote connection is down — don't attempt I/O that
+        // would either timeout or return confusing errors.
+        if !self.filesystem.is_remote_connected() {
+            anyhow::bail!(
+                "Cannot open file: remote connection lost ({})",
+                self.filesystem
+                    .remote_connection_info()
+                    .unwrap_or("unknown host")
+            );
+        }
+
         // Resolve relative paths against appropriate base directory
         // For remote mode, use the remote home directory; for local, use working_dir
         let base_dir = if self.filesystem.remote_connection_info().is_some() {
@@ -225,11 +462,13 @@ impl Editor {
                 self.config.editor.large_file_threshold_bytes as usize,
                 Arc::clone(&self.filesystem),
             )?;
-            let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-                &display_path,
-                &self.grammar_registry,
-                &self.config.languages,
-            );
+            let detected =
+                crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                    &display_path,
+                    &self.grammar_registry,
+                    &self.config.languages,
+                    self.config.default_language.as_deref(),
+                );
             EditorState::from_buffer_with_language(buffer, detected)
         } else {
             // File doesn't exist - create empty buffer with the file path set
@@ -258,7 +497,8 @@ impl Editor {
         state.buffer_settings.auto_surround = self.config.editor.auto_surround;
         if let Some(lang_config) = self.config.languages.get(&state.language) {
             whitespace = whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
-            state.buffer_settings.use_tabs = lang_config.use_tabs;
+            state.buffer_settings.use_tabs =
+                lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs);
             // Use language-specific tab_size if set, otherwise fall back to global
             state.buffer_settings.tab_size =
                 lang_config.tab_size.unwrap_or(self.config.editor.tab_size);
@@ -276,6 +516,7 @@ impl Editor {
             }
         } else {
             state.buffer_settings.tab_size = self.config.editor.tab_size;
+            state.buffer_settings.use_tabs = self.config.editor.use_tabs;
         }
         state.buffer_settings.whitespace = whitespace;
 
@@ -289,8 +530,11 @@ impl Editor {
             .insert(buffer_id, crate::model::event::EventLog::new());
 
         // Create metadata for this buffer
-        let mut metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let mut metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
 
         // Mark binary files in metadata and disable LSP
         if is_binary {
@@ -300,12 +544,8 @@ impl Editor {
         }
 
         // Check if the file is read-only on disk (filesystem permissions)
-        if file_exists && !metadata.read_only {
-            if let Ok(file_meta) = self.filesystem.metadata(path) {
-                if file_meta.is_readonly {
-                    metadata.read_only = true;
-                }
-            }
+        if file_exists && !metadata.read_only && !self.filesystem.is_writable(path) {
+            metadata.read_only = true;
         }
 
         // Mark read-only files (library, binary, or filesystem-readonly) as editing-disabled
@@ -326,16 +566,25 @@ impl Editor {
         // Add buffer to the preferred split's tabs (but don't switch to it)
         // Uses preferred_split_for_file() to avoid opening in labeled splits (e.g., sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
+        let page_view = self.resolve_page_view_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             // Initialize per-buffer view state for the new buffer with config defaults
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
+            // Auto-activate page view if configured for this language
+            if let Some(page_width) = page_view {
+                buf_state.activate_page_view(page_width);
+            }
         }
 
         // Restore global file state (scroll/cursor position) if available
@@ -411,11 +660,13 @@ impl Editor {
             self.config.editor.large_file_threshold_bytes as usize,
             Arc::clone(&self.local_filesystem),
         )?;
-        let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-            &display_path,
-            &self.grammar_registry,
-            &self.config.languages,
-        );
+        let detected =
+            crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                &display_path,
+                &self.grammar_registry,
+                &self.config.languages,
+                self.config.default_language.as_deref(),
+            );
         let state = EditorState::from_buffer_with_language(buffer, detected);
 
         self.buffers.insert(buffer_id, state);
@@ -423,19 +674,26 @@ impl Editor {
             .insert(buffer_id, crate::model::event::EventLog::new());
 
         // Create metadata
-        let metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
         self.buffer_metadata.insert(buffer_id, metadata);
 
         // Add to preferred split's tabs (avoids labeled splits like sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -507,11 +765,13 @@ impl Editor {
         )?;
         // Create editor state with the buffer
         // Use display_path for language detection (glob patterns match user-visible paths)
-        let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-            &display_path,
-            &self.grammar_registry,
-            &self.config.languages,
-        );
+        let detected =
+            crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                &display_path,
+                &self.grammar_registry,
+                &self.config.languages,
+                self.config.default_language.as_deref(),
+            );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
 
@@ -523,19 +783,26 @@ impl Editor {
         self.event_logs
             .insert(buffer_id, crate::model::event::EventLog::new());
 
-        let metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
         self.buffer_metadata.insert(buffer_id, metadata);
 
         // Add to preferred split's tabs (avoids labeled splits like sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -643,11 +910,13 @@ impl Editor {
         )?;
         // Create editor state with the buffer
         // Use display_path for language detection (glob patterns match user-visible paths)
-        let detected = crate::primitives::detected_language::DetectedLanguage::from_path(
-            &display_path,
-            &self.grammar_registry,
-            &self.config.languages,
-        );
+        let detected =
+            crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                &display_path,
+                &self.grammar_registry,
+                &self.config.languages,
+                self.config.default_language.as_deref(),
+            );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
 
@@ -659,19 +928,26 @@ impl Editor {
         self.event_logs
             .insert(buffer_id, crate::model::event::EventLog::new());
 
-        let metadata =
-            super::types::BufferMetadata::with_file(path.to_path_buf(), &self.working_dir);
+        let metadata = super::types::BufferMetadata::with_file(
+            path.to_path_buf(),
+            &display_path,
+            &self.working_dir,
+        );
         self.buffer_metadata.insert(buffer_id, metadata);
 
         // Add to preferred split's tabs (avoids labeled splits like sidebars)
         let target_split = self.preferred_split_for_file();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -999,11 +1275,15 @@ impl Editor {
         // Must happen AFTER set_active_buffer, because switch_buffer creates
         // the new BufferViewState with defaults (show_line_numbers=true).
         let active_split = self.split_manager.active_split();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -1100,13 +1380,17 @@ impl Editor {
 
         // Add buffer to the active split's tabs
         let active_split = self.split_manager.active_split();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         }
@@ -1276,13 +1560,17 @@ impl Editor {
 
         // Add buffer to the active split's open_buffers (tabs)
         let active_split = self.split_manager.active_split();
+        let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+        let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.add_buffer(buffer_id);
             let buf_state = view_state.ensure_buffer_state(buffer_id);
             buf_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
         } else {
@@ -1291,8 +1579,10 @@ impl Editor {
                 SplitViewState::with_buffer(self.terminal_width, self.terminal_height, buffer_id);
             view_state.apply_config_defaults(
                 self.config.editor.line_numbers,
-                self.config.editor.line_wrap,
+                self.config.editor.highlight_current_line,
+                line_wrap,
                 self.config.editor.wrap_indent,
+                wrap_column,
                 self.config.editor.rulers.clone(),
             );
             self.split_view_states.insert(active_split, view_state);
@@ -1443,7 +1733,7 @@ impl Editor {
         }
 
         // Get all keybindings
-        let bindings = self.keybindings.get_all_bindings();
+        let bindings = self.keybindings.read().unwrap().get_all_bindings();
 
         // Format the keybindings as readable text
         let mut content = String::from("Keyboard Shortcuts\n");
@@ -1509,32 +1799,25 @@ impl Editor {
         self.open_warning_log();
     }
 
-    /// Show LSP status - opens the warning log file if there are LSP warnings,
-    /// otherwise shows a brief status message.
+    /// Show LSP status popup with details about servers active for the current buffer.
+    /// Lists each server with its status and provides actions: restart, stop, view log.
     pub fn show_lsp_status_popup(&mut self) {
+        // Toggle behavior: if the LSP popup is already showing, close it
+        // instead of rebuilding and re-showing it.  This lets clicking the
+        // status-bar LSP indicator a second time dismiss the popup, matching
+        // the common affordance for status-bar menus.
+        if self.pending_lsp_status_popup.is_some() {
+            self.hide_popup();
+            self.pending_lsp_status_popup = None;
+            return;
+        }
+
         let has_error = self.warning_domains.lsp.level() == crate::app::WarningLevel::Error;
-
-        // Use the language from the LSP error state if available, otherwise detect from buffer.
-        // This ensures clicking the status indicator works regardless of which buffer is focused.
         let language = self
-            .warning_domains
-            .lsp
-            .language
-            .clone()
-            .unwrap_or_else(|| {
-                // Use buffer's stored language
-                self.buffers
-                    .get(&self.active_buffer())
-                    .map(|s| s.language.clone())
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
-
-        tracing::info!(
-            "show_lsp_status_popup: language={}, has_error={}, has_warnings={}",
-            language,
-            has_error,
-            self.warning_domains.lsp.has_warnings()
-        );
+            .buffers
+            .get(&self.active_buffer())
+            .map(|s| s.language.clone())
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Fire the LspStatusClicked hook for plugins
         self.plugin_manager.run_hook(
@@ -1544,29 +1827,271 @@ impl Editor {
                 has_error,
             },
         );
-        tracing::info!("show_lsp_status_popup: hook fired");
 
-        if !self.warning_domains.lsp.has_warnings() {
-            if self.lsp_status.is_empty() {
-                self.status_message = Some(t!("lsp.no_server_active").to_string());
-            } else {
-                self.status_message = Some(t!("lsp.status", status = &self.lsp_status).to_string());
+        self.build_and_show_lsp_status_popup(&language);
+    }
+
+    /// Rebuild the LSP-status popup in place if it's currently open.
+    ///
+    /// Used when an async event (progress update, server state change) might
+    /// change the popup's contents — notably while rust-analyzer is indexing
+    /// and emits `$/progress` every few hundred ms.  Without this, the popup
+    /// would freeze on the snapshot taken at open time while the status-bar
+    /// spinner keeps moving, making them look disconnected.
+    pub fn refresh_lsp_status_popup_if_open(&mut self) {
+        if self.pending_lsp_status_popup.is_none() {
+            return;
+        }
+        let language = self
+            .buffers
+            .get(&self.active_buffer())
+            .map(|s| s.language.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        // Replace contents: hide then rebuild.  hide_popup() clears
+        // pending_lsp_status_popup via handle_popup_cancel pathways, but
+        // here we're calling it directly without routing through a cancel,
+        // so stash and restore the marker so the rebuild sees "already
+        // open" and doesn't fall through the toggle branch.
+        let was_pending = self.pending_lsp_status_popup.take();
+        self.hide_popup();
+        drop(was_pending);
+        self.build_and_show_lsp_status_popup(&language);
+    }
+
+    fn build_and_show_lsp_status_popup(&mut self, language: &str) {
+        use crate::services::async_bridge::LspServerStatus;
+
+        // Build a unified list of all configured servers for this language,
+        // merged with their runtime status (if running).
+        let running_statuses: std::collections::HashMap<String, LspServerStatus> = self
+            .lsp_server_statuses
+            .iter()
+            .filter(|((lang, _), _)| lang == language)
+            .map(|((_, name), status)| (name.clone(), *status))
+            .collect();
+
+        let configured_servers: Vec<String> = self
+            .config
+            .lsp
+            .get(language)
+            .map(|cfg| {
+                cfg.as_slice()
+                    .iter()
+                    .filter(|c| !c.command.is_empty())
+                    .map(|c| c.display_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if configured_servers.is_empty() && running_statuses.is_empty() {
+            self.status_message = Some(t!("lsp.no_server_active").to_string());
+            return;
+        }
+
+        // Merge: start with configured servers, then add any running servers
+        // not in the config (shouldn't happen, but be safe).
+        let mut all_servers: Vec<String> = configured_servers;
+        for name in running_statuses.keys() {
+            if !all_servers.contains(name) {
+                all_servers.push(name.clone());
             }
-            return;
+        }
+        all_servers.sort();
+
+        // Build the popup's items as view-level `PopupListItem`s directly.
+        // We bypass the `PopupListItemData` event type here because we need
+        // the `disabled` field (for "View Log" when no log exists), which
+        // is a view-only concern and plumbing it through the event boundary
+        // would require touching ~40 existing literals across the test
+        // suite.
+        let mut items: Vec<crate::view::popup::PopupListItem> = Vec::new();
+        let mut action_keys: Vec<(String, String)> = Vec::new();
+
+        /// Truncate `s` to at most `max_cells` display cells, appending an
+        /// ellipsis if truncation happened (the ellipsis is included in the
+        /// budget, so the result is ≤ `max_cells` wide regardless of input).
+        fn truncate(s: &str, max_cells: usize) -> String {
+            use unicode_width::UnicodeWidthChar;
+            let w = unicode_width::UnicodeWidthStr::width(s);
+            if w <= max_cells {
+                return s.to_string();
+            }
+            let budget = max_cells.saturating_sub(1);
+            let mut used = 0;
+            let mut out = String::new();
+            for ch in s.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if used + cw > budget {
+                    break;
+                }
+                used += cw;
+                out.push(ch);
+            }
+            out.push('…');
+            out
+        }
+        const PROGRESS_FIELD_MAX: usize = 14;
+        const POPUP_WIDTH_MAX: u16 = 50;
+
+        for name in &all_servers {
+            let status = running_statuses.get(name).copied();
+            let is_active = status
+                .map(|s| !matches!(s, LspServerStatus::Shutdown))
+                .unwrap_or(false);
+
+            // Header: server name + status (data = None → not clickable,
+            // not underlined).
+            let (icon, label) = match status {
+                Some(LspServerStatus::Running) => ("●", "ready"),
+                Some(LspServerStatus::Error) => ("✗", "error"),
+                Some(LspServerStatus::Starting) => ("◌", "starting"),
+                Some(LspServerStatus::Initializing) => ("◌", "initializing"),
+                Some(LspServerStatus::Shutdown) | None => ("○", "not running"),
+            };
+            items.push(crate::view::popup::PopupListItem::new(format!(
+                "{} {} ({})",
+                icon, name, label
+            )));
+
+            // Progress row immediately UNDER the server's name row, if
+            // there's an active `$/progress` notification for this
+            // language.  Indented to match the action rows below, and the
+            // title + message fields are individually truncated so a
+            // runaway progress path can't stretch the popup.  The popup
+            // width is pinned in advance (see below) so the row's content
+            // changing never reshapes the popup.
+            if let Some(info) = self
+                .lsp_progress
+                .values()
+                .find(|info| info.language == language)
+            {
+                let mut line = format!("    ⏳ {}", truncate(&info.title, PROGRESS_FIELD_MAX));
+                if let Some(ref msg) = info.message {
+                    line.push_str(&format!(" · {}", truncate(msg, PROGRESS_FIELD_MAX)));
+                }
+                if let Some(pct) = info.percentage {
+                    line.push_str(&format!(" ({}%)", pct));
+                }
+                items.push(crate::view::popup::PopupListItem::new(line));
+            }
+
+            if is_active {
+                // Restart
+                let restart_key = format!("restart:{}/{}", language, name);
+                items.push(
+                    crate::view::popup::PopupListItem::new(format!("    Restart {}", name))
+                        .with_data(restart_key.clone()),
+                );
+                action_keys.push((restart_key, format!("Restart {}", name)));
+
+                // Stop
+                let stop_key = format!("stop:{}/{}", language, name);
+                items.push(
+                    crate::view::popup::PopupListItem::new(format!("    Stop {}", name))
+                        .with_data(stop_key.clone()),
+                );
+                action_keys.push((stop_key, format!("Stop {}", name)));
+            } else {
+                // Start
+                let start_key = format!("start:{}", language);
+                if !action_keys.iter().any(|(k, _)| k == &start_key) {
+                    items.push(
+                        crate::view::popup::PopupListItem::new(format!("    Start {}", name))
+                            .with_data(start_key.clone()),
+                    );
+                    action_keys.push((start_key, format!("Start {}", name)));
+                }
+            }
         }
 
-        // If there's an LSP error AND a plugin is handling the status click, don't open the
-        // warning log which would switch focus and break language detection for subsequent clicks.
-        // Only suppress if a plugin has registered to handle the hook.
-        if has_error && self.plugin_manager.has_hook_handlers("lsp_status_clicked") {
-            tracing::info!(
-                "show_lsp_status_popup: has_error=true and plugin registered, skipping warning log"
-            );
-            return;
+        // View log action (always, at the end) — grayed out and
+        // non-actionable when no log file exists yet for this language
+        // (e.g. the server was never started, or has been rotated away).
+        let log_path = crate::services::log_dirs::lsp_log_path(language);
+        let log_exists = log_path.exists();
+        let log_key = format!("log:{}", language);
+        let mut log_item = crate::view::popup::PopupListItem::new("    View Log".to_string());
+        if log_exists {
+            log_item = log_item.with_data(log_key.clone());
+            action_keys.push((log_key, "View Log".to_string()));
+        } else {
+            log_item = log_item.disabled();
         }
+        items.push(log_item);
 
-        // Open the warning log file directly (same as warnings popup)
-        self.open_warning_log();
+        // Store action keys for handling confirmation
+        self.pending_lsp_status_popup = Some(action_keys);
+
+        // Pin the popup width up-front, using the *worst-case* widths for
+        // any row that varies at runtime (the progress line).  This keeps
+        // the popup from jittering when progress messages come and go or
+        // change length — the whole point of the spinner + live-refresh
+        // pair is that the UI should look stable while the LSP churns.
+        //
+        //   worst-case progress line =
+        //     "    ⏳ " (4-space indent + ⏳ (2 cells) + space = 7 cells)
+        //     + PROGRESS_FIELD_MAX   (title)
+        //     + " · "                (3 cells)
+        //     + PROGRESS_FIELD_MAX   (message)
+        //     + " (100%)"            (7 cells)
+        //   = 7 + 14 + 3 + 14 + 7 = 45 cells
+        const PROGRESS_LINE_MAX: usize = 7 + PROGRESS_FIELD_MAX + 3 + PROGRESS_FIELD_MAX + 7;
+        let max_static_item_width = items
+            .iter()
+            .map(|i| unicode_width::UnicodeWidthStr::width(i.text.as_str()))
+            .max()
+            .unwrap_or(20);
+        let popup_width =
+            (max_static_item_width.max(PROGRESS_LINE_MAX) as u16 + 4).clamp(30, POPUP_WIDTH_MAX);
+
+        // Pre-select the first actionable item (skip header items with no
+        // data and disabled items like a non-existent View Log).
+        let first_actionable = items
+            .iter()
+            .position(|i| i.data.is_some() && !i.disabled)
+            .unwrap_or(0);
+
+        // Left-align the popup's column with the LSP indicator on the
+        // status bar, if we know where it was drawn in the last frame.
+        // Falls back to the previous BottomRight anchor when the LSP
+        // segment isn't visible (e.g. first render).
+        let position = self
+            .cached_layout
+            .status_bar_lsp_area
+            .map(
+                |(_, col_start, _)| crate::view::popup::PopupPosition::AboveStatusBarAt {
+                    x: col_start,
+                },
+            )
+            .unwrap_or(crate::view::popup::PopupPosition::BottomRight);
+
+        use crate::view::popup::{Popup, PopupContent, PopupKind};
+        use ratatui::style::Style;
+
+        let popup = Popup {
+            kind: PopupKind::List,
+            title: Some(format!("LSP Servers ({})", language)),
+            description: None,
+            transient: false,
+            content: PopupContent::List {
+                items,
+                selected: first_actionable,
+            },
+            position,
+            width: popup_width,
+            max_height: 15,
+            bordered: true,
+            border_style: Style::default().fg(self.theme.popup_border_fg),
+            background_style: Style::default().bg(self.theme.popup_bg),
+            scroll_offset: 0,
+            text_selection: None,
+            accept_key_hint: None,
+        };
+
+        let buffer_id = self.active_buffer();
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            state.popups.show(popup);
+        }
     }
 
     /// Show a transient hover popup with the given message text, positioned below the cursor.
@@ -1624,6 +2149,14 @@ impl Editor {
 
     /// Internal helper to close a buffer (shared by close_buffer and force_close_buffer)
     fn close_buffer_internal(&mut self, id: BufferId) -> anyhow::Result<()> {
+        // Clear preview tracking if we're closing the current preview buffer.
+        // This keeps `preview` from pointing at a freed buffer id.
+        if let Some((_, preview_id)) = self.preview {
+            if preview_id == id {
+                self.preview = None;
+            }
+        }
+
         // Complete any --wait tracking for this buffer
         if let Some((wait_id, _)) = self.wait_tracking.remove(&id) {
             self.completed_waits.push(wait_id);
@@ -1668,28 +2201,42 @@ impl Editor {
             }
         }
 
-        // Find a replacement buffer, preferring the most recently focused one
-        // First try focus history, then fall back to any visible buffer
+        // Walk the focus-history LRU (most recent first) to find the tab
+        // the user should land on. This naturally handles both buffer and
+        // group tabs — whichever the user was looking at most recently wins.
         let active_split = self.split_manager.active_split();
-        let replacement_from_history = self.split_view_states.get(&active_split).and_then(|vs| {
-            // Find the most recently focused buffer that's still open and visible
-            vs.focus_history
-                .iter()
-                .rev()
-                .find(|&&bid| {
-                    bid != id
-                        && self.buffers.contains_key(&bid)
-                        && !self
-                            .buffer_metadata
-                            .get(&bid)
-                            .map(|m| m.hidden_from_tabs)
-                            .unwrap_or(false)
-                })
-                .copied()
-        });
 
-        // Fall back to any visible buffer if no history match
-        let visible_replacement = replacement_from_history.or_else(|| {
+        let replacement_target: Option<crate::view::split::TabTarget> =
+            self.split_view_states.get(&active_split).and_then(|vs| {
+                use crate::view::split::TabTarget;
+                vs.focus_history.iter().rev().find_map(|t| match t {
+                    TabTarget::Buffer(bid) if *bid == id => None, // skip the closing buffer
+                    TabTarget::Buffer(bid) => {
+                        // Skip hidden-from-tabs buffers (panel helpers etc.)
+                        let hidden = self
+                            .buffer_metadata
+                            .get(bid)
+                            .map(|m| m.hidden_from_tabs)
+                            .unwrap_or(false);
+                        if hidden || !self.buffers.contains_key(bid) {
+                            None
+                        } else {
+                            Some(*t)
+                        }
+                    }
+                    TabTarget::Group(leaf) => {
+                        // Only if the group still exists
+                        if self.grouped_subtrees.contains_key(leaf) {
+                            Some(*t)
+                        } else {
+                            None
+                        }
+                    }
+                })
+            });
+
+        // Fall back: any visible buffer in the split, then any visible buffer at all.
+        let fallback_buffer: Option<BufferId> = if replacement_target.is_none() {
             self.buffers
                 .keys()
                 .find(|&&bid| {
@@ -1701,21 +2248,65 @@ impl Editor {
                             .unwrap_or(false)
                 })
                 .copied()
-        });
-
-        let is_last_visible_buffer = visible_replacement.is_none();
-        let replacement_buffer = if is_last_visible_buffer {
-            self.new_buffer()
         } else {
-            visible_replacement.unwrap()
+            None
         };
 
+        // Capture before the replacement computation — new_buffer() has the
+        // side effect of calling set_active_buffer which changes active_buffer().
+        let closing_active = self.active_buffer() == id;
+
+        // Determine what to do: activate a group, switch to a buffer, or
+        // create a new empty buffer as last resort.
+        let return_to_group = match replacement_target {
+            Some(crate::view::split::TabTarget::Group(leaf)) => Some(leaf),
+            _ => None,
+        };
+        let replacement_buffer = match replacement_target {
+            Some(crate::view::split::TabTarget::Buffer(bid)) => bid,
+            Some(crate::view::split::TabTarget::Group(group_leaf)) => {
+                // The group's inner panel buffer serves as the split leaf's
+                // underlying buffer. The group takes over the active target
+                // via activate_group_tab below, so this isn't user-visible.
+                self.grouped_subtrees
+                    .get(&group_leaf)
+                    .and_then(|node| {
+                        if let crate::view::split::SplitNode::Grouped {
+                            active_inner_leaf, ..
+                        } = node
+                        {
+                            self.split_view_states
+                                .get(active_inner_leaf)
+                                .map(|vs| vs.active_buffer)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| fallback_buffer.unwrap_or_else(|| self.new_buffer()))
+            }
+            None => fallback_buffer.unwrap_or_else(|| self.new_buffer()),
+        };
+
+        let created_empty_buffer = replacement_target.is_none() && fallback_buffer.is_none();
+
         // Switch to replacement buffer BEFORE updating splits.
-        // This is important because set_active_buffer returns early if the buffer
-        // is already active, and updating splits changes what active_buffer() returns.
-        // We need set_active_buffer to run its terminal_mode_resume logic.
-        if self.active_buffer() == id {
+        // Only needed when the closing buffer is the one the user is
+        // looking at — otherwise the current active buffer stays.
+        if closing_active {
             self.set_active_buffer(replacement_buffer);
+
+            // When the replacement is a group's hidden inner panel buffer,
+            // undo the side effects of set_active_buffer adding it to the
+            // host split's tab list and focus history.
+            if return_to_group.is_some() {
+                if let Some(vs) = self.split_view_states.get_mut(&active_split) {
+                    use crate::view::split::TabTarget;
+                    vs.open_buffers
+                        .retain(|t| *t != TabTarget::Buffer(replacement_buffer));
+                    vs.focus_history
+                        .retain(|t| *t != TabTarget::Buffer(replacement_buffer));
+                }
+            }
         }
 
         // Update all splits that are showing this buffer to show the replacement
@@ -1750,9 +2341,13 @@ impl Editor {
             view_state.remove_from_history(id);
         }
 
-        // If this was the last visible buffer, focus file explorer
-        if is_last_visible_buffer {
-            self.focus_file_explorer();
+        if closing_active {
+            if created_empty_buffer {
+                self.focus_file_explorer();
+            }
+            if let Some(group_leaf) = return_to_group {
+                self.activate_group_tab(group_leaf);
+            }
         }
 
         Ok(())
@@ -1779,9 +2374,26 @@ impl Editor {
     /// Close the current tab in the current split view.
     /// If the tab is the last viewport of the underlying buffer, do the same as close_buffer
     /// (including triggering the save/discard prompt for modified buffers).
+    ///
+    /// When the active tab is a buffer group (its `active_group_tab` is set),
+    /// this closes the entire group rather than the currently-focused inner
+    /// panel buffer. Individual panels are internal details of the group —
+    /// the user closes them all together by closing the group tab.
     pub fn close_tab(&mut self) {
-        let buffer_id = self.active_buffer();
+        // If the active split has a group tab active, close the whole group
+        // rather than just the focused panel buffer.
         let active_split = self.split_manager.active_split();
+        if let Some(group_leaf_id) = self
+            .split_view_states
+            .get(&active_split)
+            .and_then(|vs| vs.active_group_tab)
+        {
+            self.close_buffer_group_by_leaf(group_leaf_id);
+            self.set_status_message(t!("buffer.tab_closed").to_string());
+            return;
+        }
+
+        let buffer_id = self.active_buffer();
 
         // Count how many splits have this buffer in their open_buffers
         let buffer_in_other_splits = self
@@ -1796,7 +2408,7 @@ impl Editor {
         let current_split_tabs = self
             .split_view_states
             .get(&active_split)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         // If this is the only tab in this split and there are no other splits with this buffer,
@@ -1919,7 +2531,7 @@ impl Editor {
         let split_tabs = self
             .split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         let is_last_viewport = buffer_in_other_splits == 0;
@@ -1988,7 +2600,7 @@ impl Editor {
         let split_tabs = self
             .split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         // Close all tabs except the one we want to keep
@@ -2021,7 +2633,7 @@ impl Editor {
         let split_tabs = self
             .split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         // Find the index of the target buffer
@@ -2051,7 +2663,7 @@ impl Editor {
         let split_tabs = self
             .split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         // Find the index of the target buffer
@@ -2081,7 +2693,7 @@ impl Editor {
         let split_tabs = self
             .split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         let mut closed = 0;
@@ -2131,7 +2743,7 @@ impl Editor {
         let split_tabs = self
             .split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
 
         let is_last_viewport = buffer_in_other_splits == 0;
@@ -2178,92 +2790,77 @@ impl Editor {
         }
     }
 
-    /// Get visible (non-hidden) buffers for the current split.
-    /// This filters out buffers with hidden_from_tabs=true.
-    fn visible_buffers_for_active_split(&self) -> Vec<BufferId> {
-        let active_split = self.split_manager.active_split();
-        if let Some(view_state) = self.split_view_states.get(&active_split) {
-            view_state
-                .open_buffers
-                .iter()
-                .copied()
-                .filter(|id| {
-                    !self
-                        .buffer_metadata
-                        .get(id)
-                        .map(|m| m.hidden_from_tabs)
-                        .unwrap_or(false)
-                })
-                .collect()
-        } else {
-            // Fallback to all visible buffers if no view state
-            let mut all_ids: Vec<_> = self
-                .buffers
-                .keys()
-                .copied()
-                .filter(|id| {
-                    !self
-                        .buffer_metadata
-                        .get(id)
-                        .map(|m| m.hidden_from_tabs)
-                        .unwrap_or(false)
-                })
-                .collect();
-            all_ids.sort_by_key(|id| id.0);
-            all_ids
-        }
-    }
-
     /// Switch to next buffer in current split's tabs
     pub fn next_buffer(&mut self) {
-        let ids = self.visible_buffers_for_active_split();
-
-        if ids.is_empty() {
-            return;
-        }
-
-        if let Some(idx) = ids.iter().position(|&id| id == self.active_buffer()) {
-            let next_idx = (idx + 1) % ids.len();
-            if ids[next_idx] != self.active_buffer() {
-                // Save current position before switching
-                self.position_history.commit_pending_movement();
-
-                // Also explicitly record current position
-                let cursors = self.active_cursors();
-                let position = cursors.primary().position;
-                let anchor = cursors.primary().anchor;
-                self.position_history
-                    .record_movement(self.active_buffer(), position, anchor);
-                self.position_history.commit_pending_movement();
-
-                self.set_active_buffer(ids[next_idx]);
-            }
-        }
+        self.cycle_tab(1);
     }
 
     /// Switch to previous buffer in current split's tabs
     pub fn prev_buffer(&mut self) {
-        let ids = self.visible_buffers_for_active_split();
+        self.cycle_tab(-1);
+    }
 
-        if ids.is_empty() {
+    /// Cycle through the active split's tab targets (buffers AND groups).
+    /// Direction: +1 = next, -1 = previous.
+    fn cycle_tab(&mut self, direction: i32) {
+        use crate::view::split::TabTarget;
+
+        let active_split = self.split_manager.active_split();
+        let Some(view_state) = self.split_view_states.get(&active_split) else {
+            return;
+        };
+
+        // Collect visible tab targets, filtering out hidden buffers.
+        let targets: Vec<TabTarget> = view_state
+            .open_buffers
+            .iter()
+            .copied()
+            .filter(|t| match t {
+                TabTarget::Buffer(id) => !self
+                    .buffer_metadata
+                    .get(id)
+                    .map(|m| m.hidden_from_tabs)
+                    .unwrap_or(false),
+                TabTarget::Group(_) => true,
+            })
+            .collect();
+
+        if targets.len() < 2 {
             return;
         }
 
-        if let Some(idx) = ids.iter().position(|&id| id == self.active_buffer()) {
-            let prev_idx = if idx == 0 { ids.len() - 1 } else { idx - 1 };
-            if ids[prev_idx] != self.active_buffer() {
-                // Save current position before switching
-                self.position_history.commit_pending_movement();
+        let current_target = view_state.active_target();
+        let Some(idx) = targets.iter().position(|t| *t == current_target) else {
+            return;
+        };
 
-                // Also explicitly record current position
-                let cursors = self.active_cursors();
-                let position = cursors.primary().position;
-                let anchor = cursors.primary().anchor;
-                self.position_history
-                    .record_movement(self.active_buffer(), position, anchor);
-                self.position_history.commit_pending_movement();
+        let next_idx = if direction > 0 {
+            (idx + 1) % targets.len()
+        } else if idx == 0 {
+            targets.len() - 1
+        } else {
+            idx - 1
+        };
 
-                self.set_active_buffer(ids[prev_idx]);
+        if targets[next_idx] == current_target {
+            return;
+        }
+
+        // Save current position before switching
+        self.position_history.commit_pending_movement();
+        let cursors = self.active_cursors();
+        let position = cursors.primary().position;
+        let anchor = cursors.primary().anchor;
+        self.position_history
+            .record_movement(self.active_buffer(), position, anchor);
+        self.position_history.commit_pending_movement();
+
+        match targets[next_idx] {
+            TabTarget::Buffer(buffer_id) => {
+                self.set_active_buffer(buffer_id);
+            }
+            TabTarget::Group(group_leaf_id) => {
+                self.activate_group_tab(group_leaf_id);
             }
         }
     }
@@ -2382,16 +2979,20 @@ impl Editor {
     /// Force check the mouse hover timer (for testing)
     /// This bypasses the normal 500ms delay
     pub fn force_check_mouse_hover(&mut self) -> bool {
-        // Temporarily mark the hover as ready by checking if state exists
         if let Some((byte_pos, _, screen_x, screen_y)) = self.mouse_state.lsp_hover_state {
             if !self.mouse_state.lsp_hover_request_sent {
-                self.mouse_state.lsp_hover_request_sent = true;
                 self.mouse_hover_screen_position = Some((screen_x, screen_y));
-                if let Err(e) = self.request_hover_at_position(byte_pos) {
-                    tracing::debug!("Failed to request hover: {}", e);
-                    return false;
+                match self.request_hover_at_position(byte_pos) {
+                    Ok(true) => {
+                        self.mouse_state.lsp_hover_request_sent = true;
+                        return true;
+                    }
+                    Ok(false) => return false, // no server ready, retry later
+                    Err(e) => {
+                        tracing::debug!("Failed to request hover: {}", e);
+                        return false;
+                    }
                 }
-                return true;
             }
         }
         false
@@ -2409,6 +3010,7 @@ impl Editor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn queue_file_open(
         &mut self,
         path: PathBuf,

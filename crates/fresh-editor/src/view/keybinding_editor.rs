@@ -7,6 +7,7 @@ use crate::app::keybinding_editor::{
     SourceFilter,
 };
 use crate::input::keybindings::{format_keybinding, KeybindingResolver};
+use crate::view::dimming::apply_dimming;
 use crate::view::theme::Theme;
 use crate::view::ui::scrollbar::{render_scrollbar, ScrollbarColors};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -96,11 +97,13 @@ pub fn render_keybinding_editor(
 
     // Need to temporarily take dialog to avoid borrow conflict
     if let Some(dialog) = editor.edit_dialog.take() {
+        apply_dimming(frame, modal_area);
         render_edit_dialog(frame, inner, &dialog, editor, theme);
         editor.edit_dialog = Some(dialog);
     }
 
     if editor.showing_confirm_dialog {
+        apply_dimming(frame, modal_area);
         render_confirm_dialog(frame, inner, editor, theme);
     }
 }
@@ -261,7 +264,7 @@ fn render_table(frame: &mut Frame, area: Rect, editor: &mut KeybindingEditor, th
     // Column widths (adaptive): Key | Action Name | Description | Context | Source
     let key_col_width = (inner_width as f32 * 0.16).min(20.0) as u16;
     let action_name_col_width = (inner_width as f32 * 0.22).min(28.0) as u16;
-    let context_col_width = (inner_width as f32 * 0.18).min(30.0).max(14.0) as u16;
+    let context_col_width = (inner_width as f32 * 0.18).clamp(14.0, 30.0) as u16;
     let source_col_width = 8u16;
     let fixed_cols =
         key_col_width + action_name_col_width + context_col_width + source_col_width + 5; // +5 for spacers
@@ -743,10 +746,14 @@ fn render_edit_dialog(
     .split(inner);
 
     // Instructions
-    let instr = match dialog.mode {
-        EditMode::RecordingKey => t!("keybinding_editor.instr_recording_key").to_string(),
-        EditMode::EditingAction => t!("keybinding_editor.instr_editing_action").to_string(),
-        EditMode::EditingContext => t!("keybinding_editor.instr_editing_context").to_string(),
+    let instr = if dialog.capturing_special && dialog.focus_area == 0 {
+        t!("keybinding_editor.instr_capturing_special").to_string()
+    } else {
+        match dialog.mode {
+            EditMode::RecordingKey => t!("keybinding_editor.instr_recording_key").to_string(),
+            EditMode::EditingAction => t!("keybinding_editor.instr_editing_action").to_string(),
+            EditMode::EditingContext => t!("keybinding_editor.instr_editing_context").to_string(),
+        }
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -791,16 +798,28 @@ fn render_edit_dialog(
             chunks[2],
         );
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("   {:9}", t!("keybinding_editor.label_key")),
-                key_label_style,
-            ),
-            Span::styled(key_text, key_value_style),
-        ])),
-        chunks[2],
-    );
+    let mut key_spans = vec![
+        Span::styled(
+            format!("   {:9}", t!("keybinding_editor.label_key")),
+            key_label_style,
+        ),
+        Span::styled(key_text, key_value_style),
+    ];
+    if key_focused && dialog.capturing_special {
+        key_spans.push(Span::styled(
+            format!("  {}", t!("keybinding_editor.capture_any_key_hint")),
+            Style::default()
+                .fg(theme.diagnostic_warning_fg)
+                .bg(field_bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if key_focused && !dialog.capturing_special {
+        key_spans.push(Span::styled(
+            format!("  {}", t!("keybinding_editor.capture_special_hint")),
+            Style::default().fg(theme.popup_text_fg).bg(field_bg),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(key_spans)), chunks[2]);
 
     // Action field
     let action_focused = dialog.focus_area == 1;
@@ -1404,6 +1423,24 @@ fn handle_edit_dialog_input(
         None => return KeybindingEditorAction::Consumed,
     };
 
+    // In special-capture mode on the key field, record the very next key
+    // (including Esc, Tab, Enter) and exit capture mode.
+    if dialog.capturing_special && dialog.focus_area == 0 {
+        match event.code {
+            KeyCode::Modifier(_) => {} // ignore bare modifier presses
+            _ => {
+                dialog.key_code = Some(event.code);
+                dialog.modifiers = event.modifiers;
+                dialog.key_display = format_keybinding(&event.code, &event.modifiers);
+                dialog.conflicts =
+                    editor.find_conflicts(event.code, event.modifiers, &dialog.context);
+                dialog.capturing_special = false;
+            }
+        }
+        editor.edit_dialog = Some(dialog);
+        return KeybindingEditorAction::Consumed;
+    }
+
     // Close dialog on Esc
     if event.code == KeyCode::Esc && event.modifiers == KeyModifiers::NONE {
         // Don't put it back - it's closed
@@ -1414,27 +1451,17 @@ fn handle_edit_dialog_input(
         0 => {
             // Key recording area
             match (event.code, event.modifiers) {
-                (KeyCode::Tab, KeyModifiers::NONE) => {
-                    dialog.focus_area = 1;
-                    dialog.mode = EditMode::EditingAction;
+                // Enter enters special-capture mode for the next keypress
+                (KeyCode::Enter, KeyModifiers::NONE) => {
+                    dialog.capturing_special = true;
                 }
-                (KeyCode::Enter, KeyModifiers::NONE) if dialog.key_code.is_some() => {
+                (KeyCode::Tab | KeyCode::Down, KeyModifiers::NONE) => {
                     dialog.focus_area = 1;
                     dialog.mode = EditMode::EditingAction;
                 }
                 _ => {
-                    // Record the key (but not modifier-only presses)
-                    match event.code {
-                        KeyCode::Modifier(_) => {}
-                        _ => {
-                            dialog.key_code = Some(event.code);
-                            dialog.modifiers = event.modifiers;
-                            dialog.key_display = format_keybinding(&event.code, &event.modifiers);
-                            // Check conflicts
-                            dialog.conflicts =
-                                editor.find_conflicts(event.code, event.modifiers, &dialog.context);
-                        }
-                    }
+                    // Keys are only recorded via capture mode (Enter then key).
+                    // Ignore everything else in the key field.
                 }
             }
         }
@@ -1500,6 +1527,17 @@ fn handle_edit_dialog_input(
                         }
                     }
                 }
+                (KeyCode::Up, KeyModifiers::NONE) => {
+                    // Move to previous field (key)
+                    dialog.autocomplete_visible = false;
+                    dialog.focus_area = 0;
+                    dialog.mode = EditMode::RecordingKey;
+                }
+                (KeyCode::Down, KeyModifiers::NONE) => {
+                    // Move to next field (context)
+                    dialog.focus_area = 2;
+                    dialog.mode = EditMode::EditingContext;
+                }
                 (KeyCode::Esc, _) if dialog.autocomplete_visible => {
                     // Close autocomplete without closing dialog
                     dialog.autocomplete_visible = false;
@@ -1534,11 +1572,11 @@ fn handle_edit_dialog_input(
         2 => {
             // Context selection area
             match (event.code, event.modifiers) {
-                (KeyCode::Tab, KeyModifiers::NONE) => {
+                (KeyCode::Tab | KeyCode::Down, KeyModifiers::NONE) => {
                     dialog.focus_area = 3;
                     dialog.selected_button = 0;
                 }
-                (KeyCode::BackTab, _) => {
+                (KeyCode::BackTab, _) | (KeyCode::Up, KeyModifiers::NONE) => {
                     dialog.focus_area = 1;
                     dialog.mode = EditMode::EditingAction;
                 }
@@ -1594,6 +1632,10 @@ fn handle_edit_dialog_input(
                         dialog.focus_area = 2;
                         dialog.mode = EditMode::EditingContext;
                     }
+                }
+                (KeyCode::Up, KeyModifiers::NONE) => {
+                    dialog.focus_area = 2;
+                    dialog.mode = EditMode::EditingContext;
                 }
                 (KeyCode::Left, _) => {
                     if dialog.selected_button > 0 {

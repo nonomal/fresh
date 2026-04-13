@@ -1303,8 +1303,10 @@ fn test_settings_percentage_value_saves_correctly() {
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // Navigate down to find the Width setting
-    // File Explorer settings: Custom Ignore Patterns, Respect Gitignore, Show Gitignored, Show Hidden, Width
+    // Navigate down to find the Width setting.
+    // File Explorer settings (alphabetical): Custom Ignore Patterns,
+    // Preview Tabs, Respect Gitignore, Show Gitignored, Show Hidden, Width.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Preview Tabs
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Respect Gitignore
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Show Gitignored
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Show Hidden
@@ -1781,9 +1783,12 @@ fn test_category_selection_indicator_visible() {
 
     // Categories panel is focused by default, should show ">" before General
     // General may have "●" modified indicator due to test defaults
+    // Category format: "> " + modified_indicator + icon + name
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">● General") || screen.contains(">  General"),
+        screen
+            .lines()
+            .any(|l| l.contains(">") && l.contains("General") && l.find(">") < l.find("General")),
         "Expected '>' indicator on General category when focused. Screen: {}",
         screen
     );
@@ -1795,7 +1800,9 @@ fn test_category_selection_indicator_visible() {
     // Now Clipboard should have the ">" indicator
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">● Clipboard") || screen.contains(">  Clipboard"),
+        screen.lines().any(|l| l.contains(">")
+            && l.contains("Clipboard")
+            && l.find(">") < l.find("Clipboard")),
         "Expected '>' indicator on Clipboard category when focused. Screen: {}",
         screen
     );
@@ -1804,9 +1811,22 @@ fn test_category_selection_indicator_visible() {
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // Now Clipboard should not have the ">" indicator (panel not focused)
-    harness.assert_screen_not_contains(">● Clipboard");
-    harness.assert_screen_not_contains(">  Clipboard");
+    // Now the ">" indicator before Clipboard should be gone (categories panel not focused)
+    // The ">" may still appear as the item selection indicator in the settings panel,
+    // so check that no line has ">" before "Clipboard"
+    let screen = harness.screen_to_string();
+    let has_focused_clipboard = screen.lines().any(|l| {
+        if let (Some(gt_pos), Some(cb_pos)) = (l.find("> "), l.find("Clipboard")) {
+            gt_pos < cb_pos
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_focused_clipboard,
+        "Clipboard should not have '>' indicator when categories panel is unfocused. Screen: {}",
+        screen
+    );
 
     // But Clipboard should still be visible (just highlighted differently)
     harness.assert_screen_contains("Clipboard");
@@ -1887,7 +1907,7 @@ fn test_entry_dialog_focus_indicator() {
     // Navigate down to find a language entry in the Languages list
     // Languages section is after Keybinding Maps and Keybindings sections
     // Navigate down many times to reach Languages
-    for _ in 0..10 {
+    for _ in 0..11 {
         harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     }
     harness.render().unwrap();
@@ -2041,13 +2061,43 @@ fn test_entry_dialog_delete_textlist_item() {
     harness.assert_screen_contains("Edit Value");
 
     // Navigate to Extensions section which has existing items
+    // The ">" focus indicator may be on the section header or on a sub-item line
+    // below it (for composite controls like TextList).
+    let mut attempts = 0;
     loop {
         harness.render().unwrap();
         let screen = harness.screen_to_string();
+        // Check if Extensions header is focused directly
         if screen.contains(">  Extensions") || screen.contains(">● Extensions") {
             break;
         }
+        // Also check if ">" is on a sub-item line near the Extensions header
+        let lines: Vec<&str> = screen.lines().collect();
+        let mut found_near = false;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains(">") && !line.contains("Extensions") {
+                for offset in 1..=3 {
+                    if i >= offset && lines[i - offset].contains("Extensions:") {
+                        found_near = true;
+                        break;
+                    }
+                }
+            }
+            if found_near {
+                break;
+            }
+        }
+        if found_near {
+            break;
+        }
         harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "Could not find Extensions section after {} Down presses.\nScreen:\n{}",
+            attempts,
+            screen
+        );
     }
 
     // The Extensions section should have items and "[x]" delete buttons
@@ -2150,11 +2200,11 @@ fn test_settings_toggle_persists_after_save_and_reopen() {
         .unwrap();
     harness.render().unwrap();
 
-    // Verify it now shows as checked [x]
+    // Verify it now shows as checked [✓]
     // After toggling, the item is modified so it shows ">● " (3-char indicator area)
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">● Check For Updates") && screen.contains(": [x]"),
+        screen.contains(">● Check For Updates") && screen.contains(": [✓]"),
         "Check For Updates should now be checked (with modified indicator). Screen:\n{}",
         screen
     );
@@ -2190,14 +2240,14 @@ fn test_settings_toggle_persists_after_save_and_reopen() {
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // This is the key assertion: the toggle should show the SAVED value [x]
+    // This is the key assertion: the toggle should show the SAVED value [✓]
     // not the ORIGINAL value [ ]
-    // Note: The item shows the correct [x] value; the "●" indicator may or may not
+    // Note: The item shows the correct [✓] value; the "●" indicator may or may not
     // appear depending on layer detection
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("Check For Updates") && screen.contains(": [x]"),
-        "BUG #474: After save and reopen, Check For Updates should still be checked [x], \
+        screen.contains("Check For Updates") && screen.contains(": [✓]"),
+        "BUG #474: After save and reopen, Check For Updates should still be checked [✓], \
          but it shows the original value [ ]. Screen:\n{}",
         screen
     );
@@ -2384,6 +2434,13 @@ fn navigate_to_lsp_json_editor(harness: &mut EditorTestHarness) {
 
     // Verify we're in an Edit dialog
     harness.assert_screen_contains("Edit Value");
+
+    // LSP values are now arrays of server configs. The dialog shows the array.
+    // Press Enter to drill into the first server item's nested dialog.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
 
     // Navigate down to "Initialization Options" field
     // Navigate until we see the focus indicator on Initialization Options
@@ -2699,7 +2756,11 @@ fn test_settings_edit_button_keyboard_navigation() {
 /// 3. Show a status message indicating which file was opened
 #[test]
 fn test_settings_edit_button_opens_config_file() {
-    let mut harness = EditorTestHarness::new(100, 40).unwrap();
+    // Width 120 (not 100) because the status bar's right side now includes
+    // the color-coded "LSP (off)" dormant-indicator for any language with
+    // a default LSP config (json has one), which truncates the "Editing
+    // User config" status message to "Editing User ..." at 100 cols.
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
 
     // Open settings
     harness.open_settings().unwrap();
@@ -2833,8 +2894,10 @@ fn test_map_add_new_button_clickable_with_mouse() {
         .unwrap();
     harness.render().unwrap();
 
-    // The "[+] Add new" button should be visible
-    harness.assert_screen_contains("[+] Add new");
+    // Wait for the "[+] Add new" button to be visible after search navigation
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[+] Add new"))
+        .unwrap();
 
     // Find the position of "[+] Add new" on screen and click it
     let screen = harness.screen_to_string();
@@ -3523,38 +3586,41 @@ fn test_usability_entry_dialog_button_focus_indicator() {
         .unwrap();
     harness.render().unwrap();
 
-    // Navigate down past all items to reach the buttons
-    loop {
-        harness.render().unwrap();
-        let screen = harness.screen_to_string();
-        if screen.contains("> [ Save ]") || screen.contains(">[ Save ]") {
-            break;
-        }
-        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    }
-
-    // The entry dialog buttons should show ">" focus indicator
-    let screen = harness.screen_to_string();
-    let has_focused_button = screen.contains(">[ Save ]")
-        || screen.contains(">[ Delete ]")
-        || screen.contains(">[ Cancel ]");
-
-    if !has_focused_button {
-        // Try Tab to cycle to buttons (some dialogs use Tab for items<->buttons)
+    // Tab cycles through all fields and buttons — press Tab until we reach a button
+    let mut has_focused_button = false;
+    for _ in 0..60 {
         harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
         harness.render().unwrap();
-    }
 
-    let screen = harness.screen_to_string();
-    // The ">" indicator is rendered with a gap before the button bracket
-    let has_focused_button = screen.contains("> [ Save ]")
-        || screen.contains("> [ Delete ]")
-        || screen.contains("> [ Cancel ]");
+        let screen = harness.screen_to_string();
+        // The ">" indicator is rendered with a gap before the button bracket
+        if screen.contains("> [ Save ]")
+            || screen.contains("> [ Delete ]")
+            || screen.contains("> [ Cancel ]")
+        {
+            has_focused_button = true;
+            break;
+        }
+        // Also check for button focus via REVERSED style (> may be in separate cell)
+        if screen.contains("[ Save ]") || screen.contains("[ Cancel ]") {
+            // Check if any button row has a focus indicator nearby
+            for line in screen.lines() {
+                if (line.contains("[ Save ]") || line.contains("[ Cancel ]")) && line.contains(">")
+                {
+                    has_focused_button = true;
+                    break;
+                }
+            }
+            if has_focused_button {
+                break;
+            }
+        }
+    }
 
     assert!(
         has_focused_button,
-        "Entry dialog buttons should show > focus indicator. Screen:\n{}",
-        screen
+        "Entry dialog buttons should show > focus indicator after Tab cycling. Screen:\n{}",
+        harness.screen_to_string()
     );
 
     // Close the dialog

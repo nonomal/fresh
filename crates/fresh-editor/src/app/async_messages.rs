@@ -43,6 +43,35 @@ impl Editor {
             .map(|(buffer_id, _)| *buffer_id)
     }
 
+    /// Collect `(buffer_id, uri)` pairs for every open buffer whose stored
+    /// language matches `language`.
+    ///
+    /// This is the single correct way to enumerate buffers for sending a
+    /// per-URI LSP request (pull diagnostics, inlay hints, semantic tokens,
+    /// folding ranges, …) to a language-scoped server. Without the language
+    /// filter, a server configured only for e.g. "rust" ends up receiving
+    /// requests for every open URI regardless of type, and a responsible
+    /// server rejects unknown URIs with `file not found (code -32603)` —
+    /// polluting logs and wasting a round-trip per unrelated buffer.
+    ///
+    /// Callers that need richer per-buffer info (line counts, content, file
+    /// paths) can still iterate themselves, but should use the same
+    /// `state.language == language` predicate this helper encodes.
+    pub(crate) fn buffers_for_language(&self, language: &str) -> Vec<(BufferId, lsp_types::Uri)> {
+        self.buffers
+            .iter()
+            .filter_map(|(buffer_id, state)| {
+                if state.language != language {
+                    return None;
+                }
+                self.buffer_metadata
+                    .get(buffer_id)
+                    .and_then(|m| m.file_uri().cloned())
+                    .map(|uri| (*buffer_id, uri))
+            })
+            .collect()
+    }
+
     /// Apply diagnostics to a buffer identified by URI.
     /// Returns `(buffer_id, actually_updated)` if buffer was found, None otherwise.
     /// `actually_updated` is false when the DIAG CACHE determined no overlay changes were needed.
@@ -69,10 +98,12 @@ impl Editor {
 impl Editor {
     /// Merge push + pull diagnostics for a URI and apply the combined set
     fn merge_and_apply_diagnostics(&mut self, uri: &str) {
-        // Merge push (flycheck/cargo) and pull (native RA) diagnostics
+        // Merge diagnostics from all servers (push model) and pull model
         let mut merged = Vec::new();
-        if let Some(push) = self.stored_push_diagnostics.get(uri) {
-            merged.extend(push.iter().cloned());
+        if let Some(server_map) = self.stored_push_diagnostics.get(uri) {
+            for diagnostics in server_map.values() {
+                merged.extend(diagnostics.iter().cloned());
+            }
         }
         if let Some(pull) = self.stored_pull_diagnostics.get(uri) {
             merged.extend(pull.iter().cloned());
@@ -116,18 +147,42 @@ impl Editor {
     }
 
     /// Handle LSP diagnostics (push model — publishDiagnostics from flycheck/cargo)
-    pub(super) fn handle_lsp_diagnostics(&mut self, uri: String, diagnostics: Vec<Diagnostic>) {
+    pub(super) fn handle_lsp_diagnostics(
+        &mut self,
+        uri: String,
+        diagnostics: Vec<Diagnostic>,
+        server_name: String,
+    ) {
+        // Discard diagnostics from servers that have been shut down.  The async
+        // bridge may still contain queued messages from a server that was stopped
+        // between the time it sent the notification and when we drain the channel.
+        if let Some(lsp) = &self.lsp {
+            if !lsp.has_server_named(&server_name) {
+                tracing::debug!(
+                    "Dropping diagnostics from stopped server '{}' for {}",
+                    server_name,
+                    uri
+                );
+                return;
+            }
+        }
+
         tracing::debug!(
-            "Processing {} push diagnostics for {}",
+            "Processing {} push diagnostics from '{}' for {}",
             diagnostics.len(),
+            server_name,
             uri
         );
 
+        let server_map = self.stored_push_diagnostics.entry(uri.clone()).or_default();
         if diagnostics.is_empty() {
-            self.stored_push_diagnostics.remove(&uri);
+            server_map.remove(&server_name);
+            // Clean up empty outer entry
+            if server_map.is_empty() {
+                self.stored_push_diagnostics.remove(&uri);
+            }
         } else {
-            self.stored_push_diagnostics
-                .insert(uri.clone(), diagnostics);
+            server_map.insert(server_name, diagnostics);
         }
 
         self.merge_and_apply_diagnostics(&uri);
@@ -170,6 +225,52 @@ impl Editor {
         }
 
         self.merge_and_apply_diagnostics(&uri);
+    }
+
+    /// Clear all diagnostics originating from a specific server.
+    ///
+    /// Removes the server's entries from `stored_push_diagnostics`, then
+    /// re-merges and re-applies diagnostics for every affected URI so that
+    /// overlays on screen are updated immediately.
+    pub(crate) fn clear_diagnostics_for_server(&mut self, server_name: &str) {
+        // Collect URIs that have diagnostics from this server.
+        let affected_uris: Vec<String> = self
+            .stored_push_diagnostics
+            .iter()
+            .filter_map(|(uri, server_map)| {
+                if server_map.contains_key(server_name) {
+                    Some(uri.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if affected_uris.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "Clearing diagnostics from server '{}' for {} URIs",
+            server_name,
+            affected_uris.len()
+        );
+
+        for uri in &affected_uris {
+            if let Some(server_map) = self.stored_push_diagnostics.get_mut(uri) {
+                server_map.remove(server_name);
+                if server_map.is_empty() {
+                    self.stored_push_diagnostics.remove(uri);
+                }
+            }
+
+            // Invalidate the diagnostic overlay cache so the re-merge actually
+            // updates on-screen overlays even if the resulting hash happens to
+            // match a previous state.
+            crate::services::lsp::diagnostics::invalidate_cache_for_file(uri);
+
+            self.merge_and_apply_diagnostics(uri);
+        }
     }
 }
 
@@ -605,30 +706,34 @@ impl Editor {
             return;
         }
 
+        // Collect only buffers whose language matches this server's
+        // scope, before mutably borrowing `self.lsp`. Previously this
+        // iterated every open buffer regardless of language, so the
+        // rust handle was asked for inlay hints on `.json` / `.nix`
+        // URIs and replied `file not found (-32603)`.
+        let buffer_infos: Vec<_> = self
+            .buffers_for_language(&language)
+            .into_iter()
+            .map(|(buffer_id, uri)| {
+                let line_count = self
+                    .buffers
+                    .get(&buffer_id)
+                    .and_then(|s| s.buffer.line_count())
+                    .unwrap_or(1000);
+                (uri, line_count)
+            })
+            .collect();
+
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
 
         // LSP should already be running since we got a quiescent notification
-        let Some(client) = lsp.get_handle_mut(&language) else {
+        let Some(sh) = lsp.handle_for_feature_mut(&language, crate::types::LspFeature::InlayHints)
+        else {
             return;
         };
-
-        // Collect buffer info first to avoid borrow issues
-        let buffer_infos: Vec<_> = self
-            .buffer_metadata
-            .iter()
-            .filter_map(|(buffer_id, metadata)| {
-                metadata.file_uri().map(|uri| {
-                    let line_count = self
-                        .buffers
-                        .get(buffer_id)
-                        .and_then(|s| s.buffer.line_count())
-                        .unwrap_or(1000);
-                    (uri.clone(), line_count)
-                })
-            })
-            .collect();
+        let client = &mut sh.handle;
 
         // Request inlay hints for each buffer
         for (uri, line_count) in buffer_infos {
@@ -668,11 +773,12 @@ impl Editor {
 
     /// Re-pull diagnostics for all open buffers associated with the given language.
     fn pull_diagnostics_for_language(&mut self, language: &str) {
-        // Collect URIs and their previous result IDs
+        // Use the shared language-filtered buffer enumeration so requests
+        // never leak out to a server with a different scope.
         let uris: Vec<_> = self
-            .buffer_metadata
-            .values()
-            .filter_map(|metadata| metadata.file_uri().cloned())
+            .buffers_for_language(language)
+            .into_iter()
+            .map(|(_, uri)| uri)
             .collect();
 
         if uris.is_empty() {
@@ -682,9 +788,11 @@ impl Editor {
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let Some(client) = lsp.get_handle_mut(language) else {
+        let Some(sh) = lsp.handle_for_feature_mut(language, crate::types::LspFeature::Diagnostics)
+        else {
             return;
         };
+        let client = &mut sh.handle;
 
         for uri in uris {
             let request_id = self.next_lsp_request_id;
@@ -725,7 +833,6 @@ impl Editor {
                         percentage,
                     },
                 );
-                self.update_lsp_status_from_progress();
             }
             LspProgressValue::Report {
                 message,
@@ -734,14 +841,17 @@ impl Editor {
                 if let Some(info) = self.lsp_progress.get_mut(&token) {
                     info.message = message;
                     info.percentage = percentage;
-                    self.update_lsp_status_from_progress();
                 }
             }
             LspProgressValue::End { .. } => {
                 self.lsp_progress.remove(&token);
-                self.update_lsp_status_from_progress();
             }
         }
+        // If the LSP status popup is open, rebuild it so the progress line
+        // inside reflects the new title / message / percentage.  The
+        // status-bar indicator itself only shows a spinner, so the popup
+        // is the user's only window into the live progress text.
+        self.refresh_lsp_status_popup_if_open();
     }
 
     /// Handle LSP window message (window/showMessage)
@@ -796,18 +906,63 @@ impl Editor {
     }
 
     /// Handle LSP server status update
-    pub(super) fn handle_lsp_status_update(&mut self, language: String, status: LspServerStatus) {
+    pub(super) fn handle_lsp_status_update(
+        &mut self,
+        language: String,
+        server_name: String,
+        status: LspServerStatus,
+    ) {
         use crate::services::async_bridge::LspServerStatus;
 
+        let server_name_ref = server_name.clone();
+        let key = (language.clone(), server_name);
+
         // Get old status for event
-        let old_status = self.lsp_server_statuses.get(&language).cloned();
+        let old_status = self.lsp_server_statuses.get(&key).cloned();
 
         // Update server status
-        self.lsp_server_statuses.insert(language.clone(), status);
-        self.update_lsp_status_from_server_statuses();
+        self.lsp_server_statuses.insert(key, status);
 
         // Update warning domain for LSP status indicator
         self.update_lsp_warning_domain();
+
+        // When a server becomes ready, send didOpen for all open buffers of
+        // that language so the server can start providing diagnostics, etc.
+        // without waiting for the next user edit.
+        if status == LspServerStatus::Running {
+            let was_already_running = old_status
+                .as_ref()
+                .is_some_and(|s| matches!(s, LspServerStatus::Running));
+            if !was_already_running {
+                let scope = self
+                    .lsp
+                    .as_ref()
+                    .and_then(|lsp| lsp.server_scope(&server_name_ref).cloned());
+                match scope {
+                    Some(scope) if scope.is_universal() => {
+                        let languages: Vec<String> = self
+                            .buffers
+                            .values()
+                            .map(|s| s.language.clone())
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        for lang in languages {
+                            self.reopen_buffers_for_language(&lang);
+                        }
+                    }
+                    Some(scope) => {
+                        for lang in scope.languages() {
+                            self.reopen_buffers_for_language(lang);
+                        }
+                    }
+                    None => {
+                        // Per-language server — language comes from the status message
+                        self.reopen_buffers_for_language(&language);
+                    }
+                }
+            }
+        }
 
         // Handle server crash - trigger auto-restart
         if status == LspServerStatus::Error {
@@ -817,8 +972,12 @@ impl Editor {
                 .unwrap_or(false);
 
             if was_running {
+                // Clear stale diagnostics from the crashed server so they
+                // don't linger on screen while we wait for a restart.
+                self.clear_diagnostics_for_server(&server_name_ref);
+
                 if let Some(lsp) = self.lsp.as_mut() {
-                    let message = lsp.handle_server_crash(&language);
+                    let message = lsp.handle_server_crash(&language, &server_name_ref);
                     self.status_message = Some(message);
                 }
             }
@@ -1230,11 +1389,19 @@ impl Editor {
                 if let Some(uri) = uri {
                     let lang_id = state.language.clone();
                     if let Some(lsp) = self.lsp.as_mut() {
-                        // LSP should already be running since we just restarted it
-                        if let Some(handle) = lsp.get_handle_mut(&lang_id) {
-                            let handle_id = handle.id();
-                            if let Err(e) = handle.did_open(uri, content, lang_id) {
-                                tracing::warn!("LSP did_open failed after restart: {}", e);
+                        // Send didOpen to ALL handles for this language, not just the first.
+                        // Each server needs its own didOpen notification.
+                        for sh in lsp.get_handles_mut(&lang_id) {
+                            let handle_id = sh.handle.id();
+                            if let Err(e) =
+                                sh.handle
+                                    .did_open(uri.clone(), content.clone(), lang_id.clone())
+                            {
+                                tracing::warn!(
+                                    "LSP did_open failed for '{}' after restart: {}",
+                                    sh.name,
+                                    e
+                                );
                             } else {
                                 // Mark buffer as opened with this handle so that
                                 // send_lsp_changes_for_buffer doesn't re-send didOpen
@@ -1251,19 +1418,11 @@ impl Editor {
 
     /// Request semantic tokens for all open buffers matching a language.
     pub(super) fn request_semantic_tokens_for_language(&mut self, language: &str) {
-        // Use stored buffer language instead of detecting from path
         let buffer_ids: Vec<_> = self
-            .buffers
-            .iter()
-            .filter_map(|(buffer_id, state)| {
-                if state.language == language {
-                    Some(*buffer_id)
-                } else {
-                    None
-                }
-            })
+            .buffers_for_language(language)
+            .into_iter()
+            .map(|(id, _)| id)
             .collect();
-
         for buffer_id in buffer_ids {
             self.schedule_semantic_tokens_full_refresh(buffer_id);
         }
@@ -1272,17 +1431,10 @@ impl Editor {
     /// Request folding ranges for all open buffers matching a language.
     pub(super) fn request_folding_ranges_for_language(&mut self, language: &str) {
         let buffer_ids: Vec<_> = self
-            .buffers
-            .iter()
-            .filter_map(|(buffer_id, state)| {
-                if state.language == language {
-                    Some(*buffer_id)
-                } else {
-                    None
-                }
-            })
+            .buffers_for_language(language)
+            .into_iter()
+            .map(|(id, _)| id)
             .collect();
-
         for buffer_id in buffer_ids {
             self.schedule_folding_ranges_refresh(buffer_id);
         }

@@ -10,12 +10,12 @@ const editor = getEditor();
 const NAMESPACE = "git-explorer";
 
 const COLORS = {
-  added: [80, 250, 123] as [number, number, number],
-  modified: [255, 184, 108] as [number, number, number],
-  deleted: [255, 85, 85] as [number, number, number],
-  renamed: [139, 233, 253] as [number, number, number],
-  untracked: [241, 250, 140] as [number, number, number],
-  conflicted: [255, 121, 198] as [number, number, number],
+  added:      "ui.file_status_added_fg",
+  modified:   "ui.file_status_modified_fg",
+  deleted:    "ui.file_status_deleted_fg",
+  renamed:    "ui.file_status_renamed_fg",
+  untracked:  "ui.file_status_untracked_fg",
+  conflicted: "ui.file_status_conflicted_fg",
 };
 
 const PRIORITY = {
@@ -58,7 +58,7 @@ function parseStatusOutput(output: string, repoRoot: string) {
     .split(separator)
     .map((entry) => entry.replace(/\r$/, ""))
     .filter((entry) => entry.length > 0);
-  const byPath = new Map<string, { path: string; symbol: string; color: [number, number, number]; priority: number }>();
+  const byPath = new Map<string, { path: string; symbol: string; color: string; priority: number }>();
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
@@ -156,8 +156,14 @@ function onGitExplorerEditorInitialized() {
 }
 registerHandler("onGitExplorerEditorInitialized", onGitExplorerEditorInitialized);
 
+function onGitExplorerFocusGained() {
+  refreshGitExplorerDecorations();
+}
+registerHandler("onGitExplorerFocusGained", onGitExplorerFocusGained);
+
 editor.on("after_file_open", "onGitExplorerAfterFileOpen");
 editor.on("after_file_save", "onGitExplorerAfterFileSave");
 editor.on("editor_initialized", "onGitExplorerEditorInitialized");
+editor.on("focus_gained", "onGitExplorerFocusGained");
 
 refreshGitExplorerDecorations();

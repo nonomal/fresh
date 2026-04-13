@@ -62,7 +62,8 @@ type ColorValue = RGB | string;
 // =============================================================================
 
 const LEFT_WIDTH = 38;
-const RIGHT_WIDTH = 61;
+const RIGHT_WIDTH_CONST = 61;
+function RIGHT_WIDTH(): number { return RIGHT_WIDTH_CONST; }
 
 type PickerFocusTarget =
   | { type: "hex-input" }
@@ -74,28 +75,28 @@ type PickerFocusTarget =
 // =============================================================================
 
 const NAMED_COLORS_PER_ROW = 6;
-const NAMED_COLOR_GRID: Array<Array<{ display: string; value: string; rgb: RGB | null }>> = [
+const NAMED_COLOR_GRID: Array<Array<{ display: string; value: string; rgb: OverlayColorSpec | null }>> = [
   [
-    { display: "Black", value: "Black", rgb: [0, 0, 0] },
-    { display: "Red", value: "Red", rgb: [255, 0, 0] },
-    { display: "Green", value: "Green", rgb: [0, 128, 0] },
-    { display: "Yellow", value: "Yellow", rgb: [255, 255, 0] },
-    { display: "Blue", value: "Blue", rgb: [0, 0, 255] },
-    { display: "Magenta", value: "Magenta", rgb: [255, 0, 255] },
+    { display: "Black", value: "Black", rgb: "Black" },
+    { display: "Red", value: "Red", rgb: "Red" },
+    { display: "Green", value: "Green", rgb: "Green" },
+    { display: "Yellow", value: "Yellow", rgb: "Yellow" },
+    { display: "Blue", value: "Blue", rgb: "Blue" },
+    { display: "Magenta", value: "Magenta", rgb: "Magenta" },
   ],
   [
-    { display: "Cyan", value: "Cyan", rgb: [0, 255, 255] },
-    { display: "Gray", value: "Gray", rgb: [128, 128, 128] },
-    { display: "DkGray", value: "DarkGray", rgb: [169, 169, 169] },
-    { display: "LtRed", value: "LightRed", rgb: [255, 128, 128] },
-    { display: "LtGreen", value: "LightGreen", rgb: [144, 238, 144] },
-    { display: "LtYellw", value: "LightYellow", rgb: [255, 255, 224] },
+    { display: "Cyan", value: "Cyan", rgb: "Cyan" },
+    { display: "Gray", value: "Gray", rgb: "Gray" },
+    { display: "DkGray", value: "DarkGray", rgb: "DarkGray" },
+    { display: "LtRed", value: "LightRed", rgb: "LightRed" },
+    { display: "LtGreen", value: "LightGreen", rgb: "LightGreen" },
+    { display: "LtYellw", value: "LightYellow", rgb: "LightYellow" },
   ],
   [
-    { display: "LtBlue", value: "LightBlue", rgb: [173, 216, 230] },
-    { display: "LtMag", value: "LightMagenta", rgb: [255, 128, 255] },
-    { display: "LtCyan", value: "LightCyan", rgb: [224, 255, 255] },
-    { display: "White", value: "White", rgb: [255, 255, 255] },
+    { display: "LtBlue", value: "LightBlue", rgb: "LightBlue" },
+    { display: "LtMag", value: "LightMagenta", rgb: "LightMagenta" },
+    { display: "LtCyan", value: "LightCyan", rgb: "LightCyan" },
+    { display: "White", value: "White", rgb: "White" },
     { display: "Default", value: "Default", rgb: null },
     { display: "Reset", value: "Reset", rgb: null },
   ],
@@ -333,8 +334,10 @@ interface ThemeEditorState {
   themeData: Record<string, unknown>;
   /** Original theme data (for change detection) */
   originalThemeData: Record<string, unknown>;
-  /** Theme name */
+  /** Theme display name */
   themeName: string;
+  /** Theme registry key (for lookups) */
+  themeKey: string;
   /** Theme file path (null for new themes) */
   themePath: string | null;
   /** Expanded sections */
@@ -345,8 +348,10 @@ interface ThemeEditorState {
   selectedIndex: number;
   /** Whether there are unsaved changes */
   hasChanges: boolean;
-  /** Available built-in themes */
-  builtinThemes: string[];
+  /** All themes from registry: key → {name, pack} */
+  themeRegistry: Map<string, {name: string; pack: string}>;
+  /** Keys of builtin themes (empty pack) */
+  builtinKeys: Set<string>;
   /** Pending save name for overwrite confirmation */
   pendingSaveName: string | null;
   /** Whether current theme is a built-in (requires Save As) */
@@ -355,6 +360,8 @@ interface ThemeEditorState {
   savedCursorPath: string | null;
   /** Whether to close the editor after a successful save */
   closeAfterSave: boolean;
+  /** Whether the Save As prompt has been pre-filled (to distinguish first vs second Enter) */
+  saveAsPreFilled: boolean;
   /** Which panel has focus */
   focusPanel: "tree" | "picker";
   /** Focus target within picker panel */
@@ -369,6 +376,10 @@ interface ThemeEditorState {
   viewportHeight: number;
   /** Cached viewport width */
   viewportWidth: number;
+  /** Buffer group ID (when using buffer groups) */
+  groupId: number | null;
+  /** Panel buffer IDs keyed by panel name */
+  panelBuffers: Record<string, number>;
 }
 
 /**
@@ -409,17 +420,20 @@ const state: ThemeEditorState = {
   sourceBufferId: null,
   themeData: {},
   originalThemeData: {},
-  themeName: "custom",
+  themeName: "",
+  themeKey: "",
   themePath: null,
   expandedSections: new Set(["editor", "syntax"]),
   visibleFields: [],
   selectedIndex: 0,
   hasChanges: false,
-  builtinThemes: [],
+  themeRegistry: new Map(),
+  builtinKeys: new Set(),
   pendingSaveName: null,
   isBuiltin: false,
   savedCursorPath: null,
   closeAfterSave: false,
+  saveAsPreFilled: false,
   focusPanel: "tree",
   pickerFocus: { type: "hex-input" },
   filterText: "",
@@ -427,30 +441,55 @@ const state: ThemeEditorState = {
   treeScrollOffset: 0,
   viewportHeight: 40,
   viewportWidth: 120,
+  groupId: null,
+  panelBuffers: {},
 };
 
 // =============================================================================
 // Color Definitions for UI
 // =============================================================================
 
+/**
+ * UI palette for the theme editor's own chrome.
+ *
+ * Each role maps to a theme-key path (e.g. `"syntax.keyword"`). The plugin
+ * passes these strings straight through to the core as
+ * `OverlayColorSpec::ThemeKey`, and the core's renderer resolves them
+ * against the *currently-active* theme on every frame
+ * (see `OverlayFace::from_options` → `OverlayFace::ThemedStyle`, and the
+ * render-time lookup in `split_rendering.rs`). That means the theme editor
+ * inherits the host theme's look and automatically picks up theme switches
+ * without the plugin having to rebuild its overlays or even be notified —
+ * the `resolve_theme_key` lookup runs with the new theme on the next render.
+ *
+ * Important: we only use keys that the theme defines as readable on
+ * `editor.bg` (since that's the background the theme editor draws over).
+ * That rules out `ui.menu_*`, `ui.tab_*`, etc. — those are designed for
+ * their own bg pairs (e.g. `ui.menu_active_fg` on `ui.menu_active_bg`) and
+ * will clash or go invisible when drawn on `editor.bg` (notoriously in
+ * high-contrast, where `ui.menu_active_fg` is pure black). So we only pull
+ * from `editor.*` and `syntax.*`, and lean on bold + distinct syntax roles
+ * to give each UI element its own visual identity.
+ *
+ * We don't need a client-side fallback chain: the core's `Theme` struct has
+ * serde defaults for every field, so `resolve_theme_key` always returns a
+ * value for any key listed here — a stub theme file can omit them and the
+ * defaults still apply.
+ */
 const colors = {
-  sectionHeader: [255, 200, 100] as RGB,   // Gold
-  fieldName: [200, 200, 255] as RGB,       // Light blue
-  defaultValue: [150, 150, 150] as RGB,    // Gray
-  customValue: [100, 255, 100] as RGB,     // Green
-  description: [120, 120, 120] as RGB,     // Dim gray
-  modified: [255, 255, 100] as RGB,        // Yellow
-  footer: [100, 100, 100] as RGB,          // Gray
-  colorBlock: [200, 200, 200] as RGB,      // Light gray for color swatch outline
-  selectionBg: [50, 50, 80] as RGB,        // Dark blue-gray for selected field
-  divider: [60, 60, 80] as RGB,            // Muted divider color
-  header: [100, 180, 255] as RGB,          // Header blue
-  pickerLabel: [180, 180, 200] as RGB,     // Picker section labels
-  pickerValue: [255, 255, 255] as RGB,     // Picker value text
-  pickerFocusBg: [40, 60, 100] as RGB,     // Picker focused item bg
-  filterText: [200, 200, 100] as RGB,      // Filter input text
-  previewBg: [25, 25, 30] as RGB,          // Preview background
-};
+  sectionHeader: "syntax.keyword",
+  fieldName:     "editor.fg",
+  customValue:   "syntax.string",
+  description:   "syntax.comment",
+  footer:        "editor.line_number_fg",
+  selectionBg:   "editor.selection_bg",
+  divider:       "editor.line_number_fg",
+  header:        "syntax.keyword",
+  pickerLabel:   "editor.fg",
+  pickerValue:   "syntax.constant",
+  pickerFocusBg: "editor.selection_bg",
+  filterText:    "syntax.function",
+} as const satisfies Record<string, OverlayColorSpec>;
 
 // =============================================================================
 // Keyboard Shortcuts (defined once, used in mode and i18n)
@@ -556,6 +595,27 @@ function parseColorToRgb(value: ColorValue): RGB | null {
 }
 
 /**
+ * Convert a color value to an OverlayColorSpec for rendering.
+ * Named colors (e.g. "Yellow") are sent as strings so the editor renders them
+ * using native ANSI color codes, matching the actual theme rendering.
+ * RGB arrays are passed through directly.
+ */
+function colorValueToOverlaySpec(value: ColorValue): OverlayColorSpec | null {
+  if (Array.isArray(value) && value.length === 3) {
+    return value as RGB;
+  }
+  if (typeof value === "string") {
+    // For recognized named colors, send the name directly so the editor
+    // uses native ANSI rendering (matching actual theme output)
+    if (NAMED_COLORS[value] !== undefined) {
+      return value;
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
  * Convert RGB to hex string
  */
 function rgbToHex(r: number, g: number, b: number): string {
@@ -645,33 +705,50 @@ function findThemesDir(): string {
 /**
  * Load list of available built-in themes
  */
-async function loadBuiltinThemes(): Promise<string[]> {
+/**
+ * Load all themes from the registry, returning a map of key → display name.
+ *
+ * The registry is keyed by unique keys (repo URLs, file:// paths, or bare
+ * names for builtins). Each value contains a `name` field (display name)
+ * and `_key`/`_pack` metadata.
+ */
+/**
+ * Load theme registry and populate state.themeRegistry + state.builtinKeys.
+ */
+async function loadThemeRegistry(): Promise<void> {
   try {
-    editor.debug("[theme_editor] loadBuiltinThemes: calling editor.getBuiltinThemes()");
+    editor.debug("[theme_editor] loadThemeRegistry: calling editor.getBuiltinThemes()");
     const rawThemes = editor.getBuiltinThemes();
-    editor.debug(`[theme_editor] loadBuiltinThemes: got rawThemes type=${typeof rawThemes}`);
-    // getBuiltinThemes returns a JSON string, need to parse it
-    const builtinThemes = typeof rawThemes === "string"
-      ? JSON.parse(rawThemes) as Record<string, string>
-      : rawThemes as Record<string, string>;
-    editor.debug(`[theme_editor] loadBuiltinThemes: parsed ${Object.keys(builtinThemes).length} themes`);
-    return Object.keys(builtinThemes);
+    const themes = typeof rawThemes === "string"
+      ? JSON.parse(rawThemes) as Record<string, Record<string, unknown>>
+      : rawThemes as Record<string, Record<string, unknown>>;
+    state.themeRegistry = new Map();
+    state.builtinKeys = new Set();
+    for (const [key, data] of Object.entries(themes)) {
+      const name = (data?.name as string) || key;
+      const pack = (data?._pack as string) || "";
+      state.themeRegistry.set(key, {name, pack});
+      // Builtin themes have an empty pack; user themes start with "user"
+      if (!pack || (!pack.startsWith("user") && !pack.startsWith("pkg"))) {
+        state.builtinKeys.add(key);
+      }
+    }
+    editor.debug(`[theme_editor] loadThemeRegistry: loaded ${state.themeRegistry.size} themes (${state.builtinKeys.size} builtin)`);
   } catch (e) {
-    editor.debug(`[theme_editor] Failed to load built-in themes list: ${e}`);
+    editor.debug(`[theme_editor] Failed to load theme registry: ${e}`);
     throw e;
   }
 }
 
 /**
- * Load theme data by name from the in-memory theme registry.
- * Works for all theme types (builtin, user, package) — no file I/O needed.
+ * Load theme data by key from the in-memory theme registry.
  */
-function loadThemeFile(name: string): Record<string, unknown> | null {
+function loadThemeFile(key: string): Record<string, unknown> | null {
   try {
-    const data = editor.getThemeData(name);
+    const data = editor.getThemeData(key);
     return data as Record<string, unknown> | null;
   } catch (e) {
-    editor.debug(`[theme_editor] Failed to load theme data for '${name}': ${e}`);
+    editor.debug(`[theme_editor] Failed to load theme data for '${key}': ${e}`);
     return null;
   }
 }
@@ -769,8 +846,8 @@ function buildTreeLines(): TreeLine[] {
     type: "header",
   });
 
-  // Separator
-  lines.push({ text: "─".repeat(36), type: "separator" });
+  // Separator (adapt to panel width)
+  lines.push({ text: "─".repeat(Math.max(10, LEFT_WIDTH - 2)), type: "separator" });
 
   // Filter
   if (state.filterText) {
@@ -778,7 +855,7 @@ function buildTreeLines(): TreeLine[] {
       text: `Filter: [${state.filterText}]`,
       type: "filter",
     });
-    lines.push({ text: "─".repeat(36), type: "separator" });
+    lines.push({ text: "─".repeat(Math.max(10, LEFT_WIDTH - 2)), type: "separator" });
   }
 
   // Build visible fields
@@ -805,11 +882,15 @@ function buildTreeLines(): TreeLine[] {
       });
     } else {
       const sel = isSelected && state.focusPanel === "tree" ? "▸" : " ";
-      const name = field.def.key.length > 13 ? field.def.key.slice(0, 12) + "…" : field.def.key;
+      // Adapt name/value truncation to panel width
+      // Layout: "  ▸ name.padEnd(nameW) ██ value" = 6 + nameW + 3 + valueW
+      const nameW = Math.max(8, LEFT_WIDTH - 18);
+      const valueW = Math.max(5, LEFT_WIDTH - nameW - 9);
+      const name = field.def.key.length > nameW ? field.def.key.slice(0, nameW - 1) + "…" : field.def.key;
       const colorStr = formatColorValue(field.value);
-      const valueStr = colorStr.length > 9 ? colorStr.slice(0, 8) + "…" : colorStr;
+      const valueStr = colorStr.length > valueW ? colorStr.slice(0, valueW - 1) + "…" : colorStr;
       lines.push({
-        text: `  ${sel} ${name.padEnd(13)} ██ ${valueStr}`,
+        text: `  ${sel} ${name.padEnd(nameW)} ██ ${valueStr}`,
         type: "tree-field",
         index: i,
         path: field.path,
@@ -846,7 +927,7 @@ function buildPickerLines(): PickerLine[] {
     } else {
       lines.push({ text: "No field selected", type: "picker-title" });
     }
-    lines.push({ text: "─".repeat(RIGHT_WIDTH - 2), type: "picker-separator" });
+    lines.push({ text: "─".repeat(RIGHT_WIDTH() - 2), type: "picker-separator" });
     lines.push({ text: "Select a color field to edit", type: "picker-desc" });
     return lines;
   }
@@ -854,16 +935,21 @@ function buildPickerLines(): PickerLine[] {
   // Field title
   lines.push({ text: `${field.path} - ${field.def.displayName}`, type: "picker-title" });
   lines.push({ text: `"${field.def.description}"`, type: "picker-desc" });
-  lines.push({ text: "─".repeat(RIGHT_WIDTH - 2), type: "picker-separator" });
+  lines.push({ text: "─".repeat(RIGHT_WIDTH() - 2), type: "picker-separator" });
 
-  // Hex / RGB value
-  const colorStr = formatColorValue(field.value);
-  const rgb = parseColorToRgb(field.value);
-  let valueLine = `Hex: ${colorStr}`;
-  if (rgb) {
-    valueLine += `     RGB: ${rgb[0]}, ${rgb[1]}, ${rgb[2]}`;
+  // Color value display
+  const isNamed = typeof field.value === "string" && NAMED_COLORS[field.value] !== undefined;
+  if (isNamed) {
+    lines.push({ text: `Color: ${field.value} (terminal native)`, type: "picker-hex" });
+  } else {
+    const colorStr = formatColorValue(field.value);
+    const rgb = parseColorToRgb(field.value);
+    let valueLine = `Hex: ${colorStr}`;
+    if (rgb) {
+      valueLine += `     RGB: ${rgb[0]}, ${rgb[1]}, ${rgb[2]}`;
+    }
+    lines.push({ text: valueLine, type: "picker-hex" });
   }
-  lines.push({ text: valueLine, type: "picker-hex" });
 
   lines.push({ text: "", type: "picker-blank" });
 
@@ -890,7 +976,7 @@ function buildPickerLines(): PickerLine[] {
     lines.push({ text: rowText, type: "picker-palette-row", paletteRow: row });
   }
 
-  lines.push({ text: "─".repeat(RIGHT_WIDTH - 2), type: "picker-separator" });
+  lines.push({ text: "─".repeat(RIGHT_WIDTH() - 2), type: "picker-separator" });
 
   // Preview section
   lines.push({ text: "Preview:", type: "picker-label" });
@@ -929,14 +1015,22 @@ function styleForLeftEntry(item: TreeLine | undefined): { style?: Partial<Overla
     const paddedLen = getUtf8ByteLength(text.padEnd(LEFT_WIDTH));
     const colorValue = item.colorValue;
     const swatchIdx = colorValue !== undefined ? text.indexOf("██") : -1;
-    const rgb = colorValue !== undefined ? parseColorToRgb(colorValue) : null;
 
-    if (rgb && swatchIdx >= 0) {
+    // For the swatch, use the native color representation to ensure it matches
+    // how the theme actually renders: named colors (e.g. "Yellow") should use
+    // the terminal's native ANSI color, not an RGB approximation.
+    const swatchColor: OverlayColorSpec | null = colorValue !== undefined
+      ? (typeof colorValue === "string" && NAMED_COLORS[colorValue] !== undefined
+        ? colorValue as OverlayColorSpec  // Send named color string directly
+        : parseColorToRgb(colorValue))    // Send RGB for array values
+      : null;
+
+    if (swatchColor && swatchIdx >= 0) {
       const swatchStart = getUtf8ByteLength(text.substring(0, swatchIdx));
       const swatchEnd = swatchStart + getUtf8ByteLength("██");
       // Non-overlapping segments: fieldName | swatch | value
       inlines.push({ start: 0, end: swatchStart, style: { fg: colors.fieldName } });
-      inlines.push({ start: swatchStart, end: swatchEnd, style: { fg: rgb, bg: rgb } });
+      inlines.push({ start: swatchStart, end: swatchEnd, style: { fg: swatchColor, bg: swatchColor } });
       const valueStart = swatchEnd + getUtf8ByteLength(" ");
       if (valueStart < paddedLen) {
         inlines.push({ start: valueStart, end: paddedLen, style: { fg: colors.customValue } });
@@ -1015,10 +1109,10 @@ function styleForRightEntry(item: PickerLine | undefined): { style?: Partial<Ove
     // entry text = " " + item.text
     // item.text = " " + token texts concatenated
     const editorBg = getNestedValue(state.themeData, "editor.bg") as ColorValue;
-    const bgRgb = parseColorToRgb(editorBg);
+    const bgSpec = colorValueToOverlaySpec(editorBg);
     const entryText = " " + item.text;
     const entryLen = getUtf8ByteLength(entryText);
-    const baseStyle: Partial<OverlayOptions> | undefined = bgRgb ? { bg: bgRgb } : undefined;
+    const baseStyle: Partial<OverlayOptions> | undefined = bgSpec ? { bg: bgSpec } : undefined;
 
     // Skip the leading " " + " " (from entry " " prefix + item.text leading " ")
     let charPos = 2; // " " prefix + " " in item.text
@@ -1028,15 +1122,15 @@ function styleForRightEntry(item: PickerLine | undefined): { style?: Partial<Ove
       if (token.syntaxType) {
         const syntaxPath = `syntax.${token.syntaxType}`;
         const syntaxColor = getNestedValue(state.themeData, syntaxPath) as ColorValue;
-        const syntaxRgb = parseColorToRgb(syntaxColor);
-        if (syntaxRgb) {
-          inlines.push({ start: bytePos, end: bytePos + tokenLen, style: { fg: syntaxRgb } });
+        const fgSpec = colorValueToOverlaySpec(syntaxColor);
+        if (fgSpec) {
+          inlines.push({ start: bytePos, end: bytePos + tokenLen, style: { fg: fgSpec } });
         }
       } else {
         const fgColor = getNestedValue(state.themeData, "editor.fg") as ColorValue;
-        const fgRgb = parseColorToRgb(fgColor);
-        if (fgRgb) {
-          inlines.push({ start: bytePos, end: bytePos + tokenLen, style: { fg: fgRgb } });
+        const fgSpec = colorValueToOverlaySpec(fgColor);
+        if (fgSpec) {
+          inlines.push({ start: bytePos, end: bytePos + tokenLen, style: { fg: fgSpec } });
         }
       }
       bytePos += tokenLen;
@@ -1181,7 +1275,7 @@ function addBackgroundHighlight(
   bufferId: number,
   start: number,
   end: number,
-  bgColor: RGB
+  bgColor: OverlayColorSpec
 ): void {
   editor.addOverlay(bufferId, "theme-sel", start, end, { bg: bgColor });
 }
@@ -1292,9 +1386,98 @@ let isUpdatingDisplay = false;
  * Full display update — rebuilds content and all overlays.
  * Use for structural changes (open, section toggle, color edit, filter).
  */
+// --- Buffer Group panel content builders ---
+
+function buildTreePanelEntries(): TextPropertyEntry[] {
+  const entries: TextPropertyEntry[] = [];
+  const allLeftLines = buildTreeLines();
+  for (const item of allLeftLines) {
+    const leftStyle = styleForLeftEntry(item);
+    entries.push({
+      text: " " + item.text + "\n",
+      properties: {
+        type: item.type,
+        index: item.index,
+        path: item.path,
+        selected: item.selected,
+        colorValue: item.colorValue,
+      },
+      style: leftStyle.style,
+      inlineOverlays: leftStyle.inlineOverlays,
+    });
+  }
+  return entries;
+}
+
+function buildPickerPanelEntries(): TextPropertyEntry[] {
+  const entries: TextPropertyEntry[] = [];
+  const rightLines = buildPickerLines();
+  for (const item of rightLines) {
+    const rightStyle = styleForRightEntry(item);
+    entries.push({
+      text: " " + item.text + "\n",
+      properties: {
+        type: item.type,
+        namedRow: item.namedRow,
+        paletteRow: item.paletteRow,
+        previewLineIdx: item.previewLineIdx,
+      },
+      style: rightStyle.style,
+      inlineOverlays: rightStyle.inlineOverlays,
+    });
+  }
+  return entries;
+}
+
+function buildFooterPanelEntries(): TextPropertyEntry[] {
+  const hintText = " ↑↓ Navigate  Tab Switch Panel  Enter Edit  /Filter  Ctrl+S Save  Esc Close";
+  return [{ text: hintText + "\n", style: { fg: colors.header } }];
+}
+
 function updateDisplay(): void {
-  if (state.bufferId === null) return;
   isUpdatingDisplay = true;
+
+  // Always refresh viewport dimensions
+  const viewport = editor.getViewport();
+  if (viewport) {
+    state.viewportHeight = viewport.height;
+    state.viewportWidth = viewport.width;
+  }
+
+  // Buffer group mode: write to each panel separately
+  if (state.groupId !== null) {
+    editor.setPanelContent(state.groupId, "tree", buildTreePanelEntries());
+    editor.setPanelContent(state.groupId, "picker", buildPickerPanelEntries());
+    editor.setPanelContent(state.groupId, "footer", buildFooterPanelEntries());
+
+    // Keep the selected tree row in view. The plugin's `selectedIndex`
+    // navigation doesn't move the buffer cursor, so without this the
+    // core-driven panel viewport would stay at the top even after many
+    // Down-arrow presses, causing the `▸` marker to scroll off-screen
+    // for sections with many fields.
+    const treeBufferId = state.panelBuffers["tree"];
+    if (typeof treeBufferId === "number") {
+      const treeLines = buildTreeLines();
+      let selectedLine = -1;
+      for (let i = 0; i < treeLines.length; i++) {
+        if (treeLines[i].index === state.selectedIndex && treeLines[i].selected) {
+          selectedLine = i;
+          break;
+        }
+      }
+      if (selectedLine >= 0) {
+        editor.scrollBufferToLine(treeBufferId, selectedLine);
+      }
+    }
+
+    isUpdatingDisplay = false;
+    return;
+  }
+
+  if (state.bufferId === null) {
+    isUpdatingDisplay = false;
+    return;
+  }
 
   const entries = buildDisplayEntries();
 
@@ -1344,11 +1527,9 @@ function buildColorSuggestions(field: ThemeField): PromptSuggestion[] {
     suggestions.push({ text: name, description: editor.t("suggestion.terminal_native"), value: name });
   }
 
-  // Add named colors with hex format
+  // Add named colors (terminal native - no hex shown since actual color depends on terminal)
   for (const name of NAMED_COLOR_LIST) {
-    const rgb = NAMED_COLORS[name];
-    const hexValue = rgbToHex(rgb[0], rgb[1], rgb[2]);
-    suggestions.push({ text: name, description: hexValue, value: name });
+    suggestions.push({ text: name, description: editor.t("suggestion.terminal_native"), value: name });
   }
 
   return suggestions;
@@ -1474,11 +1655,7 @@ function onThemeColorPromptConfirmed(args: {
     setNestedValue(state.themeData, path, result.value);
     state.hasChanges = !deepEqual(state.themeData, state.originalThemeData);
 
-    const entries = buildDisplayEntries();
-    if (state.bufferId !== null) {
-      editor.setVirtualBufferContent(state.bufferId, entries);
-      applySelectionHighlighting(entries);
-    }
+    updateDisplay();
     moveCursorToField(path);
     editor.setStatus(editor.t("status.updated", { path }));
   } else {
@@ -1524,28 +1701,17 @@ async function onThemeOpenPromptConfirmed(args: {
 }): Promise<boolean> {
   if (args.prompt_type !== "theme-open") return true;
 
-  const value = args.input.trim();
+  const key = args.input.trim();
+  const isBuiltin = state.builtinKeys.has(key);
+  const entry = state.themeRegistry.get(key);
+  const themeName = entry?.name || key;
 
-  // Parse the value to determine if it's user or builtin
-  let isBuiltin = false;
-  let themeName = value;
-
-  if (value.startsWith("user:")) {
-    themeName = value.slice(5);
-    isBuiltin = false;
-  } else if (value.startsWith("builtin:")) {
-    themeName = value.slice(8);
-    isBuiltin = true;
-  } else {
-    // Fallback: check if it's a builtin theme
-    isBuiltin = state.builtinThemes.includes(value);
-  }
-
-  const themeData = loadThemeFile(themeName);
+  const themeData = loadThemeFile(key);
   if (themeData) {
     state.themeData = deepClone(themeData);
     state.originalThemeData = deepClone(themeData);
     state.themeName = themeName;
+    state.themeKey = key;
     state.themePath = null;
     state.isBuiltin = isBuiltin;
     state.hasChanges = false;
@@ -1572,10 +1738,31 @@ async function onThemeSaveAsPromptConfirmed(args: {
 
   const name = args.input.trim();
   if (name) {
+    // If user accepted a suggestion without typing, pre-fill the prompt so they can edit the name
+    if (args.selected_index !== null && !state.saveAsPreFilled) {
+      state.saveAsPreFilled = true;
+      editor.startPromptWithInitial(editor.t("prompt.save_as"), "theme-save-as", name);
+      editor.setPromptSuggestions([{
+        text: state.themeName,
+        description: state.isBuiltin
+          ? editor.t("suggestion.current_builtin")
+          : editor.t("suggestion.current"),
+        value: state.themeName,
+      }]);
+      return true;
+    }
+    state.saveAsPreFilled = false;
+
     // Reject names that match a built-in theme
-    if (state.builtinThemes.includes(name)) {
-      editor.setStatus(editor.t("error.name_is_builtin", { name }));
-      theme_editor_save_as();
+    if (state.builtinKeys.has(name)) {
+      editor.startPromptWithInitial(editor.t("prompt.save_as_builtin_error"), "theme-save-as", name);
+      editor.setPromptSuggestions([{
+        text: state.themeName,
+        description: state.isBuiltin
+          ? editor.t("suggestion.current_builtin")
+          : editor.t("suggestion.current"),
+        value: state.themeName,
+      }]);
       return true;
     }
 
@@ -1637,30 +1824,19 @@ async function onThemeSelectInitialPromptConfirmed(args: {
   }
   editor.debug(`[theme_editor] prompt_type matched, processing selection...`);
 
-  const value = args.input.trim();
-
-  // Parse the value to determine if it's user or builtin
-  let isBuiltin = false;
-  let themeName = value;
-
-  if (value.startsWith("user:")) {
-    themeName = value.slice(5);
-    isBuiltin = false;
-  } else if (value.startsWith("builtin:")) {
-    themeName = value.slice(8);
-    isBuiltin = true;
-  } else {
-    // Fallback: check if it's a builtin theme
-    isBuiltin = state.builtinThemes.includes(value);
-  }
+  const key = args.input.trim();
+  const isBuiltin = state.builtinKeys.has(key);
+  const entry = state.themeRegistry.get(key);
+  const themeName = entry?.name || key;
 
   editor.debug(editor.t("status.loading"));
 
-  const themeData = loadThemeFile(themeName);
+  const themeData = loadThemeFile(key);
   if (themeData) {
     state.themeData = deepClone(themeData);
     state.originalThemeData = deepClone(themeData);
     state.themeName = themeName;
+    state.themeKey = key;
     state.themePath = null;
     state.isBuiltin = isBuiltin;
     state.hasChanges = false;
@@ -1702,6 +1878,11 @@ async function saveTheme(name?: string, restorePath?: string | null): Promise<bo
   // (must match Rust's normalize_theme_name so config name matches filename)
   const themeName = (name || state.themeName).toLowerCase().replace(/[_ ]/g, "-");
 
+  if (!themeName) {
+    editor.setStatus(editor.t("status.save_failed", { error: "No theme name" }));
+    return false;
+  }
+
   try {
     // Build a complete theme object from all known fields.
     // This ensures we always write every field, even if state.themeData
@@ -1725,16 +1906,13 @@ async function saveTheme(name?: string, restorePath?: string | null): Promise<bo
 
     state.themePath = savedPath;
     state.themeName = themeName;
+    state.themeKey = `file://${savedPath}`;
     state.isBuiltin = false; // After saving, it's now a user theme
     state.originalThemeData = deepClone(state.themeData);
     state.hasChanges = false;
 
     // Update display
-    const entries = buildDisplayEntries();
-    if (state.bufferId !== null) {
-      editor.setVirtualBufferContent(state.bufferId, entries);
-      applySelectionHighlighting(entries);
-    }
+    updateDisplay();
 
     // Restore cursor position if provided
     if (restorePath) {
@@ -1840,7 +2018,17 @@ function onThemeEditorCursorMoved(data: {
   new_position: number;
   text_properties?: Array<Record<string, any>>;
 }): void {
-  if (state.bufferId === null || data.buffer_id !== state.bufferId) return;
+  if (state.bufferId === null) return;
+  // Accept cursor_moved events for any of the buffer group's panels
+  // (tree, picker, footer). With buffer groups each panel is its own
+  // buffer, so clicks in the picker fire cursor_moved for the picker
+  // buffer — not the tree buffer (state.bufferId). We must handle
+  // events for all of them so picker clicks (named colors, palette,
+  // hex) still update selection/colors.
+  const groupBufferIds = Object.values(state.panelBuffers || {});
+  const isGroupBuffer =
+    data.buffer_id === state.bufferId || groupBufferIds.includes(data.buffer_id);
+  if (!isGroupBuffer) return;
   if (isUpdatingDisplay) return;
 
   const props = data.text_properties || [];
@@ -1911,20 +2099,6 @@ function onThemeEditorResize(data: { width: number; height: number }): void {
 registerHandler("onThemeEditorResize", onThemeEditorResize);
 editor.on("resize", "onThemeEditorResize");
 
-function onThemeEditorMouseScroll(data: { buffer_id: number; delta: number; col: number; row: number }): void {
-  if (state.bufferId === null || data.buffer_id !== state.bufferId) return;
-
-  // Only scroll the tree when mouse is over the left panel area (col < LEFT_WIDTH)
-  if (data.col >= LEFT_WIDTH) return;
-
-  // delta > 0 = scroll down, delta < 0 = scroll up
-  const scrollAmount = data.delta > 0 ? 3 : -3;
-  state.treeScrollOffset = Math.max(0, state.treeScrollOffset + scrollAmount);
-  updateDisplay();
-}
-registerHandler("onThemeEditorMouseScroll", onThemeEditorMouseScroll);
-editor.on("mouse_scroll", "onThemeEditorMouseScroll");
-
 /**
  * Handle buffer_closed event to reset state when buffer is closed by any means
  */
@@ -1973,20 +2147,24 @@ async function onThemeInspectKey(data: {
   // Save context
   state.sourceSplitId = editor.getActiveSplitId();
   state.sourceBufferId = editor.getActiveBufferId();
-  state.builtinThemes = await loadBuiltinThemes();
+  await loadThemeRegistry();
 
-  // Auto-load the current theme (builtin or user)
-  const isBuiltin = state.builtinThemes.includes(data.theme_name);
-  const themeData = loadThemeFile(data.theme_name);
+  // Auto-load the current theme (data.theme_name is the config key)
+  const themeKey = data.theme_name;
+  const isBuiltin = state.builtinKeys.has(themeKey);
+  const entry = state.themeRegistry.get(themeKey);
+  const themeName = entry?.name || themeKey;
+  const themeData = loadThemeFile(themeKey);
   if (themeData) {
     state.themeData = deepClone(themeData);
     state.originalThemeData = deepClone(themeData);
-    state.themeName = data.theme_name;
+    state.themeName = themeName;
+    state.themeKey = themeKey;
     state.themePath = null;
     state.isBuiltin = isBuiltin;
     state.hasChanges = false;
   } else {
-    editor.setStatus(`Failed to load theme '${data.theme_name}'`);
+    editor.setStatus(`Failed to load theme '${themeName}'`);
     return;
   }
 
@@ -2388,46 +2566,35 @@ async function open_theme_editor() : Promise<void> {
 
   editor.debug("[theme_editor] loading builtin themes...");
   // Load available themes
-  state.builtinThemes = await loadBuiltinThemes();
-  editor.debug(`[theme_editor] loaded ${state.builtinThemes.length} builtin themes`);
+  await loadThemeRegistry();
+  editor.debug(`[theme_editor] loaded ${state.themeRegistry.size} themes (${state.builtinKeys.size} builtin)`);
 
-  // Get current theme name from config
+  // Get current theme key from config
   const config = editor.getConfig() as Record<string, unknown>;
-  const currentThemeName = (config?.theme as string) || "dark";
+  const currentThemeKey = (config?.theme as string) || "dark";
 
   // Prompt user to select which theme to edit
   editor.startPrompt(editor.t("prompt.select_theme_to_edit"), "theme-select-initial");
 
   const suggestions: PromptSuggestion[] = [];
 
-  // Add user themes first (from themes directory)
-  const userThemesDir = editor.getThemesDir();
-  try {
-    const entries = editor.readDir(userThemesDir);
-    for (const e of entries) {
-      if (e.is_file && e.name.endsWith(".json")) {
-        const name = e.name.replace(".json", "");
-        const isCurrent = name === currentThemeName;
-        suggestions.push({
-          text: name,
-          description: isCurrent ? editor.t("suggestion.user_theme_current") : editor.t("suggestion.user_theme"),
-          value: `user:${name}`,
-        });
-      }
+  // Build suggestions from theme registry (user themes first, then builtins)
+  const userSuggestions: PromptSuggestion[] = [];
+  const builtinSuggestions: PromptSuggestion[] = [];
+  for (const [key, {name}] of state.themeRegistry) {
+    const isCurrent = key === currentThemeKey || name === currentThemeKey;
+    const isBuiltin = state.builtinKeys.has(key);
+    const desc = isBuiltin
+      ? (isCurrent ? editor.t("suggestion.builtin_theme_current") : editor.t("suggestion.builtin_theme"))
+      : (isCurrent ? editor.t("suggestion.user_theme_current") : editor.t("suggestion.user_theme"));
+    const suggestion = { text: name, description: desc, value: key };
+    if (isBuiltin) {
+      builtinSuggestions.push(suggestion);
+    } else {
+      userSuggestions.push(suggestion);
     }
-  } catch {
-    // No user themes directory
   }
-
-  // Add built-in themes
-  for (const name of state.builtinThemes) {
-    const isCurrent = name === currentThemeName;
-    suggestions.push({
-      text: name,
-      description: isCurrent ? editor.t("suggestion.builtin_theme_current") : editor.t("suggestion.builtin_theme"),
-      value: `builtin:${name}`,
-    });
-  }
+  suggestions.push(...userSuggestions, ...builtinSuggestions);
 
   // Sort suggestions to put current theme first
   suggestions.sort((a, b) => {
@@ -2454,38 +2621,30 @@ async function doOpenThemeEditor(): Promise<void> {
   }
   state.treeScrollOffset = 0;
 
-  editor.debug("[theme_editor] doOpenThemeEditor: building display entries");
-  // Build initial entries
-  const entries = buildDisplayEntries();
-  editor.debug(`[theme_editor] doOpenThemeEditor: built ${entries.length} entries`);
-
-  // Create virtual buffer in current split (no new split)
-  editor.debug("[theme_editor] doOpenThemeEditor: calling createVirtualBuffer...");
-  const result = await editor.createVirtualBuffer({
-    name: "*Theme Editor*",
-    mode: "theme-editor",
-    readOnly: true,
-    entries: entries,
-    showLineNumbers: false,
-    showCursors: false,
-    editingDisabled: true,
+  // Create buffer group with layout: horizontal split (tree | picker) + footer
+  const layout = JSON.stringify({
+    type: "split",
+    direction: "v",
+    ratio: 0.95,
+    first: {
+      type: "split",
+      direction: "h",
+      ratio: 0.38,
+      first: { type: "scrollable", id: "tree" },
+      second: { type: "scrollable", id: "picker" },
+    },
+    second: { type: "fixed", id: "footer", height: 1 },
   });
-  const bufferId = result.bufferId;
-  editor.debug(`[theme_editor] doOpenThemeEditor: createVirtualBuffer returned bufferId=${bufferId}`);
-  editor.debug(`[theme_editor] doOpenThemeEditor: checking if bufferId !== null...`);
 
-  if (bufferId !== null) {
-    editor.debug(`[theme_editor] doOpenThemeEditor: bufferId is not null, setting state...`);
-    state.bufferId = bufferId;
-    state.splitId = null;
+  const groupResult = await editor.createBufferGroup("*Theme Editor*", "theme-editor", layout);
+  state.groupId = groupResult.groupId;
+  state.panelBuffers = groupResult.panels;
+  state.bufferId = groupResult.panels["tree"]; // representative buffer
+  state.splitId = null;
 
-    // Disable line wrapping — our layout is fixed-width
-    editor.setLineWrap(bufferId, null, false);
-
-    editor.debug(`[theme_editor] doOpenThemeEditor: calling applySelectionHighlighting...`);
-    applySelectionHighlighting();
-    editor.debug(`[theme_editor] doOpenThemeEditor: applySelectionHighlighting completed`);
-    editor.debug(`[theme_editor] doOpenThemeEditor: calling setStatus...`);
+  if (state.bufferId !== null) {
+    // Set initial content for all panels
+    updateDisplay();
     editor.debug(editor.t("status.ready"));
     editor.debug(`[theme_editor] doOpenThemeEditor: completed successfully`);
   } else {
@@ -2519,8 +2678,12 @@ registerHandler("theme_editor_close", theme_editor_close);
  * Actually close the editor (called after confirmation or when no changes)
  */
 function doCloseEditor(): void {
-  // Close the buffer (this will switch to another buffer in the same split)
-  if (state.bufferId !== null) {
+  // Close the buffer group (or fall back to single buffer close)
+  if (state.groupId !== null) {
+    editor.closeBufferGroup(state.groupId);
+    state.groupId = null;
+    state.panelBuffers = {};
+  } else if (state.bufferId !== null) {
     editor.closeBuffer(state.bufferId);
   }
 
@@ -2611,32 +2774,20 @@ function theme_editor_open() : void {
 
   const suggestions: PromptSuggestion[] = [];
 
-  // Add user themes first (from themes directory)
-  const userThemesDir = editor.getThemesDir();
-  try {
-    const entries = editor.readDir(userThemesDir);
-    for (const e of entries) {
-      if (e.is_file && e.name.endsWith(".json")) {
-        const name = e.name.replace(".json", "");
-        suggestions.push({
-          text: name,
-          description: editor.t("suggestion.user_theme"),
-          value: `user:${name}`,
-        });
-      }
+  // Build suggestions from theme registry (user themes first, then builtins)
+  const userSuggestions: PromptSuggestion[] = [];
+  const builtinSuggestions: PromptSuggestion[] = [];
+  for (const [key, {name}] of state.themeRegistry) {
+    const isBuiltin = state.builtinKeys.has(key);
+    const desc = isBuiltin ? editor.t("suggestion.builtin_theme") : editor.t("suggestion.user_theme");
+    const suggestion = { text: name, description: desc, value: key };
+    if (isBuiltin) {
+      builtinSuggestions.push(suggestion);
+    } else {
+      userSuggestions.push(suggestion);
     }
-  } catch {
-    // No user themes directory
   }
-
-  // Add built-in themes
-  for (const name of state.builtinThemes) {
-    suggestions.push({
-      text: name,
-      description: editor.t("suggestion.builtin_theme"),
-      value: `builtin:${name}`,
-    });
-  }
+  suggestions.push(...userSuggestions, ...builtinSuggestions);
 
   editor.setPromptSuggestions(suggestions);
 }
@@ -2725,11 +2876,14 @@ function theme_editor_save_as() : void {
     state.savedCursorPath = getCurrentFieldPath();
   }
 
+  state.saveAsPreFilled = false;
   editor.startPrompt(editor.t("prompt.save_as"), "theme-save-as");
 
   editor.setPromptSuggestions([{
     text: state.themeName,
-    description: editor.t("suggestion.current"),
+    description: state.isBuiltin
+      ? editor.t("suggestion.current_builtin")
+      : editor.t("suggestion.current"),
     value: state.themeName,
   }]);
 }
@@ -2740,8 +2894,7 @@ registerHandler("theme_editor_save_as", theme_editor_save_as);
  */
 async function theme_editor_reload() : Promise<void> {
   if (state.themePath) {
-    const themeName = state.themeName;
-    const themeData = loadThemeFile(themeName);
+    const themeData = loadThemeFile(state.themeKey);
     if (themeData) {
       state.themeData = deepClone(themeData);
       state.originalThemeData = deepClone(themeData);
@@ -2808,7 +2961,8 @@ async function onThemeDeletePromptConfirmed(args: {
         // Reset to default theme
         state.themeData = createDefaultTheme();
         state.originalThemeData = deepClone(state.themeData);
-        state.themeName = "custom";
+        state.themeName = "";
+        state.themeKey = "";
         state.themePath = null;
         state.hasChanges = false;
         updateDisplay();

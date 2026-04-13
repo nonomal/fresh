@@ -28,6 +28,12 @@ impl Editor {
 
     /// Common split creation logic
     fn split_pane_impl(&mut self, direction: crate::model::event::SplitDirection) {
+        // Splitting the layout is a commitment gesture for any preview tab:
+        // the user is setting up their working environment around it. Promote
+        // before touching the split tree so the invariant "preview is anchored
+        // to a single split" stays consistent across the operation.
+        self.promote_current_preview();
+
         let current_buffer_id = self.active_buffer();
         let active_split = self.split_manager.active_split();
 
@@ -67,8 +73,10 @@ impl Editor {
                 );
                 view_state.apply_config_defaults(
                     self.config.editor.line_numbers,
-                    self.config.editor.line_wrap,
+                    self.config.editor.highlight_current_line,
+                    self.resolve_line_wrap_for_buffer(current_buffer_id),
                     self.config.editor.wrap_indent,
+                    self.resolve_wrap_column_for_buffer(current_buffer_id),
                     self.config.editor.rulers.clone(),
                 );
 
@@ -119,6 +127,12 @@ impl Editor {
 
     /// Close the active split
     pub fn close_active_split(&mut self) {
+        // Closing a split rearranges tab ownership (remaining tabs migrate
+        // to the new active split). Promote any preview first so it doesn't
+        // end up orphaned in a split that no longer exists, or silently
+        // migrated to an unrelated pane.
+        self.promote_current_preview();
+
         let closing_split = self.split_manager.active_split();
 
         // Get the tabs from the split we're closing before we close it
@@ -138,10 +152,10 @@ impl Editor {
 
                 // Transfer tabs from closed split to the new active split
                 if let Some(view_state) = self.split_view_states.get_mut(&new_active_split) {
-                    for buffer_id in closing_split_tabs {
+                    for target in closing_split_tabs {
                         // Only add if not already in the split's tabs
-                        if !view_state.open_buffers.contains(&buffer_id) {
-                            view_state.open_buffers.push(buffer_id);
+                        if !view_state.open_buffers.contains(&target) {
+                            view_state.open_buffers.push(target);
                         }
                     }
                 }
@@ -180,6 +194,9 @@ impl Editor {
 
         // Ensure the active tab is visible in the newly active split
         let split_id = self.split_manager.active_split();
+        // Moving focus to a different split commits the preview — walking
+        // away is commitment. Matches the rule applied in `focus_split`.
+        self.promote_preview_if_not_in_split(split_id);
         self.ensure_active_tab_visible(split_id, self.active_buffer(), self.effective_tabs_width());
 
         let buffer_id = self.active_buffer();
@@ -339,9 +356,14 @@ impl Editor {
         &self.cached_layout.split_areas
     }
 
-    /// Get the ratio of a specific split (for testing)
+    /// Get the ratio of a specific split (for testing).
+    ///
+    /// Looks in the main split tree first, then falls back to splits
+    /// that live inside stashed Grouped subtrees (buffer-group panels).
     pub fn get_split_ratio(&self, split_id: SplitId) -> Option<f32> {
-        self.split_manager.get_ratio(split_id)
+        self.split_manager
+            .get_ratio(split_id)
+            .or_else(|| self.grouped_split_ratio(crate::model::event::ContainerId(split_id)))
     }
 
     /// Get the active split ID (for testing)
@@ -358,7 +380,7 @@ impl Editor {
     pub fn get_split_tabs(&self, split_id: LeafId) -> Vec<BufferId> {
         self.split_view_states
             .get(&split_id)
-            .map(|vs| vs.open_buffers.clone())
+            .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default()
     }
 

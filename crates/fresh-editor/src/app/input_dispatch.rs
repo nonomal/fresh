@@ -34,10 +34,20 @@ impl Editor {
 
         // Handle terminal mode input
         if self.terminal_mode {
+            // If the user navigated away from the terminal buffer (e.g. opened
+            // Review Diff via the command palette), the active buffer is no
+            // longer a terminal. Exit terminal mode so the new buffer's
+            // keybindings work.
+            if !self.is_terminal_buffer(self.active_buffer()) {
+                self.terminal_mode = false;
+                self.key_context = crate::input::keybindings::KeyContext::Normal;
+                return None; // fall through to normal input dispatch
+            }
             let mut ctx = InputContext::new();
-            let mut handler =
-                TerminalModeInputHandler::new(self.keyboard_capture, &self.keybindings);
+            let keybindings = self.keybindings.read().unwrap();
+            let mut handler = TerminalModeInputHandler::new(self.keyboard_capture, &keybindings);
             let result = handler.dispatch_input(event, &mut ctx);
+            drop(keybindings);
             self.process_deferred_actions(ctx);
             return Some(result);
         }
@@ -108,10 +118,11 @@ impl Editor {
                 .contains(crossterm::event::KeyModifiers::ALT)
             {
                 if let crossterm::event::KeyCode::Char(_) = event.code {
-                    if let Some(action) = self.keybindings.resolve_in_context_only(
+                    let prompt_action = self.keybindings.read().unwrap().resolve_in_context_only(
                         event,
                         crate::input::keybindings::KeyContext::Prompt,
-                    ) {
+                    );
+                    if let Some(action) = prompt_action {
                         // For file browser actions, route to handle_file_open_action
                         if self.is_file_open_active() && self.handle_file_open_action(&action) {
                             return Some(InputResult::Consumed);
@@ -282,42 +293,6 @@ impl Editor {
             }
             DeferredAction::ConfirmPopup => {
                 self.handle_action(Action::PopupConfirm)?;
-            }
-            DeferredAction::CompletionEnterKey => {
-                use crate::config::AcceptSuggestionOnEnter;
-                match self.config.editor.accept_suggestion_on_enter {
-                    AcceptSuggestionOnEnter::On => {
-                        // Enter always accepts
-                        self.handle_action(Action::PopupConfirm)?;
-                    }
-                    AcceptSuggestionOnEnter::Off => {
-                        // Enter inserts newline - close popup and insert newline
-                        self.hide_popup();
-                        self.handle_action(Action::InsertNewline)?;
-                    }
-                    AcceptSuggestionOnEnter::Smart => {
-                        // Accept if completion differs from typed text
-                        // For now, we check if there's a selected item with data
-                        // that differs from what's in the buffer
-                        let should_accept = self
-                            .active_state()
-                            .popups
-                            .top()
-                            .and_then(|p| p.selected_item())
-                            .map(|item| {
-                                // If there's selection data, accept the completion
-                                item.data.is_some()
-                            })
-                            .unwrap_or(false);
-
-                        if should_accept {
-                            self.handle_action(Action::PopupConfirm)?;
-                        } else {
-                            self.hide_popup();
-                            self.handle_action(Action::InsertNewline)?;
-                        }
-                    }
-                }
             }
             DeferredAction::PopupTypeChar(c) => {
                 self.handle_popup_type_char(c);

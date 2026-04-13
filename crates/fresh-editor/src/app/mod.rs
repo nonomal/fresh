@@ -1,9 +1,11 @@
 mod async_messages;
+mod buffer_groups;
 mod buffer_management;
 mod calibration_actions;
 pub mod calibration_wizard;
 mod clipboard;
 mod composite_buffer_actions;
+mod dabbrev_actions;
 pub mod event_debug;
 mod event_debug_actions;
 mod file_explorer;
@@ -56,31 +58,35 @@ pub fn editor_tick(
 ) -> AnyhowResult<bool> {
     let mut needs_render = false;
 
-    if {
+    let async_messages = {
         let _s = tracing::info_span!("process_async_messages").entered();
         editor.process_async_messages()
-    } {
+    };
+    if async_messages {
         needs_render = true;
     }
-    if {
+    let pending_file_opens = {
         let _s = tracing::info_span!("process_pending_file_opens").entered();
         editor.process_pending_file_opens()
-    } {
+    };
+    if pending_file_opens {
         needs_render = true;
     }
     if editor.process_line_scan() {
         needs_render = true;
     }
-    if {
+    let search_scan = {
         let _s = tracing::info_span!("process_search_scan").entered();
         editor.process_search_scan()
-    } {
+    };
+    if search_scan {
         needs_render = true;
     }
-    if {
+    let search_overlay_refresh = {
         let _s = tracing::info_span!("check_search_overlay_refresh").entered();
         editor.check_search_overlay_refresh()
-    } {
+    };
+    if search_overlay_refresh {
         needs_render = true;
     }
     if editor.check_mouse_hover_timer() {
@@ -161,7 +167,8 @@ use crate::input::commands::Suggestion;
 use crate::input::keybindings::{Action, KeyContext, KeybindingResolver};
 use crate::input::position_history::PositionHistory;
 use crate::input::quick_open::{
-    FileProvider, GotoLineProvider, QuickOpenContext, QuickOpenProvider, QuickOpenRegistry,
+    BufferInfo, BufferProvider, CommandProvider, FileProvider, GotoLineProvider, QuickOpenContext,
+    QuickOpenRegistry,
 };
 use crate::model::cursor::Cursors;
 use crate::model::event::{Event, EventLog, LeafId, SplitDirection, SplitId};
@@ -173,7 +180,7 @@ use crate::services::plugins::PluginManager;
 use crate::services::recovery::{RecoveryConfig, RecoveryService};
 use crate::services::time_source::{RealTimeSource, SharedTimeSource};
 use crate::state::EditorState;
-use crate::types::LspServerConfig;
+use crate::types::{LspLanguageConfig, LspServerConfig, ProcessLimits};
 use crate::view::file_tree::{FileTree, FileTreeView};
 use crate::view::prompt::{Prompt, PromptType};
 use crate::view::scroll_sync::ScrollSyncManager;
@@ -208,11 +215,7 @@ pub use crate::model::event::BufferId;
 
 /// Helper function to convert lsp_types::Uri to PathBuf
 fn uri_to_path(uri: &lsp_types::Uri) -> Result<PathBuf, String> {
-    // Convert to url::Url for path conversion
-    url::Url::parse(uri.as_str())
-        .map_err(|e| format!("Failed to parse URI: {}", e))?
-        .to_file_path()
-        .map_err(|_| "URI is not a file path".to_string())
+    fresh_core::file_uri::lsp_uri_to_path(uri).ok_or_else(|| "URI is not a file path".to_string())
 }
 
 /// A pending grammar registration waiting for reload_grammars() to apply
@@ -255,6 +258,23 @@ struct FoldingRangeRequest {
     version: u64,
 }
 
+/// State for the dabbrev cycling session (Alt+/ style).
+///
+/// When the user presses Alt+/ repeatedly, we cycle through candidates
+/// in proximity order without showing a popup. The session is reset when
+/// any other action is taken (typing, moving, etc.).
+#[derive(Debug, Clone)]
+pub struct DabbrevCycleState {
+    /// The original prefix the user typed before the first expansion.
+    pub original_prefix: String,
+    /// Byte position where the prefix starts.
+    pub word_start: usize,
+    /// The list of candidates (ordered by proximity).
+    pub candidates: Vec<String>,
+    /// Current index into `candidates`.
+    pub index: usize,
+}
+
 /// The main editor struct - manages multiple buffers, clipboard, and rendering
 pub struct Editor {
     /// All open buffers
@@ -293,6 +313,11 @@ pub struct Editor {
     /// When true, `flush_pending_grammars()` defers work until the build completes.
     grammar_build_in_progress: bool,
 
+    /// Whether the initial full grammar build (user grammars + language packs)
+    /// still needs to happen. Deferred from construction so that plugin-registered
+    /// grammars from the first event-loop tick are included in a single build.
+    needs_full_grammar_build: bool,
+
     /// Cancellation flag for the current streaming grep search.
     streaming_grep_cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
@@ -319,8 +344,8 @@ pub struct Editor {
     /// Blend amount for the ANSI background (0..1)
     background_fade: f32,
 
-    /// Keybinding resolver
-    keybindings: KeybindingResolver,
+    /// Keybinding resolver (shared with Quick Open CommandProvider)
+    keybindings: Arc<RwLock<KeybindingResolver>>,
 
     /// Shared clipboard (handles both internal and system clipboard)
     clipboard: crate::services::clipboard::Clipboard,
@@ -400,6 +425,27 @@ pub struct Editor {
     /// File explorer view (optional, only when open)
     file_explorer: Option<FileTreeView>,
 
+    /// Buffer currently opened in "preview" (ephemeral) mode, together with
+    /// the split (pane) it lives in. At most one preview exists editor-wide.
+    ///
+    /// Invariants:
+    /// - The `is_preview` flag on the referenced buffer's metadata is true
+    ///   iff this tuple is `Some` and points at that buffer.
+    /// - The preview is **anchored to the split it was opened in**. Moving
+    ///   focus to a different split, splitting the layout, or closing the
+    ///   hosting split promotes the preview to a permanent tab first, so
+    ///   layout manipulations never silently destroy the tab the user was
+    ///   reading.
+    /// - Cleared when the buffer is closed or promoted (edit / double-click
+    ///   / tab-click / explicit Enter in the explorer).
+    preview: Option<(LeafId, BufferId)>,
+
+    /// One-shot flag: when true, the next `open_file` call skips writing to
+    /// the back/forward position history. Set by `open_file_preview` so a
+    /// string of exploratory single-clicks doesn't flood the history stack
+    /// with entries pointing at tabs that are about to be closed.
+    suppress_position_history_once: bool,
+
     /// Filesystem manager for file explorer
     fs_manager: Arc<FsManager>,
 
@@ -449,6 +495,9 @@ pub struct Editor {
     /// Whether status bar is visible
     status_bar_visible: bool,
 
+    /// Whether prompt line is visible (when no prompt is active)
+    prompt_line_visible: bool,
+
     /// Whether mouse capture is enabled
     mouse_enabled: bool,
 
@@ -484,8 +533,8 @@ pub struct Editor {
     /// Next LSP request ID
     next_lsp_request_id: u64,
 
-    /// Pending LSP completion request ID (if any)
-    pending_completion_request: Option<u64>,
+    /// Pending LSP completion request IDs (supports multiple servers)
+    pending_completion_requests: HashSet<u64>,
 
     /// Original LSP completion items (for type-to-filter)
     /// Stored when completion popup is shown, used for re-filtering as user types
@@ -495,11 +544,25 @@ pub struct Editor {
     /// When Some, completion will be triggered when this instant is reached
     scheduled_completion_trigger: Option<Instant>,
 
+    /// Pluggable completion service that orchestrates multiple providers
+    /// (dabbrev, buffer words, LSP, plugin providers).
+    completion_service: crate::services::completion::CompletionService,
+
+    /// Dabbrev cycling state: when the user presses Alt+/ repeatedly, we
+    /// cycle through candidates without a popup. `None` when not in a
+    /// dabbrev session. Reset when any other action is taken.
+    dabbrev_state: Option<DabbrevCycleState>,
+
     /// Pending LSP go-to-definition request ID (if any)
     pending_goto_definition_request: Option<u64>,
 
     /// Pending LSP hover request ID (if any)
     pending_hover_request: Option<u64>,
+
+    /// LSP position (line, UTF-16 character) of the pending hover request.
+    /// Retained so `handle_hover_response` can look up diagnostics whose
+    /// range overlaps this position and fuse them into the hover card.
+    pending_hover_position: Option<(u32, u32)>,
 
     /// Pending LSP find references request ID (if any)
     pending_references_request: Option<u64>,
@@ -510,8 +573,16 @@ pub struct Editor {
     /// Pending LSP signature help request ID (if any)
     pending_signature_help_request: Option<u64>,
 
-    /// Pending LSP code actions request ID (if any)
-    pending_code_actions_request: Option<u64>,
+    /// Pending LSP code actions request IDs (supports merging from multiple servers)
+    pending_code_actions_requests: HashSet<u64>,
+
+    /// Maps pending code action request IDs to server names for attribution
+    pending_code_actions_server_names: HashMap<u64, String>,
+
+    /// Stored code actions from the most recent LSP response, used when the
+    /// user selects an action from the code-action popup.
+    /// Each entry is (server_name, action).
+    pending_code_actions: Option<Vec<(String, lsp_types::CodeActionOrCommand)>>,
 
     /// Pending LSP inlay hints request ID (if any)
     pending_inlay_hints_request: Option<u64>,
@@ -572,9 +643,6 @@ pub struct Editor {
     /// Interactive replace state (if interactive replace is active)
     interactive_replace_state: Option<InteractiveReplaceState>,
 
-    /// LSP status indicator for status bar
-    lsp_status: String,
-
     /// Mouse state for scrollbar dragging
     mouse_state: MouseState,
 
@@ -591,12 +659,7 @@ pub struct Editor {
     command_registry: Arc<RwLock<CommandRegistry>>,
 
     /// Quick Open registry for unified prompt providers
-    /// Note: Currently unused as provider logic is inlined, but kept for future plugin support
-    #[allow(dead_code)]
     quick_open_registry: QuickOpenRegistry,
-
-    /// File provider for Quick Open (stored separately for cache management)
-    file_provider: Arc<FileProvider>,
 
     /// Plugin manager (handles both enabled and disabled cases)
     plugin_manager: PluginManager,
@@ -616,6 +679,23 @@ pub struct Editor {
     /// Maps panel ID (e.g., "diagnostics") to buffer ID
     panel_ids: HashMap<String, BufferId>,
 
+    /// Buffer groups: multiple splits/buffers appearing as one tab
+    buffer_groups: HashMap<types::BufferGroupId, types::BufferGroup>,
+    /// Reverse index: buffer ID → group ID (for lookups)
+    buffer_to_group: HashMap<BufferId, types::BufferGroupId>,
+    /// Next buffer group ID
+    next_buffer_group_id: usize,
+
+    /// Grouped SplitNode subtrees, keyed by their LeafId (which is what
+    /// `TabTarget::Group(leaf_id)` references). Each entry is a
+    /// `SplitNode::Grouped` node holding the layout for one buffer group.
+    ///
+    /// These subtrees are NOT part of the main split tree — they live
+    /// here and are dispatched to at render time when the current split's
+    /// active target is a `TabTarget::Group`.
+    pub(crate) grouped_subtrees:
+        HashMap<crate::model::event::LeafId, crate::view::split::SplitNode>,
+
     /// Background process abort handles for cancellation
     /// Maps process_id to abort handle
     background_process_handles: HashMap<u64, tokio::task::AbortHandle>,
@@ -632,9 +712,9 @@ pub struct Editor {
     /// LSP progress tracking (token -> progress info)
     lsp_progress: std::collections::HashMap<String, LspProgressInfo>,
 
-    /// LSP server statuses (language -> status)
+    /// LSP server statuses ((language, server_name) -> status)
     lsp_server_statuses:
-        std::collections::HashMap<String, crate::services::async_bridge::LspServerStatus>,
+        std::collections::HashMap<(String, String), crate::services::async_bridge::LspServerStatus>,
 
     /// LSP window messages (recent messages from window/showMessage)
     lsp_window_messages: Vec<LspMessageEntry>,
@@ -650,8 +730,9 @@ pub struct Editor {
     /// When set, diagnostics will be re-pulled when this instant is reached
     scheduled_diagnostic_pull: Option<(BufferId, Instant)>,
 
-    /// Stored LSP diagnostics per URI (push model - publishDiagnostics from flycheck/cargo)
-    stored_push_diagnostics: HashMap<String, Vec<lsp_types::Diagnostic>>,
+    /// Stored LSP diagnostics per URI, per server (push model - publishDiagnostics)
+    /// Outer key: URI string, Inner key: server name
+    stored_push_diagnostics: HashMap<String, HashMap<String, Vec<lsp_types::Diagnostic>>>,
 
     /// Stored LSP diagnostics per URI (pull model - native RA diagnostics)
     stored_pull_diagnostics: HashMap<String, Vec<lsp_types::Diagnostic>>,
@@ -707,6 +788,11 @@ pub struct Editor {
     /// When Some, a confirmation popup is shown asking user to approve LSP spawn
     pending_lsp_confirmation: Option<String>,
 
+    /// Pending LSP status popup - when true, the active popup is an LSP status
+    /// details popup with server actions (restart/stop/view log).
+    /// Contains the list of (action_key, label) pairs for the popup items.
+    pending_lsp_status_popup: Option<Vec<(String, String)>>,
+
     /// Pending close buffer - buffer to close after SaveFileAs completes
     /// Used when closing a modified buffer that needs to be saved first
     pending_close_buffer: Option<BufferId>,
@@ -720,6 +806,9 @@ pub struct Editor {
     /// Last time we polled for directory changes (for file tree refresh)
     last_file_tree_poll: std::time::Instant,
 
+    /// Whether we've resolved and seeded the .git/index path in dir_mod_times
+    git_index_resolved: bool,
+
     /// Last known modification times for open files (for auto-revert)
     /// Maps file path to last known modification time
     file_mod_times: HashMap<PathBuf, std::time::SystemTime>,
@@ -727,6 +816,27 @@ pub struct Editor {
     /// Last known modification times for expanded directories (for file tree refresh)
     /// Maps directory path to last known modification time
     dir_mod_times: HashMap<PathBuf, std::time::SystemTime>,
+
+    /// Receiver for background file change poll results.
+    /// When Some, a background metadata poll is in progress. Results arrive as
+    /// `(path, Option<mtime>)` pairs — None means metadata() failed.
+    #[allow(clippy::type_complexity)]
+    pending_file_poll_rx:
+        Option<std::sync::mpsc::Receiver<Vec<(PathBuf, Option<std::time::SystemTime>)>>>,
+
+    /// Receiver for background directory change poll results.
+    /// The tuple contains: (dir metadata results, optional git index mtime).
+    #[allow(clippy::type_complexity)]
+    pending_dir_poll_rx: Option<
+        std::sync::mpsc::Receiver<(
+            Vec<(
+                crate::view::file_tree::NodeId,
+                PathBuf,
+                Option<std::time::SystemTime>,
+            )>,
+            Option<(PathBuf, std::time::SystemTime)>,
+        )>,
+    >,
 
     /// Tracks rapid file change events for debouncing
     /// Maps file path to (last event time, event count)
@@ -981,8 +1091,14 @@ impl Editor {
         color_capability: crate::view::color_support::ColorCapability,
         filesystem: Arc<dyn FileSystem + Send + Sync>,
     ) -> AnyhowResult<Self> {
+        tracing::info!("Building default grammar registry...");
+        let start = std::time::Instant::now();
         let grammar_registry = crate::primitives::grammar::GrammarRegistry::defaults_only();
-        let mut editor = Self::with_options(
+        tracing::info!("Default grammar registry built in {:?}", start.elapsed());
+        // Don't start background grammar build here — it's deferred to the
+        // first flush_pending_grammars() call so that plugin-registered grammars
+        // from the first event-loop tick are included in a single build.
+        Self::with_options(
             config,
             width,
             height,
@@ -993,9 +1109,7 @@ impl Editor {
             None,
             color_capability,
             grammar_registry,
-        )?;
-        editor.start_background_grammar_build();
-        Ok(editor)
+        )
     }
 
     /// Create a new editor for testing with custom backends
@@ -1016,7 +1130,7 @@ impl Editor {
     ) -> AnyhowResult<Self> {
         let grammar_registry =
             grammar_registry.unwrap_or_else(crate::primitives::grammar::GrammarRegistry::empty);
-        Self::with_options(
+        let mut editor = Self::with_options(
             config,
             width,
             height,
@@ -1027,7 +1141,11 @@ impl Editor {
             time_source,
             color_capability,
             grammar_registry,
-        )
+        )?;
+        // Tests typically have no async_bridge, so the deferred grammar build
+        // would just drain pending_grammars and early-return. Skip it entirely.
+        editor.needs_full_grammar_build = false;
+        Ok(editor)
     }
 
     /// Create a new editor with custom options
@@ -1059,8 +1177,32 @@ impl Editor {
         let working_dir = working_dir.canonicalize().unwrap_or(working_dir);
 
         // Load all themes into registry
+        tracing::info!("Loading themes...");
         let theme_loader = crate::view::theme::ThemeLoader::new(dir_context.themes_dir());
-        let theme_registry = theme_loader.load_all();
+        // Scan installed packages (language packs + bundles) before plugin loading.
+        // This replaces the JS loadInstalledPackages() — configs, grammars, plugin dirs,
+        // and theme dirs are all collected here and applied synchronously.
+        let scan_result =
+            crate::services::packages::scan_installed_packages(&dir_context.config_dir);
+
+        // Apply package language configs (user config takes priority via or_insert)
+        for (lang_id, lang_config) in &scan_result.language_configs {
+            config
+                .languages
+                .entry(lang_id.clone())
+                .or_insert_with(|| lang_config.clone());
+        }
+
+        // Apply package LSP configs (user config takes priority via or_insert)
+        for (lang_id, lsp_config) in &scan_result.lsp_configs {
+            config
+                .lsp
+                .entry(lang_id.clone())
+                .or_insert_with(|| LspLanguageConfig::Multi(vec![lsp_config.clone()]));
+        }
+
+        let theme_registry = theme_loader.load_all(&scan_result.bundle_theme_dirs);
+        tracing::info!("Themes loaded");
 
         // Get active theme from registry, falling back to default if not found
         let theme = theme_registry.get_cloned(&config.theme).unwrap_or_else(|| {
@@ -1078,7 +1220,7 @@ impl Editor {
         // Set terminal cursor color to match theme
         theme.set_terminal_cursor_color();
 
-        let keybindings = KeybindingResolver::new(&config);
+        let keybindings = Arc::new(RwLock::new(KeybindingResolver::new(&config)));
 
         // Create an empty initial buffer
         let mut buffers = HashMap::new();
@@ -1137,8 +1279,34 @@ impl Editor {
         }
 
         // Configure LSP servers from config
-        for (language, lsp_config) in &config.lsp {
-            lsp.set_language_config(language.clone(), lsp_config.clone());
+        for (language, lsp_configs) in &config.lsp {
+            lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
+        }
+
+        // Configure universal (global) LSP servers — spawned once, shared across languages
+        let universal_servers: Vec<LspServerConfig> = config
+            .universal_lsp
+            .values()
+            .flat_map(|lc| lc.as_slice().to_vec())
+            .filter(|c| c.enabled)
+            .collect();
+        lsp.set_universal_configs(universal_servers);
+
+        // Auto-detect Deno projects: if deno.json or deno.jsonc exists in the
+        // workspace root, override JS/TS LSP to use `deno lsp` (#1191)
+        if working_dir.join("deno.json").exists() || working_dir.join("deno.jsonc").exists() {
+            tracing::info!("Detected Deno project (deno.json found), using deno lsp for JS/TS");
+            let deno_config = LspServerConfig {
+                command: "deno".to_string(),
+                args: vec!["lsp".to_string()],
+                enabled: true,
+                auto_start: false,
+                process_limits: ProcessLimits::default(),
+                initialization_options: Some(serde_json::json!({"enable": true})),
+                ..Default::default()
+            };
+            lsp.set_language_config("javascript".to_string(), deno_config.clone());
+            lsp.set_language_config("typescript".to_string(), deno_config);
         }
 
         // Initialize split manager with the initial buffer
@@ -1150,8 +1318,10 @@ impl Editor {
         let mut initial_view_state = SplitViewState::with_buffer(width, height, buffer_id);
         initial_view_state.apply_config_defaults(
             config.editor.line_numbers,
+            config.editor.highlight_current_line,
             config.editor.line_wrap,
             config.editor.wrap_indent,
+            config.editor.wrap_column,
             config.editor.rulers.clone(),
         );
         split_view_states.insert(initial_split_id, initial_view_state);
@@ -1162,14 +1332,22 @@ impl Editor {
         // Initialize command registry (always available, used by both plugins and core)
         let command_registry = Arc::new(RwLock::new(CommandRegistry::new()));
 
-        // Initialize file provider for Quick Open (stored separately for cache management)
-        let file_provider = Arc::new(FileProvider::new());
-
-        // Initialize Quick Open registry with providers
+        // Initialize Quick Open registry with all providers
         let mut quick_open_registry = QuickOpenRegistry::new();
+        let process_spawner: Arc<dyn crate::services::remote::ProcessSpawner> =
+            Arc::new(crate::services::remote::LocalProcessSpawner);
+        quick_open_registry.register(Box::new(FileProvider::new(
+            Arc::clone(&filesystem),
+            Arc::clone(&process_spawner),
+            tokio_runtime.as_ref().map(|rt| rt.handle().clone()),
+            Some(async_bridge.sender()),
+        )));
+        quick_open_registry.register(Box::new(CommandProvider::new(
+            Arc::clone(&command_registry),
+            Arc::clone(&keybindings),
+        )));
+        quick_open_registry.register(Box::new(BufferProvider::new()));
         quick_open_registry.register(Box::new(GotoLineProvider::new()));
-        // File provider is the default (empty prefix) - use the shared Arc instance
-        // We'll handle commands and buffers inline since they need App state
 
         // Build shared theme cache for plugin access
         let theme_cache = Arc::new(RwLock::new(theme_registry.to_json_map()));
@@ -1252,6 +1430,12 @@ impl Editor {
                 }
             }
 
+            // Add bundle plugin directories from package scan
+            for dir in &scan_result.bundle_plugin_dirs {
+                tracing::info!("Found bundle plugin directory: {:?}", dir);
+                plugin_dirs.push(dir.clone());
+            }
+
             if plugin_dirs.is_empty() {
                 tracing::debug!(
                     "No plugins directory found next to executable or in working dir: {:?}",
@@ -1293,6 +1477,7 @@ impl Editor {
         let show_menu_bar = config.editor.show_menu_bar;
         let show_tab_bar = config.editor.show_tab_bar;
         let show_status_bar = config.editor.show_status_bar;
+        let show_prompt_line = config.editor.show_prompt_line;
 
         // Start periodic update checker if enabled (also sends daily telemetry)
         let update_checker = if check_for_updates {
@@ -1320,9 +1505,18 @@ impl Editor {
             user_config_raw,
             dir_context: dir_context.clone(),
             grammar_registry,
-            pending_grammars: Vec::new(),
+            pending_grammars: scan_result
+                .additional_grammars
+                .iter()
+                .map(|g| PendingGrammar {
+                    language: g.language.clone(),
+                    grammar_path: g.path.to_string_lossy().to_string(),
+                    extensions: g.extensions.clone(),
+                })
+                .collect(),
             grammar_reload_pending: false,
             grammar_build_in_progress: false,
+            needs_full_grammar_build: true,
             streaming_grep_cancellation: None,
             pending_grammar_callbacks: Vec::new(),
             theme,
@@ -1356,10 +1550,12 @@ impl Editor {
             previous_viewports: HashMap::new(),
             scroll_sync_manager: ScrollSyncManager::new(),
             file_explorer: None,
+            preview: None,
+            suppress_position_history_once: false,
             fs_manager,
             filesystem,
             local_filesystem: Arc::new(crate::model::filesystem::StdFileSystem),
-            process_spawner: Arc::new(crate::services::remote::LocalProcessSpawner),
+            process_spawner,
             file_explorer_visible: false,
             file_explorer_sync_in_progress: false,
             file_explorer_width_percent: file_explorer_width,
@@ -1372,6 +1568,7 @@ impl Editor {
             menu_bar_auto_shown: false,
             tab_bar_visible: show_tab_bar,
             status_bar_visible: show_status_bar,
+            prompt_line_visible: show_prompt_line,
             mouse_enabled: true,
             same_buffer_scroll_sync: false,
             mouse_cursor_position: None,
@@ -1383,15 +1580,20 @@ impl Editor {
             position_history: PositionHistory::new(),
             in_navigation: false,
             next_lsp_request_id: 0,
-            pending_completion_request: None,
+            pending_completion_requests: HashSet::new(),
             completion_items: None,
             scheduled_completion_trigger: None,
+            completion_service: crate::services::completion::CompletionService::new(),
+            dabbrev_state: None,
             pending_goto_definition_request: None,
             pending_hover_request: None,
+            pending_hover_position: None,
             pending_references_request: None,
             pending_references_symbol: String::new(),
             pending_signature_help_request: None,
-            pending_code_actions_request: None,
+            pending_code_actions_requests: HashSet::new(),
+            pending_code_actions_server_names: HashMap::new(),
+            pending_code_actions: None,
             pending_inlay_hints_request: None,
             pending_folding_range_requests: HashMap::new(),
             folding_ranges_in_flight: HashMap::new(),
@@ -1415,18 +1617,20 @@ impl Editor {
             ),
             pending_search_range: None,
             interactive_replace_state: None,
-            lsp_status: String::new(),
             mouse_state: MouseState::default(),
             tab_context_menu: None,
             theme_info_popup: None,
             cached_layout: CachedLayout::default(),
             command_registry,
             quick_open_registry,
-            file_provider,
             plugin_manager,
             plugin_dev_workspaces: HashMap::new(),
             seen_byte_ranges: HashMap::new(),
             panel_ids: HashMap::new(),
+            buffer_groups: HashMap::new(),
+            buffer_to_group: HashMap::new(),
+            next_buffer_group_id: 0,
+            grouped_subtrees: HashMap::new(),
             background_process_handles: HashMap::new(),
             prompt_histories: {
                 // Load prompt histories from disk if available
@@ -1469,12 +1673,16 @@ impl Editor {
             plugin_render_requested: false,
             chord_state: Vec::new(),
             pending_lsp_confirmation: None,
+            pending_lsp_status_popup: None,
             pending_close_buffer: None,
             auto_revert_enabled: true,
             last_auto_revert_poll: time_source.now(),
             last_file_tree_poll: time_source.now(),
+            git_index_resolved: false,
             file_mod_times: HashMap::new(),
             dir_mod_times: HashMap::new(),
+            pending_file_poll_rx: None,
+            pending_dir_poll_rx: None,
             file_rapid_change_counts: HashMap::new(),
             file_open_state: None,
             file_browser_layout: None,
@@ -1552,24 +1760,42 @@ impl Editor {
     }
 
     /// Spawn a background thread to build the full grammar registry
-    /// (embedded grammars, user grammars, and language packs).
-    /// Called by production entry points after construction; tests skip this
-    /// since they provide their own registry and don't need the expensive build.
-    fn start_background_grammar_build(&mut self) {
+    /// (embedded grammars, user grammars, language packs, and any plugin-registered grammars).
+    /// Called on the first event-loop tick (via `flush_pending_grammars`) so that
+    /// plugin grammars registered during init are included in a single build.
+    fn start_background_grammar_build(
+        &mut self,
+        additional: Vec<crate::primitives::grammar::GrammarSpec>,
+        callback_ids: Vec<fresh_core::api::JsCallbackId>,
+    ) {
         let Some(bridge) = &self.async_bridge else {
             return;
         };
         self.grammar_build_in_progress = true;
         let sender = bridge.sender();
         let config_dir = self.dir_context.config_dir.clone();
+        tracing::info!(
+            "Spawning background grammar build thread ({} plugin grammars)...",
+            additional.len()
+        );
         std::thread::Builder::new()
             .name("grammar-build".to_string())
             .spawn(move || {
-                let registry = crate::primitives::grammar::GrammarRegistry::for_editor(config_dir);
+                tracing::info!("[grammar-build] Thread started");
+                let start = std::time::Instant::now();
+                let registry = if additional.is_empty() {
+                    crate::primitives::grammar::GrammarRegistry::for_editor(config_dir)
+                } else {
+                    crate::primitives::grammar::GrammarRegistry::for_editor_with_additional(
+                        config_dir,
+                        &additional,
+                    )
+                };
+                tracing::info!("[grammar-build] Complete in {:?}", start.elapsed());
                 drop(sender.send(
                     crate::services::async_bridge::AsyncMessage::GrammarRegistryBuilt {
                         registry,
-                        callback_ids: Vec::new(),
+                        callback_ids,
                     },
                 ));
             })
@@ -1584,6 +1810,14 @@ impl Editor {
     /// Get a reference to the config
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Get a mutable reference to the config.
+    /// Intended for tests and in-process settings UIs that update the
+    /// live editor configuration. Not all config fields take effect
+    /// immediately — some are read only at startup or on buffer open.
+    pub fn config_mut(&mut self) -> &mut Config {
+        &mut self.config
     }
 
     /// Get a reference to the key translator (for input calibration)
@@ -1638,13 +1872,15 @@ impl Editor {
 
     /// Get all keybindings as (key, action) pairs
     pub fn get_all_keybindings(&self) -> Vec<(String, String)> {
-        self.keybindings.get_all_bindings()
+        self.keybindings.read().unwrap().get_all_bindings()
     }
 
     /// Get the formatted keybinding for a specific action (for display in messages)
     /// Returns None if no keybinding is found for the action
     pub fn get_keybinding_for_action(&self, action_name: &str) -> Option<String> {
         self.keybindings
+            .read()
+            .unwrap()
             .find_keybinding_for_action(action_name, self.key_context.clone())
     }
 
@@ -1662,11 +1898,56 @@ impl Editor {
     ///
     /// This is derived from the split manager (single source of truth).
     /// The editor always has at least one buffer, so this never fails.
+    ///
+    /// When the active split has a buffer-group tab as its active target
+    /// (i.e., `active_group_tab.is_some()`), this returns the buffer of the
+    /// currently-focused inner panel — so that input routing, command palette
+    /// context, buffer mode, and other "what is the user looking at" queries
+    /// resolve to the panel the user is actually interacting with rather than
+    /// the split's background leaf buffer.
+    ///
+    /// The override only takes effect if the inner panel's buffer is still
+    /// live in `self.buffers`; otherwise it falls back to the main split's
+    /// leaf buffer so callers never see a stale/freed buffer id.
     #[inline]
     pub fn active_buffer(&self) -> BufferId {
+        let active_split = self.split_manager.active_split();
+        if let Some(vs) = self.split_view_states.get(&active_split) {
+            if vs.active_group_tab.is_some() {
+                if let Some(inner_leaf) = vs.focused_group_leaf {
+                    if let Some(inner_vs) = self.split_view_states.get(&inner_leaf) {
+                        let inner_buf = inner_vs.active_buffer;
+                        if self.buffers.contains_key(&inner_buf) {
+                            return inner_buf;
+                        }
+                    }
+                }
+            }
+        }
         self.split_manager
             .active_buffer_id()
             .expect("Editor always has at least one buffer")
+    }
+
+    /// The split id whose `SplitViewState` owns the currently-focused
+    /// cursors/viewport/buffer state. For a regular split this is just
+    /// `split_manager.active_split()`. For a split that has a group tab
+    /// active, this returns the focused inner panel's leaf id (which
+    /// lives in `split_view_states` even though it's not in the main
+    /// split tree).
+    #[inline]
+    pub fn effective_active_split(&self) -> crate::model::event::LeafId {
+        let active_split = self.split_manager.active_split();
+        if let Some(vs) = self.split_view_states.get(&active_split) {
+            if vs.active_group_tab.is_some() {
+                if let Some(inner_leaf) = vs.focused_group_leaf {
+                    if self.split_view_states.contains_key(&inner_leaf) {
+                        return inner_leaf;
+                    }
+                }
+            }
+        }
+        active_split
     }
 
     /// Get the mode name for the active buffer (if it's a virtual buffer)
@@ -1729,18 +2010,25 @@ impl Editor {
             .collect()
     }
 
-    /// Check if LSP server for a given language is running (ready)
+    /// Check if any LSP server for a given language is running (ready)
     pub fn is_lsp_server_ready(&self, language: &str) -> bool {
         use crate::services::async_bridge::LspServerStatus;
         self.lsp_server_statuses
-            .get(language)
-            .map(|status| matches!(status, LspServerStatus::Running))
-            .unwrap_or(false)
-    }
-
-    /// Get the LSP status string (displayed in status bar)
-    pub fn get_lsp_status(&self) -> &str {
-        &self.lsp_status
+            .iter()
+            .any(|((lang, server_name), status)| {
+                if !matches!(status, LspServerStatus::Running) {
+                    return false;
+                }
+                if lang == language {
+                    return true;
+                }
+                // Check if this server's scope accepts the queried language
+                self.lsp
+                    .as_ref()
+                    .and_then(|lsp| lsp.server_scope(server_name))
+                    .map(|scope| scope.accepts(language))
+                    .unwrap_or(false)
+            })
     }
 
     /// Get stored LSP diagnostics (for testing and external access)
@@ -1786,9 +2074,9 @@ impl Editor {
     }
 
     /// Configure LSP server for a specific language
-    pub fn set_lsp_config(&mut self, language: String, config: LspServerConfig) {
+    pub fn set_lsp_config(&mut self, language: String, config: Vec<LspServerConfig>) {
         if let Some(ref mut lsp) = self.lsp {
-            lsp.set_language_config(language, config);
+            lsp.set_language_configs(language, config);
         }
     }
 
@@ -1798,6 +2086,29 @@ impl Editor {
             .as_ref()
             .map(|lsp| lsp.running_servers())
             .unwrap_or_default()
+    }
+
+    /// Return the number of pending completion requests.
+    pub fn pending_completion_requests_count(&self) -> usize {
+        self.pending_completion_requests.len()
+    }
+
+    /// Return the number of stored completion items.
+    pub fn completion_items_count(&self) -> usize {
+        self.completion_items.as_ref().map_or(0, |v| v.len())
+    }
+
+    /// Return the number of initialized LSP servers for a given language.
+    pub fn initialized_lsp_server_count(&self, language: &str) -> usize {
+        self.lsp
+            .as_ref()
+            .map(|lsp| {
+                lsp.get_handles(language)
+                    .iter()
+                    .filter(|sh| sh.capabilities.initialized)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Shutdown an LSP server by language (marks it as disabled until manual restart)
@@ -1998,19 +2309,21 @@ impl Editor {
             return false;
         };
 
-        // Mark as sent before requesting (to prevent double-sending)
-        self.mouse_state.lsp_hover_request_sent = true;
-
         // Store mouse position for popup positioning
         self.mouse_hover_screen_position = Some((screen_x, screen_y));
 
-        // Request hover at the byte position
-        if let Err(e) = self.request_hover_at_position(byte_pos) {
-            tracing::debug!("Failed to request hover: {}", e);
-            return false;
+        // Request hover at the byte position — only mark as sent if dispatched
+        match self.request_hover_at_position(byte_pos) {
+            Ok(true) => {
+                self.mouse_state.lsp_hover_request_sent = true;
+                true
+            }
+            Ok(false) => false, // no server ready, timer will retry
+            Err(e) => {
+                tracing::debug!("Failed to request hover: {}", e);
+                false
+            }
         }
-
-        true
     }
 
     /// Check if semantic highlight debounce timer has expired
@@ -2058,9 +2371,11 @@ impl Editor {
         let Some(lsp) = self.lsp.as_mut() else {
             return false;
         };
-        let Some(client) = lsp.get_handle_mut(&language) else {
+        let Some(sh) = lsp.handle_for_feature_mut(&language, crate::types::LspFeature::Diagnostics)
+        else {
             return false;
         };
+        let client = &mut sh.handle;
 
         let request_id = self.next_lsp_request_id;
         self.next_lsp_request_id += 1;
@@ -2198,10 +2513,14 @@ impl Editor {
         // Switch per-buffer view state in the active split
         let active_split = self.split_manager.active_split();
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
+            // Capture what the user was looking at (buffer tab or group tab)
+            // BEFORE clearing the group marker, so the LRU records the right thing.
+            let previous_target = view_state.active_target();
             view_state.switch_buffer(buffer_id);
             view_state.add_buffer(buffer_id);
-            // Update the focus history (push the previous buffer we're leaving)
-            view_state.push_focus(previous);
+            view_state.active_group_tab = None;
+            view_state.focused_group_leaf = None;
+            view_state.push_focus(previous_target);
         }
 
         // If switching to a terminal buffer that should resume terminal mode, re-enter it
@@ -2247,6 +2566,60 @@ impl Editor {
         let previous_buffer = self.active_buffer(); // Get BEFORE changing split
         let split_changed = previous_split != split_id;
 
+        // Preview is anchored to the split it was opened in. Moving focus to
+        // a different split commits the preview — walking away is commitment.
+        if split_changed {
+            self.promote_preview_if_not_in_split(split_id);
+        }
+
+        // If `split_id` is not in the main split tree, it must be an inner
+        // leaf of a Grouped subtree stashed in `grouped_subtrees`. For those
+        // we don't change `split_manager.active_split` (the group's host
+        // split remains active). Instead, find the host split and update
+        // its `focused_group_leaf` marker so `active_buffer()` routes to
+        // the clicked inner panel buffer.
+        if !self
+            .split_manager
+            .root()
+            .leaf_split_ids()
+            .contains(&split_id)
+        {
+            // Find which group contains this inner leaf.
+            let host_split = self
+                .grouped_subtrees
+                .iter()
+                .find(|(_, node)| {
+                    if let crate::view::split::SplitNode::Grouped { layout, .. } = node {
+                        layout.find(split_id.into()).is_some()
+                    } else {
+                        false
+                    }
+                })
+                .map(|(group_leaf_id, _)| *group_leaf_id)
+                .and_then(|group_leaf_id| {
+                    // Find the split whose open_buffers has this group tab.
+                    self.split_view_states
+                        .iter()
+                        .find(|(_, vs)| vs.has_group(group_leaf_id))
+                        .map(|(sid, _)| (*sid, group_leaf_id))
+                });
+
+            if let Some((host, group_leaf_id)) = host_split {
+                self.split_manager.set_active_split(host);
+                if let Some(vs) = self.split_view_states.get_mut(&host) {
+                    vs.active_group_tab = Some(group_leaf_id);
+                    vs.focused_group_leaf = Some(split_id);
+                }
+                if let Some(inner_vs) = self.split_view_states.get_mut(&split_id) {
+                    inner_vs.switch_buffer(buffer_id);
+                }
+                self.key_context = crate::input::keybindings::KeyContext::Normal;
+                return;
+            }
+            // Fall through: we couldn't find the group; the original path
+            // will set_active_split which will fail silently.
+        }
+
         if split_changed {
             // Switching to a different split - exit terminal mode if active
             if self.terminal_mode && self.is_terminal_buffer(previous_buffer) {
@@ -2281,7 +2654,7 @@ impl Editor {
                 self.position_history.commit_pending_movement();
                 if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
                     view_state.add_buffer(buffer_id);
-                    view_state.push_focus(previous_buffer);
+                    view_state.push_focus(crate::view::split::TabTarget::Buffer(previous_buffer));
                 }
                 // Note: We don't sync file explorer here to avoid flicker during split focus changes.
                 // File explorer syncs when explicitly focused via focus_file_explorer().
@@ -2366,6 +2739,24 @@ impl Editor {
     /// - Any other cross-cutting concerns
     ///
     /// All event applications MUST go through this method to ensure consistency.
+    /// Log an event and apply it to the active buffer.
+    /// For Delete events, captures displaced marker positions before applying
+    /// so undo can restore them to their exact original positions.
+    pub fn log_and_apply_event(&mut self, event: &Event) {
+        // Capture displaced markers before the event is applied
+        if let Event::Delete { range, .. } = event {
+            let displaced = self.active_state().capture_displaced_markers(range);
+            self.active_event_log_mut().append(event.clone());
+            if !displaced.is_empty() {
+                self.active_event_log_mut()
+                    .set_displaced_markers_on_last(displaced);
+            }
+        } else {
+            self.active_event_log_mut().append(event.clone());
+        }
+        self.apply_event_to_active_buffer(event);
+    }
+
     pub fn apply_event_to_active_buffer(&mut self, event: &Event) {
         // Handle View events at Editor level - View events go to SplitViewState, not EditorState
         // This properly separates Buffer state from View state
@@ -2385,6 +2776,17 @@ impl Editor {
             _ => {}
         }
 
+        // Any buffer-modifying event commits the user to this file, so promote
+        // it out of preview mode. Cursor moves and view-only events don't
+        // count — only real edits (Insert / Delete / BulkEdit, or a Batch
+        // containing any of those) flip the bit. Placed here (rather than
+        // in `log_and_apply_event`) because several edit paths bypass
+        // logging and call `apply_event_to_active_buffer` directly — notably
+        // `InsertChar` (single-character typing).
+        if event.modifies_buffer() {
+            self.promote_active_buffer_from_preview();
+        }
+
         // IMPORTANT: Calculate LSP changes and line info BEFORE applying to buffer!
         // The byte positions in the events are relative to the ORIGINAL buffer,
         // so we must convert them to LSP positions before modifying the buffer.
@@ -2394,9 +2796,15 @@ impl Editor {
         let line_info = self.calculate_event_line_info(event);
 
         // 1. Apply the event to the buffer
-        // Borrow cursors from SplitViewState (sole source of truth) and state from buffers
+        // Borrow cursors from SplitViewState (sole source of truth) and state from buffers.
+        //
+        // Use the *effective* active split so events targeting a focused
+        // buffer-group panel land in the panel's own split view state, not
+        // the group host's. Without this, MoveCursor events for a focused
+        // panel would try to look up the panel buffer's keyed state in the
+        // host split (which doesn't have it) and panic on unwrap.
         {
-            let split_id = self.split_manager.active_split();
+            let split_id = self.effective_active_split();
             let active_buf = self.active_buffer();
             let cursors = &mut self
                 .split_view_states
@@ -2450,7 +2858,22 @@ impl Editor {
         self.trigger_plugin_hooks_for_event(event, line_info);
 
         // 4. Notify LSP of the change using pre-calculated positions
-        self.send_lsp_changes_for_buffer(self.active_buffer(), lsp_changes);
+        // For BulkEdit events (undo/redo of code actions, renames, etc.),
+        // collect_lsp_changes returns empty because there are no incremental byte
+        // positions to convert — BulkEdit restores a tree snapshot.  Send a
+        // full-document replacement so the LSP server stays in sync.
+        if lsp_changes.is_empty() && event.modifies_buffer() {
+            if let Some(full_text) = self.active_state().buffer.to_string() {
+                let full_change = vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: full_text,
+                }];
+                self.send_lsp_changes_for_buffer(self.active_buffer(), full_change);
+            }
+        } else {
+            self.send_lsp_changes_for_buffer(self.active_buffer(), lsp_changes);
+        }
     }
 
     /// Apply multiple Insert/Delete events efficiently using bulk edit optimization.
@@ -2482,6 +2905,12 @@ impl Editor {
             // No buffer modifications - use regular Batch
             return None;
         }
+
+        // Multi-cursor edits and code-action rewrites go through this path
+        // (not `apply_event_to_active_buffer`). Promote any preview tab
+        // here too so the invariant "edited buffer is never preview"
+        // holds regardless of which edit path runs.
+        self.promote_active_buffer_from_preview();
 
         let active_buf = self.active_buffer();
         let split_id = self.split_manager.active_split();
@@ -2530,8 +2959,56 @@ impl Editor {
             .map(|(pos, del, text)| (*pos, *del, text.as_str()))
             .collect();
 
+        // Snapshot displaced markers before edits so undo can restore them exactly.
+        let displaced_markers = state.capture_displaced_markers_bulk(&edits);
+
         // Apply bulk edits
         let _delta = state.buffer.apply_bulk_edits(&edit_refs);
+
+        // Convert edit list to lengths-only for marker replay.
+        // Merge edits at the same position into a single (pos, del_len, ins_len)
+        // tuple. This is necessary because delete+insert at the same position
+        // (e.g., line move: delete block, insert rearranged block) should be
+        // treated as a replacement, not two independent adjustments.
+        let edit_lengths: Vec<(usize, usize, usize)> = {
+            let mut lengths: Vec<(usize, usize, usize)> = Vec::new();
+            for (pos, del_len, text) in &edits {
+                if let Some(last) = lengths.last_mut() {
+                    if last.0 == *pos {
+                        // Same position: merge del and ins lengths
+                        last.1 += del_len;
+                        last.2 += text.len();
+                        continue;
+                    }
+                }
+                lengths.push((*pos, *del_len, text.len()));
+            }
+            lengths
+        };
+
+        // Adjust markers and margins using the merged edit lengths.
+        // Using merged edits (net delta for same-position replacements) avoids
+        // the marker-at-boundary problem where sequential delete+insert at the
+        // same position pushes markers incorrectly.
+        for &(pos, del_len, ins_len) in &edit_lengths {
+            if del_len > 0 && ins_len > 0 {
+                // Replacement: adjust by net delta only
+                if ins_len > del_len {
+                    state.marker_list.adjust_for_insert(pos, ins_len - del_len);
+                    state.margins.adjust_for_insert(pos, ins_len - del_len);
+                } else if del_len > ins_len {
+                    state.marker_list.adjust_for_delete(pos, del_len - ins_len);
+                    state.margins.adjust_for_delete(pos, del_len - ins_len);
+                }
+                // Equal: net delta 0, no adjustment needed
+            } else if del_len > 0 {
+                state.marker_list.adjust_for_delete(pos, del_len);
+                state.margins.adjust_for_delete(pos, del_len);
+            } else if ins_len > 0 {
+                state.marker_list.adjust_for_insert(pos, ins_len);
+                state.margins.adjust_for_insert(pos, ins_len);
+            }
+        }
 
         // Snapshot buffer state after edits (for redo)
         let new_snapshot = state.buffer.snapshot_buffer_state();
@@ -2677,6 +3154,8 @@ impl Editor {
             old_cursors,
             new_cursors,
             description,
+            edits: edit_lengths,
+            displaced_markers,
         };
 
         // Post-processing (layout invalidation, split cursor sync, etc.)
@@ -3353,6 +3832,14 @@ impl Editor {
             .count()
     }
 
+    /// Handle terminal focus gained event
+    pub fn focus_gained(&mut self) {
+        self.plugin_manager.run_hook(
+            "focus_gained",
+            crate::services::plugins::hooks::HookArgs::FocusGained,
+        );
+    }
+
     /// Resize all buffers to match new terminal size
     pub fn resize(&mut self, width: u16, height: u16) {
         // Update terminal dimensions for future buffer creation
@@ -3458,10 +3945,7 @@ impl Editor {
         // Check if we need to update suggestions after creating the prompt
         let needs_suggestions = matches!(
             prompt_type,
-            PromptType::OpenFile
-                | PromptType::SwitchProject
-                | PromptType::SaveFileAs
-                | PromptType::Command
+            PromptType::OpenFile | PromptType::SwitchProject | PromptType::SaveFileAs
         );
 
         self.prompt = Some(Prompt::with_suggestions(message, prompt_type, suggestions));
@@ -3507,65 +3991,9 @@ impl Editor {
         self.update_quick_open_suggestions(">");
     }
 
-    /// Update Quick Open suggestions based on current input
-    fn update_quick_open_suggestions(&mut self, input: &str) {
-        let suggestions = if let Some(query) = input.strip_prefix('>') {
-            // Command mode
-            let active_buffer_mode = self
-                .buffer_metadata
-                .get(&self.active_buffer())
-                .and_then(|m| m.virtual_mode());
-            let has_lsp_config = {
-                let language = self
-                    .buffers
-                    .get(&self.active_buffer())
-                    .map(|s| s.language.as_str());
-                language
-                    .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
-                    .is_some()
-            };
-            self.command_registry.read().unwrap().filter(
-                query,
-                self.key_context.clone(),
-                &self.keybindings,
-                self.has_active_selection(),
-                &self.active_custom_contexts,
-                active_buffer_mode,
-                has_lsp_config,
-            )
-        } else if let Some(query) = input.strip_prefix('#') {
-            // Buffer mode
-            self.get_buffer_suggestions(query)
-        } else if let Some(line_str) = input.strip_prefix(':') {
-            // Go to line mode
-            self.get_goto_line_suggestions(line_str)
-        } else {
-            // File mode (default) — strip :line:col suffix so fuzzy matching
-            // continues to work when the user appends a jump target.
-            let (path_part, _, _) = prompt_actions::parse_path_line_col(input);
-            let query = if path_part.is_empty() {
-                input
-            } else {
-                &path_part
-            };
-            self.get_file_suggestions(query)
-        };
-
-        if let Some(prompt) = &mut self.prompt {
-            prompt.suggestions = suggestions;
-            prompt.selected_suggestion = if prompt.suggestions.is_empty() {
-                None
-            } else {
-                Some(0)
-            };
-        }
-    }
-
-    /// Get buffer suggestions for Quick Open
-    fn get_buffer_suggestions(&self, query: &str) -> Vec<Suggestion> {
-        use crate::input::fuzzy::fuzzy_match;
-
-        let mut suggestions: Vec<(Suggestion, i32)> = self
+    /// Build a QuickOpenContext from current editor state
+    fn build_quick_open_context(&self) -> QuickOpenContext {
+        let open_buffers = self
             .buffers
             .iter()
             .filter_map(|(buffer_id, state)| {
@@ -3574,89 +4002,28 @@ impl Editor {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| format!("Buffer {}", buffer_id.0));
-
-                let match_result = if query.is_empty() {
-                    crate::input::fuzzy::FuzzyMatch {
-                        matched: true,
-                        score: 0,
-                        match_positions: vec![],
-                    }
-                } else {
-                    fuzzy_match(query, &name)
-                };
-
-                if match_result.matched {
-                    let modified = state.buffer.is_modified();
-                    let display_name = if modified {
-                        format!("{} [+]", name)
-                    } else {
-                        name
-                    };
-
-                    Some((
-                        Suggestion {
-                            text: display_name,
-                            description: Some(path.display().to_string()),
-                            value: Some(buffer_id.0.to_string()),
-                            disabled: false,
-                            keybinding: None,
-                            source: None,
-                        },
-                        match_result.score,
-                    ))
-                } else {
-                    None
-                }
+                Some(BufferInfo {
+                    id: buffer_id.0,
+                    path: path.display().to_string(),
+                    name,
+                    modified: state.buffer.is_modified(),
+                })
             })
             .collect();
 
-        suggestions.sort_by(|a, b| b.1.cmp(&a.1));
-        suggestions.into_iter().map(|(s, _)| s).collect()
-    }
+        let has_lsp_config = {
+            let language = self
+                .buffers
+                .get(&self.active_buffer())
+                .map(|s| s.language.as_str());
+            language
+                .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
+                .is_some()
+        };
 
-    /// Get go-to-line suggestions for Quick Open
-    fn get_goto_line_suggestions(&self, line_str: &str) -> Vec<Suggestion> {
-        if line_str.is_empty() {
-            return vec![Suggestion {
-                text: t!("quick_open.goto_line_hint").to_string(),
-                description: Some(t!("quick_open.goto_line_desc").to_string()),
-                value: None,
-                disabled: true,
-                keybinding: None,
-                source: None,
-            }];
-        }
-
-        if let Ok(line_num) = line_str.parse::<usize>() {
-            if line_num > 0 {
-                return vec![Suggestion {
-                    text: t!("quick_open.goto_line", line = line_num.to_string()).to_string(),
-                    description: Some(t!("quick_open.press_enter").to_string()),
-                    value: Some(line_num.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }];
-            }
-        }
-
-        vec![Suggestion {
-            text: t!("quick_open.invalid_line").to_string(),
-            description: Some(line_str.to_string()),
-            value: None,
-            disabled: true,
-            keybinding: None,
-            source: None,
-        }]
-    }
-
-    /// Get file suggestions for Quick Open
-    fn get_file_suggestions(&self, query: &str) -> Vec<Suggestion> {
-        // Use the file provider's file loading mechanism
-        let cwd = self.working_dir.display().to_string();
-        let context = QuickOpenContext {
-            cwd: cwd.clone(),
-            open_buffers: vec![], // Not needed for file suggestions
+        QuickOpenContext {
+            cwd: self.working_dir.display().to_string(),
+            open_buffers,
             active_buffer_id: self.active_buffer().0,
             active_buffer_path: self
                 .active_state()
@@ -3671,10 +4038,29 @@ impl Editor {
                 .get(&self.active_buffer())
                 .and_then(|m| m.virtual_mode())
                 .map(|s| s.to_string()),
-            has_lsp_config: false, // Not needed for file suggestions
+            has_lsp_config,
+        }
+    }
+
+    /// Update Quick Open suggestions based on current input, dispatching through the registry
+    fn update_quick_open_suggestions(&mut self, input: &str) {
+        let context = self.build_quick_open_context();
+        let suggestions = if let Some((provider, query)) =
+            self.quick_open_registry.get_provider_for_input(input)
+        {
+            provider.suggestions(query, &context)
+        } else {
+            vec![]
         };
 
-        self.file_provider.suggestions(query, &context)
+        if let Some(prompt) = &mut self.prompt {
+            prompt.suggestions = suggestions;
+            prompt.selected_suggestion = if prompt.suggestions.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        }
     }
 
     /// Cancel search/replace prompts if one is active.
@@ -3943,6 +4329,18 @@ impl Editor {
                             .resolve_callback(callback_id, "null".to_string());
                     }
                 }
+                PromptType::QuickOpen => {
+                    // Cancel any in-progress background file loading
+                    if let Some((provider, _)) = self.quick_open_registry.get_provider_for_input("")
+                    {
+                        if let Some(fp) = provider
+                            .as_any()
+                            .downcast_ref::<crate::input::quick_open::providers::FileProvider>(
+                        ) {
+                            fp.cancel_loading();
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -4007,11 +4405,11 @@ impl Editor {
                 prompt.input.clone()
             } else if matches!(
                 prompt.prompt_type,
-                PromptType::Command
-                    | PromptType::OpenFile
+                PromptType::OpenFile
                     | PromptType::SwitchProject
                     | PromptType::SaveFileAs
                     | PromptType::StopLspServer
+                    | PromptType::RestartLspServer
                     | PromptType::SelectTheme { .. }
                     | PromptType::SelectLocale
                     | PromptType::SwitchToTab
@@ -4023,15 +4421,8 @@ impl Editor {
                 // Use the selected suggestion if any
                 if let Some(selected_idx) = prompt.selected_suggestion {
                     if let Some(suggestion) = prompt.suggestions.get(selected_idx) {
-                        // Don't confirm disabled commands, but still record usage for history
+                        // Don't confirm disabled suggestions
                         if suggestion.disabled {
-                            // Record usage even for disabled commands so they appear in history
-                            if matches!(prompt.prompt_type, PromptType::Command) {
-                                self.command_registry
-                                    .write()
-                                    .unwrap()
-                                    .record_usage(&suggestion.text);
-                            }
                             self.set_status_message(
                                 t!(
                                     "error.command_not_available",
@@ -4053,8 +4444,11 @@ impl Editor {
                 prompt.input.clone()
             };
 
-            // For StopLspServer, validate that the input matches a running server
-            if matches!(prompt.prompt_type, PromptType::StopLspServer) {
+            // For StopLspServer/RestartLspServer, validate that the input matches a suggestion
+            if matches!(
+                prompt.prompt_type,
+                PromptType::StopLspServer | PromptType::RestartLspServer
+            ) {
                 let is_valid = prompt
                     .suggestions
                     .iter()
@@ -4220,39 +4614,6 @@ impl Editor {
         };
 
         match prompt_type {
-            PromptType::Command => {
-                let selection_active = self.has_active_selection();
-                let active_buffer_mode = self
-                    .buffer_metadata
-                    .get(&self.active_buffer())
-                    .and_then(|m| m.virtual_mode());
-                let has_lsp_config = {
-                    let language = self
-                        .buffers
-                        .get(&self.active_buffer())
-                        .map(|s| s.language.as_str());
-                    language
-                        .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
-                        .is_some()
-                };
-                if let Some(prompt) = &mut self.prompt {
-                    // Use the underlying context (not Prompt context) for filtering
-                    prompt.suggestions = self.command_registry.read().unwrap().filter(
-                        &input,
-                        self.key_context.clone(),
-                        &self.keybindings,
-                        selection_active,
-                        &self.active_custom_contexts,
-                        active_buffer_mode,
-                        has_lsp_config,
-                    );
-                    prompt.selected_suggestion = if prompt.suggestions.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    };
-                }
-            }
             PromptType::QuickOpen => {
                 // Update Quick Open suggestions based on prefix
                 self.update_quick_open_suggestions(&input);
@@ -4307,6 +4668,7 @@ impl Editor {
             PromptType::SwitchToTab
             | PromptType::SelectTheme { .. }
             | PromptType::StopLspServer
+            | PromptType::RestartLspServer
             | PromptType::SetLanguage
             | PromptType::SetEncoding
             | PromptType::SetLineEnding => {
@@ -4352,40 +4714,28 @@ impl Editor {
 
         for message in messages {
             match message {
-                AsyncMessage::LspDiagnostics { uri, diagnostics } => {
-                    self.handle_lsp_diagnostics(uri, diagnostics);
+                AsyncMessage::LspDiagnostics {
+                    uri,
+                    diagnostics,
+                    server_name,
+                } => {
+                    self.handle_lsp_diagnostics(uri, diagnostics, server_name);
                 }
                 AsyncMessage::LspInitialized {
                     language,
-                    completion_trigger_characters,
-                    semantic_tokens_legend,
-                    semantic_tokens_full,
-                    semantic_tokens_full_delta,
-                    semantic_tokens_range,
-                    folding_ranges_supported,
+                    server_name,
+                    capabilities,
                 } => {
-                    tracing::info!("LSP server initialized for language: {}", language);
-                    tracing::debug!(
-                        "LSP completion trigger characters for {}: {:?}",
-                        language,
-                        completion_trigger_characters
+                    tracing::info!(
+                        "LSP server '{}' initialized for language: {}",
+                        server_name,
+                        language
                     );
                     self.status_message = Some(format!("LSP ({}) ready", language));
 
-                    // Store completion trigger characters
+                    // Store capabilities on the specific server handle
                     if let Some(lsp) = &mut self.lsp {
-                        lsp.set_completion_trigger_characters(
-                            &language,
-                            completion_trigger_characters,
-                        );
-                        lsp.set_semantic_tokens_capabilities(
-                            &language,
-                            semantic_tokens_legend,
-                            semantic_tokens_full,
-                            semantic_tokens_full_delta,
-                            semantic_tokens_range,
-                        );
-                        lsp.set_folding_ranges_supported(&language, folding_ranges_supported);
+                        lsp.set_server_capabilities(&language, &server_name, capabilities);
                     }
 
                     // Send didOpen for all open buffers of this language
@@ -4406,6 +4756,7 @@ impl Editor {
                         .config
                         .lsp
                         .get(&language)
+                        .and_then(|configs| configs.as_slice().first())
                         .map(|c| c.command.clone())
                         .unwrap_or_else(|| "unknown".to_string());
 
@@ -4498,6 +4849,59 @@ impl Editor {
                     actions,
                 } => {
                     self.handle_code_actions_response(request_id, actions);
+                }
+                AsyncMessage::LspApplyEdit { edit, label } => {
+                    tracing::info!("Applying workspace edit from server (label: {:?})", label);
+                    match self.apply_workspace_edit(edit) {
+                        Ok(n) => {
+                            if let Some(label) = label {
+                                self.set_status_message(
+                                    t!("lsp.code_action_applied", title = &label, count = n)
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to apply workspace edit: {}", e);
+                        }
+                    }
+                }
+                AsyncMessage::LspCodeActionResolved {
+                    request_id: _,
+                    action,
+                } => match action {
+                    Ok(resolved) => {
+                        self.execute_resolved_code_action(resolved);
+                    }
+                    Err(e) => {
+                        tracing::warn!("codeAction/resolve failed: {}", e);
+                        self.set_status_message(format!("Code action resolve failed: {e}"));
+                    }
+                },
+                AsyncMessage::LspCompletionResolved {
+                    request_id: _,
+                    item,
+                } => {
+                    if let Ok(resolved) = item {
+                        self.handle_completion_resolved(resolved);
+                    }
+                }
+                AsyncMessage::LspFormatting {
+                    request_id: _,
+                    uri,
+                    edits,
+                } => {
+                    if !edits.is_empty() {
+                        if let Err(e) = self.apply_formatting_edits(&uri, edits) {
+                            tracing::error!("Failed to apply formatting: {}", e);
+                        }
+                    }
+                }
+                AsyncMessage::LspPrepareRename {
+                    request_id: _,
+                    result,
+                } => {
+                    self.handle_prepare_rename_response(result);
                 }
                 AsyncMessage::LspPulledDiagnostics {
                     request_id: _,
@@ -4674,10 +5078,11 @@ impl Editor {
                 }
                 AsyncMessage::LspStatusUpdate {
                     language,
+                    server_name,
                     status,
                     message: _,
                 } => {
-                    self.handle_lsp_status_update(language, status);
+                    self.handle_lsp_status_update(language, server_name, status);
                 }
                 AsyncMessage::FileOpenDirectoryLoaded(result) => {
                     self.handle_file_open_directory_loaded(result);
@@ -4839,6 +5244,30 @@ impl Editor {
                     // Flush any plugin grammars that arrived during the build
                     self.flush_pending_grammars();
                 }
+                AsyncMessage::QuickOpenFilesLoaded { files, complete } => {
+                    // Update the file provider cache and refresh suggestions
+                    // if Quick Open is currently showing file mode (empty prefix).
+                    if let Some((provider, _)) = self.quick_open_registry.get_provider_for_input("")
+                    {
+                        if let Some(fp) = provider
+                            .as_any()
+                            .downcast_ref::<crate::input::quick_open::providers::FileProvider>(
+                        ) {
+                            if complete {
+                                fp.set_cache(files);
+                            } else {
+                                fp.set_partial_cache(files);
+                            }
+                        }
+                    }
+                    // Refresh the Quick Open suggestions if the prompt is open
+                    if let Some(prompt) = &self.prompt {
+                        if prompt.prompt_type == PromptType::QuickOpen {
+                            let input = prompt.input.clone();
+                            self.update_quick_open_suggestions(&input);
+                        }
+                    }
+                }
             }
         }
 
@@ -4908,64 +5337,6 @@ impl Editor {
         needs_render || processed_any_commands || plugin_render || file_changes || tree_changes
     }
 
-    /// Update LSP status bar string from active progress operations
-    fn update_lsp_status_from_progress(&mut self) {
-        if self.lsp_progress.is_empty() {
-            // No active progress, update from server statuses
-            self.update_lsp_status_from_server_statuses();
-            return;
-        }
-
-        // Show the first active progress operation
-        if let Some((_, info)) = self.lsp_progress.iter().next() {
-            let mut status = format!("LSP ({}): {}", info.language, info.title);
-            if let Some(ref msg) = info.message {
-                status.push_str(&format!(" - {}", msg));
-            }
-            if let Some(pct) = info.percentage {
-                status.push_str(&format!(" ({}%)", pct));
-            }
-            self.lsp_status = status;
-        }
-    }
-
-    /// Update LSP status bar string from server statuses
-    fn update_lsp_status_from_server_statuses(&mut self) {
-        use crate::services::async_bridge::LspServerStatus;
-
-        // Collect all server statuses
-        let mut statuses: Vec<(String, LspServerStatus)> = self
-            .lsp_server_statuses
-            .iter()
-            .map(|(lang, status)| (lang.clone(), *status))
-            .collect();
-
-        if statuses.is_empty() {
-            self.lsp_status = String::new();
-            return;
-        }
-
-        // Sort by language name for consistent display
-        statuses.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Build status string
-        let status_parts: Vec<String> = statuses
-            .iter()
-            .map(|(lang, status)| {
-                let status_str = match status {
-                    LspServerStatus::Starting => "starting",
-                    LspServerStatus::Initializing => "initializing",
-                    LspServerStatus::Running => "ready",
-                    LspServerStatus::Error => "error",
-                    LspServerStatus::Shutdown => "shutdown",
-                };
-                format!("{}: {}", lang, status_str)
-            })
-            .collect();
-
-        self.lsp_status = format!("LSP [{}]", status_parts.join(", "));
-    }
-
     /// Update the plugin state snapshot with current editor state
     #[cfg(feature = "plugins")]
     fn update_plugin_state_snapshot(&mut self) {
@@ -4973,6 +5344,22 @@ impl Editor {
         if let Some(snapshot_handle) = self.plugin_manager.state_snapshot_handle() {
             use fresh_core::api::{BufferInfo, CursorInfo, ViewportInfo};
             let mut snapshot = snapshot_handle.write().unwrap();
+
+            // Update grammar info (only rebuild if count changed, cheap check)
+            let grammar_count = self.grammar_registry.available_syntaxes().len();
+            if snapshot.available_grammars.len() != grammar_count {
+                snapshot.available_grammars = self
+                    .grammar_registry
+                    .available_grammar_info()
+                    .into_iter()
+                    .map(|g| fresh_core::api::GrammarInfoSnapshot {
+                        name: g.name,
+                        source: g.source.to_string(),
+                        file_extensions: g.file_extensions,
+                        short_name: g.short_name,
+                    })
+                    .collect();
+            }
 
             // Update active buffer ID
             snapshot.active_buffer_id = self.active_buffer();
@@ -5002,7 +5389,7 @@ impl Editor {
                     .and_then(|vs| vs.buffer_state(*buffer_id))
                     .map(|bs| match bs.view_mode {
                         crate::state::ViewMode::Source => "source",
-                        crate::state::ViewMode::Compose => "compose",
+                        crate::state::ViewMode::PageView => "compose",
                     })
                     .unwrap_or("source");
                 let compose_width = active_vs
@@ -5010,9 +5397,14 @@ impl Editor {
                     .and_then(|bs| bs.compose_width);
                 let is_composing_in_any_split = self.split_view_states.values().any(|vs| {
                     vs.buffer_state(*buffer_id)
-                        .map(|bs| matches!(bs.view_mode, crate::state::ViewMode::Compose))
+                        .map(|bs| matches!(bs.view_mode, crate::state::ViewMode::PageView))
                         .unwrap_or(false)
                 });
+                let is_preview = self
+                    .buffer_metadata
+                    .get(buffer_id)
+                    .map(|m| m.is_preview)
+                    .unwrap_or(false);
                 let buffer_info = BufferInfo {
                     id: *buffer_id,
                     path: state.buffer.file_path().map(|p| p.to_path_buf()),
@@ -5023,6 +5415,7 @@ impl Editor {
                     is_composing_in_any_split,
                     compose_width,
                     language: state.language.clone(),
+                    is_preview,
                 };
                 snapshot.buffers.insert(*buffer_id, buffer_info);
 
@@ -5031,7 +5424,6 @@ impl Editor {
                     BufferSavedDiff {
                         equal: diff.equal,
                         byte_ranges: diff.byte_ranges.clone(),
-                        line_ranges: diff.line_ranges.clone(),
                     }
                 };
                 snapshot.buffer_saved_diffs.insert(*buffer_id, diff);
@@ -5399,6 +5791,13 @@ impl Editor {
                 position,
             } => {
                 self.handle_set_buffer_cursor(buffer_id, position);
+            }
+            PluginCommand::SetBufferShowCursors { buffer_id, show } => {
+                if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                    state.show_cursors = show;
+                } else {
+                    tracing::warn!("SetBufferShowCursors: buffer {:?} not found", buffer_id);
+                }
             }
 
             // ==================== View/Layout Commands ====================
@@ -6042,8 +6441,11 @@ impl Editor {
                         );
                         view_state.apply_config_defaults(
                             self.config.editor.line_numbers,
-                            line_wrap.unwrap_or(self.config.editor.line_wrap),
+                            self.config.editor.highlight_current_line,
+                            line_wrap
+                                .unwrap_or_else(|| self.resolve_line_wrap_for_buffer(buffer_id)),
                             self.config.editor.wrap_indent,
+                            self.resolve_wrap_column_for_buffer(buffer_id),
                             self.config.editor.rulers.clone(),
                         );
                         // Override with plugin-requested show_line_numbers
@@ -6245,6 +6647,9 @@ impl Editor {
             } => {
                 self.handle_scroll_to_line_center(split_id, buffer_id, line);
             }
+            PluginCommand::ScrollBufferToLine { buffer_id, line } => {
+                self.handle_scroll_buffer_to_line(buffer_id, line);
+            }
             PluginCommand::SetEditorMode { mode } => {
                 self.handle_set_editor_mode(mode);
             }
@@ -6310,9 +6715,11 @@ impl Editor {
                 }
 
                 // 2. Update the config to disable the language
-                if let Some(lsp_config) = self.config.lsp.get_mut(&language) {
-                    lsp_config.enabled = false;
-                    lsp_config.auto_start = false;
+                if let Some(lsp_configs) = self.config.lsp.get_mut(&language) {
+                    for c in lsp_configs.as_mut_slice() {
+                        c.enabled = false;
+                        c.auto_start = false;
+                    }
                     tracing::info!("Disabled LSP config for {}", language);
                 }
 
@@ -6334,8 +6741,12 @@ impl Editor {
             PluginCommand::RestartLspForLanguage { language } => {
                 tracing::info!("Plugin restarting LSP for language: {}", language);
 
+                let file_path = self
+                    .buffer_metadata
+                    .get(&self.active_buffer())
+                    .and_then(|meta| meta.file_path().cloned());
                 let success = if let Some(ref mut lsp) = self.lsp {
-                    let (ok, msg) = lsp.manual_restart(&language);
+                    let (ok, msg) = lsp.manual_restart(&language, file_path.as_deref());
                     self.status_message = Some(msg);
                     ok
                 } else {
@@ -6431,15 +6842,70 @@ impl Editor {
                 layout,
                 sources,
                 hunks,
+                initial_focus_hunk,
                 request_id,
             } => {
-                self.handle_create_composite_buffer(name, mode, layout, sources, hunks, request_id);
+                self.handle_create_composite_buffer(
+                    name,
+                    mode,
+                    layout,
+                    sources,
+                    hunks,
+                    initial_focus_hunk,
+                    request_id,
+                );
             }
             PluginCommand::UpdateCompositeAlignment { buffer_id, hunks } => {
                 self.handle_update_composite_alignment(buffer_id, hunks);
             }
             PluginCommand::CloseCompositeBuffer { buffer_id } => {
                 self.close_composite_buffer(buffer_id);
+            }
+            PluginCommand::FlushLayout => {
+                self.flush_layout();
+            }
+            PluginCommand::CompositeNextHunk { buffer_id } => {
+                let split_id = self.split_manager.active_split();
+                self.composite_next_hunk(split_id, buffer_id);
+            }
+            PluginCommand::CompositePrevHunk { buffer_id } => {
+                let split_id = self.split_manager.active_split();
+                self.composite_prev_hunk(split_id, buffer_id);
+            }
+
+            // ==================== Buffer Groups ====================
+            PluginCommand::CreateBufferGroup {
+                name,
+                mode,
+                layout_json,
+                request_id,
+            } => match self.create_buffer_group(name, mode, layout_json) {
+                Ok(result) => {
+                    if let Some(req_id) = request_id {
+                        let json = serde_json::to_string(&result).unwrap_or_default();
+                        self.plugin_manager
+                            .resolve_callback(fresh_core::api::JsCallbackId::from(req_id), json);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create buffer group: {}", e);
+                }
+            },
+            PluginCommand::SetPanelContent {
+                group_id,
+                panel_name,
+                entries,
+            } => {
+                self.set_panel_content(group_id, panel_name, entries);
+            }
+            PluginCommand::CloseBufferGroup { group_id } => {
+                self.close_buffer_group(group_id);
+            }
+            PluginCommand::FocusPanel {
+                group_id,
+                panel_name,
+            } => {
+                self.focus_panel(group_id, panel_name);
             }
 
             // ==================== File Operations ====================
@@ -6557,8 +7023,10 @@ impl Editor {
                                     );
                                     view_state.apply_config_defaults(
                                         self.config.editor.line_numbers,
+                                        self.config.editor.highlight_current_line,
                                         false,
                                         false,
+                                        None,
                                         self.config.editor.rulers.clone(),
                                     );
                                     self.split_view_states.insert(new_split_id, view_state);
@@ -7053,6 +7521,68 @@ impl Editor {
                 // Mark to skip ensure_visible on next render so the scroll isn't undone
                 view_state.viewport.set_skip_ensure_visible();
             }
+        }
+    }
+
+    /// Scroll every split whose active buffer is `buffer_id` so that
+    /// `line` is within the viewport. Used by plugin panels (buffer
+    /// groups) whose plugin-side "selected row" doesn't drive the
+    /// buffer cursor — after updating the selection, the plugin calls
+    /// this to bring the selected row into view.
+    ///
+    /// Walks both the main split tree's leaves AND the inner leaves of
+    /// all Grouped subtrees stored in `grouped_subtrees`, because the
+    /// latter are not represented in `split_manager`'s tree.
+    fn handle_scroll_buffer_to_line(&mut self, buffer_id: BufferId, line: usize) {
+        if !self.buffers.contains_key(&buffer_id) {
+            return;
+        }
+
+        // Collect the leaf ids whose active buffer is `buffer_id`.
+        let mut target_leaves: Vec<LeafId> = Vec::new();
+
+        // Main tree: walk its leaves.
+        for leaf_id in self.split_manager.root().leaf_split_ids() {
+            if let Some(vs) = self.split_view_states.get(&leaf_id) {
+                if vs.active_buffer == buffer_id {
+                    target_leaves.push(leaf_id);
+                }
+            }
+        }
+
+        // Grouped subtrees: walk each group's inner leaves.
+        for (_group_leaf_id, node) in self.grouped_subtrees.iter() {
+            if let crate::view::split::SplitNode::Grouped { layout, .. } = node {
+                for inner_leaf in layout.leaf_split_ids() {
+                    if let Some(vs) = self.split_view_states.get(&inner_leaf) {
+                        if vs.active_buffer == buffer_id && !target_leaves.contains(&inner_leaf) {
+                            target_leaves.push(inner_leaf);
+                        }
+                    }
+                }
+            }
+        }
+
+        if target_leaves.is_empty() {
+            return;
+        }
+
+        let state = match self.buffers.get_mut(&buffer_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        for leaf_id in target_leaves {
+            let Some(view_state) = self.split_view_states.get_mut(&leaf_id) else {
+                continue;
+            };
+            let viewport_height = view_state.viewport.height as usize;
+            // Place `line` roughly a third of the viewport from the top so
+            // the next few navigation steps don't immediately scroll again.
+            let lines_above = viewport_height / 3;
+            let target = line.saturating_sub(lines_above);
+            view_state.viewport.scroll_to(&mut state.buffer, target);
+            view_state.viewport.set_skip_ensure_visible();
         }
     }
 }
@@ -8891,8 +9421,13 @@ mod tests {
             .rename_file_path(std::path::PathBuf::from("ccc_long_name_03.txt"));
 
         {
+            use crate::view::split::TabTarget;
             let view_state = editor.split_view_states.get_mut(&split_id).unwrap();
-            view_state.open_buffers = vec![buf1, buf2, buf3];
+            view_state.open_buffers = vec![
+                TabTarget::Buffer(buf1),
+                TabTarget::Buffer(buf2),
+                TabTarget::Buffer(buf3),
+            ];
             view_state.tab_scroll_offset = 50;
         }
 
@@ -8913,8 +9448,8 @@ mod tests {
         editor.ensure_active_tab_visible(split_id, buf3, 25);
         let view_state = editor.split_view_states.get(&split_id).unwrap();
         assert!(view_state.tab_scroll_offset > 0);
-        let total_width: usize = view_state
-            .open_buffers
+        let buffer_ids: Vec<_> = view_state.buffer_tab_ids_vec();
+        let total_width: usize = buffer_ids
             .iter()
             .enumerate()
             .map(|(idx, id)| {
@@ -8927,7 +9462,7 @@ mod tests {
                     .map(|s| s.chars().count())
                     .unwrap_or(0);
                 let tab_width = 2 + name_len;
-                if idx < view_state.open_buffers.len() - 1 {
+                if idx < buffer_ids.len() - 1 {
                     tab_width + 1 // separator
                 } else {
                     tab_width

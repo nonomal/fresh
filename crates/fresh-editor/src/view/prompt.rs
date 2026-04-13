@@ -33,8 +33,6 @@ pub enum PromptType {
     QueryReplace { search: String },
     /// Query replace confirmation prompt (y/n/!/q for each match)
     QueryReplaceConfirm,
-    /// Execute a command by name (M-x)
-    Command,
     /// Quick Open - unified prompt with prefix-based provider routing
     /// Supports file finding (default), commands (>), buffers (#), goto line (:)
     QuickOpen,
@@ -67,8 +65,8 @@ pub enum PromptType {
     SetBookmark,
     /// Jump to a bookmark - prompts for register (0-9)
     JumpToBookmark,
-    /// Set compose width (empty clears to viewport)
-    SetComposeWidth,
+    /// Set page width (empty clears to viewport)
+    SetPageWidth,
     /// Add a vertical ruler at a column position
     AddRuler,
     /// Remove a vertical ruler (select from list)
@@ -83,6 +81,8 @@ pub enum PromptType {
     SetLanguage,
     /// Stop a running LSP server (select from list)
     StopLspServer,
+    /// Restart LSP server(s) (select from list)
+    RestartLspServer,
     /// Select a theme (select from list)
     /// Stores the original theme name for restoration on cancel
     SelectTheme { original_theme: String },
@@ -104,6 +104,8 @@ pub enum PromptType {
     },
     /// Confirm overwriting an existing file during SaveAs
     ConfirmOverwriteFile { path: std::path::PathBuf },
+    /// Confirm creating parent directories for a save target
+    ConfirmCreateDirectory { path: std::path::PathBuf },
     /// Confirm closing a modified buffer (save/discard/cancel)
     /// Stores buffer_id to close after user confirms
     ConfirmCloseBuffer {
@@ -535,7 +537,7 @@ impl Prompt {
     /// # Example
     /// ```
     /// # use fresh::prompt::{Prompt, PromptType};
-    /// let mut prompt = Prompt::new("Command: ".to_string(), PromptType::Command);
+    /// let mut prompt = Prompt::new("Command: ".to_string(), PromptType::QuickOpen);
     /// prompt.input = "save".to_string();
     /// prompt.cursor_pos = 4;
     /// prompt.insert_str(" file");
@@ -958,7 +960,7 @@ mod tests {
     // Tests for selection functionality
     #[test]
     fn test_selection_with_shift_arrows() {
-        let mut prompt = Prompt::new("Command: ".to_string(), PromptType::Command);
+        let mut prompt = Prompt::new("Command: ".to_string(), PromptType::QuickOpen);
         prompt.input = "hello world".to_string();
         prompt.cursor_pos = 5; // After "hello"
 
@@ -999,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_selection_with_home_end() {
-        let mut prompt = Prompt::new("Prompt: ".to_string(), PromptType::Command);
+        let mut prompt = Prompt::new("Prompt: ".to_string(), PromptType::QuickOpen);
         prompt.input = "select this text".to_string();
         prompt.cursor_pos = 7; // After "select "
 

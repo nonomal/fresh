@@ -166,6 +166,31 @@ impl IntervalTree {
         self.insert_with_type(start, end, MarkerType::Position)
     }
 
+    /// Insert a marker with a specific ID and type (for set_position).
+    /// The caller must ensure the ID is not already in use.
+    fn insert_with_id(&mut self, id: MarkerId, start: u64, end: u64, marker_type: MarkerType) {
+        debug_assert!(
+            id < self.next_id,
+            "insert_with_id: id {} must be < next_id {}",
+            id,
+            self.next_id
+        );
+        debug_assert!(
+            !self.marker_map.contains_key(&id),
+            "insert_with_id: id {} already in use",
+            id
+        );
+        let marker = Marker {
+            id,
+            interval: Interval { start, end },
+            marker_type,
+        };
+
+        let new_node = Node::new(marker.clone(), Weak::new());
+        self.root = Self::insert_recursive(self.root.take(), new_node.clone());
+        self.marker_map.insert(id, new_node);
+    }
+
     /// Insert a marker with a specific type
     pub fn insert_with_type(&mut self, start: u64, end: u64, marker_type: MarkerType) -> MarkerId {
         let id = self.next_id;
@@ -240,6 +265,27 @@ impl IntervalTree {
         self.root = Self::delete_recursive(self.root.take(), start, id);
 
         self.marker_map.remove(&id).is_some()
+    }
+
+    /// Move a marker to a new position, preserving its ID and type.
+    /// Implemented as delete + reinsert with the same ID.
+    /// Returns false if the marker doesn't exist.
+    /// Performance: O(log n)
+    pub fn set_position(&mut self, id: MarkerId, new_start: u64, new_end: u64) -> bool {
+        // Get the marker's type before deleting
+        let marker_type = match self.get_marker(id) {
+            Some(m) => m.marker_type,
+            None => return false,
+        };
+
+        // Delete from tree
+        if !self.delete(id) {
+            return false;
+        }
+
+        // Reinsert with same ID
+        self.insert_with_id(id, new_start, new_end, marker_type);
+        true
     }
 
     /// Adjusts all markers for a text edit (insertion or deletion).

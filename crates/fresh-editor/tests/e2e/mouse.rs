@@ -2,7 +2,7 @@
 
 use crate::common::fixtures::TestFixture;
 use crate::common::harness::EditorTestHarness;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::fs;
 
 /// Test scrollbar rendering in a single split
@@ -1637,18 +1637,12 @@ fn test_force_check_mouse_hover() {
         "Should have hover state"
     );
 
-    // Force check should return true (would trigger hover if LSP was available)
+    // Force check returns false when no LSP server is available — the request
+    // is not dispatched and the sent flag is not set, allowing retry later.
     let triggered = harness.editor_mut().force_check_mouse_hover();
     assert!(
-        triggered,
-        "force_check_mouse_hover should return true when hover state exists"
-    );
-
-    // Second call should return false (already sent)
-    let triggered_again = harness.editor_mut().force_check_mouse_hover();
-    assert!(
-        !triggered_again,
-        "Second force_check should return false (already sent)"
+        !triggered,
+        "force_check_mouse_hover should return false when no LSP server is available"
     );
 }
 
@@ -1840,6 +1834,109 @@ fn test_double_click_requires_same_position() {
         !selected_text_same_pos.is_empty(),
         "Double-click at same position SHOULD select a word, but got empty selection"
     );
+}
+
+/// Test that after double-clicking a word, dragging extends selection by words (issue #1202).
+/// Example: double-click "quick" and drag right → "quick" → "quick brown" → "quick brown fox".
+#[test]
+fn test_double_click_drag_extends_selection_by_words() {
+    let mut harness = EditorTestHarness::new_no_wrap(80, 24).unwrap();
+    let content = "quick brown fox\n";
+    let _fixture = harness.load_buffer_from_text(content).unwrap();
+    harness.render().unwrap();
+
+    let (content_first_row, _) = harness.content_area_rows();
+    let row = content_first_row as u16;
+    let gutter_width = harness.editor().active_state().margins.left_total_width() as u16;
+
+    // "quick" at cols gutter_width..gutter_width+5, " brown" at +6..+12, " fox" at +13..+17
+    let quick_col = gutter_width + 3; // middle of "quick"
+    let brown_col = gutter_width + 9; // in "brown"
+    let fox_col = gutter_width + 14; // in "fox"
+
+    // 1. First click
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: quick_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: quick_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+    // 2. Second click (double-click) – selects "quick" and enables word-drag mode
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: quick_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
+
+    let after_double = harness.get_selected_text();
+    assert_eq!(
+        after_double, "quick",
+        "After double-click, should have 'quick' selected, got '{}'",
+        after_double
+    );
+
+    // 3. Drag right to "brown" – selection should extend to "quick brown"
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: brown_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
+
+    let after_drag_brown = harness.get_selected_text();
+    assert!(
+        after_drag_brown.contains("quick") && after_drag_brown.contains("brown"),
+        "After drag to 'brown', selection should include both words, got '{}'",
+        after_drag_brown
+    );
+
+    // 4. Drag further right to "fox" – selection should extend to "quick brown fox"
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: fox_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
+
+    let after_drag_fox = harness.get_selected_text();
+    assert_eq!(
+        after_drag_fox.trim(),
+        "quick brown fox",
+        "After drag to 'fox', selection should be 'quick brown fox', got '{}'",
+        after_drag_fox
+    );
+
+    // 5. Release
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: fox_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
 }
 
 /// Test that with blinking_bar cursor style, the first character of a selection
@@ -2060,5 +2157,220 @@ fn test_hover_popup_position_with_file_explorer() {
         explorer_width - 1,
         explorer_width,
         screen
+    );
+}
+
+/// Test that after double-clicking a word, dragging *backward* keeps the initial word selected
+/// and extends selection to include previous words (issue #1334).
+/// Example: double-click "brown" and drag left → "brown" → "quick brown".
+/// Bug: dragging backward unselects the initial word before selecting previous words.
+#[test]
+fn test_double_click_drag_backward_keeps_initial_word_selected() {
+    let mut harness = EditorTestHarness::new_no_wrap(80, 24).unwrap();
+    let content = "quick brown fox\n";
+    let _fixture = harness.load_buffer_from_text(content).unwrap();
+    harness.render().unwrap();
+
+    let (content_first_row, _) = harness.content_area_rows();
+    let row = content_first_row as u16;
+    let gutter_width = harness.editor().active_state().margins.left_total_width() as u16;
+
+    // "quick" at cols gutter+0..gutter+5, "brown" at gutter+6..gutter+11, "fox" at gutter+12..gutter+15
+    let brown_col = gutter_width + 9; // middle of "brown"
+    let quick_col = gutter_width + 3; // middle of "quick"
+
+    // 1. First click on "brown"
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: brown_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: brown_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+
+    // 2. Second click (double-click) – selects "brown"
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: brown_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
+
+    let after_double = harness.get_selected_text();
+    assert_eq!(
+        after_double, "brown",
+        "After double-click, should have 'brown' selected, got '{}'",
+        after_double
+    );
+
+    // 3. Drag backward (left) to "quick" – selection should extend to "quick brown"
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: quick_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
+
+    let after_drag_back = harness.get_selected_text();
+    assert!(
+        after_drag_back.contains("quick") && after_drag_back.contains("brown"),
+        "After dragging backward to 'quick', selection should include both 'quick' and 'brown', got '{}'",
+        after_drag_back
+    );
+
+    // 4. Release
+    harness
+        .send_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: quick_col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify final selection still contains both words
+    let final_selection = harness.get_selected_text();
+    assert_eq!(
+        final_selection.trim(),
+        "quick brown",
+        "Final selection should be 'quick brown', got '{}'",
+        final_selection
+    );
+}
+
+/// Test that hovering over the scrollbar track highlights only the hovered cell,
+/// not the entire track.
+#[test]
+fn test_scrollbar_track_hover_highlights_single_cell() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+
+    // Create scrollable content
+    let content: String = (1..=100)
+        .map(|i| format!("Line {i} with some content\n"))
+        .collect();
+    let _fixture = harness.load_buffer_from_text(&content).unwrap();
+    harness.render().unwrap();
+
+    let scrollbar_col: u16 = 79;
+    let (content_first_row, content_last_row) = harness.content_area_rows();
+
+    // Find two distinct track cells (not on the thumb)
+    let mut track_rows: Vec<u16> = Vec::new();
+    for row in content_first_row..=content_last_row {
+        if harness.is_scrollbar_track_at(scrollbar_col, row as u16) {
+            track_rows.push(row as u16);
+        }
+    }
+    assert!(
+        track_rows.len() >= 2,
+        "Need at least 2 track cells, found {}",
+        track_rows.len()
+    );
+
+    let hover_row = track_rows[0];
+    let other_track_row = track_rows[track_rows.len() - 1];
+
+    // Record styles before hover
+    let style_before_hover = harness.get_cell_style(scrollbar_col, hover_row).unwrap();
+    let style_before_other = harness
+        .get_cell_style(scrollbar_col, other_track_row)
+        .unwrap();
+
+    // Move mouse to one track cell
+    harness.mouse_move(scrollbar_col, hover_row).unwrap();
+
+    // The hovered cell should have a different (hover) background
+    let style_after_hover = harness.get_cell_style(scrollbar_col, hover_row).unwrap();
+    assert_ne!(
+        style_before_hover.bg, style_after_hover.bg,
+        "Hovered track cell at row {} should change color on hover",
+        hover_row
+    );
+
+    // Other track cells should NOT be highlighted
+    let style_after_other = harness
+        .get_cell_style(scrollbar_col, other_track_row)
+        .unwrap();
+    assert_eq!(
+        style_before_other.bg, style_after_other.bg,
+        "Non-hovered track cell at row {} should NOT change color (before: {:?}, after: {:?})",
+        other_track_row, style_before_other.bg, style_after_other.bg
+    );
+}
+
+/// Test that hovering over a track cell highlights it, then clicking jumps the
+/// thumb there and the single-cell hover highlight disappears.
+#[test]
+fn test_scrollbar_track_hover_then_click_clears_highlight() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+
+    // Create scrollable content
+    let content: String = (1..=200)
+        .map(|i| format!("Line {i} with some content\n"))
+        .collect();
+    let _fixture = harness.load_buffer_from_text(&content).unwrap();
+    harness.render().unwrap();
+
+    let scrollbar_col: u16 = 79;
+    let (content_first_row, content_last_row) = harness.content_area_rows();
+
+    // Find a track cell far from the thumb (pick the last track cell)
+    let mut click_row = None;
+    for row in (content_first_row..=content_last_row).rev() {
+        if harness.is_scrollbar_track_at(scrollbar_col, row as u16) {
+            click_row = Some(row as u16);
+            break;
+        }
+    }
+    let click_row = click_row.expect("Should have a track cell to click");
+
+    // Record the normal track style before any interaction
+    let normal_style = harness.get_cell_style(scrollbar_col, click_row).unwrap();
+
+    // Step 1: Hover over the track cell - should highlight it
+    harness.mouse_move(scrollbar_col, click_row).unwrap();
+    let hover_style = harness.get_cell_style(scrollbar_col, click_row).unwrap();
+    assert_ne!(
+        normal_style.bg, hover_style.bg,
+        "Track cell at row {} should be highlighted on hover",
+        click_row
+    );
+
+    // Step 2: Click the track cell - thumb should jump there
+    let top_line_before = harness.top_line_number();
+    harness.mouse_click(scrollbar_col, click_row).unwrap();
+    let top_line_after = harness.top_line_number();
+    assert!(
+        top_line_after > top_line_before,
+        "Clicking track should scroll down (before: {}, after: {})",
+        top_line_before,
+        top_line_after
+    );
+
+    // Step 3: After click, the thumb jumped toward the click position. The mouse
+    // is still there, so if the thumb now covers that cell it should show thumb
+    // style. Either way, the track hover highlight must NOT appear — the click
+    // transitions the hover target to ScrollbarThumb.
+    let post_click_style = harness.get_cell_style(scrollbar_col, click_row).unwrap();
+    assert_ne!(
+        post_click_style.bg, hover_style.bg,
+        "After clicking, cell at row {} should not show track hover highlight (got: {:?})",
+        click_row, post_click_style.bg
     );
 }

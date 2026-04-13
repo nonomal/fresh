@@ -8,19 +8,19 @@ use crate::primitives::display_width::str_width;
 
 use super::items::SettingControl;
 use super::layout::{SettingsHit, SettingsLayout};
-use super::search::SearchResult;
+use super::search::{DeepMatch, SearchResult};
 use super::state::SettingsState;
 use crate::view::controls::{
-    render_dropdown_aligned, render_number_input_aligned, render_text_input_aligned,
-    render_toggle_aligned, DropdownColors, MapColors, NumberInputColors, TextInputColors,
-    TextListColors, ToggleColors,
+    render_dropdown_aligned, render_dual_list_partial, render_number_input_aligned,
+    render_text_input_aligned, render_toggle_aligned, DropdownColors, DualListColors, MapColors,
+    NumberInputColors, TextInputColors, TextListColors, ToggleColors,
 };
 use crate::view::theme::Theme;
 use crate::view::ui::scrollbar::{render_scrollbar, ScrollbarColors, ScrollbarState};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 /// Build spans for a text line with selection highlighting
@@ -113,8 +113,22 @@ pub fn render_settings(
     state: &mut SettingsState,
     theme: &Theme,
 ) -> SettingsLayout {
-    // Calculate modal size (80% of screen width, 90% height to fill most of available space)
-    let modal_width = (area.width * 80 / 100).min(100);
+    // Minimum size guard — prevent panics from zero-sized layout arithmetic
+    if area.width < 40 || area.height < 10 {
+        let msg = "[Terminal too small for settings]";
+        let x = area.x + area.width.saturating_sub(msg.len() as u16) / 2;
+        let y = area.y + area.height / 2;
+        if area.width > 0 && area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(msg).style(Style::default().fg(theme.diagnostic_warning_fg)),
+                Rect::new(x, y, msg.len() as u16, 1),
+            );
+        }
+        return SettingsLayout::new(Rect::ZERO);
+    }
+
+    // Calculate modal size (90% of screen width, 90% height to fill most of available space)
+    let modal_width = (area.width * 90 / 100).min(160);
     let modal_height = area.height * 90 / 100;
     let modal_x = (area.width.saturating_sub(modal_width)) / 2;
     let modal_y = (area.height.saturating_sub(modal_height)) / 2;
@@ -133,6 +147,7 @@ pub fn render_settings(
     let block = Block::default()
         .title(title.as_str())
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.popup_border_fg))
         .style(Style::default().bg(theme.popup_bg));
     frame.render_widget(block, modal_area);
@@ -202,12 +217,15 @@ pub fn render_settings(
         render_reset_dialog(frame, modal_area, state, theme);
     }
 
-    // Render entry detail dialog if showing
+    // Render entry dialog stack — dim between each level
     if has_entry {
-        if !has_help {
-            crate::view::dimming::apply_dimming(frame, modal_area);
+        let stack_depth = state.entry_dialog_stack.len();
+        for dialog_idx in 0..stack_depth {
+            if !has_help || dialog_idx < stack_depth - 1 {
+                crate::view::dimming::apply_dimming(frame, modal_area);
+            }
+            render_entry_dialog_at(frame, modal_area, state, theme, dialog_idx);
         }
-        render_entry_dialog(frame, modal_area, state, theme);
     }
 
     // Render help overlay if showing
@@ -230,7 +248,7 @@ fn render_horizontal_layout(
 ) {
     // Layout: [left panel (categories)] | [right panel (settings)]
     let chunks =
-        Layout::horizontal([Constraint::Length(20), Constraint::Min(40)]).split(content_area);
+        Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
 
     let categories_area = chunks[0];
     let settings_area = chunks[1];
@@ -413,6 +431,23 @@ fn render_categories_horizontal(
     }
 }
 
+/// Get an icon for a settings category name (Nerd Font icons)
+fn category_icon(name: &str) -> &'static str {
+    match name.to_lowercase().as_str() {
+        "general" => "\u{f013} ",       //
+        "editor" => "\u{f044} ",        //
+        "clipboard" => "\u{f328} ",     //
+        "file browser" => "\u{f07b} ",  //
+        "file explorer" => "\u{f07c} ", //
+        "packages" => "\u{f487} ",      //
+        "plugins" => "\u{f1e6} ",       //
+        "terminal" => "\u{f120} ",      //
+        "warnings" => "\u{f071} ",      //
+        "keybindings" => "\u{f11c} ",   //
+        _ => "\u{f111} ",               //  (dot circle as fallback)
+    }
+}
+
 /// Render the category list
 fn render_categories(
     frame: &mut Frame,
@@ -454,20 +489,45 @@ fn render_categories(
 
         // Indicator for categories with modified settings
         let has_changes = page.items.iter().any(|i| i.modified);
-        let modified_indicator = if has_changes { "●" } else { " " };
+        let modified_indicator = if has_changes { "● " } else { "  " };
 
         // Show ">" when selected and focused for clearer selection indicator
         let selection_indicator = if is_selected && state.focus_panel() == FocusPanel::Categories {
-            ">"
+            "> "
         } else {
-            " "
+            "  "
         };
 
-        let text = format!(
-            "{}{} {}",
-            selection_indicator, modified_indicator, page.name
-        );
-        let line = Line::from(Span::styled(text, style));
+        let icon = category_icon(&page.name);
+
+        let mut spans = vec![Span::styled(selection_indicator, style)];
+        if has_changes {
+            spans.push(Span::styled(
+                modified_indicator,
+                Style::default().fg(theme.menu_highlight_fg),
+            ));
+        } else {
+            spans.push(Span::styled(modified_indicator, style));
+        }
+        spans.push(Span::styled(
+            icon,
+            Style::default()
+                .fg(theme.popup_border_fg)
+                .bg(if is_selected {
+                    if state.focus_panel() == FocusPanel::Categories {
+                        theme.menu_highlight_bg
+                    } else {
+                        theme.selection_bg
+                    }
+                } else if is_hovered {
+                    theme.menu_hover_bg
+                } else {
+                    theme.popup_bg
+                }),
+        ));
+        spans.push(Span::styled(&page.name, style));
+
+        let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), row_area);
     }
 }
@@ -532,15 +592,39 @@ fn render_settings_panel(
     frame.render_widget(Paragraph::new(title), Rect::new(area.x, y, area.width, 1));
     y += 1;
 
-    // Page description
+    // Page description (supports multi-line descriptions separated by \n)
     if let Some(ref desc) = page.description {
         let desc_style = Style::default().fg(theme.line_number_fg);
-        let desc_line = Line::from(Span::styled(desc, desc_style));
+        let lines: Vec<Line> = desc
+            .lines()
+            .map(|line| Line::from(Span::styled(line, desc_style)))
+            .collect();
+        let line_count = lines.len() as u16;
         frame.render_widget(
-            Paragraph::new(desc_line),
-            Rect::new(area.x, y, area.width, 1),
+            Paragraph::new(lines),
+            Rect::new(area.x, y, area.width, line_count),
         );
+        y += line_count;
+    }
+
+    // "Clear" button for nullable categories (e.g., Option<LanguageConfig>)
+    if page.nullable && state.current_category_has_values() {
+        let btn_text = format!("[{}]", t!("settings.btn_clear_category"));
+        let btn_len = btn_text.len() as u16;
+        let is_hovered = matches!(state.hover_hit, Some(SettingsHit::ClearCategoryButton));
+        let btn_style = if is_hovered {
+            Style::default()
+                .fg(theme.menu_hover_fg)
+                .bg(theme.menu_hover_bg)
+        } else {
+            Style::default().fg(theme.line_number_fg)
+        };
+        let btn_area = Rect::new(area.x, y, btn_len, 1);
+        frame.render_widget(Paragraph::new(btn_text).style(btn_style), btn_area);
+        layout.clear_category_button = Some(btn_area);
         y += 1;
+    } else {
+        layout.clear_category_button = None;
     }
 
     y += 1; // Blank line
@@ -619,7 +703,8 @@ fn render_settings_panel(
             item_info.index,
             page.items[item_info.index].path.clone(),
             item_info.area,
-            item_info.layout,
+            item_info.layout.control,
+            item_info.layout.inherit_button,
         );
     }
 
@@ -688,7 +773,7 @@ fn render_setting_item_pure(
     ctx: &RenderContext,
     theme: &Theme,
     label_width: Option<u16>,
-) -> ControlLayoutInfo {
+) -> SettingItemLayoutInfo {
     use super::items::SECTION_HEADER_HEIGHT;
 
     // Handle section header if this item starts a new section
@@ -703,10 +788,10 @@ fn render_setting_item_pure(
                 let header_y = area.y;
                 let _header_area_height = header_visible_height.min(area.height);
 
-                // First row: section title (bold, slightly dimmed)
+                // First row: section title (bold)
                 if header_visible_start == 0 {
                     let header_style = Style::default()
-                        .fg(theme.menu_active_fg)
+                        .fg(theme.editor_fg)
                         .add_modifier(Modifier::BOLD);
                     // Render section name with underline characters
                     let header_text = format!("── {} ", section_name);
@@ -742,7 +827,7 @@ fn render_setting_item_pure(
 
     // If no space left for item content, return empty layout
     if item_area.height == 0 {
-        return ControlLayoutInfo::default();
+        return SettingItemLayoutInfo::default();
     }
 
     // Use adjusted area and skip_top for the rest of rendering
@@ -761,6 +846,7 @@ fn render_setting_item_pure(
         Some(SettingsHit::ControlText(i)) => i == idx,
         Some(SettingsHit::ControlTextListRow(i, _)) => i == idx,
         Some(SettingsHit::ControlMapRow(i, _)) => i == idx,
+        Some(SettingsHit::ControlInherit(i)) => i == idx,
         _ => false,
     };
 
@@ -787,7 +873,10 @@ fn render_setting_item_pure(
         // the label row — per-entry highlighting is handled by the control itself
         let is_multi_row_control = matches!(
             item.control,
-            SettingControl::Map(_) | SettingControl::ObjectArray(_) | SettingControl::TextList(_)
+            SettingControl::Map(_)
+                | SettingControl::ObjectArray(_)
+                | SettingControl::TextList(_)
+                | SettingControl::DualList(_)
         );
         let highlight_rows = if is_multi_row_control && skip_top == 0 {
             1 // Only the label/name row
@@ -830,8 +919,8 @@ fn render_setting_item_pure(
         visible_control_height.min(area.height),
     );
 
-    // Render the control
-    let layout = render_control(
+    // Render the control (dimmed if nullable and currently null/inherited)
+    let control_layout = render_control(
         frame,
         control_area,
         &item.control,
@@ -840,7 +929,54 @@ fn render_setting_item_pure(
         theme,
         label_width.map(|w| w.saturating_sub(focus_indicator_width)),
         item.read_only,
+        item.is_null,
     );
+
+    // Render nullable UI elements: (Inherited) badge or [Inherit] button
+    let mut inherit_button_area: Option<Rect> = None;
+    if item.nullable && skip_top == 0 {
+        if item.is_null {
+            // Show "(Inherited)" badge after the control on the first row
+            let badge_text = t!("settings.inherited_badge").to_string();
+            let badge_style = Style::default()
+                .fg(theme.line_number_fg)
+                .add_modifier(Modifier::ITALIC);
+            // Place badge at end of control row
+            let badge_len = badge_text.len() as u16 + 1; // +1 for spacing
+            let badge_x = control_area
+                .x
+                .saturating_add(control_area.width)
+                .saturating_sub(badge_len);
+            if badge_x > control_area.x {
+                frame.render_widget(
+                    Paragraph::new(badge_text).style(badge_style),
+                    Rect::new(badge_x, control_area.y, badge_len, 1),
+                );
+            }
+        } else {
+            // Show [Inherit] button after the control on the first row
+            let btn_text = format!("[{}]", t!("settings.btn_inherit"));
+            let btn_len = btn_text.len() as u16 + 1; // +1 for spacing
+            let btn_x = control_area
+                .x
+                .saturating_add(control_area.width)
+                .saturating_sub(btn_len);
+            if btn_x > control_area.x {
+                let btn_area = Rect::new(btn_x, control_area.y, btn_len, 1);
+                let is_hovered =
+                    matches!(ctx.hover_hit, Some(SettingsHit::ControlInherit(i)) if i == idx);
+                let btn_style = if is_hovered {
+                    Style::default()
+                        .fg(theme.menu_hover_fg)
+                        .bg(theme.menu_hover_bg)
+                } else {
+                    Style::default().fg(theme.line_number_fg)
+                };
+                frame.render_widget(Paragraph::new(btn_text).style(btn_style), btn_area);
+                inherit_button_area = Some(btn_area);
+            }
+        }
+    }
 
     // Render description below the control (if visible and exists)
     // Description is also offset by focus_indicator_width to align with control
@@ -896,7 +1032,10 @@ fn render_setting_item_pure(
         }
     }
 
-    layout
+    SettingItemLayoutInfo {
+        control: control_layout,
+        inherit_button: inherit_button_area,
+    }
 }
 
 /// Render the appropriate control for a setting
@@ -916,6 +1055,7 @@ fn render_control(
     theme: &Theme,
     label_width: Option<u16>,
     read_only: bool,
+    is_null: bool,
 ) -> ControlLayoutInfo {
     match control {
         // Single-row controls: only render if not skipped
@@ -967,7 +1107,7 @@ fn render_control(
                 return ControlLayoutInfo::Text(Rect::default());
             }
             if read_only {
-                // Render read-only text as plain text (not editable)
+                // Truly read-only fields (e.g., Key: in entry dialogs) render as plain text
                 let label_w = label_width.unwrap_or(20);
                 let label_style = Style::default().fg(theme.editor_fg);
                 let value_style = Style::default().fg(theme.line_number_fg);
@@ -987,7 +1127,13 @@ fn render_control(
                     Paragraph::new(value.as_str()).style(value_style),
                     value_area,
                 );
-                ControlLayoutInfo::Text(Rect::default()) // No clickable area for read-only
+                ControlLayoutInfo::Text(Rect::default())
+            } else if is_null {
+                // Nullable-null fields render with dimmed brackets to indicate input presence
+                let colors = TextInputColors::from_theme_disabled(theme);
+                let text_layout =
+                    render_text_input_aligned(frame, area, state, &colors, 30, label_width);
+                ControlLayoutInfo::Text(text_layout.input_area)
             } else {
                 let colors = TextInputColors::from_theme(theme);
                 let text_layout =
@@ -1001,15 +1147,29 @@ fn render_control(
             let colors = TextListColors::from_theme(theme);
             let list_layout = render_text_list_partial(frame, area, state, &colors, 30, skip_rows);
             ControlLayoutInfo::TextList {
-                rows: list_layout.rows.iter().map(|r| r.text_area).collect(),
+                rows: list_layout
+                    .rows
+                    .iter()
+                    .map(|r| (r.index, r.text_area))
+                    .collect(),
             }
+        }
+
+        SettingControl::DualList(state) => {
+            let colors = DualListColors::from_theme(theme);
+            let dual_layout = render_dual_list_partial(frame, area, state, &colors, skip_rows);
+            ControlLayoutInfo::DualList(dual_layout)
         }
 
         SettingControl::Map(state) => {
             let colors = MapColors::from_theme(theme);
             let map_layout = render_map_partial(frame, area, state, &colors, 20, skip_rows);
             ControlLayoutInfo::Map {
-                entry_rows: map_layout.entry_areas.iter().map(|e| e.row_area).collect(),
+                entry_rows: map_layout
+                    .entry_areas
+                    .iter()
+                    .map(|e| (e.index, e.row_area))
+                    .collect(),
                 add_row_area: map_layout.add_row_area,
             }
         }
@@ -1027,7 +1187,11 @@ fn render_control(
             };
             let kb_layout = render_keybinding_list_partial(frame, area, state, &colors, skip_rows);
             ControlLayoutInfo::ObjectArray {
-                entry_rows: kb_layout.entry_rects,
+                entry_rows: kb_layout
+                    .entry_rects
+                    .iter()
+                    .map(|&(idx, rect)| (idx, rect))
+                    .collect(),
             }
         }
 
@@ -1649,7 +1813,7 @@ fn render_keybinding_list_partial(
 
         if content_row >= skip_rows {
             let entry_area = Rect::new(area.x + indent, y, area.width.saturating_sub(indent), 1);
-            entry_rects.push(entry_area);
+            entry_rects.push((idx, entry_area));
 
             let is_entry_focused = is_focused && state.focused_index == Some(idx);
             let bg = if is_entry_focused {
@@ -1744,6 +1908,13 @@ fn render_keybinding_list_partial(
     }
 }
 
+/// Combined layout info for a setting item (control + inherit button)
+#[derive(Debug, Clone, Default)]
+pub struct SettingItemLayoutInfo {
+    pub control: ControlLayoutInfo,
+    pub inherit_button: Option<Rect>,
+}
+
 /// Layout info for a control (for hit testing)
 #[derive(Debug, Clone, Default)]
 pub enum ControlLayoutInfo {
@@ -1760,14 +1931,18 @@ pub enum ControlLayoutInfo {
     },
     Text(Rect),
     TextList {
-        rows: Vec<Rect>,
+        /// (data_index, screen_area) - None index means "add new" row
+        rows: Vec<(Option<usize>, Rect)>,
     },
+    DualList(crate::view::controls::DualListLayout),
     Map {
-        entry_rows: Vec<Rect>,
+        /// (data_index, screen_area)
+        entry_rows: Vec<(usize, Rect)>,
         add_row_area: Option<Rect>,
     },
     ObjectArray {
-        entry_rows: Vec<Rect>,
+        /// (data_index, screen_area)
+        entry_rows: Vec<(usize, Rect)>,
     },
     Json {
         edit_area: Rect,
@@ -1865,9 +2040,18 @@ fn render_footer(
     let edit_focused = footer_focused && state.footer_button_index == 4;
 
     // Get translated button labels
+    // Use "Inherit" label instead of "Reset" when current item is nullable and explicitly set
+    let current_is_nullable_set = state
+        .current_item()
+        .map(|item| item.nullable && !item.is_null)
+        .unwrap_or(false);
     let save_label = t!("settings.btn_save").to_string();
     let cancel_label = t!("settings.btn_cancel").to_string();
-    let reset_label = t!("settings.btn_reset").to_string();
+    let reset_label = if current_is_nullable_set {
+        t!("settings.btn_inherit").to_string()
+    } else {
+        t!("settings.btn_reset").to_string()
+    };
     let edit_label = t!("settings.btn_edit").to_string();
 
     // Build button text with brackets (layer button uses layer name)
@@ -2041,11 +2225,47 @@ fn render_footer(
     } else {
         t!("settings.help_default").to_string()
     };
-    let help_style = Style::default().fg(theme.line_number_fg);
+    // Render help text with reverse-video styling for key hints
+    // Parse "Key:Action  Key:Action" format
+    let help_line = build_keyhint_line(&help, theme);
     frame.render_widget(
-        Paragraph::new(help.as_str()).style(help_style),
+        Paragraph::new(help_line),
         Rect::new(help_start_x, footer_y, help_width, 1),
     );
+}
+
+/// Build a Line with reverse-video styled key hints from "Key:Action  Key:Action" format
+fn build_keyhint_line<'a>(text: &str, theme: &Theme) -> Line<'a> {
+    let key_style = Style::default()
+        .fg(theme.popup_text_fg)
+        .bg(theme.split_separator_fg);
+    let desc_style = Style::default().fg(theme.line_number_fg);
+    let sep_style = Style::default().fg(theme.line_number_fg);
+
+    let mut spans: Vec<Span<'a>> = Vec::new();
+
+    // Split by double-space to get individual key hints
+    for (i, segment) in text.split("  ").enumerate() {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if i > 0 {
+            spans.push(Span::styled(" ", sep_style));
+        }
+        // Split by first ":" to separate key from description
+        if let Some(colon_pos) = segment.find(':') {
+            let key = &segment[..colon_pos];
+            let action = &segment[colon_pos + 1..];
+            spans.push(Span::styled(format!(" {} ", key), key_style));
+            spans.push(Span::styled(action.to_string(), desc_style));
+        } else {
+            // No colon - just render as text
+            spans.push(Span::styled(segment.to_string(), desc_style));
+        }
+    }
+
+    Line::from(spans)
 }
 
 /// Render footer with buttons stacked vertically (for narrow mode)
@@ -2093,9 +2313,18 @@ fn render_footer_vertical(
     let edit_focused = footer_focused && state.footer_button_index == 4;
 
     // Get translated button labels
+    // Use "Inherit" label instead of "Reset" when current item is nullable and explicitly set
+    let current_is_nullable_set = state
+        .current_item()
+        .map(|item| item.nullable && !item.is_null)
+        .unwrap_or(false);
     let save_label = t!("settings.btn_save").to_string();
     let cancel_label = t!("settings.btn_cancel").to_string();
-    let reset_label = t!("settings.btn_reset").to_string();
+    let reset_label = if current_is_nullable_set {
+        t!("settings.btn_inherit").to_string()
+    } else {
+        t!("settings.btn_reset").to_string()
+    };
     let edit_label = t!("settings.btn_edit").to_string();
 
     // Build button text
@@ -2269,12 +2498,12 @@ fn render_search_header(frame: &mut Frame, area: Rect, state: &SettingsState, th
 fn render_search_hint(frame: &mut Frame, area: Rect, theme: &Theme) {
     let hint_style = Style::default().fg(theme.line_number_fg);
     let key_style = Style::default()
-        .fg(theme.menu_active_fg)
-        .add_modifier(Modifier::BOLD);
+        .fg(theme.popup_text_fg)
+        .bg(theme.split_separator_fg);
 
     let spans = vec![
         Span::styled("Press ", hint_style),
-        Span::styled("/", key_style),
+        Span::styled(" / ", key_style),
         Span::styled(" to search settings...", hint_style),
     ];
     let line = Line::from(spans);
@@ -2393,6 +2622,21 @@ fn render_search_result_item(
         }
     }
 
+    // Determine display name and description based on deep match
+    let (display_name, display_desc) = match &result.deep_match {
+        Some(DeepMatch::MapKey { key, .. }) => (key.clone(), Some(result.item.name.clone())),
+        Some(DeepMatch::MapValue {
+            matched_text, key, ..
+        }) => (
+            matched_text.clone(),
+            Some(format!("{} > {}", result.item.name, key)),
+        ),
+        Some(DeepMatch::TextListItem { text, .. }) => {
+            (text.clone(), Some(result.item.name.clone()))
+        }
+        None => (result.item.name.clone(), result.item.description.clone()),
+    };
+
     // First line: Setting name with highlighting
     let name_style = if is_selected {
         Style::default().fg(theme.settings_selected_fg)
@@ -2402,15 +2646,26 @@ fn render_search_result_item(
         Style::default().fg(theme.popup_text_fg)
     };
 
-    // Build name with match highlighting
-    let name_line = build_highlighted_text(
-        &result.item.name,
+    // Build name with match highlighting, prefixed with selection indicator
+    let indicator = if is_selected { "▸ " } else { "  " };
+    let indicator_style = if is_selected {
+        Style::default()
+            .fg(theme.settings_selected_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        name_style
+    };
+    let mut name_line = build_highlighted_text(
+        &display_name,
         &result.name_matches,
         name_style,
         Style::default()
             .fg(theme.diagnostic_warning_fg)
             .add_modifier(Modifier::BOLD),
     );
+    name_line
+        .spans
+        .insert(0, Span::styled(indicator, indicator_style));
     frame.render_widget(
         Paragraph::new(name_line),
         Rect::new(area.x, area.y, area.width, 1),
@@ -2428,7 +2683,7 @@ fn render_search_result_item(
     );
 
     // Third line: Description (if any)
-    if let Some(ref desc) = result.item.description {
+    if let Some(ref desc) = display_desc {
         let desc_style = Style::default().fg(theme.line_number_fg);
         let truncated_desc = if desc.len() > area.width as usize - 2 {
             format!("  {}...", &desc[..area.width as usize - 5])
@@ -2521,6 +2776,7 @@ fn render_confirm_dialog(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.diagnostic_warning_fg))
         .style(Style::default().bg(theme.popup_bg));
     frame.render_widget(block, dialog_area);
@@ -2642,6 +2898,7 @@ fn render_reset_dialog(frame: &mut Frame, parent_area: Rect, state: &SettingsSta
     let block = Block::default()
         .title(" Reset All Changes ")
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.diagnostic_warning_fg))
         .style(Style::default().bg(theme.popup_bg));
     frame.render_widget(block, dialog_area);
@@ -2737,20 +2994,30 @@ fn render_reset_dialog(frame: &mut Frame, parent_area: Rect, state: &SettingsSta
     );
 }
 
-/// Render the entry detail dialog for editing Language/LSP/Keybinding entries
-///
-/// Now uses the same SettingItem/SettingControl infrastructure as the main settings UI,
-/// eliminating duplication and ensuring consistent rendering.
-fn render_entry_dialog(
+/// Render a specific entry dialog from the stack by index.
+fn render_entry_dialog_at(
     frame: &mut Frame,
     parent_area: Rect,
     state: &mut SettingsState,
     theme: &Theme,
+    dialog_idx: usize,
 ) {
-    let Some(dialog) = state.entry_dialog_mut() else {
+    let Some(dialog) = state.entry_dialog_stack.get_mut(dialog_idx) else {
         return;
     };
+    render_entry_dialog_inner(frame, parent_area, dialog, theme);
+}
 
+/// Render the entry detail dialog for editing Language/LSP/Keybinding entries
+///
+/// Now uses the same SettingItem/SettingControl infrastructure as the main settings UI,
+/// eliminating duplication and ensuring consistent rendering.
+fn render_entry_dialog_inner(
+    frame: &mut Frame,
+    parent_area: Rect,
+    dialog: &mut super::entry_dialog::EntryDialogState,
+    theme: &Theme,
+) {
     // Calculate dialog size - use most of available space for editing
     let dialog_width = (parent_area.width * 85 / 100).clamp(50, 90);
     let dialog_height = (parent_area.height * 90 / 100).max(15);
@@ -2767,6 +3034,7 @@ fn render_entry_dialog(
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.popup_border_fg))
         .style(Style::default().bg(theme.popup_bg));
     frame.render_widget(block, dialog_area);
@@ -2837,6 +3105,38 @@ fn render_entry_dialog(
             content_y = separator_end;
         }
 
+        // Render section header if this is the first item in a section
+        if item.is_section_start {
+            if let Some(ref section_name) = item.section {
+                let header_start = content_y;
+                let header_end = content_y + 2; // 2 lines: label + separator
+
+                if header_end > scroll_offset && screen_y < inner.y + inner.height {
+                    let skip_h = if header_start < scroll_offset {
+                        (scroll_offset - header_start) as u16
+                    } else {
+                        0
+                    };
+                    if skip_h == 0 {
+                        // Section label
+                        let section_style = Style::default()
+                            .fg(theme.line_number_fg)
+                            .add_modifier(Modifier::BOLD);
+                        frame.render_widget(
+                            Paragraph::new(format!("── {} ──", section_name)).style(section_style),
+                            Rect::new(inner.x + 1, screen_y, inner.width.saturating_sub(2), 1),
+                        );
+                        screen_y += 1;
+                    }
+                    if skip_h <= 1 && screen_y < inner.y + inner.height {
+                        // Blank line after section header
+                        screen_y += 1;
+                    }
+                }
+                content_y = header_end;
+            }
+        }
+
         let control_height = item.control.control_height() as usize;
 
         // Check if this item is visible in the viewport
@@ -2878,15 +3178,26 @@ fn render_entry_dialog(
 
         // Draw selection or hover highlight background (only for editable items)
         if is_focused || is_hovered {
-            // Use dedicated settings colors for focused items
             let bg_style = if is_focused {
                 Style::default().bg(theme.settings_selected_bg)
             } else {
                 Style::default().bg(theme.menu_hover_bg)
             };
-            for row in 0..render_height as u16 {
-                let row_area = Rect::new(inner.x, screen_y + row, inner.width, 1);
-                frame.render_widget(Paragraph::new("").style(bg_style), row_area);
+
+            if item.control.is_composite() {
+                // For composite controls, only highlight the focused sub-row
+                let sub_row = item.control.focused_sub_row();
+                if sub_row >= skip_rows && (sub_row - skip_rows) < render_height as u16 {
+                    let highlight_y = screen_y + sub_row - skip_rows;
+                    let row_area = Rect::new(inner.x, highlight_y, inner.width, 1);
+                    frame.render_widget(Paragraph::new("").style(bg_style), row_area);
+                }
+            } else {
+                // For simple controls, highlight the entire area
+                for row in 0..render_height as u16 {
+                    let row_area = Rect::new(inner.x, screen_y + row, inner.width, 1);
+                    frame.render_widget(Paragraph::new("").style(bg_style), row_area);
+                }
             }
         }
 
@@ -2894,15 +3205,42 @@ fn render_entry_dialog(
         // Examples: ">● ", ">  ", " ● ", "   "
         let focus_indicator_width: u16 = 3;
 
-        // Render focus indicator ">" at position 0 for the focused item
+        // Render focus indicator ">" — on sub-row for composites, first row for simple controls
         if is_focused && skip_rows == 0 {
             let indicator_style = Style::default()
                 .fg(theme.settings_selected_fg)
                 .add_modifier(Modifier::BOLD);
+
+            let indicator_y = if item.control.is_composite() {
+                let sub_row = item.control.focused_sub_row();
+                if sub_row < render_height as u16 {
+                    screen_y + sub_row
+                } else {
+                    screen_y
+                }
+            } else {
+                screen_y
+            };
+
             frame.render_widget(
                 Paragraph::new(">").style(indicator_style),
-                Rect::new(inner.x, screen_y, 1, 1),
+                Rect::new(inner.x, indicator_y, 1, 1),
             );
+        } else if is_focused && skip_rows > 0 {
+            // If the item is partially scrolled, check if the focused sub-row is visible
+            if item.control.is_composite() {
+                let sub_row = item.control.focused_sub_row();
+                if sub_row >= skip_rows && (sub_row - skip_rows) < render_height as u16 {
+                    let indicator_style = Style::default()
+                        .fg(theme.settings_selected_fg)
+                        .add_modifier(Modifier::BOLD);
+                    let indicator_y = screen_y + sub_row - skip_rows;
+                    frame.render_widget(
+                        Paragraph::new(">").style(indicator_style),
+                        Rect::new(inner.x, indicator_y, 1, 1),
+                    );
+                }
+            }
         }
 
         // Render modified indicator "●" at position 1 for modified items
@@ -2932,6 +3270,7 @@ fn render_entry_dialog(
             theme,
             Some(label_col_width.saturating_sub(focus_indicator_width)),
             item.read_only,
+            item.is_null,
         );
 
         screen_y += render_height as u16;
@@ -3033,7 +3372,7 @@ fn render_entry_dialog(
         let help_style = Style::default().fg(theme.line_number_fg);
         frame.render_widget(Paragraph::new(help).style(help_style), help_area);
     } else {
-        let help = "↑↓:Navigate  Tab:Fields/Buttons  Enter:Edit/Confirm  Esc:Cancel";
+        let help = "↑↓:Navigate  Tab:Fields/Buttons  Enter:Edit  Ctrl+S:Save  Esc:Cancel";
         let help_style = Style::default().fg(theme.line_number_fg);
         frame.render_widget(Paragraph::new(help).style(help_style), help_area);
     }
@@ -3085,6 +3424,7 @@ fn render_help_overlay(frame: &mut Frame, parent_area: Rect, theme: &Theme) {
     let block = Block::default()
         .title(" Keyboard Shortcuts ")
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.menu_highlight_fg))
         .style(Style::default().bg(theme.popup_bg));
     frame.render_widget(block, dialog_area);
@@ -3120,13 +3460,14 @@ fn render_help_overlay(frame: &mut Frame, parent_area: Rect, theme: &Theme) {
             }
 
             let key_style = Style::default()
-                .fg(theme.diagnostic_info_fg)
-                .add_modifier(Modifier::BOLD);
+                .fg(theme.popup_text_fg)
+                .bg(theme.split_separator_fg);
             let desc_style = Style::default().fg(theme.popup_text_fg);
 
             let line = Line::from(vec![
-                Span::styled(format!("  {:12}", key), key_style),
-                Span::styled(*description, desc_style),
+                Span::styled("  ", Style::default()),
+                Span::styled(format!(" {} ", key), key_style),
+                Span::styled(format!("  {}", description), desc_style),
             ]);
             frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
             y += 1;

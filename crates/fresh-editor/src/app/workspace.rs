@@ -532,6 +532,11 @@ impl Editor {
                                 state.buffer.insert(0, &text);
                                 state.buffer.set_modified(true);
                                 state.buffer.set_recovery_pending(false);
+                                // Invalidate saved position so undo can't
+                                // incorrectly clear the modified flag
+                                if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                                    log.clear_saved_position();
+                                }
                                 recovered += 1;
                                 tracing::info!(
                                     "Restored unsaved changes for {:?} from hot exit recovery",
@@ -556,6 +561,11 @@ impl Editor {
                             }
                             state.buffer.set_modified(true);
                             state.buffer.set_recovery_pending(false);
+                            // Invalidate saved position so undo can't
+                            // incorrectly clear the modified flag
+                            if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                                log.clear_saved_position();
+                            }
                             recovered += 1;
                             tracing::info!(
                                 "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
@@ -723,6 +733,8 @@ impl Editor {
                 if abs_path.exists() {
                     match self.open_file_internal(abs_path) {
                         Ok(buffer_id) => {
+                            // Add to path_to_buffer so open_tabs with absolute paths resolve
+                            path_to_buffer.insert(abs_path.clone(), buffer_id);
                             tracing::debug!(
                                 "Restored external file {:?} as buffer {:?}",
                                 abs_path,
@@ -743,7 +755,7 @@ impl Editor {
         if self.config.editor.hot_exit {
             let entries = self.recovery_service.list_recoverable().unwrap_or_default();
             if !entries.is_empty() {
-                for (_, &buffer_id) in &path_to_buffer {
+                for &buffer_id in path_to_buffer.values() {
                     let file_path = self
                         .buffers
                         .get(&buffer_id)
@@ -782,6 +794,11 @@ impl Editor {
                                         );
                                     }
                                 }
+                                // Invalidate saved position so undo can't
+                                // incorrectly clear the modified flag
+                                if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                                    log.clear_saved_position();
+                                }
                             }
                             Ok(crate::services::recovery::RecoveryResult::RecoveredChunks {
                                 chunks,
@@ -805,6 +822,11 @@ impl Editor {
                                         "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
                                         file_path
                                     );
+                                }
+                                // Invalidate saved position so undo can't
+                                // incorrectly clear the modified flag
+                                if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                                    log.clear_saved_position();
                                 }
                             }
                             Ok(
@@ -866,11 +888,16 @@ impl Editor {
                         }) => {
                             let text = String::from_utf8_lossy(&content).into_owned();
                             let buffer_id = self.new_buffer();
-                            let state = self.active_state_mut();
-                            state.buffer.insert(0, &text);
-                            // Mark as modified so it shows the dot indicator
-                            state.buffer.set_modified(true);
-                            state.buffer.set_recovery_pending(false);
+                            {
+                                let state = self.active_state_mut();
+                                state.buffer.insert(0, &text);
+                                // Mark as modified so it shows the dot indicator
+                                state.buffer.set_modified(true);
+                                state.buffer.set_recovery_pending(false);
+                            }
+                            // Invalidate saved position so undo can't
+                            // incorrectly clear the modified flag
+                            self.active_event_log_mut().clear_saved_position();
 
                             // Store recovery ID in metadata for future saves
                             if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
@@ -965,19 +992,19 @@ impl Editor {
         let referenced: HashSet<BufferId> = self
             .split_view_states
             .values()
-            .flat_map(|vs| vs.open_buffers.iter().copied())
+            .flat_map(|vs| vs.buffer_tab_ids())
             .collect();
-        let orphans: Vec<BufferId> = self
-            .buffers
-            .keys()
-            .copied()
-            .filter(|id| {
-                !referenced.contains(id)
-                    && self.buffers.get(id).map_or(false, |s| {
-                        s.buffer.file_path().is_none() && !s.buffer.is_modified()
-                    })
-            })
-            .collect();
+        let orphans: Vec<BufferId> =
+            self.buffers
+                .keys()
+                .copied()
+                .filter(|id| {
+                    !referenced.contains(id)
+                        && self.buffers.get(id).is_some_and(|s| {
+                            s.buffer.file_path().is_none() && !s.buffer.is_modified()
+                        })
+                })
+                .collect();
         for id in orphans {
             tracing::debug!("Removing orphaned empty unnamed buffer {:?}", id);
             self.buffers.remove(&id);
@@ -992,7 +1019,7 @@ impl Editor {
             .filter(|id| {
                 self.buffer_metadata
                     .get(id)
-                    .map_or(false, |m| !m.hidden_from_tabs && !m.is_virtual())
+                    .is_some_and(|m| !m.hidden_from_tabs && !m.is_virtual())
             })
             .count();
         if restored_count > 0 {
@@ -1144,7 +1171,7 @@ impl Editor {
                 let total = state.buffer.total_bytes();
                 // Update cursor position in all splits that show this buffer
                 for vs in self.split_view_states.values_mut() {
-                    if vs.open_buffers.contains(&buffer_id) {
+                    if vs.has_buffer(buffer_id) {
                         vs.cursors.primary_mut().position = total;
                     }
                 }
@@ -1173,6 +1200,7 @@ impl Editor {
     }
 
     /// Recursively restore the split layout from a serialized tree
+    #[allow(clippy::too_many_arguments)]
     fn restore_split_node(
         &mut self,
         node: &SerializedSplitNode,
@@ -1313,8 +1341,10 @@ impl Editor {
                         );
                         view_state.apply_config_defaults(
                             self.config.editor.line_numbers,
-                            self.config.editor.line_wrap,
+                            self.config.editor.highlight_current_line,
+                            self.resolve_line_wrap_for_buffer(second_buffer_id),
                             self.config.editor.wrap_indent,
+                            self.resolve_wrap_column_for_buffer(second_buffer_id),
                             self.config.editor.rulers.clone(),
                         );
                         self.split_view_states.insert(new_leaf_id, view_state);
@@ -1371,8 +1401,8 @@ impl Editor {
                 match tab {
                     SerializedTabRef::File(rel_path) => {
                         if let Some(&buffer_id) = path_to_buffer.get(rel_path) {
-                            if !view_state.open_buffers.contains(&buffer_id) {
-                                view_state.open_buffers.push(buffer_id);
+                            if !view_state.has_buffer(buffer_id) {
+                                view_state.add_buffer(buffer_id);
                             }
                             // Ensure keyed state exists for this buffer
                             view_state.ensure_buffer_state(buffer_id);
@@ -1387,8 +1417,8 @@ impl Editor {
                     }
                     SerializedTabRef::Terminal(index) => {
                         if let Some(&buffer_id) = terminal_buffers.get(index) {
-                            if !view_state.open_buffers.contains(&buffer_id) {
-                                view_state.open_buffers.push(buffer_id);
+                            if !view_state.has_buffer(buffer_id) {
+                                view_state.add_buffer(buffer_id);
                             }
                             view_state
                                 .ensure_buffer_state(buffer_id)
@@ -1398,12 +1428,23 @@ impl Editor {
                     }
                     SerializedTabRef::Unnamed(recovery_id) => {
                         if let Some(&buffer_id) = unnamed_buffers.get(recovery_id) {
-                            if !view_state.open_buffers.contains(&buffer_id) {
-                                view_state.open_buffers.push(buffer_id);
+                            if !view_state.has_buffer(buffer_id) {
+                                view_state.add_buffer(buffer_id);
                             }
                             view_state.ensure_buffer_state(buffer_id);
                         }
                     }
+                }
+            }
+
+            // If all saved tabs referenced deleted/missing files, open_buffers
+            // is now empty. Re-add the buffer that the split manager assigned to
+            // this split so the orphan cleanup won't remove a buffer the split
+            // manager still points to (#1278).
+            if view_state.open_buffers.is_empty() {
+                if let Some(buf) = self.split_manager.buffer_for_split(current_split_id) {
+                    view_state.add_buffer(buf);
+                    view_state.ensure_buffer_state(buf);
                 }
             }
 
@@ -1420,8 +1461,8 @@ impl Editor {
             // Backward compatibility path using open_files/active_file_index
             for rel_path in &split_state.open_files {
                 if let Some(&buffer_id) = path_to_buffer.get(rel_path) {
-                    if !view_state.open_buffers.contains(&buffer_id) {
-                        view_state.open_buffers.push(buffer_id);
+                    if !view_state.has_buffer(buffer_id) {
+                        view_state.add_buffer(buffer_id);
                     }
                     view_state.ensure_buffer_state(buffer_id);
                 }
@@ -1470,7 +1511,7 @@ impl Editor {
             // Restore per-buffer view mode and compose width
             buf_state.view_mode = match file_state.view_mode {
                 SerializedViewMode::Source => ViewMode::Source,
-                SerializedViewMode::Compose => ViewMode::Compose,
+                SerializedViewMode::PageView => ViewMode::PageView,
             };
             buf_state.compose_width = file_state.compose_width;
             buf_state.plugin_state = file_state.plugin_state.clone();
@@ -1511,7 +1552,7 @@ impl Editor {
         // view_mode/compose_width as fallback (backward compatibility)
         let restored_view_mode = match split_state.view_mode {
             SerializedViewMode::Source => ViewMode::Source,
-            SerializedViewMode::Compose => ViewMode::Compose,
+            SerializedViewMode::PageView => ViewMode::PageView,
         };
 
         if let Some(active_id) = active_buffer_id {
@@ -1580,6 +1621,19 @@ fn serialize_split_node(
     split_labels: &HashMap<SplitId, String>,
 ) -> SerializedSplitNode {
     match node {
+        SplitNode::Grouped { layout, .. } => {
+            // Grouped nodes are rebuilt by plugins on load; serialize just
+            // the inner layout so the split tree structure is preserved
+            // without the group wrapper.
+            serialize_split_node(
+                layout,
+                buffer_metadata,
+                working_dir,
+                terminal_buffers,
+                terminal_indices,
+                split_labels,
+            )
+        }
         SplitNode::Leaf {
             buffer_id,
             split_id,
@@ -1630,6 +1684,7 @@ fn serialize_split_node(
             second,
             ratio,
             split_id,
+            ..
         } => {
             let raw_split_id: SplitId = (*split_id).into();
             SerializedSplitNode::Split {
@@ -1673,7 +1728,9 @@ fn serialize_split_view_state(
     let mut open_files = Vec::new();
     let mut active_tab_index = None;
 
-    for buffer_id in &view_state.open_buffers {
+    // Only serialize buffer tabs; group tabs are rebuilt by plugins on load.
+    for buffer_id in view_state.buffer_tab_ids() {
+        let buffer_id = &buffer_id;
         let tab_index = open_tabs.len();
         if let Some(terminal_id) = terminal_buffers.get(buffer_id) {
             if let Some(idx) = terminal_indices.get(terminal_id) {
@@ -1698,6 +1755,12 @@ fn serialize_split_view_state(
                 } else if let Ok(rel_path) = abs_path.strip_prefix(working_dir) {
                     open_tabs.push(SerializedTabRef::File(rel_path.to_path_buf()));
                     open_files.push(rel_path.to_path_buf());
+                    if Some(*buffer_id) == active_buffer {
+                        active_tab_index = Some(tab_index);
+                    }
+                } else {
+                    // External file (outside working_dir) - store absolute path
+                    open_tabs.push(SerializedTabRef::File(abs_path.to_path_buf()));
                     if Some(*buffer_id) == active_buffer {
                         active_tab_index = Some(tab_index);
                     }
@@ -1738,7 +1801,8 @@ fn serialize_split_view_state(
         } else if let Ok(rp) = abs_path.strip_prefix(working_dir) {
             rp.to_path_buf()
         } else {
-            continue;
+            // External file - use absolute path as key
+            abs_path.to_path_buf()
         };
 
         let primary_cursor = buf_state.cursors.primary();
@@ -1783,7 +1847,7 @@ fn serialize_split_view_state(
                 },
                 view_mode: match buf_state.view_mode {
                     ViewMode::Source => SerializedViewMode::Source,
-                    ViewMode::Compose => SerializedViewMode::Compose,
+                    ViewMode::PageView => SerializedViewMode::PageView,
                 },
                 compose_width: buf_state.compose_width,
                 plugin_state: buf_state.plugin_state.clone(),
@@ -1797,7 +1861,7 @@ fn serialize_split_view_state(
         .and_then(|id| view_state.keyed_states.get(&id))
         .map(|bs| match bs.view_mode {
             ViewMode::Source => SerializedViewMode::Source,
-            ViewMode::Compose => SerializedViewMode::Compose,
+            ViewMode::PageView => SerializedViewMode::PageView,
         })
         .unwrap_or(SerializedViewMode::Source);
     let active_compose_width = active_buffer

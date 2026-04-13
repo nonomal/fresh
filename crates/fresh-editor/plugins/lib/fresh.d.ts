@@ -156,6 +156,12 @@ type TsCreateCompositeBufferOptions = {
 	* Diff hunks for alignment (optional)
 	*/
 	hunks: Array<TsCompositeHunk> | null;
+	/**
+	* When set, the first render will scroll to center the Nth hunk (0-indexed).
+	* This avoids timing issues with imperative scroll commands that depend on
+	* render-created state (viewport dimensions, view state).
+	*/
+	initialFocusHunk?: number;
 };
 type ViewportInfo = {
 	/**
@@ -302,6 +308,15 @@ type BufferInfo = {
 	* The detected language for this buffer (e.g., "rust", "markdown", "text")
 	*/
 	language: string;
+	/**
+	* Whether this tab was opened in "preview" (ephemeral) mode — true when
+	* opened via single-click in the file explorer and not yet committed
+	* (no edit, no double-click, no tab-click, no layout change). Plugins
+	* that react to buffer lifecycle events should generally treat preview
+	* buffers as transient; e.g. a diagnostics panel may want to skip
+	* refreshing itself for a preview tab.
+	*/
+	is_preview: boolean;
 };
 type JsDiagnostic = {
 	/**
@@ -393,9 +408,9 @@ type FileExplorerDecoration = {
 	*/
 	symbol: string;
 	/**
-	* Color as RGB array (rquickjs_serde requires array, not tuple)
+	* Color as RGB array or theme key string (e.g., "ui.file_status_added_fg")
 	*/
-	color: [number, number, number];
+	color: OverlayColorSpec;
 	/**
 	* Priority for display when multiple decorations exist (higher wins)
 	*/
@@ -525,6 +540,24 @@ type InlineOverlay = {
 	*/
 	properties?: Record<string, any>;
 };
+type GrammarInfoSnapshot = {
+	/**
+	* The grammar name as used in config files (case-insensitive matching)
+	*/
+	name: string;
+	/**
+	* Where this grammar was loaded from (e.g. "built-in", "plugin (myplugin)")
+	*/
+	source: string;
+	/**
+	* File extensions associated with this grammar
+	*/
+	file_extensions: Array<string>;
+	/**
+	* Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+	*/
+	short_name: string | null;
+};
 type BackgroundProcessResult = {
 	/**
 	* Unique process ID for later reference
@@ -539,7 +572,6 @@ type BackgroundProcessResult = {
 type BufferSavedDiff = {
 	equal: boolean;
 	byte_ranges: Array<[number, number]>;
-	line_ranges: Array<[number, number]> | null;
 };
 type CreateVirtualBufferInExistingSplitOptions = {
 	/**
@@ -813,6 +845,10 @@ interface EditorAPI {
 	* List all open buffers - returns array of BufferInfo objects
 	*/
 	listBuffers(): BufferInfo[];
+	/**
+	* List all available grammars with source info - returns array of GrammarInfo objects
+	*/
+	listGrammars(): GrammarInfoSnapshot[];
 	debug(msg: string): void;
 	info(msg: string): void;
 	warn(msg: string): void;
@@ -919,6 +955,17 @@ interface EditorAPI {
 	* Line is 0-indexed (0 = first line)
 	*/
 	scrollToLineCenter(splitId: number, bufferId: number, line: number): boolean;
+	/**
+	* Scroll any split/panel showing `buffer_id` so `line` is visible.
+	* Unlike `scrollToLineCenter`, this does not require a split id — it
+	* updates every split's viewport whose active buffer is the given
+	* buffer, including inner leaves of a buffer group. Use this from
+	* a panel plugin to keep the user's "selected" row in view after
+	* arrow-key navigation (the plugin's own selection state isn't
+	* automatically reflected in the buffer cursor, so the core-driven
+	* viewport would otherwise stay put).
+	*/
+	scrollBufferToLine(bufferId: number, line: number): boolean;
 	/**
 	* Find buffer by file path, returns buffer ID or 0 if not found
 	*/
@@ -1031,6 +1078,31 @@ interface EditorAPI {
 	*/
 	readDir(path: string): DirEntry[];
 	/**
+	* Create a directory (and all parent directories) recursively.
+	* Returns true if the directory was created or already exists.
+	*/
+	createDir(path: string): boolean;
+	/**
+	* Remove a file or directory by moving it to the OS trash/recycle bin.
+	* For safety, the path must be under the OS temp directory or the Fresh
+	* config directory. Returns true on success.
+	*/
+	removePath(path: string): boolean;
+	/**
+	* Rename/move a file or directory. Returns true on success.
+	* Falls back to copy then trash for cross-filesystem moves.
+	*/
+	renamePath(from: string, to: string): boolean;
+	/**
+	* Copy a file or directory recursively to a new location.
+	* Returns true on success.
+	*/
+	copyPath(from: string, to: string): boolean;
+	/**
+	* Get the OS temporary directory path.
+	*/
+	getTempDir(): string;
+	/**
 	* Get current config as JS object
 	*/
 	getConfig(): unknown;
@@ -1070,6 +1142,11 @@ interface EditorAPI {
 	* Returns a Promise that resolves when the grammar rebuild completes.
 	*/
 	reloadGrammars(): Promise<void>;
+	/**
+	* Get the directory where this plugin's files are stored.
+	* For package plugins this is `<plugins_dir>/packages/<plugin_name>/`.
+	*/
+	getPluginDir(): string;
 	/**
 	* Get config directory path
 	*/
@@ -1139,6 +1216,20 @@ interface EditorAPI {
 	* Close a composite buffer
 	*/
 	closeCompositeBuffer(bufferId: number): boolean;
+	/**
+	* Force-materialize render-dependent state (like `layoutIfNeeded` in UIKit).
+	* After calling this, commands that depend on view state created during
+	* rendering (e.g., `compositeNextHunk`) will work correctly.
+	*/
+	flushLayout(): boolean;
+	/**
+	* Navigate to the next hunk in a composite buffer
+	*/
+	compositeNextHunk(bufferId: number): boolean;
+	/**
+	* Navigate to the previous hunk in a composite buffer
+	*/
+	compositePrevHunk(bufferId: number): boolean;
 	/**
 	* Request syntax highlights for a buffer range (async)
 	*/
@@ -1329,6 +1420,15 @@ interface EditorAPI {
 	*/
 	setBufferCursor(bufferId: number, position: number): boolean;
 	/**
+	* Toggle whether the editor draws a native caret in this buffer.
+	* 
+	* Buffer-group panel buffers default to `show_cursors = false`, which
+	* also blocks all native movement actions in `action_to_events`. Plugins
+	* that want native cursor motion in a panel (e.g. magit-style row
+	* navigation) call this with `true` after `createBufferGroup` returns.
+	*/
+	setBufferShowCursors(bufferId: number, show: boolean): boolean;
+	/**
 	* Set a line indicator in the gutter
 	*/
 	setLineIndicator(bufferId: number, line: number, namespace: string, symbol: string, r: number, g: number, b: number, priority: number): boolean;
@@ -1429,6 +1529,18 @@ interface EditorAPI {
 	* Create a virtual buffer in an existing split (async, returns buffer and split IDs)
 	*/
 	createVirtualBufferInExistingSplit(opts: CreateVirtualBufferInExistingSplitOptions): Promise<VirtualBufferResult>;
+	/**
+	* Set the content of a panel within a buffer group
+	*/
+	setPanelContent(groupId: number, panelName: string, entriesArr: Record<string, unknown>[]): boolean;
+	/**
+	* Close a buffer group
+	*/
+	closeBufferGroup(groupId: number): boolean;
+	/**
+	* Focus a specific panel within a buffer group
+	*/
+	focusBufferGroupPanel(groupId: number, panelName: string): boolean;
 	/**
 	* Set virtual buffer content (takes array of entry objects)
 	* 

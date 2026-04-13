@@ -164,6 +164,19 @@ pub struct VirtualBufferResult {
     pub split_id: Option<u64>,
 }
 
+/// Result of creating a buffer group
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct BufferGroupResult {
+    /// The group ID
+    #[ts(type = "number")]
+    pub group_id: u64,
+    /// Panel buffer IDs, keyed by panel name
+    #[ts(type = "Record<string, number>")]
+    pub panels: HashMap<String, u64>,
+}
+
 /// Response from the editor for async plugin operations
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -346,6 +359,14 @@ pub struct BufferInfo {
     pub compose_width: Option<u16>,
     /// The detected language for this buffer (e.g., "rust", "markdown", "text")
     pub language: String,
+    /// Whether this tab was opened in "preview" (ephemeral) mode — true when
+    /// opened via single-click in the file explorer and not yet committed
+    /// (no edit, no double-click, no tab-click, no layout change). Plugins
+    /// that react to buffer lifecycle events should generally treat preview
+    /// buffers as transient; e.g. a diagnostics panel may want to skip
+    /// refreshing itself for a preview tab.
+    #[serde(default)]
+    pub is_preview: bool,
 }
 
 fn serialize_path<S: serde::Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
@@ -370,27 +391,6 @@ where
     seq.end()
 }
 
-/// Serialize optional ranges as [start, end] tuples for JS compatibility
-fn serialize_opt_ranges_as_tuples<S>(
-    ranges: &Option<Vec<Range<usize>>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match ranges {
-        Some(ranges) => {
-            use serde::ser::SerializeSeq;
-            let mut seq = serializer.serialize_seq(Some(ranges.len()))?;
-            for range in ranges {
-                seq.serialize_element(&(range.start, range.end))?;
-            }
-            seq.end()
-        }
-        None => serializer.serialize_none(),
-    }
-}
-
 /// Diff between current buffer content and last saved snapshot
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -399,9 +399,6 @@ pub struct BufferSavedDiff {
     #[serde(serialize_with = "serialize_ranges_as_tuples")]
     #[ts(type = "Array<[number, number]>")]
     pub byte_ranges: Vec<Range<usize>>,
-    #[serde(serialize_with = "serialize_opt_ranges_as_tuples")]
-    #[ts(type = "Array<[number, number]> | null")]
-    pub line_ranges: Option<Vec<Range<usize>>>,
 }
 
 /// Information about the viewport
@@ -646,6 +643,12 @@ pub struct CreateCompositeBufferOptions {
     /// Diff hunks for alignment (optional)
     #[serde(default)]
     pub hunks: Option<Vec<CompositeHunk>>,
+    /// When set, the first render will scroll to center the Nth hunk (0-indexed).
+    /// This avoids timing issues with imperative scroll commands that depend on
+    /// render-created state (viewport dimensions, view state).
+    #[serde(default, rename = "initialFocusHunk")]
+    #[ts(optional, rename = "initialFocusHunk")]
+    pub initial_focus_hunk: Option<usize>,
 }
 
 /// Wire-format view token kind (serialized for plugin transforms)
@@ -763,6 +766,9 @@ pub struct EditorStateSnapshot {
     /// Fields not present here are using default values
     #[ts(type = "any")]
     pub user_config: serde_json::Value,
+    /// Available grammars with provenance info, updated when grammar registry changes
+    #[ts(type = "GrammarInfo[]")]
+    pub available_grammars: Vec<GrammarInfoSnapshot>,
     /// Global editor mode for modal editing (e.g., "vi-normal", "vi-insert")
     /// When set, this mode's keybindings take precedence over normal key handling
     pub editor_mode: Option<String>,
@@ -814,6 +820,7 @@ impl EditorStateSnapshot {
             folding_ranges: HashMap::new(),
             config: serde_json::Value::Null,
             user_config: serde_json::Value::Null,
+            available_grammars: Vec::new(),
             editor_mode: None,
             plugin_view_states: HashMap::new(),
             plugin_view_states_split: 0,
@@ -827,6 +834,20 @@ impl Default for EditorStateSnapshot {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Grammar info exposed to plugins, mirroring the editor's grammar provenance tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GrammarInfoSnapshot {
+    /// The grammar name as used in config files (case-insensitive matching)
+    pub name: String,
+    /// Where this grammar was loaded from (e.g. "built-in", "plugin (myplugin)")
+    pub source: String,
+    /// File extensions associated with this grammar
+    pub file_extensions: Vec<String>,
+    /// Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+    pub short_name: Option<String>,
 }
 
 /// Position for inserting menu items or menus
@@ -1324,6 +1345,35 @@ pub enum PluginCommand {
     /// Get text properties at the cursor position in a buffer
     GetTextPropertiesAtCursor { buffer_id: BufferId },
 
+    /// Create a buffer group: multiple panels appearing as one tab.
+    /// Each panel is a real buffer with its own scrollbar and viewport.
+    CreateBufferGroup {
+        /// Display name (shown in tab bar)
+        name: String,
+        /// Mode for keybindings
+        mode: String,
+        /// Layout tree as JSON string (parsed by the handler)
+        layout_json: String,
+        /// Optional request ID for async response
+        request_id: Option<u64>,
+    },
+
+    /// Set the content of a panel within a buffer group.
+    SetPanelContent {
+        /// Group ID
+        group_id: usize,
+        /// Panel name (e.g., "tree", "picker")
+        panel_name: String,
+        /// Content entries
+        entries: Vec<TextPropertyEntry>,
+    },
+
+    /// Close a buffer group (closes all panels and splits)
+    CloseBufferGroup { group_id: usize },
+
+    /// Focus a specific panel within a buffer group
+    FocusPanel { group_id: usize, panel_name: String },
+
     /// Define a buffer mode with keybindings
     DefineMode {
         name: String,
@@ -1378,6 +1428,8 @@ pub enum PluginCommand {
         sources: Vec<CompositeSourceConfig>,
         /// Diff hunks for line alignment (optional)
         hunks: Option<Vec<CompositeHunk>>,
+        /// When set, first render scrolls to center this hunk (0-indexed)
+        initial_focus_hunk: Option<usize>,
         /// Request ID for async response
         request_id: Option<u64>,
     },
@@ -1390,6 +1442,20 @@ pub enum PluginCommand {
 
     /// Close a composite buffer
     CloseCompositeBuffer { buffer_id: BufferId },
+
+    /// Force-materialize render-dependent state (like `layoutIfNeeded` in UIKit).
+    ///
+    /// Creates `CompositeViewState` for any visible composite buffer that doesn't
+    /// have one, and syncs viewport dimensions from split layout. This ensures
+    /// subsequent commands can read/modify view state that is normally created
+    /// lazily during the render cycle.
+    FlushLayout,
+
+    /// Navigate to the next hunk in a composite buffer
+    CompositeNextHunk { buffer_id: BufferId },
+
+    /// Navigate to the previous hunk in a composite buffer
+    CompositePrevHunk { buffer_id: BufferId },
 
     /// Focus a specific split
     FocusSplit { split_id: SplitId },
@@ -1441,6 +1507,15 @@ pub enum PluginCommand {
         /// Byte offset position for the cursor
         position: usize,
     },
+
+    /// Toggle whether the editor draws a native caret for this buffer.
+    ///
+    /// Buffer-group panel buffers default to `show_cursors = false`, which not
+    /// only hides the caret but also blocks all movement actions in
+    /// `action_to_events`. Plugins that want native cursor motion in a panel
+    /// buffer (e.g. for magit-style row navigation) flip this to `true` after
+    /// `createBufferGroup` returns.
+    SetBufferShowCursors { buffer_id: BufferId, show: bool },
 
     /// Send an arbitrary LSP request and return the raw JSON response
     SendLspRequest {
@@ -1537,6 +1612,18 @@ pub enum PluginCommand {
         /// Buffer ID containing the line
         buffer_id: BufferId,
         /// Line number to center (0-indexed)
+        line: usize,
+    },
+
+    /// Scroll any split/panel that displays `buffer_id` so the given
+    /// line is visible in the viewport. Unlike `ScrollToLineCenter` this
+    /// does not require a split id — it walks all splits (including
+    /// inner panels of a buffer group) and updates every viewport that
+    /// shows this buffer. Line is 0-indexed.
+    ScrollBufferToLine {
+        /// Buffer ID to scroll
+        buffer_id: BufferId,
+        /// Line number to bring into view (0-indexed)
         line: usize,
     },
 
@@ -2812,6 +2899,112 @@ impl Clone for PluginApi {
     }
 }
 
+// ============================================================================
+// Pluggable Completion Service — TypeScript Plugin API Types
+// ============================================================================
+//
+// These types are the bridge between the Rust `CompletionService` and
+// TypeScript plugins that want to provide completion candidates.  They are
+// serialised to/from JSON via serde and generate TypeScript definitions via
+// ts-rs so that the plugin API stays in sync automatically.
+
+/// A completion candidate produced by a TypeScript plugin provider.
+///
+/// This mirrors `CompletionCandidate` in the Rust `completion::provider`
+/// module but uses serde-friendly primitives for the JS ↔ Rust boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionCandidate {
+    /// Display text shown in the completion popup.
+    pub label: String,
+
+    /// Text to insert when accepted. Falls back to `label` if omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+
+    /// Short detail string shown next to the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+
+    /// Single-character icon hint (e.g. `"λ"`, `"v"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+
+    /// Provider-assigned relevance score (higher = better).
+    #[serde(default)]
+    pub score: i64,
+
+    /// Whether `insert_text` uses LSP snippet syntax (`$0`, `${1:ph}`, …).
+    #[serde(default)]
+    pub is_snippet: bool,
+
+    /// Opaque data carried through to the `completionAccepted` hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<String>,
+}
+
+/// Context sent to a TypeScript plugin's `provideCompletions` handler.
+///
+/// Plugins receive this as a read-only snapshot so they never need direct
+/// buffer access (which would be unsafe for huge files).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionContext {
+    /// The word prefix typed so far.
+    pub prefix: String,
+
+    /// Byte offset of the cursor.
+    pub cursor_byte: usize,
+
+    /// Byte offset of the word start (for replacement range).
+    pub word_start_byte: usize,
+
+    /// Total buffer size in bytes.
+    pub buffer_len: usize,
+
+    /// Whether the buffer is a lazily-loaded huge file.
+    pub is_large_file: bool,
+
+    /// A text excerpt around the cursor (the contents of the safe scan window).
+    /// Plugins should search only this string, not request the full buffer.
+    pub text_around_cursor: String,
+
+    /// Byte offset within `text_around_cursor` that corresponds to the cursor.
+    pub cursor_offset_in_text: usize,
+
+    /// File language id (e.g. `"rust"`, `"typescript"`), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+}
+
+/// Registration payload sent by a plugin to register a completion provider.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionProviderRegistration {
+    /// Unique id for this provider (e.g., `"my-snippets"`).
+    pub id: String,
+
+    /// Human-readable name shown in status/debug UI.
+    pub display_name: String,
+
+    /// Priority tier (lower = higher priority). Convention:
+    /// 0 = LSP, 10 = ctags, 20 = buffer words, 30 = dabbrev, 50 = plugin.
+    #[serde(default = "default_plugin_provider_priority")]
+    pub priority: u32,
+
+    /// Optional list of language ids this provider is active for.
+    /// If empty/omitted, the provider is active for all languages.
+    #[serde(default)]
+    pub language_ids: Vec<String>,
+}
+
+fn default_plugin_provider_priority() -> u32 {
+    50
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2985,6 +3178,7 @@ mod tests {
                 is_composing_in_any_split: false,
                 compose_width: None,
                 language: "text".to_string(),
+                is_preview: false,
             };
             snapshot.buffers.insert(BufferId(1), buffer_info);
         }
@@ -3029,6 +3223,7 @@ mod tests {
                     is_composing_in_any_split: false,
                     compose_width: None,
                     language: "text".to_string(),
+                    is_preview: false,
                 },
             );
             snapshot.buffers.insert(
@@ -3043,6 +3238,7 @@ mod tests {
                     is_composing_in_any_split: false,
                     compose_width: None,
                     language: "text".to_string(),
+                    is_preview: false,
                 },
             );
             snapshot.buffers.insert(
@@ -3057,6 +3253,7 @@ mod tests {
                     is_composing_in_any_split: false,
                     compose_width: None,
                     language: "text".to_string(),
+                    is_preview: false,
                 },
             );
         }
@@ -3292,5 +3489,47 @@ mod tests {
         let json = serde_json::to_string(&command).unwrap();
         assert!(json.contains("ScrollToLineCenter"));
         assert!(json.contains("50"));
+    }
+
+    /// `JsCallbackId` round-trips through `u64` via `new` / `as_u64` / `From`
+    /// and renders as its underlying integer via `Display`.
+    #[test]
+    fn js_callback_id_conversions_and_display() {
+        for raw in [0u64, 1, 42, u64::MAX] {
+            let id = JsCallbackId::new(raw);
+            assert_eq!(id.as_u64(), raw);
+            assert_eq!(u64::from(id), raw);
+            assert_eq!(JsCallbackId::from(raw), id);
+            assert_eq!(id.to_string(), raw.to_string());
+        }
+    }
+
+    /// Serde `default = ...` helpers fire when the field is omitted and are
+    /// overridden by explicit values. One test per struct pins each helper
+    /// to its documented default.
+    #[test]
+    fn serde_defaults_fire_when_fields_are_omitted() {
+        // default_action_count → 1
+        let spec: ActionSpec = serde_json::from_str(r#"{"action": "move_left"}"#).unwrap();
+        assert_eq!(spec.count, 1);
+        let spec: ActionSpec =
+            serde_json::from_str(r#"{"action": "move_left", "count": 5}"#).unwrap();
+        assert_eq!(spec.count, 5);
+
+        // default_true → showSeparator = true
+        let layout: CompositeLayoutConfig =
+            serde_json::from_str(r#"{"type": "side-by-side"}"#).unwrap();
+        assert!(layout.show_separator);
+        let layout: CompositeLayoutConfig =
+            serde_json::from_str(r#"{"type": "side-by-side", "showSeparator": false}"#).unwrap();
+        assert!(!layout.show_separator);
+
+        // default_plugin_provider_priority → 50
+        let reg: TsCompletionProviderRegistration =
+            serde_json::from_str(r#"{"id": "p", "displayName": "P"}"#).unwrap();
+        assert_eq!(reg.priority, 50);
+        let reg: TsCompletionProviderRegistration =
+            serde_json::from_str(r#"{"id": "p", "displayName": "P", "priority": 3}"#).unwrap();
+        assert_eq!(reg.priority, 3);
     }
 }

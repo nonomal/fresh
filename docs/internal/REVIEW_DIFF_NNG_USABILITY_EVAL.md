@@ -16,13 +16,21 @@ add needless cognitive load. A user who already knows the mode's vocabulary
 review; a newcomer will bounce off at least two soft failures before learning
 the layout.
 
-**Overall usability score: 3.4 / 5 (Fair, not NN/g "Good")**
+**Overall usability score: 3.1 / 5 (Fair, not NN/g "Good")**
+*(revised down from 3.4 after pass 2 uncovered three additional defects:
+terminal-resize corruption, silent empty-state, and `NO_COLOR` non-compliance.)*
 
 - Heuristic wins: highly discoverable entry (`Ctrl+P` shown in status bar),
-  a permanent action toolbar, and a safe exit affordance (`q Close`).
+  a permanent action toolbar, a safe exit affordance (`q Close`), a proper
+  confirm-dialog on destructive `d`iscard, clean rename (`R old → new`) and
+  pure-additions / pure-deletions / Unicode / emoji rendering, and an
+  inline-comment treatment (`» [hunk] …`) that persists across close-reopen.
 - Heuristic losses: **no "hunk N of M" indicator**, viewport does not follow
   the cursor in side-by-side view, word-level diff highlighting is absent,
-  and the fuzzy finder only does subsequence matching (no typo tolerance).
+  the fuzzy finder only does subsequence matching (no typo tolerance),
+  terminal resize corrupts the layout without auto-recovery, empty states
+  are ambiguous, and the in-app Manual / menu bar don't know about the
+  feature at all.
 
 **Primary roadblocks (ranked):**
 
@@ -32,12 +40,24 @@ the layout.
    tell whether the keystroke succeeded.
 2. **H1 — Viewport/cursor desync in side-by-side view.** Status bar always
    reads `Ln 1, Col 1` even after the viewport scrolls 170 lines.
-3. **H5 / accessibility — Whitespace-only changes are invisible.** Trailing
+3. **H9 — Terminal resize destroys the layout and does not auto-recover.**
+   Confirms BUG-2. Toolbar, menu, and tab row stay hidden until the user
+   guesses to press `r` (refresh). Nothing in the UI says so.
+4. **H1 — Ambiguous empty state.** Both "not a git repository" and "clean
+   repo, no changes" render identically (empty `GIT STATUS` pane, `DIFF`
+   header with no filename, `Review Diff: 0 hunks` in the status bar).
+   i18n keys `status.not_git_repo` and `panel.no_changes` exist but are
+   never displayed.
+5. **H5 / accessibility — Whitespace-only changes are invisible.** Trailing
    spaces and collapsed/expanded spaces render identically on both sides,
-   only the `-`/`+` marker differs.
-4. **H9 (error recovery) — Typo tolerance in the command palette is
+   only the `-`/`+` marker differs. Also: `NO_COLOR=1` is ignored — the
+   editor emits the full 256-color palette regardless.
+6. **H9 (error recovery) — Typo tolerance in the command palette is
    weak.** "revw difff" returns `Markdown: Toggle Compose/Preview` as the
    best match — not "Review Diff."
+7. **H10 — Feature is absent from the in-app Manual (F1) and from every
+   top-level menu.** Users who don't already know `Ctrl+P` → "Review Diff"
+   have no discoverable path.
 
 ---
 
@@ -281,6 +301,94 @@ nothing" trap that every new user hits.
 
 ---
 
+## 6. Pass 2 — Extended Scenarios (18 additional flows)
+
+Planned in `docs/internal/REVIEW_DIFF_EXTENDED_SCENARIOS.md` (33 scenarios
+catalogued; 18 executed in this pass). Artifacts under
+`/tmp/eval-workspace/pass2/p2_*.txt`.
+
+### 6.1 Summary table
+
+| ID | Scenario | Verdict | Heuristic | Key evidence |
+|----|----------|---------|-----------|--------------|
+| S1  | Unicode / emoji in diff | **Pass** | H3/H5 | `p2_06_uni.txt` — Japanese, Cyrillic, emoji (🦀🚀✨) all align in both panes. |
+| S2  | 2,000-char single line | **Partial** | H5 | `p2_36_hscroll.txt` — viewport does not scroll on `Right`; only `End` jumps to column 2001. No overflow/continuation glyph. |
+| S4  | File with no trailing newline | **Fail** | H3 | `p2_09_nonl.txt` — the standard `\ No newline at end of file` marker is **absent**; user cannot tell the newline was stripped. |
+| S6  | Pure-additions diff | **Pass** | H3 | `p2_04_pure_del.txt` context — `@@ -1 +1 @@` with `+` lines only, clean. |
+| S7  | Pure-deletions diff | **Pass** | H3 | `p2_05_pure_del.txt` — `-` lines only, no alignment issues. |
+| S8  | Review Diff in non-git dir | **Fail** | H1/H9 | `p2_41_nogit.txt` — empty panes, `0 hunks`, **no error message** despite `status.not_git_repo` existing in i18n. |
+| S9  | Clean repo, zero changes | **Fail** | H1 | `p2_42_clean.txt` — indistinguishable from S8. `panel.no_changes` string is never rendered. |
+| S10 | `git mv` rename detection | **Pass** | H3 | `p2_02_review_open.txt` — shows `R  rename_me.txt → renamed.txt` (arrow glyph included). |
+| S13 | Merge conflict file (`UU`) | **Partial** | H9 | `p2_43_conflict.txt` — status `U`, listed in *both* `Staged` and `Changes`, diff pane shows `(no diff available)`. No hint `<<<<<<` markers exist, no 3-way view. |
+| S14 | 80 × 24 terminal | **Fail** | H5 | `p2_29_resize_80.txt` — the menu bar, tab row, and toolbar all disappear; only the two panes remain. Every discoverable key hint is gone. |
+| S16 | Resize from 160×45 → 80×24 → 160×45 | **Fail** | H9 | `p2_30_resize_restore.txt` — layout does **not** auto-recover to the new width. A manual `r` press fixes it (`p2_31_after_r.txt`), but nothing tells the user that. Confirms BUG-2. |
+| S18 | Stage → review | **Pass** | H1/H3 | `p2_02_review_open.txt` — a dedicated `▸ Staged` section appears above `▸ Changes`; staged file (`happy.py`) is grouped correctly. |
+| S19 | Discard confirmation | **Pass** | H9 | `p2_14_discard_prompt.txt` — modal "Discard changes in file / Cancel" with `This cannot be undone.` warning. Proper error-prevention. |
+| S20 | Add comment → inline render | **Pass** | H1 | `p2_16_after_comment.txt` — shows `» [hunk] Nit: consider using a constant` directly under the hunk header. Regression-fix for prior BUG-6 (comments on hunks, at least, now render). |
+| S22 | Export review to markdown | **Pass** | H4 | `p2_17_export.txt` + `s_main/.review/session.md` — timestamped, includes file/hunk counts and grouped comments. |
+| S26 | `n` vs `N` key collision | **Partial** | H3 | `p2_22_lower_n.txt` vs `p2_23_upper_N.txt` — `n` moves cursor ~1 line (no hunk-jump feedback); `N` opens the "Note:" prompt. Distinct behaviors but easy to mis-fire. |
+| S27 | Menu-bar discoverability | **Fail** | H6 | `p2_10_menu.txt`, `p2_11_edit_menu.txt`, `p2_12_go_menu.txt` — `File`, `Edit`, and `Go` menus have **no** "Review Diff" entry. Only `Command Palette…` under `Go`, which delegates back to `Ctrl+P`. |
+| S28 | F1 / in-app Manual | **Fail** | H10 | `p2_25_help_search.txt` — `Ctrl+F` "review diff" → `No matches found for 'review diff'` in the Fresh Manual. |
+| S29 | Close + reopen persistence | **Pass** | H2 | `p2_21_pure_add_reopen.txt` — the inline comment from S20 survives close-and-reopen. Session file on disk is the source of truth. |
+| S30 | `NO_COLOR=1` env var | **Fail** | Accessibility | `p2_39_nocolor_ansi.txt` — full 256-color ANSI palette (`[48;5;52m`, `[48;5;22m`, `[38;5;203m`, …) emitted despite the standard `NO_COLOR` signal. |
+
+### 6.2 New friction points discovered in pass 2
+
+- **F-PASS2-A (H9).** Resize-then-wait is silently broken. The fix path
+  (`r`) exists but is never surfaced; a user with a tiling WM who
+  switches monitors will see "the toolbar vanished" and assume the
+  feature is broken.
+- **F-PASS2-B (H1).** The empty `Review Diff: 0 hunks` screen is used
+  for three disjoint conditions — not a repo, no changes, and "review
+  failed silently." Each needs its own status line.
+- **F-PASS2-C (Accessibility).** `NO_COLOR` is a well-known standard
+  (https://no-color.org). Ignoring it is a hard accessibility fail for
+  users on monochrome terminals, screen readers with ANSI-stripping,
+  and deuteranopic users.
+- **F-PASS2-D (H10).** Running `F1` → search for "review diff" returns
+  zero results. The Manual must at minimum document the feature name,
+  the launcher (`Ctrl+P → Review Diff`), and the key bindings shown in
+  the toolbar.
+- **F-PASS2-E (H3).** Files whose trailing newline is stripped look
+  like plain line edits because the `\ No newline at end of file`
+  marker from `git diff` is dropped. Reviewers will not catch the
+  newline regression — high risk for shell scripts and fixture files.
+- **F-PASS2-F (H9).** Merge-conflict files (`UU`) appear twice in the
+  file list (once under `Staged`, once under `Changes`) and the diff
+  pane reads `(no diff available)`. The user is told "there's
+  something wrong" but given no affordance to resolve it inline.
+
+### 6.3 Additional recommendations (delta from §5)
+
+- **R7 — Render empty-state messages.** Wire the existing
+  `status.not_git_repo` and `panel.no_changes` i18n keys into the
+  files pane. For non-git: show a centred message "Not a git
+  repository — run `git init` to enable Review Diff." For clean
+  repos: "No changes to review. Modify a file and press `r` to
+  refresh."
+- **R8 — Auto-recover layout on terminal resize.** Hook the `resize`
+  event to invalidate cached pane widths and recompute the toolbar /
+  tab row. If a full recompute is expensive, at least repaint
+  chrome-only on every resize.
+- **R9 — Honor `NO_COLOR`.** At the ANSI writer (see
+  `crates/fresh-editor/src/view/color_support.rs`), short-circuit
+  256-color emission when `std::env::var_os("NO_COLOR").is_some()`.
+  Fall back to plain text with `-` / `+` carrying all meaning.
+- **R10 — Preserve the `\ No newline at end of file` marker.** The
+  underlying `git diff` output contains it; the plugin's parser must
+  forward it to the diff buffer. Render as a dim-foreground,
+  italicised line so it doesn't disrupt the hunk shape.
+- **R11 — Discoverability.** Add `Review Diff…` to the `Go` menu (or
+  a new `Review` submenu). Add a "Review Diff" section to the Fresh
+  Manual (`docs/manual.md` or the plugin README) covering the
+  toolbar keys, side-by-side drill-down, and export formats.
+- **R12 — De-duplicate merge-conflict files in the files pane.** Show
+  `UU file` once (in its own "Conflicts" section if needed), and make
+  `Enter` open the file in a regular editor buffer pre-navigated to
+  the first `<<<<<<<` marker.
+
+---
+
 ## Appendix A — Reproduction Commands
 
 ```bash
@@ -320,3 +428,28 @@ All artifacts under `/tmp/eval-workspace/`:
 | `screen_20_delete_drill.txt` | Deleted-file drill-down (no hang — BUG-5 fixed) |
 | `screen_22_typo.txt` | Palette with "revw difff" — wrong top match |
 | `screen_28_ctrlc.txt` | Ctrl+C at root — editor survives |
+
+### Pass-2 captures (`/tmp/eval-workspace/pass2/`)
+
+| File | Scenario |
+|------|----------|
+| `p2_02_review_open.txt` | Staged section + rename display (S10, S18) |
+| `p2_06_uni.txt` / `_ansi.txt` | Unicode / emoji diff (S1) |
+| `p2_09_nonl.txt` | File missing trailing newline (S4) |
+| `p2_10_menu.txt` / `p2_11_edit_menu.txt` / `p2_12_go_menu.txt` | Menu-bar walk (S27) |
+| `p2_14_discard_prompt.txt` | Discard confirmation dialog (S19) |
+| `p2_16_after_comment.txt` | Inline comment rendering (S20) |
+| `p2_17_export.txt` + `.review/session.md` | Markdown export (S22) |
+| `p2_21_pure_add_reopen.txt` | Comment persists across close/reopen (S29) |
+| `p2_22_lower_n.txt` / `p2_23_upper_N.txt` | `n` vs `N` key collision (S26) |
+| `p2_25_help_search.txt` | F1 Manual — "review diff" not found (S28) |
+| `p2_29_resize_80.txt` | Chrome disappears at 80×24 (S14) |
+| `p2_30_resize_restore.txt` / `p2_31_after_r.txt` | Resize corruption + manual recovery (S16) |
+| `p2_35_long_sxs.txt` / `p2_36_hscroll.txt` / `p2_37_end.txt` | Long-line horizontal scroll (S2) |
+| `p2_39_nocolor.txt` / `_ansi.txt` | `NO_COLOR=1` ignored (S30) |
+| `p2_41_nogit.txt` | Review Diff outside a git repo (S8) |
+| `p2_42_clean.txt` | Review Diff on a clean repo (S9) |
+| `p2_43_conflict.txt` | Merge-conflict (`UU`) file (S13) |
+
+Full scenario catalogue (33 scenarios, 18 executed here, 15 deferred) is
+in `docs/internal/REVIEW_DIFF_EXTENDED_SCENARIOS.md`.

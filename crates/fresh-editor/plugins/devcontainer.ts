@@ -785,27 +785,21 @@ function devcontainer_on_action_result(data: ActionPopupResultData): void {
       case "dismissed":
         break;
     }
-  } else if (data.popup_id === "devcontainer-activate") {
-    switch (data.action_id) {
-      case "rebuild":
-        devcontainer_rebuild();
-        break;
-      case "copy_install":
-        editor.setClipboard(INSTALL_COMMAND);
-        editor.setStatus(editor.t("status.copied_install", { cmd: INSTALL_COMMAND }));
-        break;
-      case "show_info":
-        devcontainer_show_info();
-        break;
-      case "dismiss":
-      case "dismissed":
-        break;
-    }
   }
 }
 registerHandler("devcontainer_on_action_result", devcontainer_on_action_result);
 
 async function devcontainer_rebuild(): Promise<void> {
+  // TODO: broken when core has auto-attached. Two independent issues:
+  //   1. editor.createTerminal() routes through docker exec into the
+  //      running container, so the `devcontainer up` command below runs
+  //      inside the container (where the CLI usually isn't installed).
+  //   2. Even if it succeeded, the core's cached container_id wouldn't
+  //      refresh, so subsequent terminals would target the destroyed
+  //      container.
+  // Both go away once core exposes a rebuild op (see
+  // docs/internal/DEVCONTAINER_INTEGRATION_PLAN.md). Until then, this
+  // command is only usable with `devcontainer.auto_detect = false`.
   const result = await editor.spawnProcess("which", ["devcontainer"]);
   if (result.exit_code !== 0) {
     showCliNotFoundPopup();
@@ -824,36 +818,6 @@ async function devcontainer_rebuild(): Promise<void> {
   editor.setStatus(editor.t("status.rebuilding"));
 }
 registerHandler("devcontainer_rebuild", devcontainer_rebuild);
-
-async function devcontainer_open_terminal(): Promise<void> {
-  const cliCheck = await editor.spawnProcess("which", ["devcontainer"]);
-  if (cliCheck.exit_code !== 0) {
-    showCliNotFoundPopup();
-    return;
-  }
-
-  // Check if a container is running for this workspace
-  const cwd = editor.getCwd();
-  const upCheck = await editor.spawnProcess(
-    "devcontainer",
-    ["exec", "--workspace-folder", cwd, "echo", "__devcontainer_ok__"],
-  );
-
-  if (upCheck.exit_code !== 0 || !upCheck.stdout.includes("__devcontainer_ok__")) {
-    editor.setStatus(editor.t("status.container_not_running"));
-    return;
-  }
-
-  // Open a terminal and send the exec command into it.
-  // `exec` up front replaces the host shell with `devcontainer exec`, so when
-  // the user types `exit` inside the container the terminal closes outright
-  // instead of dropping back to the host shell.
-  const term = await editor.createTerminal({ direction: "vertical", ratio: 0.5, focus: true });
-  const execCmd = `exec devcontainer exec --workspace-folder ${JSON.stringify(cwd)} /bin/sh -c 'exec \${SHELL:-/bin/sh}'\n`;
-  editor.sendTerminalInput(term.terminalId, execCmd);
-  editor.setStatus(editor.t("status.terminal_opened"));
-}
-registerHandler("devcontainer_open_terminal", devcontainer_open_terminal);
 
 // =============================================================================
 // Event Handlers
@@ -903,12 +867,6 @@ function registerCommands(): void {
     "devcontainer_rebuild",
     null,
   );
-  editor.registerCommand(
-    "%cmd.open_terminal",
-    "%cmd.open_terminal_desc",
-    "devcontainer_open_terminal",
-    null,
-  );
 }
 
 // =============================================================================
@@ -931,31 +889,6 @@ if (findConfig()) {
       ports: String(portCount),
     }),
   );
-
-  // Show activation popup on startup
-  // Check if devcontainer CLI is available to decide which actions to offer
-  const cliCheck = editor.spawnProcess("which", ["devcontainer"]);
-  cliCheck.then((result) => {
-    const hasCli = result.exit_code === 0;
-    const actions: Array<{ id: string; label: string }> = [];
-
-    if (hasCli) {
-      actions.push({ id: "rebuild", label: editor.t("popup.activate_rebuild") });
-    } else {
-      actions.push({ id: "copy_install", label: "Copy: " + INSTALL_COMMAND });
-    }
-    actions.push({ id: "show_info", label: editor.t("popup.activate_show_info") });
-    actions.push({ id: "dismiss", label: "Dismiss (ESC)" });
-
-    editor.showActionPopup({
-      id: "devcontainer-activate",
-      title: editor.t("popup.activate_title"),
-      message: hasCli
-        ? editor.t("popup.activate_message", { name, image })
-        : editor.t("popup.activate_message_no_cli", { name, image }),
-      actions,
-    });
-  });
 
   editor.debug("Dev Container plugin initialized: " + name);
 } else {

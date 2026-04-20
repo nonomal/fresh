@@ -613,6 +613,9 @@ pub enum Action {
     // Config operations
     DumpConfig,
 
+    // Force a full terminal clear + redraw (fixes display corruption from external output)
+    RedrawScreen,
+
     // Search and replace
     Search,
     FindInSelection,
@@ -1030,6 +1033,7 @@ impl Action {
             "remove_ruler" => RemoveRuler,
 
             "dump_config" => DumpConfig,
+            "redraw_screen" => RedrawScreen,
 
             "search" => Search,
             "find_in_selection" => FindInSelection,
@@ -2238,6 +2242,7 @@ impl KeybindingResolver {
             Action::ToggleWhitespaceIndicators => t!("action.toggle_whitespace_indicators"),
             Action::ResetBufferSettings => t!("action.reset_buffer_settings"),
             Action::DumpConfig => t!("action.dump_config"),
+            Action::RedrawScreen => t!("action.redraw_screen"),
             Action::Search => t!("action.search"),
             Action::FindInSelection => t!("action.find_in_selection"),
             Action::FindNext => t!("action.find_next"),

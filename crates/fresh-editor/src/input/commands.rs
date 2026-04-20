@@ -1133,6 +1133,13 @@ static COMMAND_DEFS: &[CommandDef] = &[
         custom_contexts: &[],
     },
     CommandDef {
+        name_key: "cmd.redraw_screen",
+        desc_key: "cmd.redraw_screen_desc",
+        action: || Action::RedrawScreen,
+        contexts: &[],
+        custom_contexts: &[],
+    },
+    CommandDef {
         name_key: "cmd.toggle_inlay_hints",
         desc_key: "cmd.toggle_inlay_hints_desc",
         action: || Action::ToggleInlayHints,

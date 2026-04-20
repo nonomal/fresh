@@ -4,6 +4,8 @@
 
 ### Improvements
 
+* **Redraw Screen command** (#1070): Added a "Redraw Screen" entry to the command palette (action `redraw_screen`) that clears the terminal and fully repaints the UI. Useful when an external program (e.g. a macOS pasteboard diagnostic leaked by the host terminal on Ctrl+C) scribbles over the TUI and leaves ghost text behind.
+
 * **PageUp/PageDown in wrapped buffers**: Page motion is now view-row-aware, so paging through heavily wrapped text no longer stalls mid-buffer and the cursor stays visible after every press. Each page also keeps 3 rows of overlap with the previous page (matching vim / less) so you don't lose context across the jump.
 
 * **Smarter char-wrapping of long tokens**: When a token has to be split mid-word because it doesn't fit on a fresh line, the break now prefers a UAX #29 word boundary within a lookback window instead of an arbitrary grapheme position — e.g. `dialog.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener` now wraps after `BUTTON_NEUTRAL` rather than mid-identifier.

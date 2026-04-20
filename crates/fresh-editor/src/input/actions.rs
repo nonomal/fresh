@@ -3009,6 +3009,7 @@ pub fn action_to_events(
         | Action::ToggleScrollSync
         | Action::ToggleMouseCapture
         | Action::DumpConfig
+        | Action::RedrawScreen
         | Action::Search
         | Action::FindInSelection
         | Action::FindNext

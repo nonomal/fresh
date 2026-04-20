@@ -675,6 +675,9 @@ impl Editor {
             Action::DumpConfig => {
                 self.dump_config();
             }
+            Action::RedrawScreen => {
+                self.request_full_redraw();
+            }
             Action::SelectTheme => {
                 self.start_select_theme_prompt();
             }

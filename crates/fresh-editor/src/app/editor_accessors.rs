@@ -479,8 +479,16 @@ impl Editor {
     /// only, where the editor is still being set up and there is no
     /// user-visible state to preserve. Do not call this from the event
     /// loop — use `install_authority` for that.
+    ///
+    /// Also refreshes the plugin state snapshot so hooks that fire after
+    /// this call (notably `plugins_loaded`, fired by `main.rs` right
+    /// after `set_boot_authority`) see the real `authority_label` instead
+    /// of the empty string the temporary `Authority::local()` carried
+    /// during construction.
     pub fn set_boot_authority(&mut self, authority: crate::services::authority::Authority) {
         self.authority = authority;
+        #[cfg(feature = "plugins")]
+        self.update_plugin_state_snapshot();
     }
 
     /// Read-only access to the active authority.

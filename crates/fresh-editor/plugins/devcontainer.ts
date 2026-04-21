@@ -1063,29 +1063,36 @@ if (findConfig()) {
 
   editor.debug("Dev Container plugin initialized: " + name);
 
-  // Skip the attach prompt whenever a non-local authority is already
-  // installed. This covers the (common) case of the post-attach
-  // restart reloading the plugin with the container authority in
-  // effect — the user already said yes, don't ask again. We look at
-  // the authority label rather than plugin global state because state
-  // is per-Editor and is wiped by the restart; the label survives
-  // because it lives on the fresh Editor's authority.
-  const authorityLabel = editor.getAuthorityLabel();
-  const alreadyAttached = authorityLabel.length > 0;
-
-  if (!alreadyAttached) {
+  // Decide whether to surface the attach prompt AFTER main.rs installs
+  // the boot authority. When the plugin's top-level body runs, the
+  // editor is still being constructed and `authority.display_label` is
+  // whatever the default Authority carried during Editor construction —
+  // which is empty even on the post-attach restart, because the real
+  // container authority is only installed via `set_boot_authority`
+  // (called right before `plugins_loaded` fires). Deferring to this
+  // hook means `getAuthorityLabel()` reads the freshly-refreshed
+  // snapshot and we don't re-prompt a user who already attached.
+  function devcontainer_maybe_show_attach_prompt(): void {
+    const authorityLabel = editor.getAuthorityLabel();
+    const alreadyAttached = authorityLabel.length > 0;
+    if (alreadyAttached) {
+      editor.debug(
+        "Dev Container plugin: authority '" + authorityLabel + "' already installed, skipping attach prompt",
+      );
+      return;
+    }
     // One-shot per-session dismissal: if the user already said "Not
     // now" in this Editor process, don't re-prompt. On a cold restart
     // the state is gone and we ask again — that's fine.
     const previousDecision = readAttachDecision();
-    if (previousDecision === null) {
-      showAttachPrompt();
-    }
-  } else {
-    editor.debug(
-      "Dev Container plugin: authority '" + authorityLabel + "' already installed, skipping attach prompt",
-    );
+    if (previousDecision !== null) return;
+    showAttachPrompt();
   }
+  registerHandler(
+    "devcontainer_maybe_show_attach_prompt",
+    devcontainer_maybe_show_attach_prompt,
+  );
+  editor.on("plugins_loaded", "devcontainer_maybe_show_attach_prompt");
 } else {
   editor.debug("Dev Container plugin: no devcontainer.json found");
 }

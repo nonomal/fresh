@@ -1537,14 +1537,11 @@ impl Editor {
                     })
                     .collect();
 
-                // Push tracking onto the stack parallel to `global_popups`.
-                // A second plugin calling showActionPopup while the first is
-                // still up gets a new entry, not a clobbered one, so each
-                // popup fires its own `action_popup_result` on dismiss.
-                let action_ids: Vec<(String, String)> =
-                    actions.into_iter().map(|a| (a.id, a.label)).collect();
-                self.active_action_popup
-                    .push((popup_id.clone(), action_ids));
+                // The popup_id lives on the popup itself via its
+                // `PopupResolver::PluginAction` — no side-channel stack.
+                // Drop the incoming `actions` vec; its ids are already
+                // encoded as each list item's `data` field below.
+                drop(actions);
 
                 // Create popup with message + action list
                 let popup_data = crate::model::event::PopupData {
@@ -1564,12 +1561,19 @@ impl Editor {
                 // (and dismissible) regardless of which buffer is focused —
                 // including virtual buffers like the Dashboard that own the
                 // whole split.
-                let popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
+                //
+                // The resolver carries the popup_id so confirm/cancel fires
+                // `action_popup_result` for exactly THIS popup, even when
+                // multiple plugin popups are stacked concurrently.
+                let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
+                popup_obj.resolver = crate::view::popup::PopupResolver::PluginAction {
+                    popup_id: popup_id.clone(),
+                };
                 self.global_popups.show(popup_obj);
                 tracing::info!(
                     "Action popup shown: id={}, stack_depth={}",
                     popup_id,
-                    self.active_action_popup.len()
+                    self.global_popups.all().len()
                 );
             }
 

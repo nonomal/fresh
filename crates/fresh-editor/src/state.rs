@@ -1076,6 +1076,17 @@ pub(crate) fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
         crate::model::event::PopupKindHint::Text => PopupKind::Text,
     };
 
+    // Kind-implied resolver default: a popup whose kind is
+    // `Completion` always confirms by inserting the selected
+    // completion, regardless of who built it. Other kinds need an
+    // explicit resolver (LSP confirm, plugin action, LSP status, code
+    // action) because the same `List` kind is used for all four, so we
+    // can't infer which feature owns the popup from its kind alone.
+    let resolver = match kind {
+        PopupKind::Completion => crate::view::popup::PopupResolver::Completion,
+        _ => crate::view::popup::PopupResolver::None,
+    };
+
     Popup {
         kind,
         title: data.title.clone(),
@@ -1091,6 +1102,7 @@ pub(crate) fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
         scroll_offset: 0,
         text_selection: None,
         accept_key_hint: None,
+        resolver,
     }
 }
 

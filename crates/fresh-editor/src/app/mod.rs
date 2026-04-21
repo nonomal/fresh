@@ -828,15 +828,12 @@ pub struct Editor {
     /// Stores the keys pressed so far in a chord sequence
     chord_state: Vec<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 
-    /// Pending LSP confirmation - language name awaiting user confirmation
-    /// When Some, a confirmation popup is shown asking user to approve LSP spawn
-    pending_lsp_confirmation: Option<String>,
-
-    /// Pending LSP status popup - when true, the active popup is an LSP status
-    /// details popup with server actions (restart/stop/view log).
-    /// Contains the list of (action_key, label) pairs for the popup items.
-    pending_lsp_status_popup: Option<Vec<(String, String)>>,
-
+    // (Historical `pending_lsp_confirmation` and `pending_lsp_status_popup`
+    // fields moved onto `Popup::resolver` — each popup carries its own
+    // "how do I confirm?" identity, so `handle_popup_confirm` dispatches
+    // by matching the focused popup's resolver instead of racing through
+    // a precedence cascade of side-channel `Option`s that a second
+    // simultaneously-open popup could steal.)
     /// Languages the user has interactively dismissed from the LSP popup.
     ///
     /// Separate from `LspServerConfig::enabled` (which is the persisted
@@ -1029,17 +1026,13 @@ pub struct Editor {
     /// Hunks for the Review Diff tool
     review_hunks: Vec<fresh_core::api::ReviewHunk>,
 
-    /// Stack of active plugin action popups, parallel to `global_popups`:
-    /// each entry is `(popup_id, actions)` for the popup at the same index
-    /// in the global stack. Replaces the old single-slot tracking so two
-    /// plugins firing showActionPopup concurrently each get their own
-    /// `action_popup_result` callback when their popup is resolved.
-    active_action_popup: Vec<(String, Vec<(String, String)>)>,
-
     /// Editor-level popups that float above any buffer regardless of which
     /// one is active. Plugin notifications (showActionPopup) live here so a
     /// switch to a virtual buffer (Dashboard, diagnostics panel, …) doesn't
     /// hide them mid-decision.
+    ///
+    /// Each plugin popup carries its `popup_id` inside its
+    /// `PopupResolver::PluginAction` — no parallel side-channel stack.
     pub(crate) global_popups: crate::view::popup::PopupManager,
 
     /// Composite buffers (separate from regular buffers)

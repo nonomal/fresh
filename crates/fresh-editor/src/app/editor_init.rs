@@ -687,8 +687,6 @@ impl Editor {
             #[cfg(feature = "plugins")]
             plugin_render_requested: false,
             chord_state: Vec::new(),
-            pending_lsp_confirmation: None,
-            pending_lsp_status_popup: None,
             user_dismissed_lsp_languages: std::collections::HashSet::new(),
             auto_start_prompted_languages: std::collections::HashSet::new(),
             pending_auto_start_prompts: std::collections::HashSet::new(),
@@ -752,7 +750,6 @@ impl Editor {
             search_scan: search_scan::SearchScan::default(),
             search_overlay_top_byte: None,
             review_hunks: Vec::new(),
-            active_action_popup: Vec::new(),
             global_popups: crate::view::popup::PopupManager::new(),
             composite_buffers: HashMap::new(),
             composite_view_states: HashMap::new(),

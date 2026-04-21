@@ -80,6 +80,21 @@ impl Editor {
         self.apply_event_to_active_buffer(&event);
     }
 
+    /// Show a popup and attach a confirm/cancel resolver to it. The
+    /// `PopupData` event doesn't carry the resolver (it's a view-layer
+    /// concern that doesn't need event-log replay); we set it on the
+    /// resulting `Popup` immediately after `show_popup` pushes it.
+    pub fn show_popup_with_resolver(
+        &mut self,
+        popup: crate::model::event::PopupData,
+        resolver: crate::view::popup::PopupResolver,
+    ) {
+        self.show_popup(popup);
+        if let Some(top) = self.active_state_mut().popups.top_mut() {
+            top.resolver = resolver;
+        }
+    }
+
     /// Hide the topmost popup
     pub fn hide_popup(&mut self) {
         // Editor-level popups take precedence: dismiss them first if any are
@@ -193,9 +208,6 @@ impl Editor {
             PopupContentData, PopupData, PopupKindHint, PopupListItemData, PopupPositionData,
         };
 
-        // Store the pending confirmation
-        self.pending_lsp_confirmation = Some(language.to_string());
-
         // Get the server command for display
         let server_info = if let Some(lsp) = &self.lsp {
             if let Some(config) = lsp.get_config(language) {
@@ -245,7 +257,15 @@ impl Editor {
             bordered: true,
         };
 
-        self.show_popup(popup);
+        // The language travels with the popup via its resolver so
+        // confirm time reads it from the popup itself — no side-channel
+        // Editor field needed, and no coupling between popups.
+        self.show_popup_with_resolver(
+            popup,
+            crate::view::popup::PopupResolver::LspConfirm {
+                language: language.to_string(),
+            },
+        );
     }
 
     /// Handle the LSP confirmation popup response
@@ -254,11 +274,11 @@ impl Editor {
     /// confirmation popup. It processes the response and starts the LSP
     /// server if approved.
     ///
-    /// Returns true if a response was handled, false if there was no pending confirmation.
-    pub fn handle_lsp_confirmation_response(&mut self, action: &str) -> bool {
-        let Some(language) = self.pending_lsp_confirmation.take() else {
-            return false;
-        };
+    /// `language` is read from the confirming popup's `PopupResolver`
+    /// (no side-channel), so `handle_popup_confirm`'s resolver match
+    /// can call us directly with what it destructured out of the popup.
+    pub fn handle_lsp_confirmation_response(&mut self, language: &str, action: &str) -> bool {
+        let language = language.to_string();
 
         // Get file path from active buffer for workspace root detection
         let file_path = self
@@ -463,9 +483,21 @@ impl Editor {
         }
     }
 
-    /// Check if there's a pending LSP confirmation
+    /// Check if the topmost visible popup is the LSP confirmation
+    /// popup. Used by callers that need to know "is an LSP confirm
+    /// prompt currently in front of the user?" — e.g. the file-open
+    /// queue waits on this instead of racing past the prompt.
     pub fn has_pending_lsp_confirmation(&self) -> bool {
-        self.pending_lsp_confirmation.is_some()
+        use crate::view::popup::PopupResolver;
+        let matches_lsp_confirm = |p: &crate::view::popup::Popup| -> bool {
+            matches!(p.resolver, PopupResolver::LspConfirm { .. })
+        };
+        self.global_popups.top().is_some_and(matches_lsp_confirm)
+            || self
+                .active_state()
+                .popups
+                .top()
+                .is_some_and(matches_lsp_confirm)
     }
 
     /// Navigate popup selection (next item)

@@ -195,6 +195,31 @@ fn action_popup_persists_across_buffer_switch() {
     );
 }
 
+fn show_devcontainer_attach_popup_named(
+    harness: &mut EditorTestHarness,
+    popup_id: &str,
+    container_name: &str,
+) {
+    harness
+        .editor_mut()
+        .handle_plugin_command(PluginCommand::ShowActionPopup {
+            popup_id: popup_id.to_string(),
+            title: "Dev Container detected".to_string(),
+            message: format!("Attach to '{}'?", container_name),
+            actions: vec![
+                ActionPopupAction {
+                    id: "attach".to_string(),
+                    label: "Attach".to_string(),
+                },
+                ActionPopupAction {
+                    id: "dismiss".to_string(),
+                    label: "Not now".to_string(),
+                },
+            ],
+        })
+        .unwrap();
+}
+
 fn show_generic_popup(
     harness: &mut EditorTestHarness,
     popup_id: &str,
@@ -339,5 +364,155 @@ fn action_popups_queue_confirms_preserve_per_popup_identity() {
         !after_second_confirm.contains("First popup body"),
         "Both popups must be resolved. Screen:\n{}",
         after_second_confirm
+    );
+}
+
+/// Regression for "user reports Attach stopped attaching when an LSP
+/// auto-prompt is also on screen":
+///
+///   1. Open a file in a project that has devcontainer.json AND LSP
+///      configured-but-dormant for the file's language. The LSP
+///      auto-prompt shows (buffer stack); the devcontainer plugin
+///      shows its Attach popup (global stack) concurrently.
+///   2. User presses Enter on the devcontainer popup to pick "Attach".
+///   3. Pre-fix: `handle_popup_confirm`'s cascade checked
+///      `pending_lsp_status_popup.is_some()` first, read the
+///      *selected LSP popup row's* data, dismissed the devcontainer
+///      popup without firing `action_popup_result`, and surfaced the
+///      LSP popup underneath — so "Attach" never ran.
+///   4. Post-fix: the confirm path inspects the focused popup's
+///      `PopupResolver`; global popup's `PluginAction` variant is
+///      matched first, fires the hook with the right action id, and
+///      leaves the LSP popup untouched underneath.
+///
+/// The test installs a small plugin that captures every
+/// `action_popup_result` call via the status bar so we can assert the
+/// hook ran with the right arguments.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn action_popup_attach_fires_hook_even_when_lsp_auto_prompt_is_open() {
+    use crate::common::harness::{copy_plugin_lib, HarnessOptions};
+    use std::fs;
+
+    // Plugin: registers a showActionPopup caller (the "devcontainer
+    // mock") + listens for action_popup_result and writes the outcome
+    // to the status bar.
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+
+    // Plugin just needs to observe the action_popup_result hook — we
+    // show the popup itself by handing Rust a `PluginCommand`, which
+    // exercises the same dispatch code path as a JS-side
+    // `editor.showActionPopup(...)`.
+    let plugin = r#"
+const editor = getEditor();
+
+globalThis.devmock_on_result = function(data: { popup_id: string; action_id: string }): void {
+    editor.setStatus("result: " + data.popup_id + "/" + data.action_id);
+};
+editor.on("action_popup_result", "devmock_on_result");
+"#;
+    fs::write(plugins_dir.join("devmock.ts"), plugin).unwrap();
+
+    // Source file — .rs so the LSP auto-prompt's language match fires.
+    let file = project_root.join("src.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+
+    // Config with a dormant rust LSP (enabled, auto_start = false) so
+    // opening src.rs queues the auto-prompt.
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: "rust-analyzer".to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: false,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: Some("rust-analyzer".to_string()),
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(project_root.clone()),
+    )
+    .unwrap();
+    // The harness disables LSP auto-prompt by default to keep unrelated
+    // tests clean. This test specifically exercises the collision with
+    // the auto-prompt, so re-enable it for this editor.
+    harness.editor_mut().set_lsp_auto_prompt_enabled(true);
+
+    // Open the file — LSP auto-prompt will show on the buffer popup
+    // stack on the next render.
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+    // Sanity: the LSP popup surfaced.
+    assert!(
+        harness.screen_to_string().contains("rust-analyzer"),
+        "LSP auto-prompt should be visible after opening src.rs. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Trigger the devcontainer-mock action popup on top of it. From
+    // here on both popups coexist: LSP on buffer stack, plugin action
+    // on global stack.
+    show_devcontainer_attach_popup_named(&mut harness, "devcontainer-attach", "mock-container");
+    harness.render().unwrap();
+    let with_both = harness.screen_to_string();
+    assert!(
+        with_both.contains("Attach") && with_both.contains("mock-container"),
+        "Devcontainer-mock popup should be on screen. Screen:\n{}",
+        with_both
+    );
+
+    // Enter on the global (devcontainer) popup. Default selection is
+    // "Attach" (index 0). The hook must fire with action_id=attach —
+    // that's the signal the plugin's attach routine ran.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    // Bounded wait: the plugin thread processes the hook
+    // asynchronously, so poll a fixed number of tick+render cycles.
+    // When the cascade bug is in effect, the hook never fires and the
+    // assertion below trips with a concrete failure instead of
+    // hanging the test runner.
+    for _ in 0..50 {
+        harness.tick_and_render().unwrap();
+        if harness
+            .screen_to_string()
+            .contains("result: devcontainer-attach/")
+        {
+            break;
+        }
+    }
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("result: devcontainer-attach/attach"),
+        "Pressing Enter on the devcontainer popup must fire \
+         action_popup_result with action_id=attach, even while an LSP \
+         auto-prompt is also on screen. Got status line: looking for \
+         'result: devcontainer-attach/attach' in:\n{}",
+        screen
+    );
+    assert!(
+        !screen.contains("result: devcontainer-attach/dismissed"),
+        "Enter must not fire a 'dismissed' result — that would mean the \
+         popup was swallowed by an unrelated confirm branch. Screen:\n{}",
+        screen
     );
 }

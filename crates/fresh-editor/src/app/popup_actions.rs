@@ -19,121 +19,128 @@ pub enum PopupConfirmResult {
 impl Editor {
     /// Handle PopupConfirm action.
     ///
-    /// Returns `PopupConfirmResult` indicating what the caller should do next.
+    /// Dispatches by reading the currently-focused popup's `PopupResolver`
+    /// — the popup itself carries its own "how do I confirm?" identity.
+    /// This eliminates the old side-channel cascade where `pending_X:
+    /// Option<...>` flags competed for precedence: two popups coexisting
+    /// (e.g. plugin action popup on the global stack + LSP auto-prompt
+    /// on the buffer stack) would race on whose flag the cascade hit
+    /// first, and the wrong branch would claim the key.
+    ///
+    /// Global popups shadow buffer popups for keyboard focus (see
+    /// `input_dispatch::dispatch_modal_input`), so the confirm path
+    /// picks the same popup: global first, then the active buffer.
     pub fn handle_popup_confirm(&mut self) -> PopupConfirmResult {
-        // Check if this is an LSP status details popup
-        if self.pending_lsp_status_popup.is_some() {
-            let action_key = self
-                .active_state()
-                .popups
-                .top()
-                .and_then(|p| p.selected_item())
-                .and_then(|item| item.data.clone());
+        use crate::view::popup::PopupResolver;
 
-            self.hide_popup();
-            self.pending_lsp_status_popup = None;
-            // User picked a row → they've seen and handled the
-            // prompt, so end the auto-prompt cycle for this
-            // language. Mirrors the same cleanup in
-            // `handle_popup_cancel` for the Esc path.
-            let active = self.active_buffer();
-            if let Some(language) = self.buffers.get(&active).map(|s| s.language.clone()) {
-                self.pending_auto_start_prompts.remove(&language);
-                self.auto_start_prompted_languages.insert(language);
-            }
+        // Clone the top popup's resolver so we can `match` on it without
+        // keeping a borrow on `self.global_popups` / `self.buffers`
+        // while the handler mutates the editor.
+        let resolver = if self.global_popups.is_visible() {
+            self.global_popups.top().map(|p| p.resolver.clone())
+        } else {
+            self.active_state().popups.top().map(|p| p.resolver.clone())
+        };
 
-            if let Some(key) = action_key {
-                self.handle_lsp_status_action(&key);
-            }
-            return PopupConfirmResult::EarlyReturn;
-        }
-
-        // Check if this is an action popup (from plugin showActionPopup).
-        // Action popups live on the editor-level (global) stack so they show
-        // over any buffer; the `active_action_popup` stack runs parallel to
-        // `global_popups`, so the *top* entry corresponds to the *top*
-        // popup. Pop both together here.
-        if !self.active_action_popup.is_empty() {
-            let action_id = self
-                .global_popups
-                .top()
-                .or_else(|| self.active_state().popups.top())
-                .and_then(|p| p.selected_item())
-                .and_then(|item| item.data.clone())
-                .unwrap_or_else(|| "dismissed".to_string());
-
-            self.hide_popup();
-            let (popup_id, _actions) = self
-                .active_action_popup
-                .pop()
-                .expect("non-empty checked above");
-
-            // Fire the ActionPopupResult hook
-            self.plugin_manager.run_hook(
-                "action_popup_result",
-                crate::services::plugins::hooks::HookArgs::ActionPopupResult {
-                    popup_id,
-                    action_id,
-                },
-            );
-
-            return PopupConfirmResult::EarlyReturn;
-        }
-
-        // Check if this is a code action popup
-        if self.pending_code_actions.is_some() {
-            let selected_index = self
-                .active_state()
-                .popups
-                .top()
-                .and_then(|p| p.selected_item())
-                .and_then(|item| item.data.as_ref())
-                .and_then(|data| data.parse::<usize>().ok());
-
-            self.hide_popup();
-            if let Some(index) = selected_index {
-                self.execute_code_action(index);
-            }
-            self.pending_code_actions = None;
-            return PopupConfirmResult::EarlyReturn;
-        }
-
-        // Check if this is an LSP confirmation popup
-        if self.pending_lsp_confirmation.is_some() {
-            let action = self
-                .active_state()
-                .popups
-                .top()
-                .and_then(|p| p.selected_item())
-                .and_then(|item| item.data.clone());
-            if let Some(action) = action {
+        match resolver {
+            Some(PopupResolver::PluginAction { popup_id }) => {
+                let action_id = self
+                    .global_popups
+                    .top()
+                    .or_else(|| self.active_state().popups.top())
+                    .and_then(|p| p.selected_item())
+                    .and_then(|item| item.data.clone())
+                    .unwrap_or_else(|| "dismissed".to_string());
                 self.hide_popup();
-                self.handle_lsp_confirmation_response(&action);
-                return PopupConfirmResult::EarlyReturn;
-            }
-        }
-
-        // If it's a completion popup, insert the selected item
-        let completion_info = self
-            .active_state()
-            .popups
-            .top()
-            .filter(|p| p.kind == crate::view::popup::PopupKind::Completion)
-            .and_then(|p| p.selected_item())
-            .map(|item| (item.text.clone(), item.data.clone()));
-
-        // Perform the completion if we have text
-        if let Some((label, insert_text)) = completion_info {
-            if let Some(text) = insert_text {
-                self.insert_completion_text(text);
+                self.plugin_manager.run_hook(
+                    "action_popup_result",
+                    crate::services::plugins::hooks::HookArgs::ActionPopupResult {
+                        popup_id,
+                        action_id,
+                    },
+                );
+                PopupConfirmResult::EarlyReturn
             }
 
-            // Apply additional_text_edits (e.g., auto-imports) from the matching CompletionItem
-            self.apply_completion_additional_edits(&label);
-        }
+            Some(PopupResolver::LspStatus) => {
+                let action_key = self
+                    .active_state()
+                    .popups
+                    .top()
+                    .and_then(|p| p.selected_item())
+                    .and_then(|item| item.data.clone());
+                self.hide_popup();
+                // User picked a row → end the auto-prompt cycle for
+                // this language.
+                let active = self.active_buffer();
+                if let Some(language) = self.buffers.get(&active).map(|s| s.language.clone()) {
+                    self.pending_auto_start_prompts.remove(&language);
+                    self.auto_start_prompted_languages.insert(language);
+                }
+                if let Some(key) = action_key {
+                    self.handle_lsp_status_action(&key);
+                }
+                PopupConfirmResult::EarlyReturn
+            }
 
-        self.hide_popup();
-        PopupConfirmResult::Done
+            Some(PopupResolver::CodeAction) => {
+                let selected_index = self
+                    .active_state()
+                    .popups
+                    .top()
+                    .and_then(|p| p.selected_item())
+                    .and_then(|item| item.data.as_ref())
+                    .and_then(|data| data.parse::<usize>().ok());
+                self.hide_popup();
+                if let Some(index) = selected_index {
+                    self.execute_code_action(index);
+                }
+                self.pending_code_actions = None;
+                PopupConfirmResult::EarlyReturn
+            }
+
+            Some(PopupResolver::LspConfirm { language }) => {
+                let action = self
+                    .active_state()
+                    .popups
+                    .top()
+                    .and_then(|p| p.selected_item())
+                    .and_then(|item| item.data.clone());
+                if let Some(action) = action {
+                    self.hide_popup();
+                    self.handle_lsp_confirmation_response(&language, &action);
+                    PopupConfirmResult::EarlyReturn
+                } else {
+                    self.hide_popup();
+                    PopupConfirmResult::EarlyReturn
+                }
+            }
+
+            Some(PopupResolver::Completion) => {
+                // Grab the selected item's label + insert-text before we
+                // mutate the popup stack — insert_completion_text edits
+                // the buffer, which invalidates the borrow.
+                let completion_info = self
+                    .active_state()
+                    .popups
+                    .top()
+                    .and_then(|p| p.selected_item())
+                    .map(|item| (item.text.clone(), item.data.clone()));
+                if let Some((label, insert_text)) = completion_info {
+                    if let Some(text) = insert_text {
+                        self.insert_completion_text(text);
+                    }
+                    self.apply_completion_additional_edits(&label);
+                }
+                self.hide_popup();
+                PopupConfirmResult::Done
+            }
+
+            Some(PopupResolver::None) | None => {
+                self.hide_popup();
+                PopupConfirmResult::Done
+            }
+        }
     }
 
     /// Insert completion text, replacing the word prefix at cursor.
@@ -249,62 +256,67 @@ impl Editor {
     }
 
     /// Handle PopupCancel action.
+    ///
+    /// Mirrors `handle_popup_confirm`: dispatch on the focused popup's
+    /// `PopupResolver`. Each flavour does its own cleanup; no
+    /// precedence between unrelated popup types.
     pub fn handle_popup_cancel(&mut self) {
-        tracing::info!(
-            "handle_popup_cancel: action_popup_stack_depth={}",
-            self.active_action_popup.len()
-        );
+        use crate::view::popup::PopupResolver;
 
-        // Check if this is an LSP status details popup
-        if self.pending_lsp_status_popup.take().is_some() {
-            // The user has now seen the prompt and dismissed it —
-            // end the auto-prompt cycle for the active buffer's
-            // language so re-focusing another file of the same
-            // language doesn't re-pop it.
-            let active = self.active_buffer();
-            if let Some(language) = self.buffers.get(&active).map(|s| s.language.clone()) {
-                self.pending_auto_start_prompts.remove(&language);
-                self.auto_start_prompted_languages.insert(language);
+        let resolver = if self.global_popups.is_visible() {
+            self.global_popups.top().map(|p| p.resolver.clone())
+        } else {
+            self.active_state().popups.top().map(|p| p.resolver.clone())
+        };
+
+        match resolver {
+            Some(PopupResolver::PluginAction { popup_id }) => {
+                tracing::info!(
+                    "handle_popup_cancel: dismissing action popup id={}",
+                    popup_id
+                );
+                self.hide_popup();
+                self.plugin_manager.run_hook(
+                    "action_popup_result",
+                    crate::services::plugins::hooks::HookArgs::ActionPopupResult {
+                        popup_id,
+                        action_id: "dismissed".to_string(),
+                    },
+                );
             }
-            self.hide_popup();
-            return;
-        }
 
-        // Check if this is an action popup (from plugin showActionPopup).
-        // Pop the top entry of the parallel tracking stack together with the
-        // popup itself so a deeper queued popup (if any) surfaces next.
-        if let Some((popup_id, _actions)) = self.active_action_popup.pop() {
-            tracing::info!(
-                "handle_popup_cancel: dismissing action popup id={}",
-                popup_id
-            );
-            self.hide_popup();
+            Some(PopupResolver::LspStatus) => {
+                // End the auto-prompt cycle for the active buffer's
+                // language so re-focusing another file of the same
+                // language doesn't re-pop it.
+                let active = self.active_buffer();
+                if let Some(language) = self.buffers.get(&active).map(|s| s.language.clone()) {
+                    self.pending_auto_start_prompts.remove(&language);
+                    self.auto_start_prompted_languages.insert(language);
+                }
+                self.hide_popup();
+            }
 
-            // Fire the ActionPopupResult hook with "dismissed"
-            self.plugin_manager.run_hook(
-                "action_popup_result",
-                crate::services::plugins::hooks::HookArgs::ActionPopupResult {
-                    popup_id,
-                    action_id: "dismissed".to_string(),
-                },
-            );
-            tracing::info!("handle_popup_cancel: action_popup_result hook fired");
-            return;
-        }
+            Some(PopupResolver::CodeAction) => {
+                self.pending_code_actions = None;
+                self.hide_popup();
+            }
 
-        if self.pending_code_actions.is_some() {
-            self.pending_code_actions = None;
-            self.hide_popup();
-            return;
-        }
+            Some(PopupResolver::LspConfirm { language: _ }) => {
+                self.set_status_message(t!("lsp.startup_cancelled_msg").to_string());
+                self.hide_popup();
+            }
 
-        if self.pending_lsp_confirmation.is_some() {
-            self.pending_lsp_confirmation = None;
-            self.set_status_message(t!("lsp.startup_cancelled_msg").to_string());
+            Some(PopupResolver::Completion) => {
+                self.hide_popup();
+                self.completion_items = None;
+            }
+
+            Some(PopupResolver::None) | None => {
+                self.hide_popup();
+                self.completion_items = None;
+            }
         }
-        self.hide_popup();
-        // Clear completion items when popup is closed
-        self.completion_items = None;
     }
 
     /// Get the formatted key hint for the completion accept action (e.g. "Tab").
@@ -458,6 +470,7 @@ impl Editor {
         let state = self.buffers.get_mut(&buffer_id).unwrap();
         let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
         popup_obj.accept_key_hint = accept_hint;
+        popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
         state.popups.show_or_replace(popup_obj);
     }
 }

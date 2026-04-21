@@ -19,10 +19,7 @@ use super::Editor;
 /// buffers without affecting unrelated popups (completion, hover,
 /// etc.) that might be on top.
 fn is_lsp_status_popup(popup: &crate::view::popup::Popup) -> bool {
-    popup
-        .title
-        .as_deref()
-        .is_some_and(|t| t.starts_with("LSP Servers ("))
+    matches!(popup.resolver, crate::view::popup::PopupResolver::LspStatus)
 }
 
 impl Editor {
@@ -47,9 +44,13 @@ impl Editor {
         // instead of rebuilding and re-showing it.  This lets clicking the
         // status-bar LSP indicator a second time dismiss the popup, matching
         // the common affordance for status-bar menus.
-        if self.pending_lsp_status_popup.is_some() {
+        if self
+            .active_state()
+            .popups
+            .top()
+            .is_some_and(is_lsp_status_popup)
+        {
             self.hide_popup();
-            self.pending_lsp_status_popup = None;
             return;
         }
 
@@ -151,12 +152,11 @@ impl Editor {
             return;
         }
 
-        // Pop any orphan LSP status popup off *other* buffers so
-        // the user doesn't find a stale prompt when they later
-        // visit those tabs. `show_lsp_status_popup` also toggles
-        // off whatever is currently tracked in
-        // `pending_lsp_status_popup`, so reset that marker first
-        // — otherwise the call below would close instead of show.
+        // Pop any orphan LSP status popup off *other* buffers so the
+        // user doesn't find a stale prompt when they later visit those
+        // tabs. Each buffer's popup carries its own `LspStatus`
+        // resolver, so we can identify orphan LSP status popups by
+        // resolver value without a side-channel marker.
         let active_id = active;
         for (id, state) in self.buffers.iter_mut() {
             if *id == active_id {
@@ -166,7 +166,6 @@ impl Editor {
                 state.popups.hide();
             }
         }
-        self.pending_lsp_status_popup = None;
 
         self.show_lsp_status_popup();
     }
@@ -179,7 +178,15 @@ impl Editor {
     /// would freeze on the snapshot taken at open time while the status-bar
     /// spinner keeps moving, making them look disconnected.
     pub fn refresh_lsp_status_popup_if_open(&mut self) {
-        if self.pending_lsp_status_popup.is_none() {
+        // Only rebuild if the active buffer's top popup IS an LSP
+        // status popup — otherwise we'd spuriously build one on top of
+        // unrelated state.
+        if !self
+            .active_state()
+            .popups
+            .top()
+            .is_some_and(is_lsp_status_popup)
+        {
             return;
         }
         let language = self
@@ -187,14 +194,8 @@ impl Editor {
             .get(&self.active_buffer())
             .map(|s| s.language.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        // Replace contents: hide then rebuild.  hide_popup() clears
-        // pending_lsp_status_popup via handle_popup_cancel pathways, but
-        // here we're calling it directly without routing through a cancel,
-        // so stash and restore the marker so the rebuild sees "already
-        // open" and doesn't fall through the toggle branch.
-        let was_pending = self.pending_lsp_status_popup.take();
+        // Replace contents: hide then rebuild.
         self.hide_popup();
-        drop(was_pending);
         self.build_and_show_lsp_status_popup(&language);
     }
 
@@ -527,9 +528,13 @@ impl Editor {
                 .with_data(cancel_key.clone()),
         );
         action_keys.push((cancel_key, format!("Dismiss ({})", cancel_binding)));
-
-        // Store action keys for handling confirmation
-        self.pending_lsp_status_popup = Some(action_keys);
+        // `action_keys` is no longer kept on the editor — each list
+        // item already carries its action key in its `data` field, and
+        // the `LspStatus` resolver on the popup tells confirm how to
+        // interpret that data. The local binding is retained only to
+        // keep the existing construction logic unchanged; it falls out
+        // of scope with the rest.
+        let _ = action_keys;
 
         // Pin the popup width up-front, using the *worst-case* widths for
         // any row that varies at runtime (the progress line).  This keeps
@@ -574,7 +579,7 @@ impl Editor {
             )
             .unwrap_or(crate::view::popup::PopupPosition::BottomRight);
 
-        use crate::view::popup::{Popup, PopupContent, PopupKind};
+        use crate::view::popup::{Popup, PopupContent, PopupKind, PopupResolver};
         use ratatui::style::Style;
 
         let popup = Popup {
@@ -595,6 +600,10 @@ impl Editor {
             scroll_offset: 0,
             text_selection: None,
             accept_key_hint: None,
+            // This is the LSP status / auto-prompt popup — mark it so
+            // confirm/cancel routes through handle_lsp_status_action
+            // regardless of what other popups are on screen.
+            resolver: PopupResolver::LspStatus,
         };
 
         let buffer_id = self.active_buffer();

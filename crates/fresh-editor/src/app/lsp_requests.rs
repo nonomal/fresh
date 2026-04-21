@@ -193,6 +193,7 @@ impl Editor {
             // Convert PopupData to Popup and use show_or_replace to avoid stacking
             let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
             popup_obj.accept_key_hint = accept_hint;
+            popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
             state.popups.show_or_replace(popup_obj);
         }
 
@@ -647,6 +648,7 @@ impl Editor {
         let state = self.buffers.get_mut(&buffer_id).unwrap();
         let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
         popup_obj.accept_key_hint = accept_hint;
+        popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
         state.popups.show_or_replace(popup_obj);
     }
 
@@ -1720,6 +1722,10 @@ impl Editor {
         popup.max_height = 15;
         popup.border_style = Style::default().fg(self.theme.popup_border_fg);
         popup.background_style = Style::default().bg(self.theme.popup_bg);
+        // Confirm reads the selected row's `data` as an index into
+        // `self.pending_code_actions` — the heavy lsp_types payload
+        // stays on the Editor to keep the view crate LSP-free.
+        popup.resolver = crate::view::popup::PopupResolver::CodeAction;
 
         // Show the popup, replacing any existing action popup to avoid stacking
         if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {

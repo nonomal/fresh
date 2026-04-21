@@ -68,6 +68,40 @@ pub enum PopupKind {
     Text,
 }
 
+/// How `handle_popup_confirm` / `handle_popup_cancel` should resolve the
+/// popup. Each variant names the feature that owns this popup — adding a
+/// new popup flavour is "add a variant + a confirm/cancel branch," with
+/// zero precedence ordering to maintain between unrelated features.
+///
+/// Stored on the `Popup` itself so the confirm dispatcher inspects the
+/// *currently focused* popup (global or buffer) and routes by value. No
+/// out-of-band `Option` on the Editor can silently claim an Enter
+/// belonging to a different popup.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PopupResolver {
+    /// Generic popup with no feature-specific confirm/cancel logic —
+    /// confirm/cancel simply dismiss the popup.
+    #[default]
+    None,
+    /// LSP completion popup. Confirm inserts the selected item's text.
+    Completion,
+    /// "Start LSP server?" confirmation. Confirm dispatches the selected
+    /// row's `data` (e.g. "allow_once") through
+    /// `handle_lsp_confirmation_response`.
+    LspConfirm { language: String },
+    /// LSP server-status / auto-prompt popup. Confirm dispatches the
+    /// selected row's `data` through `handle_lsp_status_action`.
+    LspStatus,
+    /// LSP code-action chooser. Selected row's `data` is the index into
+    /// `Editor::pending_code_actions` (heavy `lsp_types` payload stays
+    /// there to keep the view crate free of LSP types).
+    CodeAction,
+    /// Plugin-requested action popup (`editor.showActionPopup`). Confirm
+    /// fires `action_popup_result` with this popup's id and the selected
+    /// row's `data` as the action id.
+    PluginAction { popup_id: String },
+}
+
 /// Content of a popup window
 #[derive(Debug, Clone, PartialEq)]
 pub enum PopupContent {
@@ -219,6 +253,10 @@ pub struct Popup {
 
     /// Key hint shown right-aligned on the selected item (e.g. "(Tab)")
     pub accept_key_hint: Option<String>,
+
+    /// Feature-specific resolver for confirm/cancel dispatch. Default
+    /// `None` means "no special handling — just dismiss."
+    pub resolver: PopupResolver,
 }
 
 impl Popup {
@@ -239,6 +277,7 @@ impl Popup {
             scroll_offset: 0,
             text_selection: None,
             accept_key_hint: None,
+            resolver: PopupResolver::None,
         }
     }
 
@@ -267,6 +306,7 @@ impl Popup {
             scroll_offset: 0,
             text_selection: None,
             accept_key_hint: None,
+            resolver: PopupResolver::None,
         }
     }
 
@@ -287,6 +327,7 @@ impl Popup {
             scroll_offset: 0,
             text_selection: None,
             accept_key_hint: None,
+            resolver: PopupResolver::None,
         }
     }
 
@@ -329,6 +370,13 @@ impl Popup {
     /// Set border style
     pub fn with_border_style(mut self, style: Style) -> Self {
         self.border_style = style;
+        self
+    }
+
+    /// Attach the confirm/cancel resolver so this popup dispatches to
+    /// the right handler regardless of what other popups are on screen.
+    pub fn with_resolver(mut self, resolver: PopupResolver) -> Self {
+        self.resolver = resolver;
         self
     }
 

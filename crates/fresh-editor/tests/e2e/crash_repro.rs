@@ -104,16 +104,29 @@ fn test_issue_562_delete_folder_crash_scroll_offset() {
     let screen_after_collapse = harness.screen_to_string();
     println!("Screen after collapse:\n{}", screen_after_collapse);
 
-    // Verify the folder is now collapsed (should not show file_000 anymore)
+    // The collapse invariant is about what's rendered in the explorer
+    // pane, not the rest of the screen. Keyboard nav in the explorer
+    // now also drives the preview tab, so "file_000.txt" will appear
+    // in the tab bar / status bar as the currently-previewed buffer
+    // — that has nothing to do with whether the folder is collapsed.
+    let explorer_rows: String = screen_after_collapse
+        .lines()
+        .filter(|line| line.starts_with('│'))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Verify the folder is now collapsed (explorer pane should not show file_000)
     assert!(
-        !screen_after_collapse.contains("file_000"),
-        "Folder should be collapsed, file_000 should not be visible"
+        !explorer_rows.contains("file_000"),
+        "Folder should be collapsed, file_000 should not be visible in explorer pane:\n{}",
+        explorer_rows
     );
 
     // Verify big_folder is still visible (just collapsed)
     assert!(
-        screen_after_collapse.contains("big_folder"),
-        "big_folder should still be visible after collapse"
+        explorer_rows.contains("big_folder"),
+        "big_folder should still be visible after collapse:\n{}",
+        explorer_rows
     );
 
     // Continue rendering to ensure stability

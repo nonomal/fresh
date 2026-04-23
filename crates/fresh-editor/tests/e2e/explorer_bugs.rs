@@ -1240,15 +1240,18 @@ fn test_poll_after_cut_paste_preserves_expansion_and_cursor() {
 /// are no-ops because `select_next`/`select_prev` can't locate the id in
 /// the visible list. "Cursor on root" is always a safe, recoverable state.
 ///
+/// User-facing end-to-end: drive the whole scenario with keystrokes, check
+/// the result by inspecting the rendered tree. No path comparisons, no
+/// internal-state peek — those trip over macOS tempdir symlink quirks
+/// (`/var` → `/private/var`) and are tied to implementation details the
+/// user doesn't see.
+///
 /// We drive the refresh path directly (the same method the background
 /// poller uses) rather than relying on filesystem mtime detection to
 /// trigger it. The mtime-based detection is too environment-sensitive
-/// to rely on across CI filesystems (coarser resolution on some
-/// Windows/macOS configurations, delayed parent-dir mtime updates on
-/// overlay filesystems, …) and the resulting flake has no information
-/// value for this test: the contract we care about here is "if the
-/// cursor's path is gone after a refresh, reset to root", not "the
-/// poller notices a delete".
+/// to rely on across CI filesystems; the contract we care about here
+/// is "if the cursor's path is gone after a refresh, the cursor is
+/// still usable", not "the poller notices a delete".
 #[test]
 fn test_refresh_resets_cursor_to_root_when_path_disappears() {
     let mut harness = EditorTestHarness::with_temp_project(120, 30).unwrap();
@@ -1256,78 +1259,73 @@ fn test_refresh_resets_cursor_to_root_when_path_disappears() {
     fs::write(project_root.join("doomed.txt"), "d").unwrap();
     fs::write(project_root.join("survivor.txt"), "s").unwrap();
 
-    harness.editor_mut().focus_file_explorer();
+    // Open the explorer and move the cursor onto doomed.txt.
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+        .unwrap();
     harness.wait_for_file_explorer().unwrap();
     harness.wait_for_file_explorer_item("doomed.txt").unwrap();
-
-    // Put cursor on doomed.txt.
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // doomed.txt
-    let before = harness
-        .editor()
-        .file_explorer()
-        .and_then(|e| e.get_selected_entry())
-        .map(|e| e.path.clone());
-    assert_eq!(
-        before.as_ref().and_then(|p| p.file_name()),
-        Some(std::ffi::OsStr::new("doomed.txt")),
-        "test precondition: cursor should be on doomed.txt"
+
+    // Precondition: the explorer renders the cursor glyph `▌` on the
+    // doomed.txt row (see `view/ui/file_explorer.rs` for the highlight).
+    let screen_before = harness.screen_to_string();
+    let cursor_on_doomed = screen_before
+        .lines()
+        .any(|line| line.contains("▌") && line.contains("doomed.txt"));
+    assert!(
+        cursor_on_doomed,
+        "precondition: cursor should be on doomed.txt. Screen:\n{}",
+        screen_before
     );
 
     // Delete the file outside the editor, then drive the refresh path
-    // directly. This is what the background poller would do on its
-    // next tick, minus the mtime-comparison noise.
+    // (the same one the background poll uses, minus the mtime race).
+    // Passing the tree's own root path ensures this works on macOS where
+    // tempdirs live under a `/var` symlink: the editor canonicalizes
+    // `working_dir` at startup, so the tree stores `/private/var/...`
+    // paths; using `editor().working_dir()` matches that form.
     fs::remove_file(project_root.join("doomed.txt")).unwrap();
-    harness
-        .editor_mut()
-        .refresh_file_tree_dirs(&[project_root.to_path_buf()]);
+    let tree_root = harness.editor().working_dir().to_path_buf();
+    harness.editor_mut().refresh_file_tree_dirs(&[tree_root]);
     harness.render().unwrap();
 
-    // doomed.txt must be gone from the tree. Inspect the explorer's own
-    // state rather than the rendered screen: some environments open the
-    // file as a preview tab on focus/navigation, so the filename can
-    // legitimately still appear in the tab bar or editor pane after the
-    // refresh. The contract we care about here is the tree contents.
-    let doomed_path = project_root.join("doomed.txt");
-    let tree_has_doomed = harness
-        .editor()
-        .file_explorer()
-        .and_then(|e| e.tree().get_node_by_path(&doomed_path))
-        .is_some();
+    // User-facing outcome #1: the deleted file's row is gone from the
+    // rendered tree.
+    let screen_after = harness.screen_to_string();
+    let tree_lines_after: Vec<&str> = screen_after.lines().filter(|l| l.contains("│")).collect();
+    let still_listed = tree_lines_after.iter().any(|l| l.contains("doomed.txt"));
     assert!(
-        !tree_has_doomed,
-        "refresh should have dropped the deleted file from the tree. \
-         Screen:\n{}",
-        harness.screen_to_string()
+        !still_listed,
+        "refresh should have dropped the deleted file from the tree. Screen:\n{}",
+        screen_after
     );
 
-    // Cursor must now point at a live node — specifically the root (a
-    // safe fallback), so it stays visible and navigation still works.
-    let selected = harness
-        .editor()
-        .file_explorer()
-        .and_then(|e| e.get_selected_entry())
-        .map(|e| e.path.clone());
-    assert_eq!(
-        selected.as_deref(),
-        Some(project_root.as_path()),
-        "cursor should reset to the tree root when its path is gone. \
-         Actual selected path: {:?}",
-        selected
+    // User-facing outcome #2: the cursor glyph has moved off doomed.txt
+    // and is now on the tree root (the live fallback). If the fix were
+    // missing, the cursor's NodeId would be stale and nothing would
+    // render as selected at all.
+    let cursor_on_root = screen_after
+        .lines()
+        .any(|line| line.contains("▌") && line.contains("project_root"));
+    assert!(
+        cursor_on_root,
+        "cursor should have reset to the project root row. Screen:\n{}",
+        screen_after
     );
 
-    // Sanity: Up/Down still navigate — if the cursor were stuck on a
-    // stale id, select_next would no-op and the selection wouldn't move.
+    // User-facing outcome #3: Down still navigates. Before the fix, a
+    // stale cursor id would make `select_next` a silent no-op.
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
-    let after_down = harness
-        .editor()
-        .file_explorer()
-        .and_then(|e| e.get_selected_entry())
-        .map(|e| e.path.clone());
-    assert_ne!(
-        selected, after_down,
-        "arrow-down must move the cursor off of the root once it's been \
-         reset there"
+    let screen_after_down = harness.screen_to_string();
+    let cursor_moved_off_root = screen_after_down
+        .lines()
+        .any(|line| line.contains("▌") && !line.contains("project_root"));
+    assert!(
+        cursor_moved_off_root,
+        "arrow-down must move the cursor off the root. Screen:\n{}",
+        screen_after_down
     );
 }
 

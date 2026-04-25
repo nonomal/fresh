@@ -173,32 +173,40 @@ impl Editor {
             }
         }
 
-        // Editor-level (global) popups take precedence over buffer popups so
-        // that plugin notifications stay focused even when the active buffer
-        // owns its own popup stack.
-        if self.global_popups.is_visible() {
-            let result = self.global_popups.dispatch_input(event, &mut ctx);
-            self.process_deferred_actions(ctx);
-            if result != InputResult::Ignored {
-                return Some(result);
+        // Editor-pane popups (global + buffer) belong to the editor pane and
+        // must not capture input when the file explorer is the focused pane.
+        // Mirrors the priority encoded in `get_key_context()` via the same
+        // `popups_capture_keys()` predicate so the two paths cannot drift —
+        // one source of truth for "is the popup eligible to eat this key?".
+        if self.popups_capture_keys() {
+            // Editor-level (global) popups take precedence over buffer popups
+            // so that plugin notifications stay focused even when the active
+            // buffer owns its own popup stack.
+            if self.global_popups.is_visible() {
+                let result = self.global_popups.dispatch_input(event, &mut ctx);
+                self.process_deferred_actions(ctx);
+                if result != InputResult::Ignored {
+                    return Some(result);
+                }
+                // Re-check visibility — the dispatch may have queued a
+                // ClosePopup that the deferred-action processor has now fired.
+                return None;
             }
-            // Re-check visibility — the dispatch may have queued a ClosePopup
-            // that the deferred-action processor has now fired.
-            return None;
-        }
 
-        // Popup is next
-        if self.active_state().popups.is_visible() {
-            let result = self
-                .active_state_mut()
-                .popups
-                .dispatch_input(event, &mut ctx);
-            self.process_deferred_actions(ctx);
-            // If the popup handler returned Ignored (e.g., non-word character,
-            // Ctrl+key, arrow keys), fall through to normal input handling.
-            // The deferred ClosePopup action was already processed above.
-            if result != InputResult::Ignored {
-                return Some(result);
+            // Popup is next
+            if self.active_state().popups.is_visible() {
+                let result = self
+                    .active_state_mut()
+                    .popups
+                    .dispatch_input(event, &mut ctx);
+                self.process_deferred_actions(ctx);
+                // If the popup handler returned Ignored (e.g., non-word
+                // character, Ctrl+key, arrow keys), fall through to normal
+                // input handling. The deferred ClosePopup action was already
+                // processed above.
+                if result != InputResult::Ignored {
+                    return Some(result);
+                }
             }
         }
 

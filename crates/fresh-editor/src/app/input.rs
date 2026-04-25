@@ -2,18 +2,40 @@ use super::*;
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
 impl Editor {
+    /// Whether editor-pane popups (LSP completion, hover, signature help,
+    /// global plugin popups, …) should intercept keyboard input.
+    ///
+    /// Returns `false` when the user has focus on the file explorer pane:
+    /// popups belong to the editor pane, and the explorer must own its own
+    /// keystrokes — otherwise an LSP completion popup that happened to be
+    /// open would silently swallow Down/Up while the user is browsing the
+    /// tree. Buffer-switch handlers (e.g. `open_file_preview`) clear stale
+    /// popups so a popup tied to the previous preview doesn't follow the
+    /// user across buffers.
+    ///
+    /// Single source of truth for both `get_key_context` (binding resolution)
+    /// and `dispatch_modal_input` (handler routing) so the two cannot drift.
+    pub(crate) fn popups_capture_keys(&self) -> bool {
+        use crate::input::keybindings::KeyContext;
+        !matches!(self.key_context, KeyContext::FileExplorer)
+    }
+
     /// Determine the current keybinding context based on UI state
     pub fn get_key_context(&self) -> crate::input::keybindings::KeyContext {
         use crate::input::keybindings::KeyContext;
 
-        // Priority order: Settings > Menu > Prompt > Popup > CompositeBuffer > Current context (FileExplorer or Normal)
+        // Priority order: Settings > Menu > Prompt > Popup (only when
+        // editor-pane focused) > CompositeBuffer > Current context
+        // (FileExplorer or Normal).
         if self.settings_state.as_ref().is_some_and(|s| s.visible) {
             KeyContext::Settings
         } else if self.menu_state.active_menu.is_some() {
             KeyContext::Menu
         } else if self.is_prompting() {
             KeyContext::Prompt
-        } else if self.global_popups.is_visible() || self.active_state().popups.is_visible() {
+        } else if self.popups_capture_keys()
+            && (self.global_popups.is_visible() || self.active_state().popups.is_visible())
+        {
             KeyContext::Popup
         } else if self.is_composite_buffer(self.active_buffer()) {
             KeyContext::CompositeBuffer

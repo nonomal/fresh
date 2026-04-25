@@ -80,6 +80,18 @@ impl Editor {
     /// on rapid browsing. A future optimization is to keep the LSP session
     /// for the outgoing buffer until the user commits to the new one.
     pub fn open_file_preview(&mut self, path: &Path) -> anyhow::Result<BufferId> {
+        // Dismiss any popup on the buffer being left. The explorer's preview
+        // gesture (mouse single-click *and* keyboard arrow nav both route
+        // through this function) is a focus shift away from the editor pane;
+        // an LSP popup anchored to the previous buffer's cursor must not
+        // follow the user across previews. Doing the cleanup here is the
+        // single dedup point — both input paths get it for free, and the
+        // popup is gone in the next render so a subsequent re-preview of the
+        // same file doesn't resurrect it.
+        if self.active_state().popups.is_visible() {
+            self.clear_popups();
+        }
+
         // Feature gate — fall back to normal open when preview tabs are off.
         if !self.config.file_explorer.preview_tabs {
             return self.open_file(path);

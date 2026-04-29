@@ -259,7 +259,10 @@ fn render_horizontal_layout(
     theme: &Theme,
     layout: &mut SettingsLayout,
 ) {
-    // Layout: [left panel (categories)] | [right panel (settings)]
+    // Layout: [left panel (categories)] [right panel (settings, in its own box)]
+    // The right panel gets its own rounded border, replacing the previous
+    // single-line separator. The selected category is already highlighted in
+    // the left list, so the connector character is no longer needed.
     let chunks =
         Layout::horizontal([Constraint::Length(24), Constraint::Min(40)]).split(content_area);
 
@@ -269,28 +272,21 @@ fn render_horizontal_layout(
     // Render category list (left panel)
     render_categories(frame, categories_area, state, theme, layout);
 
-    // Render separator with visual connection to selected category
-    let separator_area = Rect::new(
-        categories_area.x + categories_area.width,
-        categories_area.y,
-        1,
-        categories_area.height,
-    );
-    render_separator_with_selection(
-        frame,
-        separator_area,
-        theme,
-        state.selected_category,
-        state.pages.len(),
-    );
+    // Draw a bordered box around the settings (right) panel.
+    let body_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.popup_border_fg));
+    let body_inner = body_block.inner(settings_area);
+    frame.render_widget(body_block, settings_area);
 
-    // Render settings (right panel) or search results
-    let horizontal_padding = 2;
+    // Inside the box, leave a 1-column gutter on each side for breathing room.
+    let horizontal_padding = 1;
     let settings_inner = Rect::new(
-        settings_area.x + horizontal_padding,
-        settings_area.y,
-        settings_area.width.saturating_sub(horizontal_padding),
-        settings_area.height,
+        body_inner.x + horizontal_padding,
+        body_inner.y,
+        body_inner.width.saturating_sub(horizontal_padding * 2),
+        body_inner.height,
     );
 
     if state.search_active && !state.search_results.is_empty() {
@@ -542,34 +538,6 @@ fn render_categories(
 
         let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), row_area);
-    }
-}
-
-/// Render vertical separator with visual connection to selected category
-fn render_separator_with_selection(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    selected_category: usize,
-    category_count: usize,
-) {
-    let sep_style = Style::default().fg(theme.split_separator_fg);
-    let highlight_style = Style::default().fg(theme.menu_highlight_fg);
-
-    for y in 0..area.height {
-        let cell = Rect::new(area.x, area.y + y, 1, 1);
-        let row_idx = y as usize;
-
-        // Create visual connection at the selected category row
-        let (char, style) = if row_idx == selected_category && row_idx < category_count {
-            // Selected row - use a connector character
-            ("┤", highlight_style)
-        } else {
-            ("│", sep_style)
-        };
-
-        let sep = Paragraph::new(char).style(style);
-        frame.render_widget(sep, cell);
     }
 }
 

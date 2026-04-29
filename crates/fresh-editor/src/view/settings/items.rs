@@ -797,6 +797,17 @@ pub struct SettingsPage {
     pub items: Vec<SettingItem>,
     /// Subpages
     pub subpages: Vec<SettingsPage>,
+    /// Cached section list for the tree view in the left panel.
+    /// Computed once after sorting items in `build_page`.
+    pub sections: Vec<SectionInfo>,
+}
+
+/// One section within a page — name plus the index of its first item, used by
+/// the left-panel tree view to jump straight to that section when clicked.
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub name: String,
+    pub first_item_index: usize,
 }
 
 /// Context for building setting items with layer awareness
@@ -840,9 +851,11 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
         (None, None) => a.name.cmp(&b.name),
     });
 
-    // Mark items that start a new section
+    // Mark items that start a new section, and capture the section list
+    // for the left-panel tree view in one pass.
+    let mut sections: Vec<SectionInfo> = Vec::new();
     let mut prev_section: Option<&String> = None;
-    for item in &mut items {
+    for (idx, item) in items.iter_mut().enumerate() {
         let is_new_section = match (&item.section, prev_section) {
             (Some(sec), Some(prev)) => sec != prev,
             (Some(_), None) => true,
@@ -850,6 +863,14 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
             (None, None) => false,
         };
         item.is_section_start = is_new_section;
+        if is_new_section {
+            if let Some(name) = item.section.clone() {
+                sections.push(SectionInfo {
+                    name,
+                    first_item_index: idx,
+                });
+            }
+        }
         prev_section = item.section.as_ref();
     }
 
@@ -866,6 +887,7 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
         nullable: category.nullable,
         items,
         subpages,
+        sections,
     }
 }
 

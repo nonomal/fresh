@@ -396,6 +396,7 @@ mod tests {
             nullable: false,
             items,
             subpages: Vec::new(),
+            sections: Vec::new(),
         }
     }
 

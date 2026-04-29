@@ -648,8 +648,33 @@ impl SettingsState {
                 self.request_close(ctx);
                 InputResult::Consumed
             }
-            KeyCode::Enter | KeyCode::Right => {
-                // Enter/Right on categories: move focus to settings panel
+            KeyCode::Right => {
+                // On an expandable, not-yet-expanded category: expand it.
+                // Otherwise (already expanded or single-section/no-section
+                // category) Right moves focus into the body panel — the
+                // existing behavior.
+                let cat_idx = self.selected_category;
+                if self.is_category_expandable(cat_idx)
+                    && !self.expanded_categories.contains(&cat_idx)
+                {
+                    self.expanded_categories.insert(cat_idx);
+                } else {
+                    self.focus.set(FocusPanel::Settings);
+                }
+                InputResult::Consumed
+            }
+            KeyCode::Left => {
+                // Left collapses the focused category if it's currently
+                // expanded; otherwise it's a no-op (Categories is already
+                // the leftmost panel).
+                let cat_idx = self.selected_category;
+                if self.expanded_categories.contains(&cat_idx) {
+                    self.expanded_categories.remove(&cat_idx);
+                }
+                InputResult::Consumed
+            }
+            KeyCode::Enter => {
+                // Enter on categories: move focus to settings panel
                 self.focus.set(FocusPanel::Settings);
                 InputResult::Consumed
             }

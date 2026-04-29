@@ -124,6 +124,38 @@ pub struct SettingsState {
     /// Visual style applied to every item in this state. Toggle with
     /// [`Self::set_item_style`] to swap between card / flat presentation.
     pub item_style: super::items::ItemBoxStyle,
+    /// Categories whose sections are currently expanded in the left-panel
+    /// tree view. Only categories with `sections.len() > 1` are eligible —
+    /// a category with zero or one section stays flat.
+    pub expanded_categories: std::collections::HashSet<usize>,
+    /// Scroll state for the categories panel itself, separate from the body
+    /// panel's `scroll_panel`. Drives mouse-wheel + page-up/down on the left.
+    pub categories_scroll: ScrollablePanel,
+}
+
+/// One row of the left-panel tree. Either a top-level category, or a section
+/// row that appears under an expanded category.
+///
+/// Sections only appear when their owning category is in
+/// `expanded_categories` AND has more than one section — single-section
+/// categories show their items flat without a tree node.
+#[derive(Debug, Clone, Copy)]
+pub enum TreeRow {
+    Category {
+        idx: usize,
+        expandable: bool,
+        expanded: bool,
+    },
+    Section {
+        cat_idx: usize,
+        section_idx: usize,
+    },
+}
+
+impl crate::view::ui::ScrollItem for TreeRow {
+    fn height(&self, _width: u16) -> u16 {
+        1
+    }
 }
 
 impl SettingsState {
@@ -174,6 +206,8 @@ impl SettingsState {
             pending_deletions: std::collections::HashSet::new(),
             layout_width: 0,
             item_style: super::items::ItemBoxStyle::default(),
+            expanded_categories: std::collections::HashSet::new(),
+            categories_scroll: ScrollablePanel::new(),
         })
     }
 
@@ -232,6 +266,77 @@ impl SettingsState {
     /// Get the currently selected page mutably
     pub fn current_page_mut(&mut self) -> Option<&mut SettingsPage> {
         self.pages.get_mut(self.selected_category)
+    }
+
+    /// Whether a category should render with a chevron + be expandable in
+    /// the tree view. We require strictly more than one section, since one
+    /// section adds no information beyond the category itself.
+    pub fn is_category_expandable(&self, cat_idx: usize) -> bool {
+        self.pages
+            .get(cat_idx)
+            .is_some_and(|p| p.sections.len() > 1)
+    }
+
+    /// Toggle whether a category is expanded in the tree view. No-op for
+    /// categories that aren't expandable (zero or one section).
+    pub fn toggle_category_expanded(&mut self, cat_idx: usize) {
+        if !self.is_category_expandable(cat_idx) {
+            return;
+        }
+        if !self.expanded_categories.insert(cat_idx) {
+            self.expanded_categories.remove(&cat_idx);
+        }
+    }
+
+    /// Jump the body panel to a specific section within a category. The
+    /// category becomes the selected category, and the body's selected_item
+    /// jumps to the section's first item.
+    pub fn jump_to_section(&mut self, cat_idx: usize, section_idx: usize) {
+        let Some(page) = self.pages.get(cat_idx) else {
+            return;
+        };
+        let Some(section) = page.sections.get(section_idx) else {
+            return;
+        };
+        let target_item = section.first_item_index;
+        self.update_control_focus(false);
+        self.selected_category = cat_idx;
+        self.selected_item = target_item;
+        self.focus.set(FocusPanel::Settings);
+        self.scroll_panel.scroll.offset = 0;
+        let width = self.layout_width;
+        if let Some(page) = self.pages.get(self.selected_category) {
+            self.scroll_panel.update_content_height(&page.items, width);
+        }
+        self.sub_focus = None;
+        self.init_map_focus(true);
+        self.update_control_focus(true);
+        self.ensure_visible();
+    }
+
+    /// Flatten the categories list + currently expanded sections into the
+    /// row order rendered in the left panel. Single source of truth for
+    /// rendering, hit-testing, and Up/Down navigation in the tree.
+    pub fn visible_tree(&self) -> Vec<TreeRow> {
+        let mut rows = Vec::with_capacity(self.pages.len());
+        for (idx, page) in self.pages.iter().enumerate() {
+            let expandable = page.sections.len() > 1;
+            let expanded = expandable && self.expanded_categories.contains(&idx);
+            rows.push(TreeRow::Category {
+                idx,
+                expandable,
+                expanded,
+            });
+            if expanded {
+                for section_idx in 0..page.sections.len() {
+                    rows.push(TreeRow::Section {
+                        cat_idx: idx,
+                        section_idx,
+                    });
+                }
+            }
+        }
+        rows
     }
 
     /// Get the currently selected item

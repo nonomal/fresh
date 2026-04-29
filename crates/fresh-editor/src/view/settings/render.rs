@@ -463,108 +463,222 @@ fn category_icon(name: &str) -> &'static str {
     }
 }
 
-/// Render the category list
+/// Render the category tree (categories + expanded sections) in the left panel.
+///
+/// Rows are flattened by [`SettingsState::visible_tree`] and rendered through
+/// [`ScrollablePanel`], which handles partial-row clipping and the scrollbar.
+/// Per-row Rects are recorded on `layout` for hit-testing.
 fn render_categories(
     frame: &mut Frame,
     area: Rect,
-    state: &SettingsState,
+    state: &mut SettingsState,
     theme: &Theme,
     layout: &mut SettingsLayout,
 ) {
     use super::layout::SettingsHit;
-    use super::state::FocusPanel;
+    use super::state::{FocusPanel, TreeRow};
 
-    for (idx, page) in state.pages.iter().enumerate() {
-        if idx as u16 >= area.height {
-            break;
-        }
+    layout.categories_panel_area = Some(area);
 
-        let is_selected = idx == state.selected_category;
-        let is_hovered = matches!(state.hover_hit, Some(SettingsHit::Category(i)) if i == idx);
-        let row_area = Rect::new(area.x, area.y + idx as u16, area.width, 1);
+    let rows = state.visible_tree();
+    state.categories_scroll.set_viewport(area.height);
+    state
+        .categories_scroll
+        .update_content_height(&rows, area.width);
 
-        layout.add_category(idx, row_area);
+    let focus_panel = state.focus_panel();
+    let selected_category = state.selected_category;
+    let selected_item = state.selected_item;
+    let hover_hit = state.hover_hit;
 
-        // Background color for the entire row — paints the highlight across
-        // the full panel width, including the trailing padding past the
-        // category name.
-        let row_bg = if is_selected {
-            if state.focus_panel() == FocusPanel::Categories {
-                Some(theme.menu_highlight_bg)
-            } else {
-                Some(theme.selection_bg)
-            }
-        } else if is_hovered {
-            Some(theme.menu_hover_bg)
-        } else {
-            None
-        };
-        if let Some(bg) = row_bg {
-            frame.render_widget(
-                Paragraph::new(" ".repeat(row_area.width as usize)).style(Style::default().bg(bg)),
-                row_area,
-            );
-        }
-
-        let style = if is_selected {
-            if state.focus_panel() == FocusPanel::Categories {
-                Style::default()
-                    .fg(theme.menu_highlight_fg)
-                    .bg(theme.menu_highlight_bg)
-            } else {
-                Style::default().fg(theme.menu_fg).bg(theme.selection_bg)
-            }
-        } else if is_hovered {
-            // Hover highlight using menu hover colors
-            Style::default()
-                .fg(theme.menu_hover_fg)
-                .bg(theme.menu_hover_bg)
-        } else {
-            Style::default().fg(theme.popup_text_fg)
-        };
-
-        // Indicator for categories with modified settings
-        let has_changes = page.items.iter().any(|i| i.modified);
-        let modified_indicator = if has_changes { "● " } else { "  " };
-
-        // Show ">" when selected and focused for clearer selection indicator
-        let selection_indicator = if is_selected && state.focus_panel() == FocusPanel::Categories {
-            "> "
-        } else {
-            "  "
-        };
-
-        let icon = category_icon(&page.name);
-
-        let mut spans = vec![Span::styled(selection_indicator, style)];
-        if has_changes {
-            spans.push(Span::styled(
-                modified_indicator,
-                Style::default().fg(theme.menu_highlight_fg),
-            ));
-        } else {
-            spans.push(Span::styled(modified_indicator, style));
-        }
-        spans.push(Span::styled(
-            icon,
-            Style::default()
-                .fg(theme.popup_border_fg)
-                .bg(if is_selected {
-                    if state.focus_panel() == FocusPanel::Categories {
-                        theme.menu_highlight_bg
+    // Snapshot the data each row needs so we don't hold a borrow on `state`
+    // through the render callback.
+    struct RowData {
+        chevron: &'static str,
+        is_expandable: bool,
+        is_selected: bool,
+        is_hovered: bool,
+        has_changes: bool,
+        indent_cols: u16,
+        is_category: bool,
+        cat_idx: Option<usize>,
+        section_idx: Option<usize>,
+        label: String,
+        icon: Option<&'static str>,
+    }
+    let row_data: Vec<RowData> = rows
+        .iter()
+        .map(|row| match *row {
+            TreeRow::Category {
+                idx,
+                expandable,
+                expanded,
+            } => {
+                let page = &state.pages[idx];
+                RowData {
+                    chevron: if expandable {
+                        if expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        }
                     } else {
-                        theme.selection_bg
-                    }
-                } else if is_hovered {
-                    theme.menu_hover_bg
-                } else {
-                    theme.popup_bg
-                }),
-        ));
-        spans.push(Span::styled(&page.name, style));
+                        " "
+                    },
+                    is_expandable: expandable,
+                    is_selected: idx == selected_category,
+                    is_hovered: matches!(hover_hit, Some(SettingsHit::Category(i)) if i == idx)
+                        || matches!(hover_hit, Some(SettingsHit::CategoryDisclosure(i)) if i == idx),
+                    has_changes: page.items.iter().any(|i| i.modified),
+                    indent_cols: 0,
+                    is_category: true,
+                    cat_idx: Some(idx),
+                    section_idx: None,
+                    label: page.name.clone(),
+                    icon: Some(category_icon(&page.name)),
+                }
+            }
+            TreeRow::Section {
+                cat_idx,
+                section_idx,
+            } => {
+                let section = &state.pages[cat_idx].sections[section_idx];
+                let first = section.first_item_index;
+                RowData {
+                    chevron: " ",
+                    is_expandable: false,
+                    is_selected: cat_idx == selected_category && selected_item == first,
+                    is_hovered: matches!(
+                        hover_hit,
+                        Some(SettingsHit::CategorySection(c, s)) if c == cat_idx && s == section_idx
+                    ),
+                    has_changes: false,
+                    indent_cols: 4,
+                    is_category: false,
+                    cat_idx: Some(cat_idx),
+                    section_idx: Some(section_idx),
+                    label: section.name.clone(),
+                    icon: None,
+                }
+            }
+        })
+        .collect();
 
-        let line = Line::from(spans);
-        frame.render_widget(Paragraph::new(line), row_area);
+    // Render through ScrollablePanel so we get scrollbar + clipping.
+    let panel_layout = state.categories_scroll.render(
+        frame,
+        area,
+        &rows,
+        |frame, info, row| {
+            // Find this row's snapshot. `rows` and `row_data` are 1:1 by index.
+            let idx = info.index;
+            let data = &row_data[idx];
+            let row_area = info.area;
+
+            let row_bg = if data.is_selected {
+                if focus_panel == FocusPanel::Categories {
+                    Some(theme.menu_highlight_bg)
+                } else {
+                    Some(theme.selection_bg)
+                }
+            } else if data.is_hovered {
+                Some(theme.menu_hover_bg)
+            } else {
+                None
+            };
+            if let Some(bg) = row_bg {
+                frame.render_widget(
+                    Paragraph::new(" ".repeat(row_area.width as usize))
+                        .style(Style::default().bg(bg)),
+                    row_area,
+                );
+            }
+
+            let fg = if data.is_selected {
+                if focus_panel == FocusPanel::Categories {
+                    theme.menu_highlight_fg
+                } else {
+                    theme.menu_fg
+                }
+            } else if data.is_hovered {
+                theme.menu_hover_fg
+            } else {
+                theme.popup_text_fg
+            };
+            let bg = row_bg.unwrap_or(theme.popup_bg);
+            let style = Style::default().fg(fg).bg(bg);
+
+            let mut spans: Vec<Span> = Vec::with_capacity(8);
+            // Selection indicator (">" when this row is the focused one in
+            // the categories panel) lives in col 0 before any indentation.
+            // The category-selection-indicator-visible test asserts on this.
+            let selected_marker = if data.is_selected && focus_panel == FocusPanel::Categories {
+                ">"
+            } else {
+                " "
+            };
+            spans.push(Span::styled(selected_marker.to_string(), style));
+            if data.indent_cols > 0 {
+                spans.push(Span::styled(" ".repeat(data.indent_cols as usize), style));
+            }
+            // Chevron occupies one column; followed by a space for breathing room.
+            spans.push(Span::styled(format!("{} ", data.chevron), style));
+            if data.has_changes {
+                spans.push(Span::styled(
+                    "● ",
+                    Style::default().fg(theme.menu_highlight_fg).bg(bg),
+                ));
+            } else {
+                spans.push(Span::styled("  ", style));
+            }
+            if let Some(icon) = data.icon {
+                spans.push(Span::styled(
+                    icon.to_string(),
+                    Style::default().fg(theme.popup_border_fg).bg(bg),
+                ));
+            } else {
+                spans.push(Span::styled(" ", style));
+            }
+            spans.push(Span::styled(data.label.clone(), style));
+
+            frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+
+            // Hand back the row identity so we can register hit-test areas
+            // after rendering.
+            (
+                row_area,
+                data.is_category,
+                data.is_expandable,
+                data.cat_idx,
+                data.section_idx,
+                data.indent_cols,
+                *row,
+            )
+        },
+        theme,
+    );
+
+    // Translate per-row Rects into hit-test entries.
+    for layout_info in panel_layout.item_layouts.iter() {
+        let (row_area, is_category, is_expandable, cat_idx, section_idx, indent_cols, _row) =
+            layout_info.layout;
+        if is_category {
+            if let Some(idx) = cat_idx {
+                layout.add_category(idx, row_area);
+                if is_expandable {
+                    // Chevron sits one column after the selection-indicator
+                    // marker plus any indent for nested rows.
+                    let chevron_x = row_area.x.saturating_add(1 + indent_cols);
+                    let chevron_area = Rect::new(chevron_x, row_area.y, 1, 1);
+                    layout.add_category_disclosure(idx, chevron_area);
+                }
+            }
+        } else if let (Some(c), Some(s)) = (cat_idx, section_idx) {
+            layout.add_section(c, s, row_area);
+        }
+    }
+    if let Some(scrollbar) = panel_layout.scrollbar_area {
+        layout.categories_scrollbar_area = Some(scrollbar);
     }
 }
 

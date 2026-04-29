@@ -247,6 +247,23 @@ impl Editor {
                     state.sub_focus = None;
                 }
             }
+            SettingsHit::CategoryDisclosure(idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.toggle_category_expanded(idx);
+                }
+            }
+            SettingsHit::CategorySection(cat_idx, section_idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.jump_to_section(cat_idx, section_idx);
+                }
+            }
+            SettingsHit::CategoriesPanel | SettingsHit::CategoriesScrollbar => {
+                // Click without scroll wheel — no-op for now (the panel-area
+                // hit only fires when no other category/section row was hit).
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Categories);
+                }
+            }
             SettingsHit::SearchResult(idx) => {
                 // Click on search result - select it and jump to it (same as Enter)
                 if let Some(ref mut state) = self.settings_state {

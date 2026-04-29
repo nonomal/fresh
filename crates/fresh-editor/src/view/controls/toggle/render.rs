@@ -52,11 +52,15 @@ pub fn render_toggle_aligned(
         };
     }
 
-    // Use focused_fg for text when focused (not focused, which is the bg color)
+    // When focused/hovered the chip sits on top of the row's highlight bg
+    // (settings_selected_bg / menu_hover_bg). Use `focused_fg` for the
+    // checkmark too — themes guarantee `focused_fg` contrasts with
+    // `focused` (their bg), whereas `checkmark` is green-ish in most
+    // themes and collides with green-tinted highlights (e.g. Nostalgia).
     let (bracket_color, _check_color, label_color) = match state.focus {
         FocusState::Normal => (colors.bracket, colors.checkmark, colors.label),
-        FocusState::Focused => (colors.focused_fg, colors.checkmark, colors.focused_fg),
-        FocusState::Hovered => (colors.focused_fg, colors.checkmark, colors.focused_fg),
+        FocusState::Focused => (colors.focused_fg, colors.focused_fg, colors.focused_fg),
+        FocusState::Hovered => (colors.focused_fg, colors.focused_fg, colors.focused_fg),
         FocusState::Disabled => (colors.disabled, colors.disabled, colors.disabled),
     };
 

@@ -1004,12 +1004,13 @@ fn render_setting_item_pure(
             .saturating_sub(2 * style.card_border_cols);
         let inner_area = Rect::new(inner_x, content_rect.y, inner_width, content_rect.height);
 
-        // Highlight background for focused/hovered items. Only the label
-        // row gets the bg color — painting the whole card interior collides
-        // with theme colors that re-use the highlight bg for other roles
-        // (e.g. Nostalgia's bright green menu_hover_bg makes the green
-        // ACTIVE chip illegible). Limiting to the label row gives a clear
-        // focus indicator without nuking text contrast inside the card.
+        // Highlight background for focused/hovered items. Limited to the
+        // label row so chip / description text below stays on popup_bg
+        // and remains legible regardless of how saturated the theme's
+        // highlight bg is. The colors come from the theme's
+        // `settings_selected_bg` (selected) and `menu_hover_bg` (hovered)
+        // — each theme is responsible for picking values that contrast
+        // with its own popup_bg AND don't collide with chip text colors.
         let label_visible = skip_top <= content_logical_top;
         if is_focused_or_hovered && inner_width > 0 && label_visible {
             let bg_style = if is_selected {

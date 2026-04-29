@@ -299,12 +299,17 @@ impl SettingsState {
         if page.sections.is_empty() {
             return None;
         }
-        // Use the topmost visible item index when scrolling, falling back
-        // to the focused item — both are "where the user is looking now".
+        // Drive the section indicator off the topmost visible item — i.e.
+        // strictly what the user is looking at right now, regardless of
+        // where their last click landed. Earlier code did
+        // `topmost.max(selected_item)`, which clamped the indicator so
+        // wheel-UP after a click couldn't move the highlight back to an
+        // earlier section. Falling back to selected_item only when the
+        // body is genuinely empty (no items, no viewport) gives the
+        // expected "tree follows scroll, both directions" behavior.
         let item_idx = self
             .topmost_visible_item_index()
-            .unwrap_or(self.selected_item)
-            .max(self.selected_item);
+            .unwrap_or(self.selected_item);
         // Walk sections in order and pick the last one whose first_item_index <= item_idx.
         let mut current: Option<usize> = None;
         for (s_idx, section) in page.sections.iter().enumerate() {

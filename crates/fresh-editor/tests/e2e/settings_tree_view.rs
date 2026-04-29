@@ -432,3 +432,158 @@ fn highlighted_section_name(harness: &EditorTestHarness, term_width: u16) -> Opt
     }
     None
 }
+
+/// 4b. Single-highlight invariant under mouse hover. The previous
+/// test #4 only fires the cursor-selection path; this one specifically
+/// reproduces the visual bug where a hovered row + a selected row both
+/// got non-baseline backgrounds (with two DIFFERENT colors:
+/// `menu_hover_bg` for the hover, `menu_highlight_bg` for the cursor).
+/// At any one time the user should see exactly one highlight.
+#[test]
+fn tree_single_highlight_under_hover_and_selection() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_editor_expanded(&mut harness);
+
+    // Click an upper section to make it the cursor row.
+    let cursor_section = &EDITOR_SECTIONS[1]; // Completion
+    let (cursor_col, cursor_row) =
+        find_tree_row(&harness, cursor_section.0, 120).expect("cursor section row");
+    harness.mouse_click(cursor_col, cursor_row).unwrap();
+    harness.render().unwrap();
+
+    // Now hover the mouse over a DIFFERENT tree row (a section further
+    // down in the same expanded category).
+    let hover_section = &EDITOR_SECTIONS[5]; // Keyboard
+    let (hover_col, hover_row) =
+        find_tree_row(&harness, hover_section.0, 120).expect("hover section row");
+    harness.mouse_move(hover_col, hover_row).unwrap();
+    harness.render().unwrap();
+
+    assert_eq!(
+        count_highlighted_tree_rows(&harness, 120),
+        1,
+        "single-highlight invariant under hover-vs-cursor: exactly ONE \
+         tree row should have a non-baseline bg, but found multiple. \
+         Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // And the same in reverse: cursor on a lower section, hover on a
+    // higher one.
+    let cursor_section = &EDITOR_SECTIONS[5]; // Keyboard
+    let (col, row) = find_tree_row(&harness, cursor_section.0, 120).expect("Keyboard row");
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+
+    let hover_section = &EDITOR_SECTIONS[1]; // Completion
+    let (hcol, hrow) = find_tree_row(&harness, hover_section.0, 120).expect("Completion row");
+    harness.mouse_move(hcol, hrow).unwrap();
+    harness.render().unwrap();
+
+    assert_eq!(
+        count_highlighted_tree_rows(&harness, 120),
+        1,
+        "single-highlight invariant (reverse): exactly ONE tree row \
+         should have a non-baseline bg. Screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// 4c. Single-highlight invariant after click + move-away + wheel-scroll.
+/// User-reported repro: click an item in the tree, move the mouse off
+/// the tree (no hover bg in the tree anymore), then mouse-wheel-scroll
+/// the body. The body's current section changes; the tree should
+/// re-highlight ONE row (the new section), not retain the old selection
+/// alongside the new one.
+#[test]
+fn tree_single_highlight_after_click_then_wheel_scroll() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_editor_expanded(&mut harness);
+
+    // Click a tree section row.
+    let clicked = &EDITOR_SECTIONS[1]; // Completion
+    let (col, row) = find_tree_row(&harness, clicked.0, 120).expect("Completion row");
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+
+    // Move the mouse away from the tree, into a "neutral" body cell.
+    // Use a column past the divider (>= 32) and a row inside the body
+    // that's just empty space rather than a card edge.
+    harness.mouse_move(110, 35).unwrap();
+    harness.render().unwrap();
+
+    // Wheel-scroll the body downward to advance current_section.
+    let body_col: u16 = 100;
+    let body_row: u16 = 20;
+    for _ in 0..15 {
+        harness.mouse_scroll_down(body_col, body_row).unwrap();
+    }
+    harness.render().unwrap();
+
+    assert_eq!(
+        count_highlighted_tree_rows(&harness, 120),
+        1,
+        "after click + move-away + wheel-scroll: exactly ONE tree row \
+         should be highlighted. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // And the same in reverse — scroll back up.
+    for _ in 0..30 {
+        harness.mouse_scroll_up(body_col, body_row).unwrap();
+    }
+    harness.render().unwrap();
+
+    assert_eq!(
+        count_highlighted_tree_rows(&harness, 120),
+        1,
+        "after wheel-up: exactly ONE tree row should be highlighted. \
+         Screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// User-reported bug: clicking a middle section, then mouse-wheel-UP
+/// doesn't sync the tree highlight back to an earlier section. (Wheel-
+/// down works; only wheel-up was broken.) Reproducer for the regression.
+#[test]
+fn wheel_up_after_click_syncs_tree_highlight_to_earlier_section() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_editor_expanded(&mut harness);
+
+    // Click a middle section so the tree cursor is in the middle.
+    let middle = &EDITOR_SECTIONS[3]; // Display
+    let (col, row) = find_tree_row(&harness, middle.0, 120).expect("Display row");
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+
+    let middle_name = highlighted_section_name(&harness, 120);
+    assert_eq!(
+        middle_name.as_deref(),
+        Some(middle.0),
+        "after click, tree should highlight '{}', got {:?}",
+        middle.0,
+        middle_name
+    );
+
+    // Now wheel-UP on the body. The body scrolls back toward earlier
+    // sections, so the tree highlight should shift to one of them.
+    let body_col: u16 = 100;
+    let body_row: u16 = 20;
+    for _ in 0..30 {
+        harness.mouse_scroll_up(body_col, body_row).unwrap();
+    }
+    harness.render().unwrap();
+
+    let after_up = highlighted_section_name(&harness, 120);
+    let after_up_idx = after_up
+        .as_deref()
+        .and_then(|n| EDITOR_SECTIONS.iter().position(|s| s.0 == n));
+    assert!(
+        matches!(after_up_idx, Some(idx) if idx < 3),
+        "after wheel-UP from middle (Display), tree highlight should \
+         move to a section BEFORE Display; got {:?}. Screen:\n{}",
+        after_up,
+        harness.screen_to_string()
+    );
+}

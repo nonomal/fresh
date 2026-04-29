@@ -475,7 +475,6 @@ fn render_categories(
     theme: &Theme,
     layout: &mut SettingsLayout,
 ) {
-    use super::layout::SettingsHit;
     use super::state::{FocusPanel, TreeRow};
 
     layout.categories_panel_area = Some(area);
@@ -488,7 +487,6 @@ fn render_categories(
 
     let focus_panel = state.focus_panel();
     let selected_category = state.selected_category;
-    let hover_hit = state.hover_hit;
     // Which section is "current" for the body panel — follows scrolling and
     // selection so the left-panel indicator tracks what the user is looking
     // at, not just what they last clicked.
@@ -500,7 +498,6 @@ fn render_categories(
         chevron: &'static str,
         is_expandable: bool,
         is_selected: bool,
-        is_hovered: bool,
         has_changes: bool,
         indent_cols: u16,
         is_category: bool,
@@ -535,8 +532,6 @@ fn render_categories(
                     // marker shows up twice.
                     is_selected: idx == selected_category
                         && !(expanded && current_section.is_some()),
-                    is_hovered: matches!(hover_hit, Some(SettingsHit::Category(i)) if i == idx)
-                        || matches!(hover_hit, Some(SettingsHit::CategoryDisclosure(i)) if i == idx),
                     has_changes: page.items.iter().any(|i| i.modified),
                     indent_cols: 0,
                     is_category: true,
@@ -553,16 +548,12 @@ fn render_categories(
                 let section = &state.pages[cat_idx].sections[section_idx];
                 // Highlight the section that contains the body's current
                 // viewport position — tracks scrolling, not just clicks.
-                let is_current = cat_idx == selected_category
-                    && current_section == Some(section_idx);
+                let is_current =
+                    cat_idx == selected_category && current_section == Some(section_idx);
                 RowData {
                     chevron: " ",
                     is_expandable: false,
                     is_selected: is_current,
-                    is_hovered: matches!(
-                        hover_hit,
-                        Some(SettingsHit::CategorySection(c, s)) if c == cat_idx && s == section_idx
-                    ),
                     has_changes: false,
                     indent_cols: 4,
                     is_category: false,
@@ -586,14 +577,19 @@ fn render_categories(
             let data = &row_data[idx];
             let row_area = info.area;
 
+            // Only the cursor row paints a bg — no separate hover-bg
+            // path. Hover bg in addition to the cursor bg produced two
+            // visually-highlighted rows simultaneously (with two
+            // *different* colors, since hover and selection use
+            // different theme keys), which violates the single-cursor
+            // invariant. The OS mouse cursor itself is the user's
+            // "where am I" indicator; we don't need an in-app one.
             let row_bg = if data.is_selected {
                 if focus_panel == FocusPanel::Categories {
                     Some(theme.menu_highlight_bg)
                 } else {
                     Some(theme.selection_bg)
                 }
-            } else if data.is_hovered {
-                Some(theme.menu_hover_bg)
             } else {
                 None
             };
@@ -611,8 +607,6 @@ fn render_categories(
                 } else {
                     theme.menu_fg
                 }
-            } else if data.is_hovered {
-                theme.menu_hover_fg
             } else {
                 theme.popup_text_fg
             };

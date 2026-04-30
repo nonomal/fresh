@@ -386,16 +386,40 @@ fn test_quick_open_goto_line_live_preview_mouse_click_commits() {
         .send_key(KeyCode::Backspace, KeyModifiers::NONE)
         .unwrap();
     harness.type_text(":80").unwrap();
+    // Wait for the goto-line preview to be fully in effect, gated on TWO
+    // observables that must hold simultaneously:
+    //   - " 78 │ LINE78" — viewport scrolled to expose line 78 in the gutter
+    //   - "Go to line 80" — goto-line provider has fully replaced the
+    //     transient suggestions (file finder, command palette, etc.) that
+    //     populate the popup during the intermediate `Backspace`, `:`,
+    //     `:8` keystrokes.
+    // The status bar is hidden while a suggestions popup is visible
+    // (render.rs:143), so we cannot also check "Ln 80," here. Asserting
+    // the popup label is what guarantees the popup has shrunk to its
+    // 1-item goto-line shape — important because since commit 53d5238
+    // the popup's outer rect absorbs clicks across its full chrome, so
+    // reading coordinates on a transient taller-popup frame would have
+    // the click silently no-op against the wrong layout.
     harness
-        .wait_until(|h| h.screen_to_string().contains(" 78 │ LINE78"))
-        .expect("Preview should scroll so LINE78 is on screen near LINE80");
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains(" 78 │ LINE78") && s.contains("Go to line 80")
+        })
+        .expect("Goto-line preview popup should be fully rendered with LINE78 visible");
 
-    // Locate a visible line's rendered position and click on it. Using a line
-    // different from the preview target proves the click overrides the preview.
-    let (col, row) = harness
-        .find_text_on_screen("LINE78")
-        .expect("LINE78 should be visible while previewing line 80");
-    harness.mouse_click(col, row).unwrap();
+    // Locate the click target by the unique editor-body pattern
+    // "│ LINE78": the `│` gutter separator only appears in the editor
+    // body, never in popup chrome or hint bars. Click in the LINE78 text
+    // (skip past "│ ") so the coordinate is unambiguously over editor
+    // content rather than gutter or popup.
+    let (anchor_col, target_row) = harness
+        .find_text_on_screen("│ LINE78")
+        .expect("Editor row containing LINE78 should be visible");
+    // find_text_on_screen returns the column of the matched substring's
+    // first byte ('│', 1 cell wide). "LINE78" starts 2 columns to the
+    // right of the separator (`│ LINE78`).
+    let click_col = anchor_col + 2;
+    harness.mouse_click(click_col, target_row).unwrap();
 
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
 

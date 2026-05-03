@@ -68,10 +68,7 @@ pub struct RenderSnapshotExpect {
 impl RenderSnapshotExpect {
     /// Returns `Some((field, expected, actual))` on the first
     /// mismatch.
-    pub fn check_against(
-        &self,
-        actual: &RenderSnapshot,
-    ) -> Option<(&'static str, String, String)> {
+    pub fn check_against(&self, actual: &RenderSnapshot) -> Option<(&'static str, String, String)> {
         if let Some(want) = self.viewport_top_byte {
             if want != actual.viewport.top_byte {
                 return Some((

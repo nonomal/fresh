@@ -6,9 +6,7 @@
 //! `hardware_cursor` through the test API. None of the original
 //! `harness.send_key` / `harness.render()` interleave is needed.
 
-use crate::common::scenario::layout_scenario::{
-    assert_layout_scenario, LayoutScenario,
-};
+use crate::common::scenario::layout_scenario::{assert_layout_scenario, LayoutScenario};
 use crate::common::scenario::render_snapshot::RenderSnapshotExpect;
 use fresh::test_api::Action;
 

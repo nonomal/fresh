@@ -41,8 +41,7 @@ fn migrated_typing_and_cursor_movement_basic() {
 #[test]
 fn migrated_type_then_arrow_left_then_insert_in_middle() {
     assert_buffer_scenario(BufferScenario {
-        description: "type 'abcd', MoveLeft 2, insert 'X' produces 'abXcd' with cursor at 3"
-            .into(),
+        description: "type 'abcd', MoveLeft 2, insert 'X' produces 'abXcd' with cursor at 3".into(),
         initial_text: String::new(),
         actions: vec![
             Action::InsertChar('a'),

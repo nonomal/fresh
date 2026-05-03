@@ -28,80 +28,80 @@ fn theorem_toggle_comment_rust_uses_double_slash_prefix() {
     // Replaces test_toggle_comment_rust_prefix.
     // Cursor at byte 0 — Toggle Comment comments the first line.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.rs".into()),
-            description: "ToggleComment on a .rs file uses '// ' as the prefix".into(),
-            initial_text: "fn main() {\n    println!(\"hello\");\n}".into(),
-            actions: vec![Action::ToggleComment],
-            expected_text: "// fn main() {\n    println!(\"hello\");\n}".into(),
-            expected_primary: CursorExpect::at(3),
-            expected_extra_cursors: vec![],
-            expected_selection_text: None,
-            ..Default::default()
-        });
+        language: Some("x.rs".into()),
+        description: "ToggleComment on a .rs file uses '// ' as the prefix".into(),
+        initial_text: "fn main() {\n    println!(\"hello\");\n}".into(),
+        actions: vec![Action::ToggleComment],
+        expected_text: "// fn main() {\n    println!(\"hello\");\n}".into(),
+        expected_primary: CursorExpect::at(3),
+        expected_extra_cursors: vec![],
+        expected_selection_text: None,
+        ..Default::default()
+    });
 }
 
 #[test]
 fn theorem_toggle_comment_python_uses_hash_prefix() {
     // Replaces test_toggle_comment_python_prefix.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.py".into()),
-            description: "ToggleComment on a .py file uses '# ' as the prefix".into(),
-            initial_text: "def main():\n    print(\"hello\")\n".into(),
-            actions: vec![Action::ToggleComment],
-            expected_text: "# def main():\n    print(\"hello\")\n".into(),
-            expected_primary: CursorExpect::at(2),
-            expected_extra_cursors: vec![],
-            expected_selection_text: None,
-            ..Default::default()
-        });
+        language: Some("x.py".into()),
+        description: "ToggleComment on a .py file uses '# ' as the prefix".into(),
+        initial_text: "def main():\n    print(\"hello\")\n".into(),
+        actions: vec![Action::ToggleComment],
+        expected_text: "# def main():\n    print(\"hello\")\n".into(),
+        expected_primary: CursorExpect::at(2),
+        expected_extra_cursors: vec![],
+        expected_selection_text: None,
+        ..Default::default()
+    });
 }
 
 #[test]
 fn theorem_toggle_comment_shell_uses_hash_prefix() {
     // Replaces test_toggle_comment_shell_prefix.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.sh".into()),
-            description: "ToggleComment on a .sh file uses '# ' as the prefix".into(),
-            initial_text: "echo hello\n".into(),
-            actions: vec![Action::ToggleComment],
-            expected_text: "# echo hello\n".into(),
-            expected_primary: CursorExpect::at(2),
-            expected_extra_cursors: vec![],
-            expected_selection_text: None,
-            ..Default::default()
-        });
+        language: Some("x.sh".into()),
+        description: "ToggleComment on a .sh file uses '# ' as the prefix".into(),
+        initial_text: "echo hello\n".into(),
+        actions: vec![Action::ToggleComment],
+        expected_text: "# echo hello\n".into(),
+        expected_primary: CursorExpect::at(2),
+        expected_extra_cursors: vec![],
+        expected_selection_text: None,
+        ..Default::default()
+    });
 }
 
 #[test]
 fn theorem_toggle_comment_yaml_uses_hash_prefix() {
     // Replaces test_toggle_comment_yaml_prefix (issue #774).
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.yaml".into()),
-            description: "ToggleComment on a .yaml file uses '# ' (issue #774)".into(),
-            initial_text: "key: value\nnested:\n  child: 123".into(),
-            actions: vec![Action::ToggleComment],
-            expected_text: "# key: value\nnested:\n  child: 123".into(),
-            expected_primary: CursorExpect::at(2),
-            expected_extra_cursors: vec![],
-            expected_selection_text: None,
-            ..Default::default()
-        });
+        language: Some("x.yaml".into()),
+        description: "ToggleComment on a .yaml file uses '# ' (issue #774)".into(),
+        initial_text: "key: value\nnested:\n  child: 123".into(),
+        actions: vec![Action::ToggleComment],
+        expected_text: "# key: value\nnested:\n  child: 123".into(),
+        expected_primary: CursorExpect::at(2),
+        expected_extra_cursors: vec![],
+        expected_selection_text: None,
+        ..Default::default()
+    });
 }
 
 #[test]
 fn theorem_toggle_comment_yml_uses_hash_prefix() {
     // Replaces test_toggle_comment_yml_prefix (issue #774).
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.yml".into()),
-            description: "ToggleComment on a .yml file uses '# ' (issue #774)".into(),
-            initial_text: "server:\n  port: 8080".into(),
-            actions: vec![Action::ToggleComment],
-            expected_text: "# server:\n  port: 8080".into(),
-            expected_primary: CursorExpect::at(2),
-            expected_extra_cursors: vec![],
-            expected_selection_text: None,
-            ..Default::default()
-        });
+        language: Some("x.yml".into()),
+        description: "ToggleComment on a .yml file uses '# ' (issue #774)".into(),
+        initial_text: "server:\n  port: 8080".into(),
+        actions: vec![Action::ToggleComment],
+        expected_text: "# server:\n  port: 8080".into(),
+        expected_primary: CursorExpect::at(2),
+        expected_extra_cursors: vec![],
+        expected_selection_text: None,
+        ..Default::default()
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -116,20 +116,20 @@ fn theorem_toggle_comment_preserves_selection() {
     // FINDING (theorem-only): the original e2e test only asserted
     // that *some* selection survives; the theorem pins both endpoints.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.rs".into()),
-            description: "Comment-toggling preserves and grows the selection by 2*'// '".into(),
-            initial_text: "line1\nline2\nline3\nline4".into(),
-            actions: vec![
-                Action::SelectDown,
-                Action::SelectDown,
-                Action::ToggleComment,
-            ],
-            expected_text: "// line1\n// line2\nline3\nline4".into(),
-            expected_primary: CursorExpect::range(0, 18),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("// line1\n// line2\n".into()),
-            ..Default::default()
-        });
+        language: Some("x.rs".into()),
+        description: "Comment-toggling preserves and grows the selection by 2*'// '".into(),
+        initial_text: "line1\nline2\nline3\nline4".into(),
+        actions: vec![
+            Action::SelectDown,
+            Action::SelectDown,
+            Action::ToggleComment,
+        ],
+        expected_text: "// line1\n// line2\nline3\nline4".into(),
+        expected_primary: CursorExpect::range(0, 18),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("// line1\n// line2\n".into()),
+        ..Default::default()
+    });
 }
 
 #[test]
@@ -139,20 +139,21 @@ fn theorem_toggle_uncomment_preserves_selection() {
     // lines 1 and 2 (positions 0..18 = "// line1\n// line2\n") and
     // toggling uncomments them; the selection shrinks by 2*'// ' = 6.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.rs".into()),
-            description: "Comment-toggling on commented lines uncomments and preserves the selection".into(),
-            initial_text: "// line1\n// line2\n// line3\nline4".into(),
-            actions: vec![
-                Action::SelectDown,
-                Action::SelectDown,
-                Action::ToggleComment,
-            ],
-            expected_text: "line1\nline2\n// line3\nline4".into(),
-            expected_primary: CursorExpect::range(0, 12),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("line1\nline2\n".into()),
-            ..Default::default()
-        });
+        language: Some("x.rs".into()),
+        description: "Comment-toggling on commented lines uncomments and preserves the selection"
+            .into(),
+        initial_text: "// line1\n// line2\n// line3\nline4".into(),
+        actions: vec![
+            Action::SelectDown,
+            Action::SelectDown,
+            Action::ToggleComment,
+        ],
+        expected_text: "line1\nline2\n// line3\nline4".into(),
+        expected_primary: CursorExpect::range(0, 12),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("line1\nline2\n".into()),
+        ..Default::default()
+    });
 }
 
 #[test]
@@ -160,21 +161,21 @@ fn theorem_toggle_comment_roundtrip_with_selection_is_identity() {
     // Replaces test_toggle_comment_roundtrip_with_selection.
     // SelectAll + ToggleComment + SelectAll + ToggleComment == identity.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.rs".into()),
-            description: "SelectAll + Toggle + SelectAll + Toggle is the identity on text".into(),
-            initial_text: "line1\nline2\nline3".into(),
-            actions: vec![
-                Action::SelectAll,
-                Action::ToggleComment,
-                Action::SelectAll,
-                Action::ToggleComment,
-            ],
-            expected_text: "line1\nline2\nline3".into(),
-            expected_primary: CursorExpect::range(0, 17),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("line1\nline2\nline3".into()),
-            ..Default::default()
-        });
+        language: Some("x.rs".into()),
+        description: "SelectAll + Toggle + SelectAll + Toggle is the identity on text".into(),
+        initial_text: "line1\nline2\nline3".into(),
+        actions: vec![
+            Action::SelectAll,
+            Action::ToggleComment,
+            Action::SelectAll,
+            Action::ToggleComment,
+        ],
+        expected_text: "line1\nline2\nline3".into(),
+        expected_primary: CursorExpect::range(0, 17),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("line1\nline2\nline3".into()),
+        ..Default::default()
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -189,16 +190,16 @@ fn theorem_toggle_comment_single_line_no_newline() {
     // had no trailing newline. The theorem terminates → guaranteed
     // no-infinite-loop. C uses `// `.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.c".into()),
-            description: "ToggleComment on a single-line .c buffer with no trailing newline".into(),
-            initial_text: "int main() {}".into(),
-            actions: vec![Action::SelectAll, Action::ToggleComment],
-            expected_text: "// int main() {}".into(),
-            expected_primary: CursorExpect::range(0, 16),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("// int main() {}".into()),
-            ..Default::default()
-        });
+        language: Some("x.c".into()),
+        description: "ToggleComment on a single-line .c buffer with no trailing newline".into(),
+        initial_text: "int main() {}".into(),
+        actions: vec![Action::SelectAll, Action::ToggleComment],
+        expected_text: "// int main() {}".into(),
+        expected_primary: CursorExpect::range(0, 16),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("// int main() {}".into()),
+        ..Default::default()
+    });
 }
 
 #[test]
@@ -207,14 +208,14 @@ fn theorem_toggle_comment_selection_at_buffer_end() {
     // Multi-line .rs buffer with no trailing newline, SelectAll then
     // toggle. Both lines should get commented.
     assert_buffer_scenario(BufferScenario {
-            language: Some("x.rs".into()),
-            description: "ToggleComment over a SelectAll that ends exactly at buffer length".into(),
-            initial_text: "fn foo() {}\nfn bar() {}".into(),
-            actions: vec![Action::SelectAll, Action::ToggleComment],
-            expected_text: "// fn foo() {}\n// fn bar() {}".into(),
-            expected_primary: CursorExpect::range(0, 29),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("// fn foo() {}\n// fn bar() {}".into()),
-            ..Default::default()
-        });
+        language: Some("x.rs".into()),
+        description: "ToggleComment over a SelectAll that ends exactly at buffer length".into(),
+        initial_text: "fn foo() {}\nfn bar() {}".into(),
+        actions: vec![Action::SelectAll, Action::ToggleComment],
+        expected_text: "// fn foo() {}\n// fn bar() {}".into(),
+        expected_primary: CursorExpect::range(0, 29),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("// fn foo() {}\n// fn bar() {}".into()),
+        ..Default::default()
+    });
 }

@@ -16,10 +16,7 @@ fn migrated_basic_editing_workflow_typing_inserts_at_cursor() {
     assert_buffer_scenario(BufferScenario {
         description: "typing builds the buffer left-to-right".into(),
         initial_text: String::new(),
-        actions: vec![
-            Action::InsertChar('h'),
-            Action::InsertChar('i'),
-        ],
+        actions: vec![Action::InsertChar('h'), Action::InsertChar('i')],
         expected_text: "hi".into(),
         expected_primary: CursorExpect::at(2),
         ..Default::default()
@@ -33,10 +30,7 @@ fn migrated_append_at_end_of_file() {
     assert_buffer_scenario(BufferScenario {
         description: "MoveDocumentEnd then InsertChar appends to EOF".into(),
         initial_text: "before".into(),
-        actions: vec![
-            Action::MoveDocumentEnd,
-            Action::InsertChar('!'),
-        ],
+        actions: vec![Action::MoveDocumentEnd, Action::InsertChar('!')],
         expected_text: "before!".into(),
         expected_primary: CursorExpect::at(7),
         ..Default::default()
@@ -48,11 +42,7 @@ fn migrated_enter_in_middle_splits_line() {
     assert_buffer_scenario(BufferScenario {
         description: "InsertNewline mid-line splits into two lines".into(),
         initial_text: "abcde".into(),
-        actions: vec![
-            Action::MoveRight,
-            Action::MoveRight,
-            Action::InsertNewline,
-        ],
+        actions: vec![Action::MoveRight, Action::MoveRight, Action::InsertNewline],
         expected_text: "ab\ncde".into(),
         expected_primary: CursorExpect::at(3),
         ..Default::default()

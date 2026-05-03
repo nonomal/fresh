@@ -4,9 +4,7 @@
 //! `tests/e2e/horizontal_scrollbar.rs`,
 //! `tests/e2e/virtual_lines.rs`.
 
-use crate::common::scenario::layout_scenario::{
-    assert_layout_scenario, LayoutScenario,
-};
+use crate::common::scenario::layout_scenario::{assert_layout_scenario, LayoutScenario};
 use crate::common::scenario::render_snapshot::RenderSnapshotExpect;
 use fresh::test_api::Action;
 

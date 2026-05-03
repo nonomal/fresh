@@ -26,7 +26,9 @@
 //!   * `test_backspace_utf8_file_save_roundtrip` — full file save
 //!     round-trip, beyond the pure-state contract.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use fresh::test_api::Action;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -56,7 +58,7 @@ fn theorem_right_arrow_steps_over_4_byte_emoji_as_one_unit() {
         expected_primary: CursorExpect::at(10),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -67,7 +69,8 @@ fn theorem_typing_after_emoji_inserts_at_correct_byte_offset() {
     // byte position immediately after it — not somewhere inside the
     // multi-byte sequence.
     assert_buffer_scenario(BufferScenario {
-        description: "Typing after an emoji inserts past it without splitting the byte sequence".into(),
+        description: "Typing after an emoji inserts past it without splitting the byte sequence"
+            .into(),
         initial_text: "Hello 😀 World 🌍".into(),
         actions: vec![
             Action::MoveDocumentStart,
@@ -84,7 +87,7 @@ fn theorem_typing_after_emoji_inserts_at_correct_byte_offset() {
         expected_primary: CursorExpect::at(11),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -105,7 +108,7 @@ fn theorem_backspace_removes_entire_3_byte_euro_sign() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -127,7 +130,7 @@ fn theorem_backspace_removes_norwegian_chars_one_at_a_time() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -147,7 +150,7 @@ fn theorem_backspace_removes_4_byte_emoji_atomically() {
         expected_primary: CursorExpect::at(1),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -172,7 +175,7 @@ fn theorem_delete_forward_removes_entire_3_byte_euro() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -186,7 +189,9 @@ fn theorem_selection_delete_collapses_multibyte_run() {
     // "aæøåb" — select the three Norwegian chars (3 graphemes,
     // 6 bytes), backspace deletes the selection cleanly: "ab".
     assert_buffer_scenario(BufferScenario {
-        description: "Selection-delete over a 3-grapheme / 6-byte UTF-8 run leaves surrounding ASCII intact".into(),
+        description:
+            "Selection-delete over a 3-grapheme / 6-byte UTF-8 run leaves surrounding ASCII intact"
+                .into(),
         initial_text: "aæøåb".into(),
         actions: vec![
             Action::MoveDocumentStart,
@@ -200,7 +205,7 @@ fn theorem_selection_delete_collapses_multibyte_run() {
         expected_primary: CursorExpect::at(1),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -210,7 +215,8 @@ fn theorem_selection_replace_swaps_emoji_with_ascii() {
     // "hello😀world" — select the emoji (1 grapheme / 4 bytes) and
     // type 'X' to replace it; surrounding ASCII unchanged.
     assert_buffer_scenario(BufferScenario {
-        description: "Selection-replace swaps a 4-byte emoji for ASCII without splitting neighbors".into(),
+        description: "Selection-replace swaps a 4-byte emoji for ASCII without splitting neighbors"
+            .into(),
         initial_text: "hello😀world".into(),
         actions: vec![
             Action::MoveDocumentStart,
@@ -226,7 +232,7 @@ fn theorem_selection_replace_swaps_emoji_with_ascii() {
         expected_primary: CursorExpect::at(6),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -241,7 +247,8 @@ fn theorem_right_arrow_skips_thai_grapheme_cluster() {
     // bytes). Three Right arrows from byte 0: 'a' → byte 1, cluster
     // → byte 10, 'b' → byte 11.
     assert_buffer_scenario(BufferScenario {
-        description: "Right arrow x3 from byte 0 of 'aที่b' visits bytes 1, 10, 11 (cluster atomic)".into(),
+        description: "Right arrow x3 from byte 0 of 'aที่b' visits bytes 1, 10, 11 (cluster atomic)"
+            .into(),
         initial_text: "aที่b".into(),
         actions: vec![
             Action::MoveDocumentStart,
@@ -253,7 +260,7 @@ fn theorem_right_arrow_skips_thai_grapheme_cluster() {
         expected_primary: CursorExpect::at(11),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -263,7 +270,8 @@ fn theorem_left_arrow_skips_thai_grapheme_cluster_backwards() {
     // From end of "aที่b" (byte 11), three Left arrows: 'b' → 10,
     // cluster → 1, 'a' → 0.
     assert_buffer_scenario(BufferScenario {
-        description: "Left arrow x3 from end of 'aที่b' visits bytes 10, 1, 0 (cluster atomic)".into(),
+        description: "Left arrow x3 from end of 'aที่b' visits bytes 10, 1, 0 (cluster atomic)"
+            .into(),
         initial_text: "aที่b".into(),
         actions: vec![
             Action::MoveDocumentEnd,
@@ -275,7 +283,7 @@ fn theorem_left_arrow_skips_thai_grapheme_cluster_backwards() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -299,7 +307,7 @@ fn theorem_backspace_peels_thai_combining_marks_layer_by_layer() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -310,13 +318,14 @@ fn theorem_delete_forward_removes_thai_grapheme_atomically() {
     // removes the *whole* first cluster — not one code point —
     // because deleting just the base would orphan the marks.
     assert_buffer_scenario(BufferScenario {
-        description: "DeleteForward removes a whole Thai grapheme cluster, not one code point".into(),
+        description: "DeleteForward removes a whole Thai grapheme cluster, not one code point"
+            .into(),
         initial_text: "ที่นี่".into(),
         actions: vec![Action::MoveDocumentStart, Action::DeleteForward],
         expected_text: "นี่".into(),
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }

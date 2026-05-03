@@ -67,9 +67,7 @@ fn migrated_triple_click_selects_middle_line() {
 fn migrated_double_click_selects_word_not_line() {
     // Original: `test_double_click_still_selects_word`.
     let mut harness = EditorTestHarness::new(80, 24).unwrap();
-    let _f = harness
-        .load_buffer_from_text("hello world test\n")
-        .unwrap();
+    let _f = harness.load_buffer_from_text("hello world test\n").unwrap();
     harness.render().unwrap();
     let row = content_first_row(&harness);
 

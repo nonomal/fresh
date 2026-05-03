@@ -28,7 +28,8 @@ fn theorem_to_uppercase_selection() {
 
     assert_buffer_scenario(BufferScenario {
         description: "ToUpperCase uppercases the 5-byte selection at byte 0 \
-             and collapses the selection at the selection end".into(),
+             and collapses the selection at the selection end"
+            .into(),
         initial_text: "hello world".into(),
         actions,
         expected_text: "HELLO world".into(),
@@ -38,6 +39,6 @@ fn theorem_to_uppercase_selection() {
         expected_primary: CursorExpect::at(5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }

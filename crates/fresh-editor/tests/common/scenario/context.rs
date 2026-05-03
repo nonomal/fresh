@@ -89,8 +89,14 @@ pub struct NamedBuffer {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SplitLayout {
     Single,
-    Horizontal { left: Box<SplitLayout>, right: Box<SplitLayout> },
-    Vertical { top: Box<SplitLayout>, bottom: Box<SplitLayout> },
+    Horizontal {
+        left: Box<SplitLayout>,
+        right: Box<SplitLayout>,
+    },
+    Vertical {
+        top: Box<SplitLayout>,
+        bottom: Box<SplitLayout>,
+    },
 }
 
 impl Default for SplitLayout {
@@ -218,11 +224,31 @@ pub enum PromptKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MouseEvent {
-    Click { row: u16, col: u16, button: MouseButton },
-    Drag { from_row: u16, from_col: u16, to_row: u16, to_col: u16, button: MouseButton },
-    Wheel { row: u16, col: u16, dy: i16 },
-    DoubleClick { row: u16, col: u16 },
-    TripleClick { row: u16, col: u16 },
+    Click {
+        row: u16,
+        col: u16,
+        button: MouseButton,
+    },
+    Drag {
+        from_row: u16,
+        from_col: u16,
+        to_row: u16,
+        to_col: u16,
+        button: MouseButton,
+    },
+    Wheel {
+        row: u16,
+        col: u16,
+        dy: i16,
+    },
+    DoubleClick {
+        row: u16,
+        col: u16,
+    },
+    TripleClick {
+        row: u16,
+        col: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

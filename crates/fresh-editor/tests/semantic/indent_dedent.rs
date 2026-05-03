@@ -6,7 +6,9 @@
 //! intent without naming a keystroke; if we ever change the
 //! Shift+Tab binding the theorems below stay valid.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use fresh::test_api::Action;
 
 #[test]
@@ -22,7 +24,7 @@ fn theorem_dedent_selection_removes_leading_indent() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -39,7 +41,7 @@ fn theorem_dedent_selection_partial_indent_removes_all_leading_spaces() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -55,6 +57,6 @@ fn theorem_dedent_selection_no_indent_is_idempotent() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }

@@ -22,7 +22,8 @@ fn migrated_undo_skips_readonly_movement_actions_full() {
     // Type "hello" (cursor 5), MoveLeft ×2 (cursor 3), Undo.
     // Expect "hell", cursor 4.
     assert_buffer_scenario(BufferScenario {
-        description: "Undo after type+movement undoes the typing AND restores cursor pre-movement".into(),
+        description: "Undo after type+movement undoes the typing AND restores cursor pre-movement"
+            .into(),
         initial_text: String::new(),
         actions: vec![
             Action::InsertChar('h'),

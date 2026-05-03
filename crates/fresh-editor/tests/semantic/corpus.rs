@@ -66,10 +66,7 @@ pub fn buffer_scenarios() -> Vec<BufferScenario> {
         BufferScenario {
             description: "InsertNewline splits the buffer at the cursor".into(),
             initial_text: "abc".into(),
-            actions: vec![
-                Action::MoveRight,
-                Action::InsertNewline,
-            ],
+            actions: vec![Action::MoveRight, Action::InsertNewline],
             expected_text: "a\nbc".into(),
             expected_primary: CursorExpect::at(2),
             ..Default::default()

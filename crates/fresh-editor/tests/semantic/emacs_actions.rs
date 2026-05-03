@@ -15,7 +15,9 @@
 //!     plus the internal `deselect_on_move` flag, which isn't part of
 //!     the public `Caret` projection.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use fresh::test_api::Action;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -39,7 +41,7 @@ fn theorem_transpose_chars_swaps_two_characters() {
         expected_primary: CursorExpect::at(3),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -56,7 +58,7 @@ fn theorem_transpose_chars_at_beginning_is_noop() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -73,7 +75,7 @@ fn theorem_transpose_chars_at_end_is_noop() {
         expected_primary: CursorExpect::at(2),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -100,7 +102,7 @@ fn theorem_open_line_inserts_newline_without_advancing_cursor() {
         expected_primary: CursorExpect::at(3),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -117,7 +119,7 @@ fn theorem_open_line_at_beginning_inserts_leading_newline() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -140,7 +142,7 @@ fn theorem_open_line_then_typing_inserts_on_original_line() {
         expected_primary: CursorExpect::at(4),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -162,7 +164,7 @@ fn theorem_set_mark_creates_anchor_at_cursor_position() {
         expected_primary: CursorExpect::range(0, 0),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -188,7 +190,7 @@ fn theorem_set_mark_then_move_extends_selection() {
         expected_primary: CursorExpect::range(0, 5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("hello".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -213,6 +215,6 @@ fn theorem_set_mark_then_shift_move_extends_selection() {
         expected_primary: CursorExpect::range(0, 5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("hello".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }

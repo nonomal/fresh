@@ -17,7 +17,9 @@
 //!     disk; that observable isn't on the `EditorTestApi` projection.
 //!     Migrate together with a `dirty_state()` extension.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use fresh::test_api::Action;
 
 #[test]
@@ -27,7 +29,8 @@ fn theorem_undo_skips_readonly_movement_actions() {
     // The Undo restores the cursor *before* the movements (position 4,
     // end of "hell") and removes the last typed 'o'.
     assert_buffer_scenario(BufferScenario {
-        description: "Undo restores cursor to before the readonly movements and pops the last write".into(),
+        description:
+            "Undo restores cursor to before the readonly movements and pops the last write".into(),
         initial_text: "".into(),
         actions: vec![
             Action::InsertChar('h'),
@@ -43,7 +46,7 @@ fn theorem_undo_skips_readonly_movement_actions() {
         expected_primary: CursorExpect::at(4),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -72,7 +75,7 @@ fn theorem_multiple_undo_skips_all_readonly_actions() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -101,7 +104,7 @@ fn theorem_redo_skips_readonly_movement_actions() {
         expected_primary: CursorExpect::at(2),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -128,6 +131,6 @@ fn theorem_undo_redo_with_mixed_actions() {
         expected_primary: CursorExpect::at(1),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }

@@ -25,8 +25,7 @@ impl LayoutShadow {
         let line_count = if text.is_empty() {
             1
         } else {
-            text.bytes().filter(|&b| b == b'\n').count()
-                + if text.ends_with('\n') { 0 } else { 1 }
+            text.bytes().filter(|&b| b == b'\n').count() + if text.ends_with('\n') { 0 } else { 1 }
         };
         // Mirrors `Viewport::gutter_width` in
         // `src/view/viewport.rs`: `1 + max(digits, 2) + 3` —

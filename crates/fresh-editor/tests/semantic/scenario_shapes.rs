@@ -40,8 +40,7 @@ fn round_trip<T>(label: &str, value: T)
 where
     T: Serialize + DeserializeOwned + std::fmt::Debug + PartialEq,
 {
-    let json = serde_json::to_string(&value)
-        .unwrap_or_else(|e| panic!("{label}: serialise: {e}"));
+    let json = serde_json::to_string(&value).unwrap_or_else(|e| panic!("{label}: serialise: {e}"));
     let back: T = serde_json::from_str(&json)
         .unwrap_or_else(|e| panic!("{label}: deserialise: {e} from {json}"));
     assert_eq!(value, back, "{label}: round-trip mismatch");
@@ -51,8 +50,7 @@ fn round_trip_no_eq<T>(label: &str, value: T)
 where
     T: Serialize + DeserializeOwned + std::fmt::Debug,
 {
-    let json = serde_json::to_string(&value)
-        .unwrap_or_else(|e| panic!("{label}: serialise: {e}"));
+    let json = serde_json::to_string(&value).unwrap_or_else(|e| panic!("{label}: serialise: {e}"));
     let _: T = serde_json::from_str(&json)
         .unwrap_or_else(|e| panic!("{label}: deserialise: {e} from {json}"));
 }

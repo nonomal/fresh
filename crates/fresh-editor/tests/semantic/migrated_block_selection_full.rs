@@ -43,7 +43,8 @@ fn migrated_block_select_down_three_times_extends_through_lines() {
     // throughout; scenario verifies the final state.
     assert_buffer_scenario(BufferScenario {
         description: "Three BlockSelectDown calls extend selection across 4 lines".into(),
-        initial_text: "aaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc".into(),
+        initial_text:
+            "aaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc".into(),
         actions: vec![
             Action::MoveDocumentStart,
             Action::MoveRight,
@@ -55,7 +56,8 @@ fn migrated_block_select_down_three_times_extends_through_lines() {
             Action::BlockSelectDown,
             Action::BlockSelectDown,
         ],
-        expected_text: "aaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc".into(),
+        expected_text:
+            "aaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc\naaaa bbbb cccc".into(),
         // Selection: anchor at col 5 of line 1 (byte 5), cursor
         // at col 5 of line 4 (byte 5+15*3 = 50).
         expected_primary: CursorExpect::range(5, 50),

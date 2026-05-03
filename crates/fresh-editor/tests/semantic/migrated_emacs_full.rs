@@ -19,7 +19,11 @@ fn migrated_transpose_chars_basic() {
     assert_buffer_scenario(BufferScenario {
         description: "TransposeChars at byte 2 of 'abc' yields 'acb'".into(),
         initial_text: "abc".into(),
-        actions: vec![Action::MoveDocumentEnd, Action::MoveLeft, Action::TransposeChars],
+        actions: vec![
+            Action::MoveDocumentEnd,
+            Action::MoveLeft,
+            Action::TransposeChars,
+        ],
         expected_text: "acb".into(),
         expected_primary: CursorExpect::at(3),
         ..Default::default()
@@ -66,7 +70,8 @@ fn migrated_open_line_basic() {
     // (after the fix in commit 90ef113e — was cursor at 4
     // before the fix).
     assert_buffer_scenario(BufferScenario {
-        description: "OpenLine at byte 3 of 'hello' produces 'hel\\nlo' with cursor unchanged".into(),
+        description: "OpenLine at byte 3 of 'hello' produces 'hel\\nlo' with cursor unchanged"
+            .into(),
         initial_text: "hello".into(),
         actions: vec![
             Action::MoveDocumentEnd,

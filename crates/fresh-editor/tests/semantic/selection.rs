@@ -20,7 +20,9 @@
 //!     graphemes each; would explode into ~80 theorems. Worth a
 //!     dedicated proptest-style migration later.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use fresh::test_api::Action;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -51,7 +53,7 @@ fn theorem_select_word_from_middle_of_word() {
         expected_primary: CursorExpect::range(6, 11),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("world".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -76,7 +78,7 @@ fn theorem_select_word_from_start_of_word() {
         expected_primary: CursorExpect::range(6, 11),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("world".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -101,7 +103,7 @@ fn theorem_select_word_from_end_of_word() {
         expected_primary: CursorExpect::range(0, 5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("hello".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -120,7 +122,7 @@ fn theorem_select_word_treats_hyphen_as_separator() {
         expected_primary: CursorExpect::range(0, 3),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("foo".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -129,14 +131,15 @@ fn theorem_select_word_treats_underscore_as_word_char() {
     // Replaces test_select_word_with_underscore.
     // Underscore is part of the word — "baz_qux" is one word.
     assert_buffer_scenario(BufferScenario {
-        description: "Underscore is a word character: SelectWord on 'baz_qux' picks the whole token".into(),
+        description:
+            "Underscore is a word character: SelectWord on 'baz_qux' picks the whole token".into(),
         initial_text: "baz_qux".into(),
         actions: vec![Action::MoveDocumentStart, Action::SelectWord],
         expected_text: "baz_qux".into(),
         expected_primary: CursorExpect::range(0, 7),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("baz_qux".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -144,14 +147,15 @@ fn theorem_select_word_treats_underscore_as_word_char() {
 fn theorem_select_word_treats_alphanumeric_as_one_word() {
     // Replaces test_select_word_with_numbers.
     assert_buffer_scenario(BufferScenario {
-        description: "Letters and digits are one word: SelectWord on 'test123' picks the whole token".into(),
+        description:
+            "Letters and digits are one word: SelectWord on 'test123' picks the whole token".into(),
         initial_text: "test123".into(),
         actions: vec![Action::MoveDocumentStart, Action::SelectWord],
         expected_text: "test123".into(),
         expected_primary: CursorExpect::range(0, 7),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("test123".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -166,7 +170,7 @@ fn theorem_select_word_treats_at_symbol_as_separator() {
         expected_primary: CursorExpect::range(0, 4),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("user".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -176,7 +180,9 @@ fn theorem_select_word_treats_dot_as_separator() {
     // Cursor needs to be on/after the dot to pick up "domain". The
     // original test moved to position 4 (right after "user").
     assert_buffer_scenario(BufferScenario {
-        description: "'.' is a word separator: SelectWord on 'user.domain' from after the dot picks 'domain'".into(),
+        description:
+            "'.' is a word separator: SelectWord on 'user.domain' from after the dot picks 'domain'"
+                .into(),
         initial_text: "user.domain".into(),
         actions: vec![
             Action::MoveDocumentStart,
@@ -191,7 +197,7 @@ fn theorem_select_word_treats_dot_as_separator() {
         expected_primary: CursorExpect::range(5, 11),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("domain".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -216,7 +222,7 @@ fn theorem_select_line_includes_trailing_newline() {
         expected_primary: CursorExpect::range(11, 23),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("second line\n".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -231,7 +237,7 @@ fn theorem_select_line_first_line_includes_trailing_newline() {
         expected_primary: CursorExpect::range(0, 11),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("first line\n".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -248,7 +254,7 @@ fn theorem_select_line_last_line_no_trailing_newline() {
         expected_primary: CursorExpect::range(11, 22),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("second line".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -279,7 +285,7 @@ fn theorem_expand_selection_grows_in_three_steps() {
         expected_primary: CursorExpect::range(3, 16),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("lo world test".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -304,7 +310,7 @@ fn theorem_expand_selection_with_no_initial_selection_picks_word_tail() {
         expected_primary: CursorExpect::range(5, 7),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("ar".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -335,7 +341,7 @@ fn theorem_expand_selection_crosses_line_boundary() {
         expected_primary: CursorExpect::range(11, 29),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("ending\nsecond line".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -352,7 +358,7 @@ fn theorem_expand_selection_on_word_char_picks_current_word() {
         expected_primary: CursorExpect::range(0, 5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("hello".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -371,14 +377,15 @@ fn theorem_expand_selection_on_punctuation_run() {
     // surface as a deliberate update to this theorem rather than a
     // silent change.
     assert_buffer_scenario(BufferScenario {
-        description: "ExpandSelection from punctuation grows through the token (semantic harness)".into(),
+        description: "ExpandSelection from punctuation grows through the token (semantic harness)"
+            .into(),
         initial_text: "**-word".into(),
         actions: vec![Action::MoveDocumentStart, Action::ExpandSelection],
         expected_text: "**-word".into(),
         expected_primary: CursorExpect::range(0, 7),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("**-word".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -388,7 +395,8 @@ fn theorem_expand_selection_from_middle_of_word_picks_tail() {
     // Buffer "Event", cursor at position 1 ('v'). ExpandSelection
     // selects from cursor to word end — "vent", not the whole word.
     assert_buffer_scenario(BufferScenario {
-        description: "ExpandSelection from mid-word selects only the tail of the current word".into(),
+        description: "ExpandSelection from mid-word selects only the tail of the current word"
+            .into(),
         initial_text: "Event".into(),
         actions: vec![
             Action::MoveDocumentStart,
@@ -399,6 +407,6 @@ fn theorem_expand_selection_from_middle_of_word_picks_tail() {
         expected_primary: CursorExpect::range(1, 5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("vent".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }

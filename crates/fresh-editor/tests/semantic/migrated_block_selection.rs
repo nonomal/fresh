@@ -29,10 +29,7 @@ fn migrated_block_select_then_type_inserts_at_each_cursor() {
     assert_buffer_scenario(BufferScenario {
         description: "type after BlockSelectDown distributes across cursors".into(),
         initial_text: "alpha\nbravo".into(),
-        actions: vec![
-            Action::AddCursorBelow,
-            Action::InsertChar('X'),
-        ],
+        actions: vec![Action::AddCursorBelow, Action::InsertChar('X')],
         expected_text: "Xalpha\nXbravo".into(),
         expected_primary: CursorExpect::at(8),
         expected_extra_cursors: vec![CursorExpect::at(1)],

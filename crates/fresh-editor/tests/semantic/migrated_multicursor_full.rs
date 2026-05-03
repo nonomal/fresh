@@ -8,9 +8,7 @@
 use crate::common::scenario::buffer_scenario::{
     assert_buffer_scenario, BufferScenario, CursorExpect,
 };
-use crate::common::scenario::trace_scenario::{
-    assert_trace_scenario, TraceScenario,
-};
+use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
 
 #[test]
@@ -22,7 +20,8 @@ fn migrated_add_cursor_above_yields_two_cursors() {
     // cursor becomes primary. So after AddCursorAbove from
     // Line 3, primary lands on Line 2 (byte 13).
     assert_buffer_scenario(BufferScenario {
-        description: "AddCursorAbove on Line 3 makes the newly-added cursor (Line 2) primary".into(),
+        description: "AddCursorAbove on Line 3 makes the newly-added cursor (Line 2) primary"
+            .into(),
         initial_text: "Line 1\nLine 2\nLine 3".into(),
         actions: vec![Action::MoveDocumentEnd, Action::AddCursorAbove],
         expected_text: "Line 1\nLine 2\nLine 3".into(),
@@ -124,7 +123,8 @@ fn migrated_multi_cursor_undo_atomic_full() {
     // Original: `test_multi_cursor_undo_atomic`. 3 chars typed
     // across 3 cursors = 3 undo units (one per char).
     assert_trace_scenario(TraceScenario {
-        description: "3 chars × 3 cursors = 3 undo units (vectorisation transparent to history)".into(),
+        description: "3 chars × 3 cursors = 3 undo units (vectorisation transparent to history)"
+            .into(),
         initial_text: "aaa\nbbb\nccc\nddd".into(),
         actions: vec![
             Action::MoveDocumentStart,

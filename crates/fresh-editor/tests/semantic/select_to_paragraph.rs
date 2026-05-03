@@ -6,7 +6,9 @@
 //! imperative test inferred via printlns and "selection should have
 //! positive range" handwaves.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use fresh::test_api::Action;
 
 const PARAGRAPHS: &str =
@@ -32,7 +34,7 @@ fn theorem_select_to_paragraph_down_from_line_1() {
         expected_primary: CursorExpect::range(0, 38),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("paragraph 1 line 1\nparagraph 1 line 2\n".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -56,6 +58,6 @@ fn theorem_select_to_paragraph_up_from_paragraph_2() {
         expected_primary: CursorExpect::range(39, 38),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("\n".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }

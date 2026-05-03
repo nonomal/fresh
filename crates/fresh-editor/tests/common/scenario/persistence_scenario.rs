@@ -43,9 +43,7 @@ pub struct PersistenceScenario {
     pub expected_fs: FsState,
 }
 
-pub fn check_persistence_scenario(
-    s: PersistenceScenario,
-) -> Result<(), ScenarioFailure> {
+pub fn check_persistence_scenario(s: PersistenceScenario) -> Result<(), ScenarioFailure> {
     let mut harness = EditorTestHarness::with_temp_project(80, 24)
         .expect("EditorTestHarness::with_temp_project failed");
     let temp_root: PathBuf = harness
@@ -98,14 +96,13 @@ pub fn check_persistence_scenario(
     // root so scenarios are portable.
     for (rel, want_content) in &s.expected_fs.expected_files {
         let abs = relative_under(&temp_root, rel);
-        let got = std::fs::read_to_string(&abs).map_err(|e| {
-            ScenarioFailure::WorkspaceStateMismatch {
+        let got =
+            std::fs::read_to_string(&abs).map_err(|e| ScenarioFailure::WorkspaceStateMismatch {
                 description: s.description.clone(),
                 field: format!("fs[{rel:?}] read_to_string"),
                 expected: format!("{want_content:?}"),
                 actual: format!("err: {e}"),
-            }
-        })?;
+            })?;
         if &got != want_content {
             return Err(ScenarioFailure::WorkspaceStateMismatch {
                 description: s.description.clone(),
@@ -124,11 +121,7 @@ pub fn assert_persistence_scenario(s: PersistenceScenario) {
     }
 }
 
-fn seed_files(
-    root: &Path,
-    fs: &VirtualFs,
-    description: &str,
-) -> Result<(), ScenarioFailure> {
+fn seed_files(root: &Path, fs: &VirtualFs, description: &str) -> Result<(), ScenarioFailure> {
     for (path, file) in &fs.files {
         let abs = relative_under(root, path);
         if let Some(parent) = abs.parent() {
@@ -173,18 +166,14 @@ fn dispatch(
             // filesystem write; the editor's auto-revert / on-save
             // logic will see the change.
             let abs = relative_under(root, path);
-            std::fs::write(&abs, content).map_err(|e| {
-                ScenarioFailure::InputProjectionFailed {
-                    description: description.into(),
-                    reason: format!("FsExternalEdit write {abs:?}: {e}"),
-                }
+            std::fs::write(&abs, content).map_err(|e| ScenarioFailure::InputProjectionFailed {
+                description: description.into(),
+                reason: format!("FsExternalEdit write {abs:?}: {e}"),
             })
         }
         other => Err(ScenarioFailure::InputProjectionFailed {
             description: description.into(),
-            reason: format!(
-                "PersistenceScenario does not handle {other:?} — wrong scenario type"
-            ),
+            reason: format!("PersistenceScenario does not handle {other:?} — wrong scenario type"),
         }),
     }
 }
@@ -209,18 +198,17 @@ pub fn write_then_save(
         },
     ))
     .collect();
-    let typed_actions = std::iter::once(InputEvent::Action(
-        fresh::test_api::Action::MoveDocumentEnd,
-    ))
-    .chain(
-        typed
-            .chars()
-            .map(|c| InputEvent::Action(fresh::test_api::Action::InsertChar(c))),
-    )
-    .chain(std::iter::once(InputEvent::Action(
-        fresh::test_api::Action::Save,
-    )))
-    .collect();
+    let typed_actions =
+        std::iter::once(InputEvent::Action(fresh::test_api::Action::MoveDocumentEnd))
+            .chain(
+                typed
+                    .chars()
+                    .map(|c| InputEvent::Action(fresh::test_api::Action::InsertChar(c))),
+            )
+            .chain(std::iter::once(InputEvent::Action(
+                fresh::test_api::Action::Save,
+            )))
+            .collect();
     PersistenceScenario {
         description: description.to_string(),
         initial_fs: VirtualFs {
@@ -230,11 +218,8 @@ pub fn write_then_save(
         events: typed_actions,
         expected_buffer: None,
         expected_fs: FsState {
-            expected_files: std::iter::once((
-                filename.to_string(),
-                expected_on_disk.to_string(),
-            ))
-            .collect(),
+            expected_files: std::iter::once((filename.to_string(), expected_on_disk.to_string()))
+                .collect(),
         },
     }
 }

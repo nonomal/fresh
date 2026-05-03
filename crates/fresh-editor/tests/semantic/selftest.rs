@@ -15,7 +15,9 @@
 //! The expected-substring is matched as a prefix of the panic
 //! message; the format strings in the runners are stable.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use crate::common::scenario::layout_scenario::{assert_layout_scenario, LayoutScenario};
 use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
@@ -45,7 +47,7 @@ fn metatheorem_correct_buffer_theorem_passes() {
         expected_primary: CursorExpect::at(5),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -60,7 +62,7 @@ fn metatheorem_wrong_expected_text_panics() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -84,7 +86,7 @@ fn metatheorem_wrong_primary_cursor_panics() {
         expected_primary: CursorExpect::at(999),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -100,7 +102,7 @@ fn metatheorem_wrong_cursor_count_panics() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![CursorExpect::at(1), CursorExpect::at(2)],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -120,7 +122,7 @@ fn metatheorem_wrong_selection_text_panics() {
         expected_primary: CursorExpect::range(0, 3),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("xxx".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -201,7 +203,7 @@ fn metatheorem_check_returns_ok_on_correct_theorem() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 }
@@ -216,7 +218,7 @@ fn metatheorem_check_returns_typed_buffer_text_failure() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
     match result {
         Err(ScenarioFailure::BufferTextMismatch {
@@ -241,7 +243,7 @@ fn metatheorem_check_returns_typed_primary_cursor_failure() {
         expected_primary: CursorExpect::at(42),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
     assert!(matches!(
         result,
@@ -337,7 +339,7 @@ fn metatheorem_failure_serializes_to_json() {
         expected_primary: CursorExpect::at(0),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
     let failure = r.expect_err("expected an Err");
 

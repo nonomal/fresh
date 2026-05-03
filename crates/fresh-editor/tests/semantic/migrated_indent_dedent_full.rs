@@ -65,7 +65,8 @@ fn migrated_shift_tab_dedent_single_line_spaces() {
 fn migrated_shift_tab_dedent_multiple_lines_spaces() {
     // Original: `test_shift_tab_dedent_multiple_lines_spaces`.
     assert_buffer_scenario(BufferScenario {
-        description: "DedentSelection on multi-line indented selection removes 4 spaces from each".into(),
+        description: "DedentSelection on multi-line indented selection removes 4 spaces from each"
+            .into(),
         initial_text: "    Line 1\n    Line 2\n    Line 3".into(),
         actions: vec![Action::SelectAll, Action::DedentSelection],
         expected_text: "Line 1\nLine 2\nLine 3".into(),

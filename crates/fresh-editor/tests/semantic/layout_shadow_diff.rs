@@ -14,8 +14,7 @@ use crate::common::scenario::observable::Observable;
 use crate::common::scenario::render_snapshot::RenderSnapshot;
 
 fn editor_snapshot(text: &str, width: u16, height: u16) -> RenderSnapshot {
-    let mut harness = EditorTestHarness::with_temp_project(width, height)
-        .expect("harness");
+    let mut harness = EditorTestHarness::with_temp_project(width, height).expect("harness");
     let _fix = harness.load_buffer_from_text(text).expect("load");
     harness.render().expect("render");
     RenderSnapshot::extract(&mut harness)

@@ -46,10 +46,7 @@ fn migrated_typing_after_mixed_ascii_chinese_lands_at_end() {
     assert_buffer_scenario(BufferScenario {
         description: "InsertChar after MoveLineEnd appends to mixed-content line".into(),
         initial_text: text.into(),
-        actions: vec![
-            Action::MoveLineEnd,
-            Action::InsertChar('!'),
-        ],
+        actions: vec![Action::MoveLineEnd, Action::InsertChar('!')],
         expected_text: format!("{text}!"),
         expected_primary: CursorExpect::at(text.len() + 1),
         ..Default::default()

@@ -11,9 +11,7 @@ use crate::common::scenario::context::{
     NamedBuffer, PromptKind, VirtualFile, VirtualFs, WorkspaceContext,
 };
 use crate::common::scenario::input_event::InputEvent;
-use crate::common::scenario::modal_scenario::{
-    assert_modal_scenario, ModalScenario,
-};
+use crate::common::scenario::modal_scenario::{assert_modal_scenario, ModalScenario};
 use crate::common::scenario::observable::{
     FsState, ModalState, PopupSnapshot, RoundTripGrid, WorkspaceState,
 };
@@ -23,9 +21,7 @@ use crate::common::scenario::persistence_scenario::{
 use crate::common::scenario::terminal_io_scenario::{
     assert_terminal_io_scenario_partial, GridExpect, TerminalIoScenario,
 };
-use crate::common::scenario::workspace_scenario::{
-    assert_workspace_scenario, WorkspaceScenario,
-};
+use crate::common::scenario::workspace_scenario::{assert_workspace_scenario, WorkspaceScenario};
 use fresh::test_api::Action;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -154,9 +150,7 @@ fn phase8_partial_grid_expectation_via_substring_search() {
 #[test]
 fn phase10_advance_clock_actually_advances_test_time_source() {
     use crate::common::scenario::input_event::InputEvent;
-    use crate::common::scenario::temporal_scenario::{
-        check_temporal_scenario, TemporalScenario,
-    };
+    use crate::common::scenario::temporal_scenario::{check_temporal_scenario, TemporalScenario};
     use std::time::Duration;
     // The runner now wires AdvanceClock to harness.advance_time,
     // which delegates to the editor's existing TestTimeSource. We
@@ -223,8 +217,7 @@ fn phase6_open_seeded_file_and_save_appends_typed_text() {
         ],
         expected_buffer: None,
         expected_fs: FsState {
-            expected_files: std::iter::once(("greet.txt".into(), "hello!".into()))
-                .collect(),
+            expected_files: std::iter::once(("greet.txt".into(), "hello!".into())).collect(),
         },
     });
 }
@@ -253,8 +246,7 @@ fn phase6_external_edit_lands_on_disk_visible_to_other_processes() {
         }],
         expected_buffer: None,
         expected_fs: FsState {
-            expected_files: std::iter::once(("watch.txt".into(), "after".into()))
-                .collect(),
+            expected_files: std::iter::once(("watch.txt".into(), "after".into())).collect(),
         },
     });
 }

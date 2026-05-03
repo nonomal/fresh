@@ -32,10 +32,22 @@ pub struct StyleScenario {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Inspect {
-    Cell { row: u16, col: u16 },
-    Row { row: u16 },
-    Column { col: u16 },
-    Region { row: u16, col: u16, rows: u16, cols: u16 },
+    Cell {
+        row: u16,
+        col: u16,
+    },
+    Row {
+        row: u16,
+    },
+    Column {
+        col: u16,
+    },
+    Region {
+        row: u16,
+        col: u16,
+        rows: u16,
+        cols: u16,
+    },
     FullFrame,
 }
 

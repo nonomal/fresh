@@ -8,9 +8,7 @@
 
 use crate::common::scenario::context::PromptKind;
 use crate::common::scenario::input_event::InputEvent;
-use crate::common::scenario::modal_scenario::{
-    assert_modal_scenario, ModalScenario,
-};
+use crate::common::scenario::modal_scenario::{assert_modal_scenario, ModalScenario};
 use crate::common::scenario::observable::ModalState;
 
 #[test]

@@ -23,31 +23,31 @@ fn theorem_smart_home_on_unwrapped_indented_line_jumps_to_first_non_whitespace()
     // Pressing Home a second time then jumps to byte 0 — that's the
     // toggle. Theorem captures the first hop only.
     assert_buffer_scenario(BufferScenario {
-            terminal: TerminalSize::default(),
-            description: "SmartHome from mid-line jumps to first non-whitespace".into(),
-            initial_text: "    indented".into(),
-            // Move to end of line (byte 12), then SmartHome.
-            actions: vec![Action::MoveLineEnd, Action::SmartHome],
-            expected_text: "    indented".into(),
-            expected_primary: CursorExpect::at(4),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("".into()),
-            ..Default::default()
-        });
+        terminal: TerminalSize::default(),
+        description: "SmartHome from mid-line jumps to first non-whitespace".into(),
+        initial_text: "    indented".into(),
+        // Move to end of line (byte 12), then SmartHome.
+        actions: vec![Action::MoveLineEnd, Action::SmartHome],
+        expected_text: "    indented".into(),
+        expected_primary: CursorExpect::at(4),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("".into()),
+        ..Default::default()
+    });
 }
 
 #[test]
 fn theorem_smart_home_toggles_to_byte_zero() {
     // Second Home press toggles to byte 0.
     assert_buffer_scenario(BufferScenario {
-            terminal: TerminalSize::default(),
-            description: "SmartHome twice toggles to byte 0".into(),
-            initial_text: "    indented".into(),
-            actions: vec![Action::MoveLineEnd, Action::SmartHome, Action::SmartHome],
-            expected_text: "    indented".into(),
-            expected_primary: CursorExpect::at(0),
-            expected_extra_cursors: vec![],
-            expected_selection_text: Some("".into()),
-            ..Default::default()
-        });
+        terminal: TerminalSize::default(),
+        description: "SmartHome twice toggles to byte 0".into(),
+        initial_text: "    indented".into(),
+        actions: vec![Action::MoveLineEnd, Action::SmartHome, Action::SmartHome],
+        expected_text: "    indented".into(),
+        expected_primary: CursorExpect::at(0),
+        expected_extra_cursors: vec![],
+        expected_selection_text: Some("".into()),
+        ..Default::default()
+    });
 }

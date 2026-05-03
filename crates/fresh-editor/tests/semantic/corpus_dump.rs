@@ -13,8 +13,7 @@ use std::path::PathBuf;
 #[ignore = "writes a file; run explicitly with --include-ignored"]
 fn dump_scenario_corpus_json() {
     let scenarios = corpus::buffer_scenarios();
-    let payload = serde_json::to_string_pretty(&scenarios)
-        .expect("serialise scenario corpus");
+    let payload = serde_json::to_string_pretty(&scenarios).expect("serialise scenario corpus");
     let path = target_dir().join("scenario-corpus.json");
     std::fs::create_dir_all(path.parent().unwrap()).expect("create target dir");
     std::fs::write(&path, payload).expect("write corpus JSON");

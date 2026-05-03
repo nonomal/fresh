@@ -53,11 +53,7 @@ fn migrated_repeated_undo_at_initial_state_is_no_op() {
     assert_buffer_scenario(BufferScenario {
         description: "Undo on unedited buffer is a no-op".into(),
         initial_text: "stable".into(),
-        actions: vec![
-            Action::Undo,
-            Action::Undo,
-            Action::Undo,
-        ],
+        actions: vec![Action::Undo, Action::Undo, Action::Undo],
         expected_text: "stable".into(),
         expected_primary: CursorExpect::at(0),
         ..Default::default()
@@ -81,10 +77,7 @@ fn migrated_insert_then_delete_forward_returns_to_initial() {
     assert_buffer_scenario(BufferScenario {
         description: "InsertChar then DeleteForward + Backward roundtrip".into(),
         initial_text: "ab".into(),
-        actions: vec![
-            Action::InsertChar('X'),
-            Action::DeleteBackward,
-        ],
+        actions: vec![Action::InsertChar('X'), Action::DeleteBackward],
         expected_text: "ab".into(),
         expected_primary: CursorExpect::at(0),
         ..Default::default()

@@ -110,14 +110,11 @@ fn dispatch_input_event(
         }
         InputEvent::MenuSelect(_) => Err(ScenarioFailure::InputProjectionFailed {
             description: String::new(),
-            reason: "ModalScenario phase: MenuSelect needs `popup.select(idx)` accessor"
-                .into(),
+            reason: "ModalScenario phase: MenuSelect needs `popup.select(idx)` accessor".into(),
         }),
         other => Err(ScenarioFailure::InputProjectionFailed {
             description: String::new(),
-            reason: format!(
-                "ModalScenario does not handle {other:?} — wrong scenario type"
-            ),
+            reason: format!("ModalScenario does not handle {other:?} — wrong scenario type"),
         }),
     }
 }
@@ -132,10 +129,7 @@ pub fn modal_open_then_confirm(
     ModalScenario {
         description: description.into(),
         initial_text: String::new(),
-        events: vec![
-            InputEvent::OpenPrompt(kind),
-            InputEvent::ConfirmPrompt,
-        ],
+        events: vec![InputEvent::OpenPrompt(kind), InputEvent::ConfirmPrompt],
         expected_modal: ModalState {
             top_popup: None,
             depth: expected_depth_after,

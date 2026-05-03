@@ -5,9 +5,7 @@
 use crate::common::scenario::context::{NamedBuffer, WorkspaceContext};
 use crate::common::scenario::input_event::InputEvent;
 use crate::common::scenario::observable::WorkspaceState;
-use crate::common::scenario::workspace_scenario::{
-    assert_workspace_scenario, WorkspaceScenario,
-};
+use crate::common::scenario::workspace_scenario::{assert_workspace_scenario, WorkspaceScenario};
 use fresh::test_api::Action;
 
 #[test]
@@ -36,9 +34,18 @@ fn migrated_three_buffers_yield_count_three() {
         description: "three initial buffers ⇒ buffer_count == 3".into(),
         workspace: WorkspaceContext {
             initial_buffers: vec![
-                NamedBuffer { filename: "a.txt".into(), content: "alpha".into() },
-                NamedBuffer { filename: "b.txt".into(), content: "bravo".into() },
-                NamedBuffer { filename: "c.txt".into(), content: "charlie".into() },
+                NamedBuffer {
+                    filename: "a.txt".into(),
+                    content: "alpha".into(),
+                },
+                NamedBuffer {
+                    filename: "b.txt".into(),
+                    content: "bravo".into(),
+                },
+                NamedBuffer {
+                    filename: "c.txt".into(),
+                    content: "charlie".into(),
+                },
             ],
             initial_splits: None,
         },

@@ -44,22 +44,11 @@ pub struct GridExpect {
 }
 
 impl GridExpect {
-    pub fn check_against(
-        &self,
-        grid: &RoundTripGrid,
-    ) -> Option<(&'static str, String, String)> {
+    pub fn check_against(&self, grid: &RoundTripGrid) -> Option<(&'static str, String, String)> {
         if let Some((row, want)) = &self.row_at {
-            let got = grid
-                .rows
-                .get(*row as usize)
-                .cloned()
-                .unwrap_or_default();
+            let got = grid.rows.get(*row as usize).cloned().unwrap_or_default();
             if got.trim_end() != want.trim_end() {
-                return Some((
-                    "row_at",
-                    want.clone(),
-                    got,
-                ));
+                return Some(("row_at", want.clone(), got));
             }
         }
         if let Some((row, col, want)) = &self.cell_at {
@@ -69,11 +58,7 @@ impl GridExpect {
                 .and_then(|r| r.chars().nth(*col as usize).map(|c| c.to_string()))
                 .unwrap_or_default();
             if &got != want {
-                return Some((
-                    "cell_at",
-                    want.clone(),
-                    got,
-                ));
+                return Some(("cell_at", want.clone(), got));
             }
         }
         if let Some(want) = self.hardware_cursor {

@@ -9,9 +9,7 @@
 use crate::common::scenario::buffer_scenario::{
     assert_buffer_scenario, repeat, BufferScenario, CursorExpect,
 };
-use crate::common::scenario::trace_scenario::{
-    assert_trace_scenario, TraceScenario,
-};
+use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
 
 #[test]

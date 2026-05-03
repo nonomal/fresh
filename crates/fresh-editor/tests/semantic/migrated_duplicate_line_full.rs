@@ -15,9 +15,7 @@
 use crate::common::scenario::buffer_scenario::{
     assert_buffer_scenario, BufferScenario, CursorExpect,
 };
-use crate::common::scenario::trace_scenario::{
-    assert_trace_scenario, TraceScenario,
-};
+use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
 
 #[test]
@@ -75,8 +73,7 @@ fn migrated_duplicate_selected_lines() {
             Action::SelectDown,
             Action::DuplicateLine,
         ],
-        expected_text:
-            "line one\nline two\nline three\nline two\nline three\nline four".into(),
+        expected_text: "line one\nline two\nline three\nline two\nline three\nline four".into(),
         // FINDING: multi-line duplicate collapses the selection;
         // cursor lands at byte 29 (the position the secondary
         // SelectDown operations had at t=before-DuplicateLine).

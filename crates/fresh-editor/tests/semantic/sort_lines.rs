@@ -7,7 +7,9 @@
 //! the theorem version is dramatically shorter — it tests the
 //! transformation, not the palette UX.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
 
@@ -29,7 +31,7 @@ fn theorem_sort_lines_basic_alphabetical() {
         expected_primary: CursorExpect::at(19),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -46,7 +48,7 @@ fn theorem_sort_lines_already_sorted_is_idempotent() {
         expected_primary: CursorExpect::range(0, 19),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("apple\nbanana\ncherry".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 

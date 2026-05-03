@@ -43,11 +43,7 @@ fn migrated_redo_after_undo_reapplies_change() {
     assert_buffer_scenario(BufferScenario {
         description: "InsertChar then Undo then Redo lands at the post-insert state".into(),
         initial_text: String::new(),
-        actions: vec![
-            Action::InsertChar('x'),
-            Action::Undo,
-            Action::Redo,
-        ],
+        actions: vec![Action::InsertChar('x'), Action::Undo, Action::Redo],
         expected_text: "x".into(),
         // Redo replays both the insert *and* the cursor-advance
         // event, so we end at position 1 after one InsertChar('x').

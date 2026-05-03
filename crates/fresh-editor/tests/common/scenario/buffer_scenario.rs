@@ -19,9 +19,7 @@ use fresh::test_api::{Action, Caret};
 /// Wrapper around the test-API `Caret` so test code can spell
 /// expectations as `CursorExpect::at(5)` and `CursorExpect::range(0, 5)`
 /// instead of building a `Caret` with `Some` / `None`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CursorExpect {
     pub position: usize,
     pub anchor: Option<usize>,
@@ -73,9 +71,7 @@ impl Default for TerminalSize {
 /// turns all three OFF "for simpler testing"; scenarios whose
 /// subject *is* the auto-* behavior set [`BehaviorFlags::production`]
 /// in the scenario value.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BehaviorFlags {
     pub auto_close: bool,
     pub auto_indent: bool,

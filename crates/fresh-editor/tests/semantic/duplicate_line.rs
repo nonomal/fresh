@@ -8,7 +8,9 @@
 //!
 //! Issue #591: Duplicate line or selected lines.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
 
@@ -28,7 +30,7 @@ fn theorem_duplicate_line_basic() {
         expected_primary: CursorExpect::at(12),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -45,7 +47,7 @@ fn theorem_duplicate_line_with_following_lines() {
         expected_primary: CursorExpect::at(6),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -59,7 +61,8 @@ fn theorem_duplicate_selected_lines_duplicates_each_selected_line() {
     // (position 29 = byte index of the second occurrence of "line two"),
     // and the selection is cleared.
     assert_buffer_scenario(BufferScenario {
-        description: "DuplicateLine over a multi-line selection duplicates the selected block".into(),
+        description: "DuplicateLine over a multi-line selection duplicates the selected block"
+            .into(),
         initial_text: "line one\nline two\nline three\nline four".into(),
         // Move to start of line 2, then select two lines (down twice with shift).
         actions: vec![
@@ -73,7 +76,7 @@ fn theorem_duplicate_selected_lines_duplicates_each_selected_line() {
         expected_primary: CursorExpect::at(29),
         expected_extra_cursors: vec![],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -94,7 +97,7 @@ fn theorem_duplicate_line_then_typing_inserts_into_duplicate() {
         expected_primary: CursorExpect::at(7),
         expected_extra_cursors: vec![],
         expected_selection_text: None,
-            ..Default::default()
+        ..Default::default()
     });
 }
 

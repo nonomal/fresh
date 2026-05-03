@@ -2,9 +2,7 @@
 
 use crate::common::scenario::context::{NamedBuffer, WorkspaceContext};
 use crate::common::scenario::observable::WorkspaceState;
-use crate::common::scenario::workspace_scenario::{
-    assert_workspace_scenario, WorkspaceScenario,
-};
+use crate::common::scenario::workspace_scenario::{assert_workspace_scenario, WorkspaceScenario};
 
 #[test]
 fn migrated_zero_initial_buffers_yields_empty_workspace_runner_error() {
@@ -18,7 +16,10 @@ fn migrated_zero_initial_buffers_yields_empty_workspace_runner_error() {
         events: vec![],
         expected: WorkspaceState::default(),
     });
-    assert!(result.is_err(), "empty workspace must error, got {result:?}");
+    assert!(
+        result.is_err(),
+        "empty workspace must error, got {result:?}"
+    );
 }
 
 #[test]

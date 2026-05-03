@@ -46,9 +46,7 @@ pub fn check_workspace_scenario(s: WorkspaceScenario) -> Result<(), ScenarioFail
                 other => {
                     return Err(ScenarioFailure::InputProjectionFailed {
                         description: s.description,
-                        reason: format!(
-                            "WorkspaceScenario phase: {other:?} not yet routable"
-                        ),
+                        reason: format!("WorkspaceScenario phase: {other:?} not yet routable"),
                     });
                 }
             }

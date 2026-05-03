@@ -416,16 +416,19 @@ impl EditorTestApi for crate::app::Editor {
     }
 
     fn dispatch_mouse_click(&mut self, col: u16, row: u16) -> bool {
-        use crossterm::event::{
-            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-        };
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let down = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: col,
             row,
             modifiers: KeyModifiers::NONE,
         };
-        let _ = self.handle_mouse(down);
+        // Discard the down result; we only act on the up — but
+        // explicitly use the value so clippy's
+        // `let_underscore_must_use` is satisfied.
+        if let Err(e) = self.handle_mouse(down) {
+            tracing::trace!("mouse down errored in test dispatch: {e}");
+        }
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
             column: col,

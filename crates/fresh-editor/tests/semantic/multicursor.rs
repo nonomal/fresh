@@ -12,7 +12,9 @@
 //! `Action::AddCursorBelow`, which is the keybinding-independent name
 //! for the same effect.
 
-use crate::common::scenario::buffer_scenario::{assert_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    assert_buffer_scenario, BufferScenario, CursorExpect,
+};
 use crate::common::scenario::trace_scenario::{assert_trace_scenario, TraceScenario};
 use fresh::test_api::Action;
 
@@ -44,7 +46,7 @@ fn theorem_multi_cursor_insertion_is_vectorized() {
         // Other two cursors live on lines 0 and 1.
         expected_extra_cursors: vec![CursorExpect::at(3), CursorExpect::at(10)],
         expected_selection_text: Some("".into()),
-            ..Default::default()
+        ..Default::default()
     });
 }
 
@@ -60,7 +62,8 @@ fn theorem_multi_cursor_undo_is_atomic() {
     // atomic per keystroke".
     assert_trace_scenario(TraceScenario {
         description: "3 cursors × InsertChar(x), (y), (z) = 3 undo units, \
-             not 9 — the vectorization is transparent to history".into(),
+             not 9 — the vectorization is transparent to history"
+            .into(),
         initial_text: "aaa\nbbb\nccc\nddd".into(),
         actions: vec![
             Action::AddCursorBelow,

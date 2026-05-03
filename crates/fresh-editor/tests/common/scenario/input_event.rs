@@ -50,7 +50,10 @@ pub enum InputEvent {
     LspMessage(LspIncoming),
 
     // ── Persistence scenarios (Phase 6) ───────────────────────────
-    FsExternalEdit { path: PathBuf, content: String },
+    FsExternalEdit {
+        path: PathBuf,
+        content: String,
+    },
 
     // ── Async / settle ────────────────────────────────────────────
     /// Wait for a *semantic* condition (popup appears, LSP

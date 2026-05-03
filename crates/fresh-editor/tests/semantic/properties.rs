@@ -16,7 +16,9 @@
 //! `tests/property_theorem.proptest-regressions` and replayed on
 //! subsequent runs (proptest's standard regression-tracking).
 
-use crate::common::scenario::buffer_scenario::{check_buffer_scenario, BufferScenario, CursorExpect};
+use crate::common::scenario::buffer_scenario::{
+    check_buffer_scenario, BufferScenario, CursorExpect,
+};
 use crate::common::scenario::failure::ScenarioFailure;
 use crate::common::scenario::property::{
     evaluate_actions, initial_text_strategy, insert_only_action_strategy, safe_action_strategy,
@@ -123,7 +125,7 @@ fn property_check_runner_drives_a_batch_without_panic() {
                 expected_primary: CursorExpect::at(0),
                 expected_extra_cursors: vec![],
                 expected_selection_text: None,
-            ..Default::default()
+                ..Default::default()
             },
             true,
         ),
@@ -136,7 +138,7 @@ fn property_check_runner_drives_a_batch_without_panic() {
                 expected_primary: CursorExpect::at(0),
                 expected_extra_cursors: vec![],
                 expected_selection_text: None,
-            ..Default::default()
+                ..Default::default()
             },
             false,
         ),
@@ -149,7 +151,7 @@ fn property_check_runner_drives_a_batch_without_panic() {
                 expected_primary: CursorExpect::at(3),
                 expected_extra_cursors: vec![],
                 expected_selection_text: None,
-            ..Default::default()
+                ..Default::default()
             },
             true,
         ),

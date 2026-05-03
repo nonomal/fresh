@@ -133,10 +133,7 @@ fn migrated_select_line_last_no_trailing_newline_when_absent() {
     assert_buffer_scenario(BufferScenario {
         description: "SelectLine on last line without trailing newline picks just the text".into(),
         initial_text: "alpha\nbravo".into(),
-        actions: vec![
-            Action::MoveDown,
-            Action::SelectLine,
-        ],
+        actions: vec![Action::MoveDown, Action::SelectLine],
         expected_text: "alpha\nbravo".into(),
         expected_primary: CursorExpect::range(6, 11),
         expected_selection_text: Some("bravo".into()),

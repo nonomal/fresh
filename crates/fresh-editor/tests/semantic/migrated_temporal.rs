@@ -16,9 +16,7 @@ use crate::common::harness::EditorTestHarness;
 use crate::common::scenario::input_event::InputEvent;
 use crate::common::scenario::observable::Observable;
 use crate::common::scenario::render_snapshot::RenderSnapshot;
-use crate::common::scenario::temporal_scenario::{
-    check_temporal_scenario, TemporalScenario,
-};
+use crate::common::scenario::temporal_scenario::{check_temporal_scenario, TemporalScenario};
 use std::time::Duration;
 
 #[test]
@@ -39,7 +37,10 @@ fn temporal_one_tick_yields_one_frame() {
     use crate::common::scenario::failure::ScenarioFailure;
     match result {
         Err(ScenarioFailure::SnapshotFieldMismatch { field, .. }) => {
-            assert!(field.starts_with("frame["), "expected frame mismatch, got {field}");
+            assert!(
+                field.starts_with("frame["),
+                "expected frame mismatch, got {field}"
+            );
         }
         Err(other) => panic!("unexpected error variant: {other:?}"),
         Ok(()) => {} // also fine — defaults happened to match

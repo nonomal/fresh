@@ -33,11 +33,16 @@ pub enum PromptType {
     QueryReplace { search: String },
     /// Query replace confirmation prompt (y/n/!/q for each match)
     QueryReplaceConfirm,
-    /// Execute a command by name (M-x)
-    Command,
     /// Quick Open - unified prompt with prefix-based provider routing
     /// Supports file finding (default), commands (>), buffers (#), goto line (:)
     QuickOpen,
+    /// Live Grep — project-wide search rendered as a centred floating
+    /// overlay (issue #1796). Unlike `Plugin { custom_type }`, this
+    /// variant gets first-class layout handling: the renderer draws the
+    /// prompt and its suggestion list inside a `PopupPosition::CenteredOverlay`
+    /// frame instead of on the bottom minibuffer row, leaving the
+    /// underlying split tree untouched.
+    LiveGrep,
     /// Go to a specific line number
     GotoLine,
     /// Go to a specific byte offset (large file without line index scan)
@@ -67,8 +72,8 @@ pub enum PromptType {
     SetBookmark,
     /// Jump to a bookmark - prompts for register (0-9)
     JumpToBookmark,
-    /// Set compose width (empty clears to viewport)
-    SetComposeWidth,
+    /// Set page width (empty clears to viewport)
+    SetPageWidth,
     /// Add a vertical ruler at a column position
     AddRuler,
     /// Remove a vertical ruler (select from list)
@@ -83,6 +88,8 @@ pub enum PromptType {
     SetLanguage,
     /// Stop a running LSP server (select from list)
     StopLspServer,
+    /// Restart LSP server(s) (select from list)
+    RestartLspServer,
     /// Select a theme (select from list)
     /// Stores the original theme name for restoration on cancel
     SelectTheme { original_theme: String },
@@ -104,6 +111,8 @@ pub enum PromptType {
     },
     /// Confirm overwriting an existing file during SaveAs
     ConfirmOverwriteFile { path: std::path::PathBuf },
+    /// Confirm creating parent directories for a save target
+    ConfirmCreateDirectory { path: std::path::PathBuf },
     /// Confirm closing a modified buffer (save/discard/cancel)
     /// Stores buffer_id to close after user confirms
     ConfirmCloseBuffer {
@@ -125,6 +134,29 @@ pub enum PromptType {
         path: std::path::PathBuf,
         is_dir: bool,
     },
+    /// Confirm overwriting, renaming, or cancelling a paste conflict
+    ConfirmPasteConflict {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        is_cut: bool,
+    },
+    /// Rename destination when pasting (user chose 'r' in conflict prompt)
+    FileExplorerPasteRename {
+        src: std::path::PathBuf,
+        dst_dir: std::path::PathBuf,
+        is_cut: bool,
+    },
+    /// Confirm deleting multiple items from the file explorer
+    ConfirmMultiDelete { paths: Vec<std::path::PathBuf> },
+    /// Per-conflict prompt for multi-file paste.
+    /// `pending[0]` is the conflict currently being shown.
+    /// User choices: (o)verwrite this, (O) all, (s)kip this, (S) all, (c)ancel.
+    ConfirmMultiPasteConflict {
+        safe: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        confirmed: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        pending: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        is_cut: bool,
+    },
     /// Confirm loading a large file with non-resynchronizable encoding
     /// (like GB18030, GBK, Shift-JIS, EUC-KR) that requires full file loading
     ConfirmLargeFileEncoding { path: std::path::PathBuf },
@@ -137,6 +169,18 @@ pub enum PromptType {
     /// Async prompt from plugin (for editor.prompt() API)
     /// The result is returned via callback resolution
     AsyncPrompt,
+}
+
+impl PromptType {
+    /// Whether a mouse click on a suggestion should immediately confirm.
+    ///
+    /// Defaults to `true` (matches command palette / file finder UX). Returns
+    /// `false` for prompts that pick from a small fixed list and trigger an
+    /// expensive or destructive action — there, click should preview the
+    /// selection and Enter should commit (issue #1660).
+    pub fn click_confirms(&self) -> bool {
+        !matches!(self, PromptType::ReloadWithEncoding)
+    }
 }
 
 /// Prompt state for the minibuffer
@@ -156,6 +200,11 @@ pub struct Prompt {
     pub original_suggestions: Option<Vec<Suggestion>>,
     /// Currently selected suggestion index
     pub selected_suggestion: Option<usize>,
+    /// Index of the first suggestion shown in the popup viewport.
+    /// Updated minimally by the renderer to keep `selected_suggestion`
+    /// visible — selection changes inside the viewport never scroll
+    /// (issue #1660).
+    pub scroll_offset: usize,
     /// Selection anchor position (for Shift+Arrow selection)
     /// When Some(pos), there's a selection from anchor to cursor_pos
     pub selection_anchor: Option<usize>,
@@ -165,7 +214,25 @@ pub struct Prompt {
     /// When true, navigating suggestions updates the input text (selected) to match.
     /// Used by plugin prompts that want picker-like behavior (e.g. compose width).
     pub sync_input_on_navigate: bool,
+    /// When true, the renderer draws the prompt inside a centred
+    /// floating overlay (PopupPosition::CenteredOverlay) instead of
+    /// the bottom minibuffer row. Set by the live-grep plugin via the
+    /// `floatingOverlay` flag on `editor.startPrompt(...)`. The flag
+    /// is rendering-only — confirm/cancel/hooks behave identically to
+    /// a non-overlay prompt of the same `prompt_type`.
+    pub overlay: bool,
+    /// Title shown in the overlay's frame header (e.g.
+    /// `" Live Grep · ripgrep "`). `None` falls back to a
+    /// `prompt_type`-specific default. Plugin-controlled via
+    /// `editor.setPromptTitle(...)`. Has no effect on non-overlay
+    /// prompts.
+    pub title: Option<String>,
 }
+
+/// Maximum number of suggestion rows shown at once. Mirrors the cap used by
+/// `SuggestionsRenderer` so `Prompt::ensure_selected_visible` can compute the
+/// viewport size without inspecting render state.
+pub const MAX_VISIBLE_SUGGESTIONS: usize = 10;
 
 impl Prompt {
     /// Create a new prompt
@@ -178,9 +245,12 @@ impl Prompt {
             suggestions: Vec::new(),
             original_suggestions: None,
             selected_suggestion: None,
+            scroll_offset: 0,
             selection_anchor: None,
             suggestions_set_for_input: None,
             sync_input_on_navigate: false,
+            overlay: false,
+            title: None,
         }
     }
 
@@ -206,10 +276,25 @@ impl Prompt {
             original_suggestions: Some(suggestions.clone()),
             suggestions,
             selected_suggestion,
+            scroll_offset: 0,
             selection_anchor: None,
             suggestions_set_for_input: None,
             sync_input_on_navigate: false,
+            overlay: false,
+            title: None,
         }
+    }
+
+    /// Create a new prompt with initial text, cursor at end, ready for
+    /// incremental editing (no selection). Use for rename-style flows where
+    /// the user typically keeps most of the prefilled name and only
+    /// appends or tweaks a suffix.
+    pub fn with_initial_text_for_edit(
+        message: String,
+        prompt_type: PromptType,
+        initial_text: String,
+    ) -> Self {
+        Self::with_initial_text_inner(message, prompt_type, initial_text, false)
     }
 
     /// Create a new prompt with initial text (selected so typing replaces it)
@@ -218,12 +303,20 @@ impl Prompt {
         prompt_type: PromptType,
         initial_text: String,
     ) -> Self {
+        Self::with_initial_text_inner(message, prompt_type, initial_text, true)
+    }
+
+    fn with_initial_text_inner(
+        message: String,
+        prompt_type: PromptType,
+        initial_text: String,
+        select_all: bool,
+    ) -> Self {
         let cursor_pos = initial_text.len();
-        // Select all initial text so typing immediately replaces it
-        let selection_anchor = if initial_text.is_empty() {
-            None
-        } else {
+        let selection_anchor = if select_all && !initial_text.is_empty() {
             Some(0)
+        } else {
+            None
         };
         Self {
             message,
@@ -233,9 +326,12 @@ impl Prompt {
             suggestions: Vec::new(),
             original_suggestions: None,
             selected_suggestion: None,
+            scroll_offset: 0,
             selection_anchor,
             suggestions_set_for_input: None,
             sync_input_on_navigate: false,
+            overlay: false,
+            title: None,
         }
     }
 
@@ -408,6 +504,49 @@ impl Prompt {
         } else {
             Some(0)
         };
+        self.scroll_offset = 0;
+    }
+
+    /// Adjust `scroll_offset` so that `selected_suggestion` is inside the
+    /// viewport, scrolling the minimum amount required. A selection that's
+    /// already on-screen leaves the viewport untouched — this is what stops
+    /// a click on a near-bottom item from snapping the list upward and
+    /// recentering under the cursor (issue #1660).
+    ///
+    /// Uses the bottom-popup default cap (`MAX_VISIBLE_SUGGESTIONS`).
+    /// Callers rendering into a different-sized area (e.g. the
+    /// floating Live Grep overlay, where the suggestion list can be
+    /// 30+ rows tall) should call
+    /// [`ensure_selected_visible_within`] with the actual height
+    /// instead — otherwise the scroll moves prematurely once the
+    /// selection passes the 10th row even though the rest of the
+    /// list is still visible on-screen.
+    pub fn ensure_selected_visible(&mut self) {
+        self.ensure_selected_visible_within(MAX_VISIBLE_SUGGESTIONS);
+    }
+
+    /// Like [`ensure_selected_visible`] but with an explicit
+    /// `visible_count` argument, so renderers in differently-sized
+    /// frames don't all share the bottom-popup `MAX_VISIBLE_SUGGESTIONS`
+    /// assumption.
+    pub fn ensure_selected_visible_within(&mut self, visible_count: usize) {
+        let total = self.suggestions.len();
+        let visible = total.min(visible_count.max(1));
+        let max_offset = total.saturating_sub(visible);
+        if visible == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        if let Some(selected) = self.selected_suggestion {
+            if selected < self.scroll_offset {
+                self.scroll_offset = selected;
+            } else if selected >= self.scroll_offset + visible {
+                self.scroll_offset = selected + 1 - visible;
+            }
+        }
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
     }
 
     // ========================================================================
@@ -535,7 +674,7 @@ impl Prompt {
     /// # Example
     /// ```
     /// # use fresh::prompt::{Prompt, PromptType};
-    /// let mut prompt = Prompt::new("Command: ".to_string(), PromptType::Command);
+    /// let mut prompt = Prompt::new("Command: ".to_string(), PromptType::QuickOpen);
     /// prompt.input = "save".to_string();
     /// prompt.cursor_pos = 4;
     /// prompt.insert_str(" file");
@@ -958,7 +1097,7 @@ mod tests {
     // Tests for selection functionality
     #[test]
     fn test_selection_with_shift_arrows() {
-        let mut prompt = Prompt::new("Command: ".to_string(), PromptType::Command);
+        let mut prompt = Prompt::new("Command: ".to_string(), PromptType::QuickOpen);
         prompt.input = "hello world".to_string();
         prompt.cursor_pos = 5; // After "hello"
 
@@ -999,7 +1138,7 @@ mod tests {
 
     #[test]
     fn test_selection_with_home_end() {
-        let mut prompt = Prompt::new("Prompt: ".to_string(), PromptType::Command);
+        let mut prompt = Prompt::new("Prompt: ".to_string(), PromptType::QuickOpen);
         prompt.input = "select this text".to_string();
         prompt.cursor_pos = 7; // After "select "
 

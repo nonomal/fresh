@@ -7,7 +7,7 @@ use lsp_types::FoldingRange;
 
 fn set_fold_range(harness: &mut EditorTestHarness, start_line: usize, end_line: usize) {
     let state = harness.editor_mut().active_state_mut();
-    state.folding_ranges = vec![FoldingRange {
+    let ranges = vec![FoldingRange {
         start_line: start_line as u32,
         end_line: end_line as u32,
         start_character: None,
@@ -15,6 +15,9 @@ fn set_fold_range(harness: &mut EditorTestHarness, start_line: usize, end_line: 
         kind: None,
         collapsed_text: None,
     }];
+    state
+        .folding_ranges
+        .set_from_lsp(&state.buffer, &mut state.marker_list, ranges);
 }
 
 fn set_top_line(harness: &mut EditorTestHarness, line: usize) {
@@ -464,10 +467,10 @@ fn test_folded_gutter_line_numbers_match_content_during_scroll() -> anyhow::Resu
 
     // 1. Spawn fake LSP that advertises foldingRangeProvider and returns
     //    a single range covering lines 10..30.
-    let _fake_server = FakeLspServer::spawn_with_folding_ranges()?;
-
     // 2. Create a 60-line file where every line is "line N\n".
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_folding_ranges(temp_dir.path())?;
     let content: String = (0..60).map(|i| format!("line {i}\n")).collect();
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, &content)?;
@@ -480,8 +483,8 @@ fn test_folded_gutter_line_numbers_match_content_during_scroll() -> anyhow::Resu
     config.editor.enable_semantic_tokens_full = true;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::folding_ranges_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::folding_ranges_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -491,7 +494,11 @@ fn test_folded_gutter_line_numbers_match_content_during_scroll() -> anyhow::Resu
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -565,11 +572,10 @@ fn test_unfold_works_after_folding_ranges_cleared() {
     harness.assert_screen_not_contains("line 9");
 
     // Simulate LSP disconnect: clear folding_ranges.
-    harness
-        .editor_mut()
-        .active_state_mut()
-        .folding_ranges
-        .clear();
+    {
+        let state = harness.editor_mut().active_state_mut();
+        state.folding_ranges.clear(&mut state.marker_list);
+    }
 
     // Attempt to unfold — the fold markers still exist in the FoldManager.
     let buffer_id = harness.editor().active_buffer();

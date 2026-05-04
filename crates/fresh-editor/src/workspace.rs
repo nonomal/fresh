@@ -83,6 +83,11 @@ pub struct Workspace {
     #[serde(default)]
     pub external_files: Vec<PathBuf>,
 
+    /// Files that were read-only at save time; re-applied on restore.
+    /// Relative to `working_dir` when possible, otherwise absolute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_files: Vec<PathBuf>,
+
     /// Unnamed buffers that should be restored from recovery files
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unnamed_buffers: Vec<UnnamedBufferRef>,
@@ -119,6 +124,9 @@ pub enum SerializedSplitNode {
         /// Recovery ID for unnamed buffers (when file_path is None)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unnamed_recovery_id: Option<String>,
+        /// Role tag (e.g. UtilityDock). Mirrors `SplitNode::Leaf::role`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<crate::view::split::SplitRole>,
     },
     Terminal {
         terminal_index: usize,
@@ -126,6 +134,9 @@ pub enum SerializedSplitNode {
         /// Optional label set by plugins
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Role tag — terminals can also be the dock occupant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<crate::view::split::SplitRole>,
     },
     Split {
         direction: SerializedSplitDirection,
@@ -219,6 +230,16 @@ pub struct SerializedFoldRange {
     /// Optional placeholder text for the fold
     #[serde(default)]
     pub placeholder: Option<String>,
+    /// Text of the header line at save time. Used on restore to detect
+    /// whether the file was edited externally between sessions (issue #1568):
+    /// if the text at `header_line` no longer matches, we search nearby
+    /// lines for it and fall back to dropping the fold rather than
+    /// re-attaching it to unrelated content.
+    ///
+    /// `Option` for backward compatibility with older session files that
+    /// didn't record the text.
+    #[serde(default)]
+    pub header_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,7 +270,10 @@ pub struct SerializedScroll {
 pub enum SerializedViewMode {
     #[default]
     Source,
-    Compose,
+    /// Page view (document-style layout with centering and concealment).
+    /// Accepts "Compose" for backward compatibility with saved workspaces.
+    #[serde(alias = "Compose")]
+    PageView,
 }
 
 /// Config overrides that differ from base config
@@ -267,6 +291,11 @@ pub struct WorkspaceConfigOverrides {
     pub enable_inlay_hints: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse_enabled: Option<bool>,
+    /// Legacy: menu bar visibility was once stored as a per-workspace
+    /// override here. It is now a global preference (`editor.show_menu_bar`),
+    /// so this field is no longer written and is ignored on restore. Kept
+    /// only for serde compatibility with workspaces saved by older builds.
+    /// See issue #1156.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_bar_hidden: Option<bool>,
 }
@@ -274,8 +303,18 @@ pub struct WorkspaceConfigOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileExplorerState {
     pub visible: bool,
+    /// File explorer width. See [`crate::config::ExplorerWidth`] for
+    /// the accepted wire formats (percent string, column string, legacy
+    /// numeric forms). The `width_percent` alias preserves read
+    /// compatibility with workspace files written by earlier versions.
+    #[serde(
+        alias = "width_percent",
+        default = "crate::config::default_explorer_width_value"
+    )]
+    pub width: crate::config::ExplorerWidth,
+    /// File explorer side placement
     #[serde(default)]
-    pub width_percent: f32,
+    pub side: crate::config::FileExplorerSide,
     /// Expanded directories (relative paths)
     #[serde(default)]
     pub expanded_dirs: Vec<PathBuf>,
@@ -294,7 +333,8 @@ impl Default for FileExplorerState {
     fn default() -> Self {
         Self {
             visible: false,
-            width_percent: 0.3,
+            width: crate::config::default_explorer_width_value(),
+            side: crate::config::FileExplorerSide::Left,
             expanded_dirs: Vec::new(),
             scroll_offset: 0,
             show_hidden: false,
@@ -865,6 +905,7 @@ impl Workspace {
                 split_id: 0,
                 label: None,
                 unnamed_recovery_id: None,
+                role: None,
             },
             active_split_id: 0,
             split_states: HashMap::new(),
@@ -875,6 +916,7 @@ impl Workspace {
             bookmarks: HashMap::new(),
             terminals: Vec::new(),
             external_files: Vec::new(),
+            read_only_files: Vec::new(),
             unnamed_buffers: Vec::new(),
             plugin_global_state: HashMap::new(),
             saved_at: SystemTime::now()
@@ -987,12 +1029,14 @@ mod tests {
                 split_id: 1,
                 label: None,
                 unnamed_recovery_id: None,
+                role: None,
             }),
             second: Box::new(SerializedSplitNode::Leaf {
                 file_path: Some(PathBuf::from("src/lib.rs")),
                 split_id: 2,
                 label: None,
                 unnamed_recovery_id: None,
+                role: None,
             }),
             ratio: 0.5,
             split_id: 0,
@@ -1111,12 +1155,14 @@ mod tests {
                 split_id: 1,
                 label: None,
                 unnamed_recovery_id: None,
+                role: None,
             }),
             second: Box::new(SerializedSplitNode::Leaf {
                 file_path: Some(PathBuf::from("Cargo.toml")),
                 split_id: 2,
                 label: None,
                 unnamed_recovery_id: None,
+                role: None,
             }),
             ratio: 0.6,
             split_id: 0,
@@ -1246,10 +1292,11 @@ mod tests {
     }
 
     #[test]
-    fn test_file_explorer_state() {
+    fn test_file_explorer_state_percent_round_trip() {
         let state = FileExplorerState {
             visible: true,
-            width_percent: 0.25,
+            width: crate::config::ExplorerWidth::Percent(25),
+            side: crate::config::FileExplorerSide::Left,
             expanded_dirs: vec![
                 PathBuf::from("src"),
                 PathBuf::from("src/app"),
@@ -1264,10 +1311,44 @@ mod tests {
         let restored: FileExplorerState = serde_json::from_str(&json).unwrap();
 
         assert!(restored.visible);
-        assert_eq!(restored.width_percent, 0.25);
+        assert_eq!(restored.width, crate::config::ExplorerWidth::Percent(25));
         assert_eq!(restored.expanded_dirs.len(), 3);
         assert_eq!(restored.scroll_offset, 5);
         assert!(restored.show_hidden);
         assert!(!restored.show_gitignored);
+    }
+
+    #[test]
+    fn test_file_explorer_state_columns_round_trip() {
+        let state = FileExplorerState {
+            visible: true,
+            width: crate::config::ExplorerWidth::Columns(42),
+            side: crate::config::FileExplorerSide::Left,
+            expanded_dirs: vec![],
+            scroll_offset: 0,
+            show_hidden: false,
+            show_gitignored: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: FileExplorerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.width, crate::config::ExplorerWidth::Columns(42));
+    }
+
+    /// Legacy workspace files named the field `width_percent` and
+    /// stored the value as a float fraction in `0.0..=1.0`. Both must
+    /// still load (via serde `alias` and the `ExplorerWidth`
+    /// deserializer).
+    #[test]
+    fn test_file_explorer_state_legacy_width_percent_alias() {
+        let json = r#"{
+            "visible": true,
+            "width_percent": 0.3,
+            "expanded_dirs": [],
+            "scroll_offset": 0,
+            "show_hidden": false,
+            "show_gitignored": false
+        }"#;
+        let restored: FileExplorerState = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.width, crate::config::ExplorerWidth::Percent(30));
     }
 }

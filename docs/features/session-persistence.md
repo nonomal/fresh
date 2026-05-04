@@ -2,7 +2,23 @@
 
 > **Warning**: This feature is experimental. The API and behavior may change.
 
+> **Palette:** `Detach`. **CLI:** `fresh -a`, `fresh --cmd session list|new|kill`, `fresh --restore`, `fresh --no-restore`. **Config:** `hot_exit`, `editor.restore_previous_session`.
+
 Detach from Fresh and reattach later, similar to tmux. Your editor state persists even after closing the terminal.
+
+See also: [Remote Editing (SSH)](./ssh.md) for pairing session persistence with remote hosts, and [Devcontainers](./devcontainer.md) for routing through a container.
+
+## Hot Exit
+
+All buffers — including unnamed scratch buffers — persist across sessions automatically. When you quit Fresh, unsaved changes are preserved and restored on next startup. Configurable via the `hot_exit` setting (default: on).
+
+## Workspace Storage
+
+Session state (open files, split layout, plugin state) is restored on startup by default. Control this with:
+
+- **`editor.restore_previous_session`** (config, default `true`) — when set to `false`, Fresh skips restoring tabs and splits but still brings back unsaved "hot-exit" content (dirty files and unnamed buffers).
+- **`--no-restore`** (CLI) — one-shot skip equivalent to the config flag being off.
+- **`--restore`** (CLI) — force a full workspace restore even when the config flag is off. Mutually exclusive with `--no-restore`.
 
 ## Quick Start
 

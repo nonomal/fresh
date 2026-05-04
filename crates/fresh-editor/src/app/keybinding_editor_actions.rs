@@ -12,12 +12,27 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 impl Editor {
     /// Open the keybinding editor modal
     pub fn open_keybinding_editor(&mut self) {
+        use crate::config::MenuExt;
         let config_path = self.dir_context.config_path().display().to_string();
+        let cmd_registry = self.command_registry.read().unwrap();
+        let keybindings = self.keybindings.read().unwrap();
+        // Enumerate top-level menu ids (File, Edit, …, plus plugin menus) so
+        // the action dropdown can offer `menu_open:<name>` variants instead of
+        // one un-parseable bare `menu_open` row.
+        let menu_names: Vec<String> = self
+            .menus
+            .menus
+            .iter()
+            .chain(self.menu_state.plugin_menus.iter())
+            .map(|m| m.match_id().to_string())
+            .collect();
         self.keybinding_editor = Some(KeybindingEditor::new(
             &self.config,
-            &self.keybindings,
+            &keybindings,
             &self.mode_registry,
+            &cmd_registry,
             config_path,
+            &menu_names,
         ));
     }
 
@@ -61,7 +76,7 @@ impl Editor {
 
         // Remove deleted custom bindings from config
         for remove in editor.get_pending_removes() {
-            self.config.keybindings.retain(|kb| {
+            self.config_mut().keybindings.retain(|kb| {
                 !(kb.action == remove.action
                     && kb.key == remove.key
                     && kb.modifiers == remove.modifiers
@@ -72,11 +87,12 @@ impl Editor {
         // Add new custom bindings
         let new_bindings = editor.get_custom_bindings();
         for binding in new_bindings {
-            self.config.keybindings.push(binding);
+            self.config_mut().keybindings.push(binding);
         }
 
         // Rebuild the keybinding resolver
-        self.keybindings = crate::input::keybindings::KeybindingResolver::new(&self.config);
+        *self.keybindings.write().unwrap() =
+            crate::input::keybindings::KeybindingResolver::new(&self.config);
 
         // Save to config file via the pending changes mechanism
         let config_value = match serde_json::to_value(&self.config.keybindings) {
@@ -138,15 +154,32 @@ impl Editor {
 
         match mouse_event.kind {
             MouseEventKind::ScrollUp => {
-                // Scroll the table
+                // Scroll the viewport without touching selection. Coupling
+                // wheel to selection meant any prior scrollbar drag snapped
+                // back via `ensure_visible` on the next wheel tick. Three
+                // rows per tick matches the settings modal.
                 if editor.edit_dialog.is_none() && !editor.showing_confirm_dialog {
-                    editor.select_prev();
+                    editor.scroll.scroll_by(-3);
                 }
             }
             MouseEventKind::ScrollDown => {
                 if editor.edit_dialog.is_none() && !editor.showing_confirm_dialog {
-                    editor.select_next();
+                    editor.scroll.scroll_by(3);
                 }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Continue dragging the scrollbar thumb (no selection or
+                // dialog disambiguation needed: the press that started the
+                // drag already gated those).
+                if let Some(sb) = editor.layout.table_scrollbar {
+                    let sb_state = scrollbar_state_for(&editor);
+                    if let Some(new_offset) = editor.scrollbar_mouse.drag(sb_state, sb, row) {
+                        editor.scroll.offset = new_offset as u16;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                editor.scrollbar_mouse.release();
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Handle confirm dialog clicks first
@@ -224,6 +257,20 @@ impl Editor {
                     }
                 }
 
+                // Press on the scrollbar — delegate to the shared widget
+                // so press-on-thumb (no jump), press-on-track (recentre),
+                // and the follow-up drag all run through the same well-
+                // tested math. Checked before the row-click branch because
+                // the scrollbar overlaps the rightmost column of `table_area`.
+                if let Some(sb) = layout.table_scrollbar {
+                    let sb_state = scrollbar_state_for(&editor);
+                    if let Some(new_offset) = editor.scrollbar_mouse.press(sb_state, sb, col, row) {
+                        editor.scroll.offset = new_offset as u16;
+                        self.keybinding_editor = Some(editor);
+                        return Ok(true);
+                    }
+                }
+
                 // Click on table row to select (or toggle section header)
                 let table_area = layout.table_area;
                 let first_row_y = layout.table_first_row_y;
@@ -244,4 +291,14 @@ impl Editor {
         self.keybinding_editor = Some(editor);
         Ok(true)
     }
+}
+
+/// Snapshot the keybinding editor's scroll state as a `ScrollbarState`,
+/// so we can call into the shared scrollbar widget for click/drag math.
+fn scrollbar_state_for(editor: &KeybindingEditor) -> crate::view::ui::scrollbar::ScrollbarState {
+    crate::view::ui::scrollbar::ScrollbarState::new(
+        editor.scroll.content_height as usize,
+        editor.scroll.viewport as usize,
+        editor.scroll.offset as usize,
+    )
 }

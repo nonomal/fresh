@@ -40,8 +40,58 @@ use crate::workspace::{
     WorkspaceHistories, WORKSPACE_VERSION,
 };
 
-use super::types::Bookmark;
+use super::bookmarks::{Bookmark, BookmarkState};
 use super::Editor;
+
+/// Resolve a saved fold's header_line against the current buffer, using
+/// `header_text` to detect drift from external edits (issue #1568).
+///
+/// - If no `header_text` is available (older session files), trust the saved
+///   line number.
+/// - If the text at the saved line still matches, use that line.
+/// - Otherwise, search a small window above and below the saved line for the
+///   same text (trimmed) — lines may have shifted by a few either way after a
+///   local external edit.
+/// - If still not found, return `None` so the caller drops the fold rather
+///   than re-attaching it to unrelated content.
+fn resolve_fold_header_line(
+    buffer: &crate::model::buffer::Buffer,
+    saved_line: usize,
+    header_text: Option<&str>,
+) -> Option<usize> {
+    let Some(expected) = header_text else {
+        // Backward compatibility: no recorded text, trust the line number.
+        return Some(saved_line);
+    };
+    let expected_trimmed = expected.trim();
+    let line_matches = |line: usize| -> bool {
+        buffer
+            .get_line(line)
+            .map(|bytes| {
+                let text = String::from_utf8_lossy(&bytes);
+                text.trim_end_matches('\n').trim_end_matches('\r').trim() == expected_trimmed
+            })
+            .unwrap_or(false)
+    };
+    if line_matches(saved_line) {
+        return Some(saved_line);
+    }
+    // Search nearby (expanding outward) for the displaced header.
+    const SEARCH_WINDOW: usize = 32;
+    for delta in 1..=SEARCH_WINDOW {
+        let above = saved_line.checked_sub(delta);
+        if let Some(l) = above {
+            if line_matches(l) {
+                return Some(l);
+            }
+        }
+        let below = saved_line.saturating_add(delta);
+        if line_matches(below) {
+            return Some(below);
+        }
+    }
+    None
+}
 
 /// Workspace persistence state tracker
 ///
@@ -108,6 +158,15 @@ impl Editor {
         let mut seen = HashSet::new();
         for terminal_id in self.terminal_buffers.values().copied() {
             if seen.insert(terminal_id) {
+                // Ephemeral terminals (plugin-created tool UIs — rebuilds,
+                // exec shells, build output) do not belong in the persisted
+                // workspace. Skipping them here prevents their backing files
+                // from being serialized, which is what used to cause a newly
+                // spawned plugin terminal to come back with scrollback from
+                // the prior run.
+                if self.ephemeral_terminals.contains(&terminal_id) {
+                    continue;
+                }
                 let idx = terminals.len();
                 terminal_indices.insert(terminal_id, idx);
                 let handle = self.terminal_manager.get(terminal_id);
@@ -199,7 +258,8 @@ impl Editor {
             let expanded_dirs = get_expanded_dirs(explorer, &self.working_dir);
             FileExplorerState {
                 visible: self.file_explorer_visible,
-                width_percent: self.file_explorer_width_percent,
+                width: self.file_explorer_width,
+                side: self.file_explorer_side,
                 expanded_dirs,
                 scroll_offset: explorer.get_scroll_offset(),
                 show_hidden: explorer.ignore_patterns().show_hidden(),
@@ -208,7 +268,8 @@ impl Editor {
         } else {
             FileExplorerState {
                 visible: self.file_explorer_visible,
-                width_percent: self.file_explorer_width_percent,
+                width: self.file_explorer_width,
+                side: self.file_explorer_side,
                 expanded_dirs: Vec::new(),
                 scroll_offset: 0,
                 show_hidden: false,
@@ -216,7 +277,10 @@ impl Editor {
             }
         };
 
-        // Capture config overrides (only store deviations from defaults)
+        // Capture config overrides (only store deviations from defaults).
+        // `menu_bar_hidden` is intentionally left unset: menu bar visibility
+        // is a global preference (`editor.show_menu_bar`), not a per-workspace
+        // override. See issue #1156.
         let config_overrides = WorkspaceConfigOverrides {
             line_numbers: Some(self.config.editor.line_numbers),
             relative_line_numbers: Some(self.config.editor.relative_line_numbers),
@@ -224,7 +288,7 @@ impl Editor {
             syntax_highlighting: Some(self.config.editor.syntax_highlighting),
             enable_inlay_hints: Some(self.config.editor.enable_inlay_hints),
             mouse_enabled: Some(self.mouse_enabled),
-            menu_bar_hidden: Some(!self.menu_bar_visible),
+            menu_bar_hidden: None,
         };
 
         // Capture histories using the items() accessor from the prompt_histories HashMap
@@ -278,6 +342,22 @@ impl Editor {
             tracing::debug!("Captured {} external files", external_files.len());
         }
 
+        // Capture read-only file paths. Store relative when inside
+        // working_dir (matches how open_tabs paths are stored), otherwise
+        // absolute — mirrors external_files.
+        let read_only_files: Vec<PathBuf> = self
+            .buffer_metadata
+            .values()
+            .filter(|meta| meta.read_only)
+            .filter_map(|meta| meta.file_path().cloned())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| {
+                p.strip_prefix(&self.working_dir)
+                    .map(|rel| rel.to_path_buf())
+                    .unwrap_or(p)
+            })
+            .collect();
+
         // Capture unnamed buffer references (for hot_exit)
         let unnamed_buffers: Vec<UnnamedBufferRef> = if self.config.editor.hot_exit {
             self.buffer_metadata
@@ -325,6 +405,7 @@ impl Editor {
             bookmarks,
             terminals,
             external_files,
+            read_only_files,
             unnamed_buffers,
             plugin_global_state: self.plugin_global_state.clone(),
             saved_at: std::time::SystemTime::now()
@@ -442,7 +523,11 @@ impl Editor {
             if let Some(handle) = self.terminal_manager.get(terminal_id) {
                 if let Ok(state) = handle.state.lock() {
                     // Append visible screen to backing file
-                    if let Ok(mut file) = self.filesystem.open_file_for_append(&backing_path) {
+                    if let Ok(mut file) = self
+                        .authority
+                        .filesystem
+                        .open_file_for_append(&backing_path)
+                    {
                         let mut writer = BufWriter::new(&mut *file);
                         if let Err(e) = state.append_visible_screen(&mut writer) {
                             tracing::warn!(
@@ -520,6 +605,7 @@ impl Editor {
                     Ok(crate::services::recovery::RecoveryResult::Recovered {
                         content, ..
                     }) => {
+                        let mut mutated = false;
                         if let Some(state) = self.buffers.get_mut(&buffer_id) {
                             let current_len = state.buffer.total_bytes();
                             let text = String::from_utf8_lossy(&content).into_owned();
@@ -532,6 +618,12 @@ impl Editor {
                                 state.buffer.insert(0, &text);
                                 state.buffer.set_modified(true);
                                 state.buffer.set_recovery_pending(false);
+                                // Invalidate saved position so undo can't
+                                // incorrectly clear the modified flag
+                                if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                                    log.clear_saved_position();
+                                }
+                                mutated = true;
                                 recovered += 1;
                                 tracing::info!(
                                     "Restored unsaved changes for {:?} from hot exit recovery",
@@ -539,11 +631,15 @@ impl Editor {
                                 );
                             }
                         }
+                        if mutated {
+                            self.sync_lsp_after_recovery_replay(buffer_id);
+                        }
                     }
                     Ok(crate::services::recovery::RecoveryResult::RecoveredChunks {
                         chunks,
                         ..
                     }) => {
+                        let mut mutated = false;
                         if let Some(state) = self.buffers.get_mut(&buffer_id) {
                             for chunk in chunks.into_iter().rev() {
                                 let text = String::from_utf8_lossy(&chunk.content).into_owned();
@@ -556,11 +652,20 @@ impl Editor {
                             }
                             state.buffer.set_modified(true);
                             state.buffer.set_recovery_pending(false);
+                            // Invalidate saved position so undo can't
+                            // incorrectly clear the modified flag
+                            if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                                log.clear_saved_position();
+                            }
+                            mutated = true;
                             recovered += 1;
                             tracing::info!(
                                 "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
                                 file_path
                             );
+                        }
+                        if mutated {
+                            self.sync_lsp_after_recovery_replay(buffer_id);
                         }
                     }
                     Ok(crate::services::recovery::RecoveryResult::OriginalFileModified {
@@ -599,30 +704,8 @@ impl Editor {
             workspace.split_states.len()
         );
 
-        // 1. Apply config overrides
-        if let Some(line_numbers) = workspace.config_overrides.line_numbers {
-            self.config.editor.line_numbers = line_numbers;
-        }
-        if let Some(relative_line_numbers) = workspace.config_overrides.relative_line_numbers {
-            self.config.editor.relative_line_numbers = relative_line_numbers;
-        }
-        if let Some(line_wrap) = workspace.config_overrides.line_wrap {
-            self.config.editor.line_wrap = line_wrap;
-        }
-        if let Some(syntax_highlighting) = workspace.config_overrides.syntax_highlighting {
-            self.config.editor.syntax_highlighting = syntax_highlighting;
-        }
-        if let Some(enable_inlay_hints) = workspace.config_overrides.enable_inlay_hints {
-            self.config.editor.enable_inlay_hints = enable_inlay_hints;
-        }
-        if let Some(mouse_enabled) = workspace.config_overrides.mouse_enabled {
-            self.mouse_enabled = mouse_enabled;
-        }
-        if let Some(menu_bar_hidden) = workspace.config_overrides.menu_bar_hidden {
-            self.menu_bar_visible = !menu_bar_hidden;
-        }
+        self.restore_config_overrides(&workspace.config_overrides);
 
-        // 2. Restore plugin global state
         if !workspace.plugin_global_state.is_empty() {
             tracing::debug!(
                 "Restoring plugin global state for {} plugins",
@@ -631,299 +714,18 @@ impl Editor {
             self.plugin_global_state = workspace.plugin_global_state.clone();
         }
 
-        // 3. Restore search options
-        self.search_case_sensitive = workspace.search_options.case_sensitive;
-        self.search_whole_word = workspace.search_options.whole_word;
-        self.search_use_regex = workspace.search_options.use_regex;
-        self.search_confirm_each = workspace.search_options.confirm_each;
+        self.restore_search_options(&workspace.search_options);
+        self.restore_prompt_histories(&workspace.histories);
+        self.restore_file_explorer_settings(&workspace.file_explorer);
 
-        // 3. Restore histories (merge with any existing)
-        tracing::debug!(
-            "Restoring histories: {} search, {} replace, {} goto_line",
-            workspace.histories.search.len(),
-            workspace.histories.replace.len(),
-            workspace.histories.goto_line.len()
-        );
-        for item in &workspace.histories.search {
-            self.get_or_create_prompt_history("search")
-                .push(item.clone());
-        }
-        for item in &workspace.histories.replace {
-            self.get_or_create_prompt_history("replace")
-                .push(item.clone());
-        }
-        for item in &workspace.histories.goto_line {
-            self.get_or_create_prompt_history("goto_line")
-                .push(item.clone());
-        }
+        let mut path_to_buffer = self.open_workspace_files(&workspace.split_states);
+        self.restore_external_files(&workspace.external_files, &mut path_to_buffer);
+        self.apply_read_only_flags(&workspace.read_only_files, &path_to_buffer);
+        self.restore_hot_exit_changes(&path_to_buffer);
 
-        // 4. Restore file explorer state
-        self.file_explorer_visible = workspace.file_explorer.visible;
-        self.file_explorer_width_percent = workspace.file_explorer.width_percent;
+        let unnamed_buffer_map = self.restore_unnamed_buffers(&workspace.unnamed_buffers);
+        let terminal_buffer_map = self.restore_terminals_from_workspace(&workspace.terminals);
 
-        // Store pending show_hidden and show_gitignored settings (fixes #569)
-        // These will be applied when the file explorer is initialized (async)
-        if workspace.file_explorer.show_hidden {
-            self.pending_file_explorer_show_hidden = Some(true);
-        }
-        if workspace.file_explorer.show_gitignored {
-            self.pending_file_explorer_show_gitignored = Some(true);
-        }
-
-        // Initialize file explorer if it was visible in the workspace
-        // Note: We keep key_context as Normal so the editor has focus, not the explorer
-        if self.file_explorer_visible && self.file_explorer.is_none() {
-            self.init_file_explorer();
-        }
-
-        // 5. Open files from the workspace and build buffer mappings
-        // Collect all unique file paths from split_states (which tracks all open files per split)
-        let file_paths = collect_file_paths_from_states(&workspace.split_states);
-        tracing::debug!(
-            "Workspace has {} files to restore: {:?}",
-            file_paths.len(),
-            file_paths
-        );
-        let mut path_to_buffer: HashMap<PathBuf, BufferId> = HashMap::new();
-
-        for rel_path in file_paths {
-            let abs_path = self.working_dir.join(&rel_path);
-            tracing::trace!(
-                "Checking file: {:?} (exists: {})",
-                abs_path,
-                abs_path.exists()
-            );
-            if abs_path.exists() {
-                // Open the file (this will reuse existing buffer if already open)
-                match self.open_file_internal(&abs_path) {
-                    Ok(buffer_id) => {
-                        tracing::debug!("Opened file {:?} as buffer {:?}", rel_path, buffer_id);
-                        path_to_buffer.insert(rel_path, buffer_id);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to open file {:?}: {}", abs_path, e);
-                    }
-                }
-            } else {
-                tracing::debug!("Skipping non-existent file: {:?}", abs_path);
-            }
-        }
-
-        tracing::debug!("Opened {} files from workspace", path_to_buffer.len());
-
-        // 5b. Restore external files (files outside the working directory)
-        // These are stored as absolute paths
-        if !workspace.external_files.is_empty() {
-            tracing::debug!(
-                "Restoring {} external files: {:?}",
-                workspace.external_files.len(),
-                workspace.external_files
-            );
-            for abs_path in &workspace.external_files {
-                if abs_path.exists() {
-                    match self.open_file_internal(abs_path) {
-                        Ok(buffer_id) => {
-                            tracing::debug!(
-                                "Restored external file {:?} as buffer {:?}",
-                                abs_path,
-                                buffer_id
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to restore external file {:?}: {}", abs_path, e);
-                        }
-                    }
-                } else {
-                    tracing::debug!("Skipping non-existent external file: {:?}", abs_path);
-                }
-            }
-        }
-
-        // 5b2. Apply hot exit recovery: restore unsaved changes to file-backed buffers
-        if self.config.editor.hot_exit {
-            let entries = self.recovery_service.list_recoverable().unwrap_or_default();
-            if !entries.is_empty() {
-                for (_, &buffer_id) in &path_to_buffer {
-                    let file_path = self
-                        .buffers
-                        .get(&buffer_id)
-                        .and_then(|s| s.buffer.file_path().map(|p| p.to_path_buf()));
-                    let file_path = match file_path {
-                        Some(p) => p,
-                        None => continue,
-                    };
-
-                    // Look for a recovery entry matching this file
-                    let recovery_id = self.recovery_service.get_buffer_id(Some(&file_path));
-                    let entry = entries.iter().find(|e| e.id == recovery_id);
-                    if let Some(entry) = entry {
-                        match self.recovery_service.load_recovery(entry) {
-                            Ok(crate::services::recovery::RecoveryResult::Recovered {
-                                content,
-                                ..
-                            }) => {
-                                // Small file: replace buffer content with full recovered version
-                                if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                                    let current_len = state.buffer.total_bytes();
-                                    let text = String::from_utf8_lossy(&content).into_owned();
-                                    let current =
-                                        state.buffer.get_text_range_mut(0, current_len).ok();
-                                    let current_text = current
-                                        .as_ref()
-                                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                                    if current_text.as_deref() != Some(&text) {
-                                        state.buffer.delete(0..current_len);
-                                        state.buffer.insert(0, &text);
-                                        state.buffer.set_modified(true);
-                                        state.buffer.set_recovery_pending(false);
-                                        tracing::info!(
-                                            "Restored unsaved changes for {:?} from hot exit recovery",
-                                            file_path
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(crate::services::recovery::RecoveryResult::RecoveredChunks {
-                                chunks,
-                                ..
-                            }) => {
-                                // Large file: apply diff chunks on top of on-disk content
-                                if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                                    for chunk in chunks.into_iter().rev() {
-                                        let text =
-                                            String::from_utf8_lossy(&chunk.content).into_owned();
-                                        if chunk.original_len > 0 {
-                                            state.buffer.delete(
-                                                chunk.offset..chunk.offset + chunk.original_len,
-                                            );
-                                        }
-                                        state.buffer.insert(chunk.offset, &text);
-                                    }
-                                    state.buffer.set_modified(true);
-                                    state.buffer.set_recovery_pending(false);
-                                    tracing::info!(
-                                        "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
-                                        file_path
-                                    );
-                                }
-                            }
-                            Ok(
-                                crate::services::recovery::RecoveryResult::OriginalFileModified {
-                                    original_path,
-                                    ..
-                                },
-                            ) => {
-                                let name = original_path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy();
-                                tracing::warn!(
-                                    "{} changed on disk; unsaved changes not restored",
-                                    name
-                                );
-                                self.set_status_message(format!(
-                                    "{} changed on disk; unsaved changes not restored",
-                                    name
-                                ));
-                            }
-                            Ok(_) => {} // Corrupted, NotFound - skip
-                            Err(e) => {
-                                tracing::debug!(
-                                    "Failed to load hot exit recovery for {:?}: {}",
-                                    file_path,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5c. Restore unnamed buffers from recovery files
-        let mut unnamed_buffer_map: HashMap<String, BufferId> = HashMap::new();
-        if self.config.editor.hot_exit && !workspace.unnamed_buffers.is_empty() {
-            tracing::debug!(
-                "Restoring {} unnamed buffers from recovery",
-                workspace.unnamed_buffers.len()
-            );
-            for unnamed_ref in &workspace.unnamed_buffers {
-                // Try to load content from recovery files
-                let entries = match self.recovery_service.list_recoverable() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::warn!("Failed to list recovery entries: {}", e);
-                        continue;
-                    }
-                };
-
-                let entry = entries.iter().find(|e| e.id == unnamed_ref.recovery_id);
-                if let Some(entry) = entry {
-                    match self.recovery_service.load_recovery(entry) {
-                        Ok(crate::services::recovery::RecoveryResult::Recovered {
-                            content,
-                            ..
-                        }) => {
-                            let text = String::from_utf8_lossy(&content).into_owned();
-                            let buffer_id = self.new_buffer();
-                            let state = self.active_state_mut();
-                            state.buffer.insert(0, &text);
-                            // Mark as modified so it shows the dot indicator
-                            state.buffer.set_modified(true);
-                            state.buffer.set_recovery_pending(false);
-
-                            // Store recovery ID in metadata for future saves
-                            if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
-                                meta.recovery_id = Some(unnamed_ref.recovery_id.clone());
-                                meta.display_name = unnamed_ref.display_name.clone();
-                            }
-
-                            unnamed_buffer_map.insert(unnamed_ref.recovery_id.clone(), buffer_id);
-                            tracing::info!(
-                                "Restored unnamed buffer '{}' (recovery_id={})",
-                                unnamed_ref.display_name,
-                                unnamed_ref.recovery_id
-                            );
-                        }
-                        Ok(other) => {
-                            tracing::warn!(
-                                "Unexpected recovery result for unnamed buffer {}: {:?}",
-                                unnamed_ref.recovery_id,
-                                std::mem::discriminant(&other)
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to load recovery for unnamed buffer {}: {}",
-                                unnamed_ref.recovery_id,
-                                e
-                            );
-                        }
-                    }
-                } else {
-                    tracing::debug!(
-                        "Recovery file not found for unnamed buffer {}",
-                        unnamed_ref.recovery_id
-                    );
-                }
-            }
-        }
-
-        // Restore terminals and build index -> buffer map
-        let mut terminal_buffer_map: HashMap<usize, BufferId> = HashMap::new();
-        if !workspace.terminals.is_empty() {
-            if let Some(ref bridge) = self.async_bridge {
-                self.terminal_manager.set_async_bridge(bridge.clone());
-            }
-            for terminal in &workspace.terminals {
-                if let Some(buffer_id) = self.restore_terminal_from_workspace(terminal) {
-                    terminal_buffer_map.insert(terminal.terminal_index, buffer_id);
-                }
-            }
-        }
-
-        // 6. Rebuild split layout from the saved tree
-        // Map old split IDs to new ones as we create splits
         let mut split_id_map: HashMap<usize, SplitId> = HashMap::new();
         self.restore_split_node(
             &workspace.split_layout,
@@ -932,95 +734,18 @@ impl Editor {
             &unnamed_buffer_map,
             &workspace.split_states,
             &mut split_id_map,
-            true, // is_first_leaf - the first leaf reuses the existing split
+            true,
         );
 
-        // Set the active split based on the saved active_split_id
-        // NOTE: active_buffer is now derived from split_manager, which was already
-        // correctly set up by restore_split_view_state() via set_split_buffer()
         if let Some(&new_active_split) = split_id_map.get(&workspace.active_split_id) {
             self.split_manager
                 .set_active_split(LeafId(new_active_split));
         }
 
-        // 7. Restore bookmarks
-        for (key, bookmark) in &workspace.bookmarks {
-            if let Some(&buffer_id) = path_to_buffer.get(&bookmark.file_path) {
-                // Verify position is valid
-                if let Some(buffer) = self.buffers.get(&buffer_id) {
-                    let pos = bookmark.position.min(buffer.buffer.len());
-                    self.bookmarks.insert(
-                        *key,
-                        Bookmark {
-                            buffer_id,
-                            position: pos,
-                        },
-                    );
-                }
-            }
-        }
+        self.restore_bookmarks_from_workspace(&workspace.bookmarks, &path_to_buffer);
+        self.clean_orphaned_buffers();
+        self.log_restore_summary();
 
-        // Clean up orphaned buffers: the initial empty buffer created at startup
-        // may no longer be referenced by any split after workspace restore.
-        let referenced: HashSet<BufferId> = self
-            .split_view_states
-            .values()
-            .flat_map(|vs| vs.open_buffers.iter().copied())
-            .collect();
-        let orphans: Vec<BufferId> = self
-            .buffers
-            .keys()
-            .copied()
-            .filter(|id| {
-                !referenced.contains(id)
-                    && self.buffers.get(id).map_or(false, |s| {
-                        s.buffer.file_path().is_none() && !s.buffer.is_modified()
-                    })
-            })
-            .collect();
-        for id in orphans {
-            tracing::debug!("Removing orphaned empty unnamed buffer {:?}", id);
-            self.buffers.remove(&id);
-            self.event_logs.remove(&id);
-            self.buffer_metadata.remove(&id);
-        }
-
-        // Count restored buffers (excluding hidden/virtual)
-        let restored_count = self
-            .buffers
-            .keys()
-            .filter(|id| {
-                self.buffer_metadata
-                    .get(id)
-                    .map_or(false, |m| !m.hidden_from_tabs && !m.is_virtual())
-            })
-            .count();
-        if restored_count > 0 {
-            let session_label = self
-                .session_name
-                .as_ref()
-                .map(|n| format!("session '{}'", n));
-            let msg = if let Some(label) = session_label {
-                format!("Restored {} ({} buffer(s))", label, restored_count)
-            } else {
-                format!(
-                    "Restored {} buffer(s) from previous session",
-                    restored_count
-                )
-            };
-            self.set_status_message(msg);
-        }
-
-        tracing::debug!(
-            "Workspace restore complete: {} splits, {} buffers",
-            self.split_view_states.len(),
-            self.buffers.len()
-        );
-
-        // Fire buffer_activated for the active buffer so plugins can
-        // re-enable compose mode (the plugin's composeBuffers set is empty
-        // after restart). Only fires for the active buffer — other buffers
-        // will get buffer_activated when the user switches to them.
         #[cfg(feature = "plugins")]
         {
             let buffer_id = self.active_buffer();
@@ -1036,6 +761,445 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    fn restore_config_overrides(&mut self, overrides: &WorkspaceConfigOverrides) {
+        if let Some(line_numbers) = overrides.line_numbers {
+            self.config_mut().editor.line_numbers = line_numbers;
+        }
+        if let Some(relative_line_numbers) = overrides.relative_line_numbers {
+            self.config_mut().editor.relative_line_numbers = relative_line_numbers;
+        }
+        if let Some(line_wrap) = overrides.line_wrap {
+            self.config_mut().editor.line_wrap = line_wrap;
+        }
+        if let Some(syntax_highlighting) = overrides.syntax_highlighting {
+            self.config_mut().editor.syntax_highlighting = syntax_highlighting;
+        }
+        if let Some(enable_inlay_hints) = overrides.enable_inlay_hints {
+            self.config_mut().editor.enable_inlay_hints = enable_inlay_hints;
+        }
+        if let Some(mouse_enabled) = overrides.mouse_enabled {
+            self.mouse_enabled = mouse_enabled;
+        }
+        // `overrides.menu_bar_hidden` is a legacy field — kept for serde
+        // compatibility with workspaces written by older builds, but no
+        // longer applied: menu bar visibility is now a global preference.
+        // See issue #1156.
+    }
+
+    fn restore_search_options(&mut self, opts: &SearchOptions) {
+        self.search_case_sensitive = opts.case_sensitive;
+        self.search_whole_word = opts.whole_word;
+        self.search_use_regex = opts.use_regex;
+        self.search_confirm_each = opts.confirm_each;
+    }
+
+    fn restore_prompt_histories(&mut self, histories: &WorkspaceHistories) {
+        tracing::debug!(
+            "Restoring histories: {} search, {} replace, {} goto_line",
+            histories.search.len(),
+            histories.replace.len(),
+            histories.goto_line.len()
+        );
+        for item in &histories.search {
+            self.get_or_create_prompt_history("search")
+                .push(item.clone());
+        }
+        for item in &histories.replace {
+            self.get_or_create_prompt_history("replace")
+                .push(item.clone());
+        }
+        for item in &histories.goto_line {
+            self.get_or_create_prompt_history("goto_line")
+                .push(item.clone());
+        }
+    }
+
+    fn restore_file_explorer_settings(&mut self, fe: &FileExplorerState) {
+        self.file_explorer_visible = fe.visible;
+        self.file_explorer_width = fe.width;
+        self.file_explorer_side = fe.side;
+
+        // Store pending settings (fixes #569); applied when explorer initialises (async).
+        if fe.show_hidden {
+            self.pending_file_explorer_show_hidden = Some(true);
+        }
+        if fe.show_gitignored {
+            self.pending_file_explorer_show_gitignored = Some(true);
+        }
+
+        // Keep key_context as Normal so the editor (not the explorer) has focus.
+        if self.file_explorer_visible && self.file_explorer.is_none() {
+            self.init_file_explorer();
+        }
+    }
+
+    /// Open every file referenced by the saved split states, returning a map
+    /// from relative (or absolute) path to the new `BufferId`.
+    fn open_workspace_files(
+        &mut self,
+        split_states: &HashMap<usize, SerializedSplitViewState>,
+    ) -> HashMap<PathBuf, BufferId> {
+        let file_paths = collect_file_paths_from_states(split_states);
+        tracing::debug!(
+            "Workspace has {} files to restore: {:?}",
+            file_paths.len(),
+            file_paths
+        );
+        let mut path_to_buffer: HashMap<PathBuf, BufferId> = HashMap::new();
+        for rel_path in file_paths {
+            let abs_path = self.working_dir.join(&rel_path);
+            tracing::trace!(
+                "Checking file: {:?} (exists: {})",
+                abs_path,
+                abs_path.exists()
+            );
+            if abs_path.exists() {
+                match self.open_file_internal(&abs_path) {
+                    Ok(buffer_id) => {
+                        tracing::debug!("Opened file {:?} as buffer {:?}", rel_path, buffer_id);
+                        path_to_buffer.insert(rel_path, buffer_id);
+                    }
+                    Err(e) => tracing::warn!("Failed to open file {:?}: {}", abs_path, e),
+                }
+            } else {
+                tracing::debug!("Skipping non-existent file: {:?}", abs_path);
+            }
+        }
+        tracing::debug!("Opened {} files from workspace", path_to_buffer.len());
+        path_to_buffer
+    }
+
+    /// Restore files that live outside the working directory (stored as absolute paths).
+    fn restore_external_files(
+        &mut self,
+        external_files: &[PathBuf],
+        path_to_buffer: &mut HashMap<PathBuf, BufferId>,
+    ) {
+        if external_files.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            "Restoring {} external files: {:?}",
+            external_files.len(),
+            external_files
+        );
+        for abs_path in external_files {
+            if !abs_path.exists() {
+                tracing::debug!("Skipping non-existent external file: {:?}", abs_path);
+                continue;
+            }
+            match self.open_file_internal(abs_path) {
+                Ok(buffer_id) => {
+                    path_to_buffer.insert(abs_path.clone(), buffer_id);
+                    tracing::debug!(
+                        "Restored external file {:?} as buffer {:?}",
+                        abs_path,
+                        buffer_id
+                    );
+                }
+                Err(e) => tracing::warn!("Failed to restore external file {:?}: {}", abs_path, e),
+            }
+        }
+    }
+
+    /// Re-apply read-only flags for files that were locked in the saved session.
+    /// Paths may be relative (under `working_dir`) or absolute.
+    fn apply_read_only_flags(
+        &mut self,
+        read_only_files: &[PathBuf],
+        path_to_buffer: &HashMap<PathBuf, BufferId>,
+    ) {
+        for ro_path in read_only_files {
+            let buffer_id = path_to_buffer
+                .get(ro_path)
+                .copied()
+                .or_else(|| path_to_buffer.get(&self.working_dir.join(ro_path)).copied());
+            if let Some(id) = buffer_id {
+                self.mark_buffer_read_only(id, true);
+            }
+        }
+    }
+
+    /// Replay hot-exit recovery data onto file-backed buffers that were modified
+    /// when the editor last exited.
+    fn restore_hot_exit_changes(&mut self, path_to_buffer: &HashMap<PathBuf, BufferId>) {
+        if !self.config.editor.hot_exit {
+            return;
+        }
+        let entries = self.recovery_service.list_recoverable().unwrap_or_default();
+        if entries.is_empty() {
+            return;
+        }
+        let buffer_ids: Vec<BufferId> = path_to_buffer.values().copied().collect();
+        for buffer_id in buffer_ids {
+            let file_path = self
+                .buffers
+                .get(&buffer_id)
+                .and_then(|s| s.buffer.file_path().map(|p| p.to_path_buf()));
+            let Some(file_path) = file_path else { continue };
+
+            let recovery_id = self.recovery_service.get_buffer_id(Some(&file_path));
+            let Some(entry) = entries.iter().find(|e| e.id == recovery_id) else {
+                continue;
+            };
+            match self.recovery_service.load_recovery(entry) {
+                Ok(crate::services::recovery::RecoveryResult::Recovered { content, .. }) => {
+                    let mut mutated = false;
+                    if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                        let current_len = state.buffer.total_bytes();
+                        let text = String::from_utf8_lossy(&content).into_owned();
+                        let current = state.buffer.get_text_range_mut(0, current_len).ok();
+                        let current_text = current
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b).into_owned());
+                        if current_text.as_deref() != Some(&text) {
+                            state.buffer.delete(0..current_len);
+                            state.buffer.insert(0, &text);
+                            state.buffer.set_modified(true);
+                            state.buffer.set_recovery_pending(false);
+                            mutated = true;
+                            tracing::info!(
+                                "Restored unsaved changes for {:?} from hot exit recovery",
+                                file_path
+                            );
+                        }
+                    }
+                    if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                        log.clear_saved_position();
+                    }
+                    if mutated {
+                        self.sync_lsp_after_recovery_replay(buffer_id);
+                    }
+                }
+                Ok(crate::services::recovery::RecoveryResult::RecoveredChunks {
+                    chunks, ..
+                }) => {
+                    let mut mutated = false;
+                    if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                        for chunk in chunks.into_iter().rev() {
+                            let text = String::from_utf8_lossy(&chunk.content).into_owned();
+                            if chunk.original_len > 0 {
+                                state
+                                    .buffer
+                                    .delete(chunk.offset..chunk.offset + chunk.original_len);
+                            }
+                            state.buffer.insert(chunk.offset, &text);
+                        }
+                        state.buffer.set_modified(true);
+                        state.buffer.set_recovery_pending(false);
+                        mutated = true;
+                        tracing::info!(
+                            "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
+                            file_path
+                        );
+                    }
+                    if let Some(log) = self.event_logs.get_mut(&buffer_id) {
+                        log.clear_saved_position();
+                    }
+                    if mutated {
+                        self.sync_lsp_after_recovery_replay(buffer_id);
+                    }
+                }
+                Ok(crate::services::recovery::RecoveryResult::OriginalFileModified {
+                    original_path,
+                    ..
+                }) => {
+                    let name = original_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    tracing::warn!("{} changed on disk; unsaved changes not restored", name);
+                    self.set_status_message(format!(
+                        "{} changed on disk; unsaved changes not restored",
+                        name
+                    ));
+                }
+                Ok(_) => {} // Corrupted, NotFound — skip
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to load hot exit recovery for {:?}: {}",
+                        file_path,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Restore unnamed (unsaved) buffers from their hot-exit recovery files.
+    /// Returns a map from `recovery_id` to the newly created `BufferId`.
+    fn restore_unnamed_buffers(
+        &mut self,
+        unnamed_buffers: &[UnnamedBufferRef],
+    ) -> HashMap<String, BufferId> {
+        let mut unnamed_buffer_map: HashMap<String, BufferId> = HashMap::new();
+        if !self.config.editor.hot_exit || unnamed_buffers.is_empty() {
+            return unnamed_buffer_map;
+        }
+        tracing::debug!(
+            "Restoring {} unnamed buffers from recovery",
+            unnamed_buffers.len()
+        );
+        for unnamed_ref in unnamed_buffers {
+            let entries = match self.recovery_service.list_recoverable() {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Failed to list recovery entries: {}", e);
+                    continue;
+                }
+            };
+            let Some(entry) = entries.iter().find(|e| e.id == unnamed_ref.recovery_id) else {
+                tracing::debug!(
+                    "Recovery file not found for unnamed buffer {}",
+                    unnamed_ref.recovery_id
+                );
+                continue;
+            };
+            match self.recovery_service.load_recovery(entry) {
+                Ok(crate::services::recovery::RecoveryResult::Recovered { content, .. }) => {
+                    let text = String::from_utf8_lossy(&content).into_owned();
+                    let buffer_id = self.new_buffer();
+                    {
+                        let state = self.active_state_mut();
+                        state.buffer.insert(0, &text);
+                        state.buffer.set_modified(true);
+                        state.buffer.set_recovery_pending(false);
+                    }
+                    self.active_event_log_mut().clear_saved_position();
+                    if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+                        meta.recovery_id = Some(unnamed_ref.recovery_id.clone());
+                        meta.display_name = unnamed_ref.display_name.clone();
+                    }
+                    unnamed_buffer_map.insert(unnamed_ref.recovery_id.clone(), buffer_id);
+                    tracing::info!(
+                        "Restored unnamed buffer '{}' (recovery_id={})",
+                        unnamed_ref.display_name,
+                        unnamed_ref.recovery_id
+                    );
+                }
+                Ok(other) => {
+                    tracing::warn!(
+                        "Unexpected recovery result for unnamed buffer {}: {:?}",
+                        unnamed_ref.recovery_id,
+                        std::mem::discriminant(&other)
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load recovery for unnamed buffer {}: {}",
+                        unnamed_ref.recovery_id,
+                        e
+                    );
+                }
+            }
+        }
+        unnamed_buffer_map
+    }
+
+    /// Restore all serialized terminals and return a map from terminal index to `BufferId`.
+    fn restore_terminals_from_workspace(
+        &mut self,
+        terminals: &[SerializedTerminalWorkspace],
+    ) -> HashMap<usize, BufferId> {
+        let mut terminal_buffer_map: HashMap<usize, BufferId> = HashMap::new();
+        if terminals.is_empty() {
+            return terminal_buffer_map;
+        }
+        if let Some(ref bridge) = self.async_bridge {
+            self.terminal_manager.set_async_bridge(bridge.clone());
+        }
+        for terminal in terminals {
+            if let Some(buffer_id) = self.restore_terminal_from_workspace(terminal) {
+                terminal_buffer_map.insert(terminal.terminal_index, buffer_id);
+            }
+        }
+        terminal_buffer_map
+    }
+
+    /// Re-create bookmarks from the saved workspace, resolving file paths to buffer IDs.
+    fn restore_bookmarks_from_workspace(
+        &mut self,
+        bookmarks: &HashMap<char, SerializedBookmark>,
+        path_to_buffer: &HashMap<PathBuf, BufferId>,
+    ) {
+        for (key, bookmark) in bookmarks {
+            let Some(&buffer_id) = path_to_buffer.get(&bookmark.file_path) else {
+                continue;
+            };
+            if let Some(buffer) = self.buffers.get(&buffer_id) {
+                let pos = bookmark.position.min(buffer.buffer.len());
+                self.bookmarks.set(
+                    *key,
+                    Bookmark {
+                        buffer_id,
+                        position: pos,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Drop the initial empty unnamed buffer if it is no longer referenced by any
+    /// split after the workspace has been applied.
+    fn clean_orphaned_buffers(&mut self) {
+        let referenced: HashSet<BufferId> = self
+            .split_view_states
+            .values()
+            .flat_map(|vs| vs.buffer_tab_ids())
+            .collect();
+        let orphans: Vec<BufferId> =
+            self.buffers
+                .keys()
+                .copied()
+                .filter(|id| {
+                    !referenced.contains(id)
+                        && self.buffers.get(id).is_some_and(|s| {
+                            s.buffer.file_path().is_none() && !s.buffer.is_modified()
+                        })
+                })
+                .collect();
+        for id in orphans {
+            tracing::debug!("Removing orphaned empty unnamed buffer {:?}", id);
+            self.buffers.remove(&id);
+            self.event_logs.remove(&id);
+            self.buffer_metadata.remove(&id);
+        }
+    }
+
+    /// Set a status-bar message summarising how many buffers were restored and from
+    /// which session, then emit a debug log with split/buffer counts.
+    fn log_restore_summary(&mut self) {
+        tracing::debug!(
+            "Workspace restore complete: {} splits, {} buffers",
+            self.split_view_states.len(),
+            self.buffers.len()
+        );
+        let restored_count = self
+            .buffers
+            .keys()
+            .filter(|id| {
+                self.buffer_metadata
+                    .get(id)
+                    .is_some_and(|m| !m.hidden_from_tabs && !m.is_virtual())
+            })
+            .count();
+        if restored_count == 0 {
+            return;
+        }
+        let msg = match self
+            .session_name
+            .as_ref()
+            .map(|n| format!("session '{}'", n))
+        {
+            Some(label) => format!("Restored {} ({} buffer(s))", label, restored_count),
+            None => format!(
+                "Restored {} buffer(s) from previous session",
+                restored_count
+            ),
+        };
+        self.set_status_message(msg);
     }
 
     /// Restore a terminal from serialized workspace metadata.
@@ -1065,7 +1229,7 @@ impl Editor {
 
         // Best-effort directory creation for terminal backing files
         #[allow(clippy::let_underscore_must_use)]
-        let _ = self.filesystem.create_dir_all(
+        let _ = self.authority.filesystem.create_dir_all(
             log_path
                 .parent()
                 .or_else(|| backing_path.parent())
@@ -1086,6 +1250,7 @@ impl Editor {
             terminal.cwd.clone(),
             Some(log_path.clone()),
             Some(backing_path.clone()),
+            self.resolved_terminal_wrapper(),
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -1136,7 +1301,7 @@ impl Editor {
             large_file_threshold,
             &self.grammar_registry,
             &self.config.languages,
-            std::sync::Arc::clone(&self.filesystem),
+            std::sync::Arc::clone(&self.authority.filesystem),
         ) {
             if let Some(state) = self.buffers.get_mut(&buffer_id) {
                 *state = new_state;
@@ -1144,7 +1309,7 @@ impl Editor {
                 let total = state.buffer.total_bytes();
                 // Update cursor position in all splits that show this buffer
                 for vs in self.split_view_states.values_mut() {
-                    if vs.open_buffers.contains(&buffer_id) {
+                    if vs.has_buffer(buffer_id) {
                         vs.cursors.primary_mut().position = total;
                     }
                 }
@@ -1173,6 +1338,7 @@ impl Editor {
     }
 
     /// Recursively restore the split layout from a serialized tree
+    #[allow(clippy::too_many_arguments)]
     fn restore_split_node(
         &mut self,
         node: &SerializedSplitNode,
@@ -1189,6 +1355,7 @@ impl Editor {
                 split_id,
                 label,
                 unnamed_recovery_id,
+                role,
             } => {
                 // Get the buffer for this leaf: file path, unnamed recovery ID, or default
                 let buffer_id = file_path
@@ -1204,7 +1371,7 @@ impl Editor {
                 let current_leaf_id = if is_first_leaf {
                     // First leaf reuses the existing split
                     let leaf_id = self.split_manager.active_split();
-                    self.split_manager.set_split_buffer(leaf_id, buffer_id);
+                    self.set_pane_buffer(leaf_id, buffer_id);
                     leaf_id
                 } else {
                     // Non-first leaves use the active split (created by split_active)
@@ -1217,6 +1384,14 @@ impl Editor {
                 // Restore label if present
                 if let Some(label) = label {
                     self.split_manager.set_label(current_leaf_id, label.clone());
+                }
+
+                // Restore role tag if present (clearing any prior holder
+                // first to preserve the at-most-one-leaf-per-role invariant).
+                if let Some(role) = role {
+                    self.split_manager.clear_role(*role);
+                    self.split_manager
+                        .set_leaf_role(current_leaf_id, Some(*role));
                 }
 
                 // Restore the view state for this split
@@ -1233,6 +1408,7 @@ impl Editor {
                 terminal_index,
                 split_id,
                 label,
+                role,
             } => {
                 let buffer_id = terminal_buffers
                     .get(terminal_index)
@@ -1241,7 +1417,7 @@ impl Editor {
 
                 let current_leaf_id = if is_first_leaf {
                     let leaf_id = self.split_manager.active_split();
-                    self.split_manager.set_split_buffer(leaf_id, buffer_id);
+                    self.set_pane_buffer(leaf_id, buffer_id);
                     leaf_id
                 } else {
                     self.split_manager.active_split()
@@ -1252,6 +1428,14 @@ impl Editor {
                 // Restore label if present
                 if let Some(label) = label {
                     self.split_manager.set_label(current_leaf_id, label.clone());
+                }
+
+                // Restore role tag for terminal leaves (same one-per-role
+                // invariant as the file-leaf branch above).
+                if let Some(role) = role {
+                    self.split_manager.clear_role(*role);
+                    self.split_manager
+                        .set_leaf_role(current_leaf_id, Some(*role));
                 }
 
                 self.split_manager
@@ -1313,8 +1497,10 @@ impl Editor {
                         );
                         view_state.apply_config_defaults(
                             self.config.editor.line_numbers,
-                            self.config.editor.line_wrap,
+                            self.config.editor.highlight_current_line,
+                            self.resolve_line_wrap_for_buffer(second_buffer_id),
                             self.config.editor.wrap_indent,
+                            self.resolve_wrap_column_for_buffer(second_buffer_id),
                             self.config.editor.rulers.clone(),
                         );
                         self.split_view_states.insert(new_leaf_id, view_state);
@@ -1371,8 +1557,8 @@ impl Editor {
                 match tab {
                     SerializedTabRef::File(rel_path) => {
                         if let Some(&buffer_id) = path_to_buffer.get(rel_path) {
-                            if !view_state.open_buffers.contains(&buffer_id) {
-                                view_state.open_buffers.push(buffer_id);
+                            if !view_state.has_buffer(buffer_id) {
+                                view_state.add_buffer(buffer_id);
                             }
                             // Ensure keyed state exists for this buffer
                             view_state.ensure_buffer_state(buffer_id);
@@ -1387,8 +1573,8 @@ impl Editor {
                     }
                     SerializedTabRef::Terminal(index) => {
                         if let Some(&buffer_id) = terminal_buffers.get(index) {
-                            if !view_state.open_buffers.contains(&buffer_id) {
-                                view_state.open_buffers.push(buffer_id);
+                            if !view_state.has_buffer(buffer_id) {
+                                view_state.add_buffer(buffer_id);
                             }
                             view_state
                                 .ensure_buffer_state(buffer_id)
@@ -1398,12 +1584,23 @@ impl Editor {
                     }
                     SerializedTabRef::Unnamed(recovery_id) => {
                         if let Some(&buffer_id) = unnamed_buffers.get(recovery_id) {
-                            if !view_state.open_buffers.contains(&buffer_id) {
-                                view_state.open_buffers.push(buffer_id);
+                            if !view_state.has_buffer(buffer_id) {
+                                view_state.add_buffer(buffer_id);
                             }
                             view_state.ensure_buffer_state(buffer_id);
                         }
                     }
+                }
+            }
+
+            // If all saved tabs referenced deleted/missing files, open_buffers
+            // is now empty. Re-add the buffer that the split manager assigned to
+            // this split so the orphan cleanup won't remove a buffer the split
+            // manager still points to (#1278).
+            if view_state.open_buffers.is_empty() {
+                if let Some(buf) = self.split_manager.buffer_for_split(current_split_id) {
+                    view_state.add_buffer(buf);
+                    view_state.ensure_buffer_state(buf);
                 }
             }
 
@@ -1420,8 +1617,8 @@ impl Editor {
             // Backward compatibility path using open_files/active_file_index
             for rel_path in &split_state.open_files {
                 if let Some(&buffer_id) = path_to_buffer.get(rel_path) {
-                    if !view_state.open_buffers.contains(&buffer_id) {
-                        view_state.open_buffers.push(buffer_id);
+                    if !view_state.has_buffer(buffer_id) {
+                        view_state.add_buffer(buffer_id);
                     }
                     view_state.ensure_buffer_state(buffer_id);
                 }
@@ -1467,18 +1664,51 @@ impl Editor {
             buf_state.viewport.left_column = file_state.scroll.left_column;
             buf_state.viewport.set_skip_resize_sync();
 
+            // Saved cursor and saved viewport are independent fields; if they
+            // were already out of sync at save time (cursor moved off-screen
+            // before the user closed) the restore re-creates an off-screen
+            // cursor that arrow keys can't escape (the wrap-mode early return
+            // in `viewport.rs::ensure_visible` no-ops for any cursor whose
+            // byte position is `>= viewport.top_byte`). Reconcile so the
+            // restored view always shows the cursor (#1689 follow-up).
+            if let Some(state) = self.buffers.get_mut(&buffer_id) {
+                super::navigation::reconcile_restored_buffer_view(buf_state, &mut state.buffer);
+            }
+
             // Restore per-buffer view mode and compose width
             buf_state.view_mode = match file_state.view_mode {
                 SerializedViewMode::Source => ViewMode::Source,
-                SerializedViewMode::Compose => ViewMode::Compose,
+                SerializedViewMode::PageView => ViewMode::PageView,
             };
             buf_state.compose_width = file_state.compose_width;
             buf_state.plugin_state = file_state.plugin_state.clone();
             if let Some(state) = self.buffers.get_mut(&buffer_id) {
                 buf_state.folds.clear(&mut state.marker_list);
                 for fold in &file_state.folds {
-                    let start_line = fold.header_line.saturating_add(1);
-                    let end_line = fold.end_line;
+                    // Resolve the stored line numbers against the current
+                    // buffer content. If a header_text was recorded (issue
+                    // #1568), validate — and if necessary relocate — the
+                    // fold so it lands on the line it was actually meant
+                    // for, even after an external edit shifted line
+                    // numbers.
+                    let Some(resolved_header) = resolve_fold_header_line(
+                        &state.buffer,
+                        fold.header_line,
+                        fold.header_text.as_deref(),
+                    ) else {
+                        tracing::debug!(
+                            "Dropping stale fold: header_line={} no longer matches stored \
+                             header_text after external edit",
+                            fold.header_line,
+                        );
+                        continue;
+                    };
+
+                    // Adjust end_line by the same shift we applied to the header.
+                    let shift = resolved_header as i64 - fold.header_line as i64;
+                    let adjusted_end = (fold.end_line as i64 + shift).max(0) as usize;
+                    let start_line = resolved_header.saturating_add(1);
+                    let end_line = adjusted_end;
                     if start_line > end_line {
                         continue;
                     }
@@ -1511,7 +1741,7 @@ impl Editor {
         // view_mode/compose_width as fallback (backward compatibility)
         let restored_view_mode = match split_state.view_mode {
             SerializedViewMode::Source => ViewMode::Source,
-            SerializedViewMode::Compose => ViewMode::Compose,
+            SerializedViewMode::PageView => ViewMode::PageView,
         };
 
         if let Some(active_id) = active_buffer_id {
@@ -1579,25 +1809,84 @@ fn serialize_split_node(
     terminal_indices: &HashMap<TerminalId, usize>,
     split_labels: &HashMap<SplitId, String>,
 ) -> SerializedSplitNode {
+    serialize_split_node_pruned(
+        node,
+        buffer_metadata,
+        working_dir,
+        terminal_buffers,
+        terminal_indices,
+        split_labels,
+    )
+    .unwrap_or({
+        // Entire tree was virtual buffers — nothing to persist.  Fall back to
+        // an empty [No Name] leaf so the restored workspace is still valid.
+        SerializedSplitNode::Leaf {
+            file_path: None,
+            split_id: 0,
+            label: None,
+            unnamed_recovery_id: None,
+            role: None,
+        }
+    })
+}
+
+/// Like `serialize_split_node` but returns `None` for subtrees that only
+/// contain transient virtual buffers (e.g. `*Search/Replace*` panels).
+/// Virtual buffers can't be rebuilt from disk, so persisting their split
+/// would leave an empty or mis-attributed pane on restore (see bug #5).
+/// When one child of a Split prunes away, the surviving child is hoisted in
+/// place of the whole Split node.
+fn serialize_split_node_pruned(
+    node: &SplitNode,
+    buffer_metadata: &HashMap<BufferId, super::types::BufferMetadata>,
+    working_dir: &Path,
+    terminal_buffers: &HashMap<BufferId, TerminalId>,
+    terminal_indices: &HashMap<TerminalId, usize>,
+    split_labels: &HashMap<SplitId, String>,
+) -> Option<SerializedSplitNode> {
     match node {
+        SplitNode::Grouped { layout, .. } => {
+            // Grouped nodes are rebuilt by plugins on load; serialize just
+            // the inner layout so the split tree structure is preserved
+            // without the group wrapper.
+            serialize_split_node_pruned(
+                layout,
+                buffer_metadata,
+                working_dir,
+                terminal_buffers,
+                terminal_indices,
+                split_labels,
+            )
+        }
         SplitNode::Leaf {
             buffer_id,
             split_id,
+            role,
         } => {
             let raw_split_id: SplitId = (*split_id).into();
             let label = split_labels.get(&raw_split_id).cloned();
+            let role = *role;
 
             if let Some(terminal_id) = terminal_buffers.get(buffer_id) {
                 if let Some(index) = terminal_indices.get(terminal_id) {
-                    return SerializedSplitNode::Terminal {
+                    return Some(SerializedSplitNode::Terminal {
                         terminal_index: *index,
                         split_id: raw_split_id.0,
                         label,
-                    };
+                        role,
+                    });
                 }
             }
 
             let meta = buffer_metadata.get(buffer_id);
+
+            // Virtual buffers (e.g. the *Search/Replace* panel) have no
+            // persistent identity — drop them and let the parent Split node
+            // collapse to the sibling.
+            if meta.map(|m| m.is_virtual()).unwrap_or(false) {
+                return None;
+            }
+
             let file_path = meta.and_then(|m| m.file_path()).and_then(|abs_path| {
                 if abs_path.as_os_str().is_empty() {
                     None // unnamed buffer
@@ -1617,12 +1906,13 @@ fn serialize_split_node(
                 None
             };
 
-            SerializedSplitNode::Leaf {
+            Some(SerializedSplitNode::Leaf {
                 file_path,
                 split_id: raw_split_id.0,
                 label,
                 unnamed_recovery_id,
-            }
+                role,
+            })
         }
         SplitNode::Split {
             direction,
@@ -1630,31 +1920,40 @@ fn serialize_split_node(
             second,
             ratio,
             split_id,
+            ..
         } => {
             let raw_split_id: SplitId = (*split_id).into();
-            SerializedSplitNode::Split {
-                direction: match direction {
-                    SplitDirection::Horizontal => SerializedSplitDirection::Horizontal,
-                    SplitDirection::Vertical => SerializedSplitDirection::Vertical,
-                },
-                first: Box::new(serialize_split_node(
-                    first,
-                    buffer_metadata,
-                    working_dir,
-                    terminal_buffers,
-                    terminal_indices,
-                    split_labels,
-                )),
-                second: Box::new(serialize_split_node(
-                    second,
-                    buffer_metadata,
-                    working_dir,
-                    terminal_buffers,
-                    terminal_indices,
-                    split_labels,
-                )),
-                ratio: *ratio,
-                split_id: raw_split_id.0,
+            let first = serialize_split_node_pruned(
+                first,
+                buffer_metadata,
+                working_dir,
+                terminal_buffers,
+                terminal_indices,
+                split_labels,
+            );
+            let second = serialize_split_node_pruned(
+                second,
+                buffer_metadata,
+                working_dir,
+                terminal_buffers,
+                terminal_indices,
+                split_labels,
+            );
+            match (first, second) {
+                (Some(f), Some(s)) => Some(SerializedSplitNode::Split {
+                    direction: match direction {
+                        SplitDirection::Horizontal => SerializedSplitDirection::Horizontal,
+                        SplitDirection::Vertical => SerializedSplitDirection::Vertical,
+                    },
+                    first: Box::new(f),
+                    second: Box::new(s),
+                    ratio: *ratio,
+                    split_id: raw_split_id.0,
+                }),
+                // One side was a virtual-buffer-only subtree — collapse to
+                // the surviving sibling.
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
             }
         }
     }
@@ -1673,7 +1972,9 @@ fn serialize_split_view_state(
     let mut open_files = Vec::new();
     let mut active_tab_index = None;
 
-    for buffer_id in &view_state.open_buffers {
+    // Only serialize buffer tabs; group tabs are rebuilt by plugins on load.
+    for buffer_id in view_state.buffer_tab_ids() {
+        let buffer_id = &buffer_id;
         let tab_index = open_tabs.len();
         if let Some(terminal_id) = terminal_buffers.get(buffer_id) {
             if let Some(idx) = terminal_indices.get(terminal_id) {
@@ -1698,6 +1999,12 @@ fn serialize_split_view_state(
                 } else if let Ok(rel_path) = abs_path.strip_prefix(working_dir) {
                     open_tabs.push(SerializedTabRef::File(rel_path.to_path_buf()));
                     open_files.push(rel_path.to_path_buf());
+                    if Some(*buffer_id) == active_buffer {
+                        active_tab_index = Some(tab_index);
+                    }
+                } else {
+                    // External file (outside working_dir) - store absolute path
+                    open_tabs.push(SerializedTabRef::File(abs_path.to_path_buf()));
                     if Some(*buffer_id) == active_buffer {
                         active_tab_index = Some(tab_index);
                     }
@@ -1738,7 +2045,8 @@ fn serialize_split_view_state(
         } else if let Ok(rp) = abs_path.strip_prefix(working_dir) {
             rp.to_path_buf()
         } else {
-            continue;
+            // External file - use absolute path as key
+            abs_path.to_path_buf()
         };
 
         let primary_cursor = buf_state.cursors.primary();
@@ -1753,6 +2061,7 @@ fn serialize_split_view_state(
                         header_line: range.header_line,
                         end_line: range.end_line,
                         placeholder: range.placeholder,
+                        header_text: range.header_text,
                     })
                     .collect::<Vec<_>>()
             })
@@ -1783,7 +2092,7 @@ fn serialize_split_view_state(
                 },
                 view_mode: match buf_state.view_mode {
                     ViewMode::Source => SerializedViewMode::Source,
-                    ViewMode::Compose => SerializedViewMode::Compose,
+                    ViewMode::PageView => SerializedViewMode::PageView,
                 },
                 compose_width: buf_state.compose_width,
                 plugin_state: buf_state.plugin_state.clone(),
@@ -1797,7 +2106,7 @@ fn serialize_split_view_state(
         .and_then(|id| view_state.keyed_states.get(&id))
         .map(|bs| match bs.view_mode {
             ViewMode::Source => SerializedViewMode::Source,
-            ViewMode::Compose => SerializedViewMode::Compose,
+            ViewMode::PageView => SerializedViewMode::PageView,
         })
         .unwrap_or(SerializedViewMode::Source);
     let active_compose_width = active_buffer
@@ -1817,7 +2126,7 @@ fn serialize_split_view_state(
 }
 
 fn serialize_bookmarks(
-    bookmarks: &HashMap<char, Bookmark>,
+    bookmarks: &BookmarkState,
     buffer_metadata: &HashMap<BufferId, super::types::BufferMetadata>,
     working_dir: &Path,
 ) -> HashMap<char, SerializedBookmark> {
@@ -1830,7 +2139,7 @@ fn serialize_bookmarks(
                 .and_then(|abs_path| {
                     abs_path.strip_prefix(working_dir).ok().map(|rel_path| {
                         (
-                            *key,
+                            key,
                             SerializedBookmark {
                                 file_path: rel_path.to_path_buf(),
                                 position: bookmark.position,

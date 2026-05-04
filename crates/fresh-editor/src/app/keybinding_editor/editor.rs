@@ -3,6 +3,7 @@
 use super::helpers::{format_chord_keys, key_code_to_config_name, modifiers_to_config_names};
 use super::types::*;
 use crate::config::{Config, Keybinding};
+use crate::input::command_registry::CommandRegistry;
 use crate::input::keybindings::{format_keybinding, Action, KeyContext, KeybindingResolver};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rust_i18n::t;
@@ -79,17 +80,28 @@ pub struct KeybindingEditor {
 
     /// Layout info for mouse hit testing (updated during render)
     pub layout: KeybindingEditorLayout,
+
+    /// Mouse interaction state for the table scrollbar (press/drag/release).
+    pub scrollbar_mouse: crate::view::ui::scrollbar::ScrollbarMouse,
 }
 
 impl KeybindingEditor {
-    /// Create a new keybinding editor from config and resolver
+    /// Create a new keybinding editor from config and resolver.
+    ///
+    /// `menu_names` are the stable English identifiers of top-level menus
+    /// (File, Edit, …, plus any plugin menus). They're used to enumerate
+    /// concrete `menu_open:<name>` entries in the action dropdown, so each
+    /// menu gets its own selectable row instead of one generic `menu_open`.
     pub fn new(
         config: &Config,
         resolver: &KeybindingResolver,
         mode_registry: &crate::input::buffer_mode::ModeRegistry,
+        command_registry: &CommandRegistry,
         config_file_path: String,
+        menu_names: &[String],
     ) -> Self {
-        let bindings = Self::resolve_all_bindings(config, resolver, mode_registry);
+        let bindings =
+            Self::resolve_all_bindings(config, resolver, mode_registry, command_registry);
         let filtered_indices: Vec<usize> = (0..bindings.len()).collect();
 
         // Collect available action names (include plugin action names from plugin defaults)
@@ -107,6 +119,20 @@ impl KeybindingEditor {
                 let _ = action_name;
             }
         }
+        // Include action names from plugin-registered commands
+        for cmd in command_registry.get_all() {
+            if let Action::PluginAction(ref name) = cmd.action {
+                if !available_actions.contains(name) {
+                    available_actions.push(name.clone());
+                }
+            }
+        }
+
+        // Expand parameterised actions (menu_open, switch_keybinding_map) from a
+        // single bare entry — which is unparseable without args and silently
+        // becomes a no-op PluginAction — into one entry per concrete variant.
+        Self::expand_variant_actions(&mut available_actions, menu_names, config);
+
         available_actions.sort();
         available_actions.dedup();
 
@@ -165,6 +191,7 @@ impl KeybindingEditor {
             display_rows: Vec::new(),
             collapsed_sections,
             layout: KeybindingEditorLayout::default(),
+            scrollbar_mouse: crate::view::ui::scrollbar::ScrollbarMouse::default(),
         };
 
         editor.apply_filters();
@@ -176,6 +203,7 @@ impl KeybindingEditor {
         config: &Config,
         resolver: &KeybindingResolver,
         mode_registry: &crate::input::buffer_mode::ModeRegistry,
+        command_registry: &CommandRegistry,
     ) -> Vec<ResolvedBinding> {
         let mut bindings = Vec::new();
         let mut seen: HashMap<(String, String), usize> = HashMap::new(); // (key_display, context) -> index
@@ -222,8 +250,8 @@ impl KeybindingEditor {
                     if seen.contains_key(&seen_key) {
                         continue;
                     }
-                    let command = action.to_action_str();
-                    let action_display = KeybindingResolver::format_action_from_str(&command);
+                    let command = action.to_qualified_action_str();
+                    let action_display = KeybindingResolver::format_action(action);
                     let idx = bindings.len();
                     seen.insert(seen_key, idx);
                     bindings.push(ResolvedBinding {
@@ -236,6 +264,8 @@ impl KeybindingEditor {
                         modifiers: *modifiers,
                         is_chord: false,
                         plugin_name: Some(section.clone()),
+                        command_name: None,
+                        original_config: None,
                     });
                 }
             }
@@ -257,7 +287,61 @@ impl KeybindingEditor {
                     modifiers: KeyModifiers::NONE,
                     is_chord: false,
                     plugin_name: None,
+                    command_name: None,
+                    original_config: None,
                 });
+            }
+        }
+
+        // Add unbound entries for plugin-registered command actions
+        for cmd in command_registry.get_all() {
+            if let Action::PluginAction(ref action_name) = cmd.action {
+                if !bound_actions.contains(action_name) {
+                    let plugin_name = match &cmd.source {
+                        crate::input::commands::CommandSource::Plugin(name) => Some(name.clone()),
+                        _ => None,
+                    };
+                    bindings.push(ResolvedBinding {
+                        key_display: String::new(),
+                        action: action_name.clone(),
+                        action_display: cmd.get_localized_name(),
+                        context: String::new(),
+                        source: BindingSource::Unbound,
+                        key_code: KeyCode::Null,
+                        modifiers: KeyModifiers::NONE,
+                        is_chord: false,
+                        plugin_name,
+                        command_name: Some(cmd.get_localized_name()),
+                        original_config: None,
+                    });
+                }
+            }
+        }
+
+        // Populate command_name for bound plugin actions from the registry
+        {
+            let commands = command_registry.get_all();
+            let cmd_by_action: std::collections::HashMap<&str, &crate::input::commands::Command> =
+                commands
+                    .iter()
+                    .filter_map(|c| {
+                        if let Action::PluginAction(ref name) = c.action {
+                            Some((name.as_str(), c))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            for binding in &mut bindings {
+                if binding.command_name.is_none() {
+                    if let Some(cmd) = cmd_by_action.get(binding.action.as_str()) {
+                        let name = cmd.get_localized_name();
+                        // Use the command name as the display description so it
+                        // matches what users see in the command palette.
+                        binding.action_display = name.clone();
+                        binding.command_name = Some(name);
+                    }
+                }
             }
         }
 
@@ -280,13 +364,24 @@ impl KeybindingEditor {
     ) -> Option<ResolvedBinding> {
         let context = kb.when.as_deref().unwrap_or("normal").to_string();
 
+        // Store the qualified form (e.g. `menu_open:File`) on ResolvedBinding
+        // so the dropdown round-trips faithfully and "still-bound" checks
+        // distinguish variants of the same bare action.
+        let qualified_action = Action::qualify_action(&kb.action, &kb.args);
+
         if !kb.keys.is_empty() {
             // Chord binding
             let key_display = format_chord_keys(&kb.keys);
-            let action_display = KeybindingResolver::format_action_from_str(&kb.action);
+            let action_display =
+                KeybindingResolver::format_action_from_str_with_args(&kb.action, &kb.args);
+            let original_config = if source == BindingSource::Custom {
+                Some(kb.clone())
+            } else {
+                None
+            };
             Some(ResolvedBinding {
                 key_display,
-                action: kb.action.clone(),
+                action: qualified_action,
                 action_display,
                 context,
                 source,
@@ -294,16 +389,24 @@ impl KeybindingEditor {
                 modifiers: KeyModifiers::NONE,
                 is_chord: true,
                 plugin_name: None,
+                command_name: None,
+                original_config,
             })
         } else if !kb.key.is_empty() {
             // Single key binding
             let key_code = KeybindingResolver::parse_key_public(&kb.key)?;
             let modifiers = KeybindingResolver::parse_modifiers_public(&kb.modifiers);
             let key_display = format_keybinding(&key_code, &modifiers);
-            let action_display = KeybindingResolver::format_action_from_str(&kb.action);
+            let action_display =
+                KeybindingResolver::format_action_from_str_with_args(&kb.action, &kb.args);
+            let original_config = if source == BindingSource::Custom {
+                Some(kb.clone())
+            } else {
+                None
+            };
             Some(ResolvedBinding {
                 key_display,
-                action: kb.action.clone(),
+                action: qualified_action,
                 action_display,
                 context,
                 source,
@@ -311,6 +414,8 @@ impl KeybindingEditor {
                 modifiers,
                 is_chord: false,
                 plugin_name: None,
+                command_name: None,
+                original_config,
             })
         } else {
             None
@@ -320,6 +425,35 @@ impl KeybindingEditor {
     /// Collect all available action names (delegates to the macro-generated source of truth)
     fn collect_action_names() -> Vec<String> {
         Action::all_action_names()
+    }
+
+    /// Replace bare entries for parameterised actions (`menu_open`,
+    /// `switch_keybinding_map`) with one qualified entry per variant — e.g.
+    /// `menu_open:File`, `menu_open:Edit`. Without this, picking the bare
+    /// `menu_open` from the dropdown would produce an un-parseable binding
+    /// because `Action::from_str` requires the args map to carry the menu
+    /// name.
+    fn expand_variant_actions(actions: &mut Vec<String>, menu_names: &[String], config: &Config) {
+        // Menu names: built-in + plugin, deduplicated case-insensitively.
+        let mut menus: Vec<String> = menu_names.to_vec();
+        menus.sort();
+        menus.dedup();
+        actions.retain(|a| a != "menu_open");
+        for name in &menus {
+            actions.push(format!("menu_open:{}", name));
+        }
+
+        // Keybinding maps: the four built-ins plus user-defined.
+        let mut keymaps: Vec<String> = ["default", "emacs", "vscode", "macos"]
+            .map(String::from)
+            .to_vec();
+        keymaps.extend(config.keybinding_maps.keys().cloned());
+        keymaps.sort();
+        keymaps.dedup();
+        actions.retain(|a| a != "switch_keybinding_map");
+        for map in &keymaps {
+            actions.push(format!("switch_keybinding_map:{}", map));
+        }
     }
 
     /// Update autocomplete suggestions based on current action text
@@ -398,7 +532,11 @@ impl KeybindingEditor {
                             let matches = binding.action.to_lowercase().contains(&query)
                                 || binding.action_display.to_lowercase().contains(&query)
                                 || binding.key_display.to_lowercase().contains(&query)
-                                || binding.context.to_lowercase().contains(&query);
+                                || binding.context.to_lowercase().contains(&query)
+                                || binding
+                                    .command_name
+                                    .as_ref()
+                                    .is_some_and(|n| n.to_lowercase().contains(&query));
                             if !matches {
                                 continue;
                             }
@@ -618,6 +756,7 @@ impl KeybindingEditor {
             ContextFilter::Specific("normal".to_string()),
             ContextFilter::Specific("prompt".to_string()),
             ContextFilter::Specific("popup".to_string()),
+            ContextFilter::Specific("completion".to_string()),
             ContextFilter::Specific("file_explorer".to_string()),
             ContextFilter::Specific("menu".to_string()),
             ContextFilter::Specific("terminal".to_string()),
@@ -688,8 +827,14 @@ impl KeybindingEditor {
                 let binding = &self.bindings[idx];
                 let action_name = binding.action.clone();
 
-                // Build config-level Keybinding for matching during save
-                let config_kb = self.resolved_to_config_keybinding(binding);
+                // Use the original config-level Keybinding if available (for
+                // bindings loaded from config), otherwise reconstruct it.
+                // This avoids lossy round-trips through parse_key which
+                // lowercases key names (e.g. "N" → "n").
+                let config_kb = binding
+                    .original_config
+                    .clone()
+                    .unwrap_or_else(|| self.resolved_to_config_keybinding(binding));
 
                 // If this binding was added in the current session, just
                 // remove it from pending_adds. Otherwise track for removal
@@ -723,6 +868,8 @@ impl KeybindingEditor {
                         modifiers: KeyModifiers::NONE,
                         is_chord: false,
                         plugin_name: None,
+                        command_name: None,
+                        original_config: None,
                     });
                 }
 
@@ -768,6 +915,8 @@ impl KeybindingEditor {
                     modifiers: self.bindings[idx].modifiers,
                     is_chord: self.bindings[idx].is_chord,
                     plugin_name: self.bindings[idx].plugin_name.clone(),
+                    command_name: None,
+                    original_config: None,
                 };
                 self.has_changes = true;
 
@@ -785,6 +934,8 @@ impl KeybindingEditor {
                         modifiers: KeyModifiers::NONE,
                         is_chord: false,
                         plugin_name: None,
+                        command_name: None,
+                        original_config: None,
                     });
                 }
 
@@ -829,6 +980,8 @@ impl KeybindingEditor {
                     modifiers: self.bindings[idx].modifiers,
                     is_chord: self.bindings[idx].is_chord,
                     plugin_name: self.bindings[idx].plugin_name.clone(),
+                    command_name: None,
+                    original_config: None,
                 };
                 self.has_changes = true;
 
@@ -845,6 +998,8 @@ impl KeybindingEditor {
                         modifiers: KeyModifiers::NONE,
                         is_chord: false,
                         plugin_name: None,
+                        command_name: None,
+                        original_config: None,
                     });
                 }
 
@@ -857,6 +1012,7 @@ impl KeybindingEditor {
 
     /// Convert a ResolvedBinding to a config-level Keybinding (for matching).
     fn resolved_to_config_keybinding(&self, binding: &ResolvedBinding) -> Keybinding {
+        let (action, args) = Action::unqualify_action(&binding.action);
         Keybinding {
             key: if binding.is_chord {
                 String::new()
@@ -869,8 +1025,8 @@ impl KeybindingEditor {
                 modifiers_to_config_names(binding.modifiers)
             },
             keys: Vec::new(),
-            action: binding.action.clone(),
-            args: HashMap::new(),
+            action,
+            args,
             when: if binding.context.is_empty() {
                 None
             } else {
@@ -913,12 +1069,17 @@ impl KeybindingEditor {
         let key_name = key_code_to_config_name(key_code);
         let modifier_names = modifiers_to_config_names(modifiers);
 
+        // Split the qualified form (e.g. `menu_open:File`) into bare action +
+        // args so the written Keybinding actually parses back to the right
+        // variant at runtime.
+        let (bare_action, args) = Action::unqualify_action(&dialog.action_text);
+
         let new_binding = Keybinding {
             key: key_name,
             modifiers: modifier_names,
             keys: Vec::new(),
-            action: dialog.action_text.clone(),
-            args: HashMap::new(),
+            action: bare_action.clone(),
+            args: args.clone(),
             when: Some(dialog.context.clone()),
         };
 
@@ -928,7 +1089,8 @@ impl KeybindingEditor {
 
         // Update display
         let key_display = format_keybinding(&key_code, &modifiers);
-        let action_display = KeybindingResolver::format_action_from_str(&dialog.action_text);
+        let action_display =
+            KeybindingResolver::format_action_from_str_with_args(&bare_action, &args);
 
         // When editing an existing binding, preserve its plugin_name so it stays
         // in the same section. New bindings go to Builtin (plugin_name: None).
@@ -947,6 +1109,8 @@ impl KeybindingEditor {
             modifiers,
             is_chord: false,
             plugin_name: preserved_plugin_name,
+            command_name: None,
+            original_config: None,
         };
 
         if let Some(edit_idx) = dialog.editing_index {
@@ -1022,5 +1186,115 @@ impl KeybindingEditor {
             SourceFilter::CustomOnly => "Custom",
             SourceFilter::PluginOnly => "Plugin",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::buffer_mode::ModeRegistry;
+
+    fn make_editor(extra_menus: &[&str]) -> KeybindingEditor {
+        let config = Config::default();
+        let resolver = KeybindingResolver::new(&config);
+        let mode_registry = ModeRegistry::new();
+        let cmd_registry = CommandRegistry::new();
+        let mut menu_names: Vec<String> = ["File", "Edit", "View"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        menu_names.extend(extra_menus.iter().map(|s| s.to_string()));
+        KeybindingEditor::new(
+            &config,
+            &resolver,
+            &mode_registry,
+            &cmd_registry,
+            String::from("/tmp/fresh-config.toml"),
+            &menu_names,
+        )
+    }
+
+    #[test]
+    fn dropdown_lists_menu_open_variants_not_bare_entry() {
+        // Regression for #1407 follow-up: picking `menu_open` from the
+        // dropdown used to produce a no-op binding because no args were
+        // attached. The dropdown should instead offer one entry per menu.
+        let editor = make_editor(&[]);
+        assert!(
+            !editor.available_actions.iter().any(|a| a == "menu_open"),
+            "bare `menu_open` must not appear — it is un-parseable without args"
+        );
+        assert!(
+            editor
+                .available_actions
+                .contains(&"menu_open:File".to_string()),
+            "expected dropdown to list `menu_open:File`, got {:?}",
+            editor.available_actions
+        );
+        assert!(
+            editor
+                .available_actions
+                .contains(&"menu_open:Edit".to_string()),
+            "expected dropdown to list `menu_open:Edit`"
+        );
+    }
+
+    #[test]
+    fn dropdown_includes_plugin_menus_passed_in() {
+        let editor = make_editor(&["MyPluginMenu"]);
+        assert!(
+            editor
+                .available_actions
+                .contains(&"menu_open:MyPluginMenu".to_string()),
+            "plugin menus should surface as dropdown entries"
+        );
+    }
+
+    #[test]
+    fn dropdown_lists_builtin_keybinding_maps() {
+        let editor = make_editor(&[]);
+        for map in ["default", "emacs", "vscode", "macos"] {
+            let qualified = format!("switch_keybinding_map:{}", map);
+            assert!(
+                editor.available_actions.contains(&qualified),
+                "expected `{}` in dropdown",
+                qualified
+            );
+        }
+        assert!(
+            !editor
+                .available_actions
+                .iter()
+                .any(|a| a == "switch_keybinding_map"),
+            "bare `switch_keybinding_map` must not appear"
+        );
+    }
+
+    #[test]
+    fn qualified_action_roundtrips_through_resolved_to_config() {
+        // A binding selected from the dropdown as `menu_open:File` must be
+        // written to config as `{action: "menu_open", args: {name: "File"}}`.
+        let editor = make_editor(&[]);
+        let rb = ResolvedBinding {
+            key_display: "Alt+F".to_string(),
+            action: "menu_open:File".to_string(),
+            action_display: String::new(),
+            context: "global".to_string(),
+            source: BindingSource::Custom,
+            key_code: KeyCode::Char('f'),
+            modifiers: KeyModifiers::ALT,
+            is_chord: false,
+            plugin_name: None,
+            command_name: None,
+            original_config: None,
+        };
+        let kb = editor.resolved_to_config_keybinding(&rb);
+        assert_eq!(kb.action, "menu_open");
+        assert_eq!(
+            kb.args.get("name").and_then(|v| v.as_str()),
+            Some("File"),
+            "the variant name must land in args.name, got {:?}",
+            kb.args
+        );
     }
 }

@@ -22,6 +22,53 @@ Metadata attached to text ranges in virtual buffers. Each entry has text content
 
 Visual decorations applied to buffer text without modifying content. Overlays can change text color and add underlines. Use overlay IDs to manage them; prefix IDs enable batch removal (e.g., "lint:" prefix for all linter highlights).
 
+### Plugin Directory
+
+Plugins can call `getPluginDir()` to locate their own package directory, useful for finding bundled scripts or local dependencies.
+
+### Authority
+
+"Authority" is the editor's slot for where filesystem, process spawning, and LSP routing are targeted. The same abstraction powers the host, SSH remotes, and devcontainers — the rest of the editor doesn't need to know which one is active. Plugins that want to target the host even while the editor is attached elsewhere can use `editor.setAuthority(...)` / `editor.clearAuthority()`, and `editor.spawnHostProcess(...)` to run a process on the host regardless of the current authority. `spawnHostProcess` returns a handle with a `kill()` method (also callable from the `KillHostProcess` palette command) so long-running agents can be cancelled cleanly. LSP spawns and `command_exists` probes also go through the current authority, with `ProcessLimits` respected end-to-end.
+
+### Remote Indicator
+
+Plugins that mediate a remote authority (the built-in SSH and devcontainer plugins do this) can drive the status-bar `{remote}` indicator: `editor.setRemoteIndicatorState({ state: "Connecting" | "Connected" | "FailedAttach", … })` to set the label, context menu, and any action rows shown on click, and `editor.clearRemoteIndicatorState()` when the authority detaches.
+
+### Theme Overrides
+
+`editor.overrideThemeColors({...})` applies an in-memory tweak to the active theme without touching disk — useful for animations (e.g. fading in on startup) or environment-driven highlights from `init.ts`. Call `editor.applyTheme(name)` to drop the overrides and settle back on the saved theme.
+
+### JSONC Parsing
+
+`editor.parseJsonc(text)` parses JSON with comments using the host's parser, so plugin code doesn't need to bundle a JSONC library just to read a user config file.
+
+### Ephemeral Terminals
+
+Terminals created by a plugin now follow the lifetime of the action that spawned them — when the action finishes, the terminal closes cleanly on its own. This is what you want for one-shot commands (a test run, a formatter) where you don't want the tab to linger.
+
+### Typed Plugin APIs
+
+`editor.exportPluginApi("name", api)` makes an object available to other plugins and `init.ts` via `editor.getPluginApi("name")`. The return type is inferred automatically if the publishing plugin augments the shared `FreshPluginRegistry` interface:
+
+```ts
+// In my_plugin.ts
+export type MyPluginApi = { doThing(): void };
+declare global {
+  interface FreshPluginRegistry {
+    "my-plugin": MyPluginApi;
+  }
+}
+editor.exportPluginApi("my-plugin", { doThing() { /* ... */ } });
+```
+
+Consumers then get a typed surface with no cast:
+
+```ts
+const api = editor.getPluginApi("my-plugin"); // MyPluginApi | null
+```
+
+Each loaded plugin's augmentation is emitted to `<config_dir>/types/plugins.d.ts` at startup (via oxc's isolated-declarations), so `init.ts` sees every registry entry automatically. Plugins that don't augment the registry still work — the untyped `getPluginApi<T = unknown>(name): T | null` overload takes over.
+
 ### Modes
 
 Keybinding contexts that determine how keypresses are interpreted. Each buffer has a mode (e.g., "normal", "insert", "special"). Custom modes can inherit from parents and define buffer-local keybindings. Virtual buffers typically use custom modes.
@@ -112,8 +159,12 @@ interface BufferInfo {
   path: string;
   modified: boolean;
   length: number;
+  /** IDs of splits currently displaying this buffer (empty if not visible). */
+  splits: number[];
 }
 ```
+
+Use `splits` to implement "focus if already visible" patterns without opening a duplicate split.
 
 | Field | Description |
 |-------|-------------|

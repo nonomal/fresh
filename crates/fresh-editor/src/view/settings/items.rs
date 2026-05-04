@@ -5,8 +5,8 @@
 use super::schema::{SettingCategory, SettingSchema, SettingType};
 use crate::config_io::ConfigLayer;
 use crate::view::controls::{
-    DropdownState, FocusState, KeybindingListState, MapState, NumberInputState, TextInputState,
-    TextListState, ToggleState,
+    DropdownState, DualListState, FocusState, KeybindingListState, MapState, NumberInputState,
+    TextInputState, TextListState, ToggleState,
 };
 use crate::view::ui::{FocusRegion, ScrollItem, TextEdit};
 use std::collections::{HashMap, HashSet};
@@ -215,6 +215,41 @@ fn json_control(
     SettingControl::Json(JsonEditState::new(name, value))
 }
 
+/// Extract a JSON array of strings from a value (or fall back to a default).
+fn value_as_string_array(
+    current: Option<&serde_json::Value>,
+    default: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let from = |v: &serde_json::Value| -> Option<Vec<String>> {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+    };
+    current
+        .and_then(from)
+        .or_else(|| default.and_then(from))
+        .unwrap_or_default()
+}
+
+/// Build a DualListState from schema options, current value, and optional sibling excluded set.
+fn build_dual_list_state(
+    schema: &SettingSchema,
+    options: &[crate::view::settings::schema::EnumOption],
+    current_value: Option<&serde_json::Value>,
+    excluded: Vec<String>,
+) -> DualListState {
+    let all_options: Vec<(String, String)> = options
+        .iter()
+        .map(|o| (o.value.clone(), o.name.clone()))
+        .collect();
+    let included = value_as_string_array(current_value, schema.default.as_ref());
+    DualListState::new(&schema.name, all_options)
+        .with_included(included)
+        .with_excluded(excluded)
+}
+
 /// A renderable setting item
 #[derive(Debug, Clone)]
 pub struct SettingItem {
@@ -239,12 +274,21 @@ pub struct SettingItem {
     pub read_only: bool,
     /// Whether this is an auto-managed map (no_add) that should never show as modified
     pub is_auto_managed: bool,
+    /// Whether this setting accepts null (can be "unset" to inherit)
+    pub nullable: bool,
+    /// Whether this setting's current value is null (inherited/unset)
+    pub is_null: bool,
     /// Section/group within the category (from x-section)
     pub section: Option<String>,
     /// Whether this item is the first in its section (for rendering section headers)
     pub is_section_start: bool,
-    /// Layout width for description wrapping (set during render)
-    pub layout_width: u16,
+    /// Visual style (card border thickness, padding, etc.) for this item.
+    /// Cached on the item so the `ScrollItem::height(width)` trait impl can
+    /// compute the correct height without taking a style parameter; flipped
+    /// in bulk by `SettingsState::set_item_style` when the user toggles UI mode.
+    pub style: ItemBoxStyle,
+    /// Path to sibling dual-list setting (for cross-exclusion refresh)
+    pub dual_list_sibling: Option<String>,
 }
 
 /// The type of control to render for a setting
@@ -255,6 +299,8 @@ pub enum SettingControl {
     Dropdown(DropdownState),
     Text(TextInputState),
     TextList(TextListState),
+    /// Dual-list picker for ordered subset selection (e.g., status bar elements)
+    DualList(DualListState),
     /// Map/dictionary control for key-value pairs
     Map(MapState),
     /// Array of objects control (for keybindings, etc.)
@@ -276,6 +322,8 @@ impl SettingControl {
                 // 1 for label + items count + 1 for add-new row
                 (state.items.len() + 2) as u16
             }
+            // DualList needs: 1 label + 1 header + body rows
+            Self::DualList(state) => 2 + state.body_rows() as u16,
             // Map needs: 1 label + 1 header (if display_field) + entries + expanded content + 1 add-new row (if allowed)
             Self::Map(state) => {
                 let header_row = if state.display_field.is_some() { 1 } else { 0 };
@@ -319,51 +367,227 @@ impl SettingControl {
             _ => 1,
         }
     }
-}
 
-/// Height of a section header (header line + gap)
-pub const SECTION_HEADER_HEIGHT: u16 = 2;
-
-impl SettingItem {
-    /// Calculate the total height needed for this item (control + description + spacing + section header if applicable)
-    /// Uses layout_width for description wrapping when available.
-    pub fn item_height(&self) -> u16 {
-        // Height = section header (if first in section) + control + description (if any) + spacing
-        let section_height = if self.is_section_start {
-            SECTION_HEADER_HEIGHT
-        } else {
-            0
-        };
-        let description_height = self.description_height(self.layout_width);
-        section_height + self.control.control_height() + description_height + 1
+    /// Whether this is a composite control (TextList, Map, ObjectArray) that has
+    /// internal sub-items. For composite controls, highlighting should be per-row,
+    /// not across the entire control area.
+    pub fn is_composite(&self) -> bool {
+        matches!(
+            self,
+            Self::TextList(_) | Self::DualList(_) | Self::Map(_) | Self::ObjectArray(_)
+        )
     }
 
-    /// Calculate description height wrapped to the given width.
-    /// If width is 0 (not yet set), falls back to 1 line.
-    pub fn description_height(&self, width: u16) -> u16 {
-        if let Some(ref desc) = self.description {
-            if desc.is_empty() {
-                return 0;
+    /// Get the row offset of the focused sub-item within a composite control.
+    /// Returns 0 for non-composite controls or if no sub-item is focused.
+    /// The offset is relative to the start of the control's render area.
+    pub fn focused_sub_row(&self) -> u16 {
+        match self {
+            Self::TextList(state) => {
+                // Row 0 = label, rows 1..N = items, row N+1 = add-new
+                match state.focused_item {
+                    Some(idx) => 1 + idx as u16,          // item rows start at offset 1
+                    None => 1 + state.items.len() as u16, // add-new row
+                }
             }
-            if width == 0 {
-                return 1;
+            Self::DualList(state) => {
+                // Row 0 = label, Row 1 = headers, Rows 2+ = body
+                use crate::view::controls::DualListColumn;
+                let row = match state.active_column {
+                    DualListColumn::Available => state.available_cursor,
+                    DualListColumn::Included => state.included_cursor,
+                };
+                2 + row as u16
             }
-            // Calculate number of lines needed for wrapped description
-            let chars_per_line = width.saturating_sub(2) as usize; // Leave some margin
-            if chars_per_line == 0 {
-                return 1;
+            Self::ObjectArray(state) => {
+                // Row 0 = label, rows 1..N = bindings, row N+1 = add-new
+                match state.focused_index {
+                    Some(idx) => 1 + idx as u16,
+                    None => 1 + state.bindings.len() as u16,
+                }
             }
-            desc.len().div_ceil(chars_per_line) as u16
-        } else {
-            0
+            Self::Map(state) => {
+                // Row 0 = label, row 1 = header (if display_field), then entries, then add-new
+                let header_offset = if state.display_field.is_some() { 1 } else { 0 };
+                match state.focused_entry {
+                    Some(idx) => 1 + header_offset + idx as u16,
+                    None => 1 + header_offset + state.entries.len() as u16,
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+// === Layout primitives ===
+//
+// Every magic number that used to be sprinkled through the render path lives
+// inside `ItemBoxStyle`. The struct is `Copy`, has a `Default` impl, and is
+// stored on each `SettingItem` — so toggling cards on/off, removing the
+// indicator gutter, or tightening the padding is a single state mutation
+// rather than a code change.
+
+/// Visual style for a setting item: tunes every dimension of the layout so
+/// chrome (card border, padding, section header, indicator gutter) can be
+/// toggled or tweaked from one place.
+///
+/// All values are in terminal cells (rows or columns). Setting a row/col count
+/// to `0` disables that piece of chrome; the rest of the layout still works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemBoxStyle {
+    /// Rows occupied by a section header: title row + blank gap below it.
+    /// Set to `0` to suppress section headings entirely.
+    pub section_header_rows: u16,
+    /// Top/bottom border thickness of the per-item card (rows).
+    pub card_border_rows: u16,
+    /// Left/right border thickness of the per-item card (columns).
+    pub card_border_cols: u16,
+    /// Columns reserved on the left of the card's interior for the focus
+    /// indicator (`>`), the modified marker (`●`), and a single-space gutter.
+    pub focus_indicator_cols: u16,
+    /// Right-side padding inside the card so wrapped description text doesn't
+    /// butt up against the right border.
+    pub description_right_padding_cols: u16,
+}
+
+impl ItemBoxStyle {
+    /// The default look used by the settings panel: 1-row top/bottom card
+    /// borders, 1-col side borders, 2-row section headers.
+    pub const fn cards() -> Self {
+        Self {
+            section_header_rows: 2,
+            card_border_rows: 1,
+            card_border_cols: 1,
+            focus_indicator_cols: 3,
+            description_right_padding_cols: 2,
         }
     }
 
-    /// Calculate the content height (control + description, excluding spacing)
-    /// Uses layout_width for description wrapping when available.
-    pub fn content_height(&self) -> u16 {
-        let description_height = self.description_height(self.layout_width);
-        self.control.control_height() + description_height
+    /// A flat look with no card border. Items still get 1-row gap chrome
+    /// (carried by the section header) and the indicator gutter.
+    pub const fn flat() -> Self {
+        Self {
+            section_header_rows: 2,
+            card_border_rows: 0,
+            card_border_cols: 0,
+            focus_indicator_cols: 3,
+            description_right_padding_cols: 2,
+        }
+    }
+
+    /// Width available for wrapped description text inside a card of the
+    /// given outer width (subtracting both borders, the focus gutter, and
+    /// the right padding).
+    pub fn inner_text_width(&self, card_outer_width: u16) -> u16 {
+        card_outer_width
+            .saturating_sub(2 * self.card_border_cols)
+            .saturating_sub(self.focus_indicator_cols)
+            .saturating_sub(self.description_right_padding_cols)
+    }
+}
+
+impl Default for ItemBoxStyle {
+    fn default() -> Self {
+        Self::cards()
+    }
+}
+
+/// Vertical layout descriptor for a single setting item.
+///
+/// Fields are named bands of rows; together they describe both the total
+/// height of the item and where each band lives along the y-axis. The render
+/// path uses these offsets directly instead of recomputing them inline.
+///
+/// All offsets are relative to the top of the area allocated to the item.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ItemBox {
+    /// Section header band above the card (0 if not a section start).
+    pub section_header_rows: u16,
+    /// Top edge of the card.
+    pub top_border_rows: u16,
+    /// The control widget (toggle, dropdown, multi-row list, …).
+    pub control_rows: u16,
+    /// The wrapped description text below the control.
+    pub description_rows: u16,
+    /// Bottom edge of the card.
+    pub bottom_border_rows: u16,
+}
+
+impl ItemBox {
+    pub fn total_rows(&self) -> u16 {
+        self.section_header_rows
+            + self.top_border_rows
+            + self.control_rows
+            + self.description_rows
+            + self.bottom_border_rows
+    }
+
+    /// Y of the card's top border.
+    pub fn card_top_y(&self) -> u16 {
+        self.section_header_rows
+    }
+
+    /// Y of the first content row (the control).
+    pub fn control_y(&self) -> u16 {
+        self.card_top_y() + self.top_border_rows
+    }
+
+    /// Y of the first description row.
+    pub fn description_y(&self) -> u16 {
+        self.control_y() + self.control_rows
+    }
+
+    /// Y of the bottom border.
+    pub fn bottom_border_y(&self) -> u16 {
+        self.description_y() + self.description_rows
+    }
+
+    /// Total card height (top border + content + bottom border).
+    pub fn card_height(&self) -> u16 {
+        self.top_border_rows + self.control_rows + self.description_rows + self.bottom_border_rows
+    }
+
+    /// Card content rows (control + description, no borders).
+    pub fn content_rows(&self) -> u16 {
+        self.control_rows + self.description_rows
+    }
+}
+
+impl SettingItem {
+    /// Compute the visual layout of this item for a given outer width and
+    /// style. `width` is the full width allocated to the item (including the
+    /// card borders and the focus-indicator columns).
+    pub fn layout_box(&self, width: u16, style: &ItemBoxStyle) -> ItemBox {
+        ItemBox {
+            section_header_rows: if self.is_section_start {
+                style.section_header_rows
+            } else {
+                0
+            },
+            top_border_rows: style.card_border_rows,
+            control_rows: self.control.control_height(),
+            description_rows: self.description_rows_for(style.inner_text_width(width)),
+            bottom_border_rows: style.card_border_rows,
+        }
+    }
+
+    /// Rows needed for the description when wrapped to `inner_width` columns.
+    ///
+    /// The wrapping here is a byte-based approximation that overestimates
+    /// slightly compared to the word-wrap used at render time; that's fine —
+    /// the renderer clips to the available rows, never to fewer than the
+    /// number of wrapped lines it produces.
+    pub fn description_rows_for(&self, inner_width: u16) -> u16 {
+        let Some(desc) = self.description.as_deref() else {
+            return 0;
+        };
+        if desc.is_empty() {
+            return 0;
+        }
+        if inner_width == 0 {
+            return 1;
+        }
+        desc.len().div_ceil(inner_width as usize) as u16
     }
 }
 
@@ -412,11 +636,22 @@ pub fn clean_description(name: &str, description: Option<&str>) -> Option<String
 }
 
 impl ScrollItem for SettingItem {
-    fn height(&self) -> u16 {
-        self.item_height()
+    fn height(&self, width: u16) -> u16 {
+        self.layout_box(width, &self.style).total_rows()
     }
 
-    fn focus_regions(&self) -> Vec<FocusRegion> {
+    fn focus_regions(&self, width: u16) -> Vec<FocusRegion> {
+        // y_offset is ABSOLUTE within the item — `ScrollablePanel` adds it
+        // to the cumulative item-y to compute a screen y for
+        // `ensure_visible`. Since the item now starts with a section header
+        // and/or a card top border above the control row, y=0 of the
+        // control is `plan.control_y()` rows down from the item top. Using
+        // 0 here scrolls the viewport to the chrome, not to the actual
+        // entry, which is exactly the bug that hid the focused map entry
+        // off-screen on search-jump.
+        let plan = self.layout_box(width, &self.style);
+        let label_y = plan.control_y();
+
         match &self.control {
             // TextList: each row is a focus region
             SettingControl::TextList(state) => {
@@ -424,29 +659,50 @@ impl ScrollItem for SettingItem {
                 // Label row
                 regions.push(FocusRegion {
                     id: 0,
-                    y_offset: 0,
+                    y_offset: label_y,
                     height: 1,
                 });
                 // Each item row (id = 1 + row_index)
                 for i in 0..state.items.len() {
                     regions.push(FocusRegion {
                         id: 1 + i,
-                        y_offset: 1 + i as u16,
+                        y_offset: label_y + 1 + i as u16,
                         height: 1,
                     });
                 }
                 // Add-new row
                 regions.push(FocusRegion {
                     id: 1 + state.items.len(),
-                    y_offset: 1 + state.items.len() as u16,
+                    y_offset: label_y + 1 + state.items.len() as u16,
                     height: 1,
                 });
+                regions
+            }
+            // DualList: label + header + body rows
+            SettingControl::DualList(state) => {
+                let mut regions = Vec::new();
+                // Label row
+                regions.push(FocusRegion {
+                    id: 0,
+                    y_offset: label_y,
+                    height: 1,
+                });
+                // Header row (not selectable, but takes space)
+                // Body rows (id = 1 + row_index)
+                let body = state.body_rows();
+                for i in 0..body {
+                    regions.push(FocusRegion {
+                        id: 1 + i,
+                        y_offset: label_y + 2 + i as u16, // after label + header
+                        height: 1,
+                    });
+                }
                 regions
             }
             // Map: each entry row is a focus region
             SettingControl::Map(state) => {
                 let mut regions = Vec::new();
-                let mut y = 0u16;
+                let mut y = label_y;
 
                 // Label row
                 regions.push(FocusRegion {
@@ -495,31 +751,31 @@ impl ScrollItem for SettingItem {
                 // Label row
                 regions.push(FocusRegion {
                     id: 0,
-                    y_offset: 0,
+                    y_offset: label_y,
                     height: 1,
                 });
                 // Each binding (id = 1 + index)
                 for i in 0..state.bindings.len() {
                     regions.push(FocusRegion {
                         id: 1 + i,
-                        y_offset: 1 + i as u16,
+                        y_offset: label_y + 1 + i as u16,
                         height: 1,
                     });
                 }
                 // Add-new row
                 regions.push(FocusRegion {
                     id: 1 + state.bindings.len(),
-                    y_offset: 1 + state.bindings.len() as u16,
+                    y_offset: label_y + 1 + state.bindings.len() as u16,
                     height: 1,
                 });
                 regions
             }
-            // Other controls: single region covering the whole item
+            // Other controls: single region covering the card content.
             _ => {
                 vec![FocusRegion {
                     id: 0,
-                    y_offset: 0,
-                    height: self.item_height().saturating_sub(1), // Exclude spacing
+                    y_offset: label_y,
+                    height: plan.content_rows(),
                 }]
             }
         }
@@ -535,10 +791,23 @@ pub struct SettingsPage {
     pub path: String,
     /// Description
     pub description: Option<String>,
+    /// Whether this page represents a nullable category that can be cleared as a whole
+    pub nullable: bool,
     /// Settings on this page
     pub items: Vec<SettingItem>,
     /// Subpages
     pub subpages: Vec<SettingsPage>,
+    /// Cached section list for the tree view in the left panel.
+    /// Computed once after sorting items in `build_page`.
+    pub sections: Vec<SectionInfo>,
+}
+
+/// One section within a page — name plus the index of its first item, used by
+/// the left-panel tree view to jump straight to that section when clicked.
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub name: String,
+    pub first_item_index: usize,
 }
 
 /// Context for building setting items with layer awareness
@@ -571,7 +840,7 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
     let mut items: Vec<SettingItem> = category
         .settings
         .iter()
-        .map(|s| build_item(s, ctx))
+        .flat_map(|s| expand_or_build(s, ctx))
         .collect();
 
     // Sort items: by section first (None comes last), then alphabetically by name
@@ -582,9 +851,11 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
         (None, None) => a.name.cmp(&b.name),
     });
 
-    // Mark items that start a new section
+    // Mark items that start a new section, and capture the section list
+    // for the left-panel tree view in one pass.
+    let mut sections: Vec<SectionInfo> = Vec::new();
     let mut prev_section: Option<&String> = None;
-    for item in &mut items {
+    for (idx, item) in items.iter_mut().enumerate() {
         let is_new_section = match (&item.section, prev_section) {
             (Some(sec), Some(prev)) => sec != prev,
             (Some(_), None) => true,
@@ -592,6 +863,14 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
             (None, None) => false,
         };
         item.is_section_start = is_new_section;
+        if is_new_section {
+            if let Some(name) = item.section.clone() {
+                sections.push(SectionInfo {
+                    name,
+                    first_item_index: idx,
+                });
+            }
+        }
         prev_section = item.section.as_ref();
     }
 
@@ -605,15 +884,61 @@ fn build_page(category: &SettingCategory, ctx: &BuildContext) -> SettingsPage {
         name: category.name.clone(),
         path: category.path.clone(),
         description: category.description.clone(),
+        nullable: category.nullable,
         items,
         subpages,
+        sections,
     }
+}
+
+/// Expand an Object schema into its children when every child has a native
+/// (non-JSON) control, otherwise build it as a single item. This lets compound
+/// config structs like `StatusBarConfig` surface their children as individual
+/// settings with proper DualList / toggle / etc. controls, while objects whose
+/// children would all fall through to JSON editors stay collapsed.
+fn expand_or_build(schema: &SettingSchema, ctx: &BuildContext) -> Vec<SettingItem> {
+    if let SettingType::Object { properties } = &schema.setting_type {
+        let all_native = !properties.is_empty()
+            && properties.iter().all(|child| {
+                !matches!(
+                    child.setting_type,
+                    SettingType::Object { .. } | SettingType::Complex
+                )
+            });
+        if all_native {
+            // Children parsed inside determine_type have paths relative to ""
+            // (e.g. "/left"); prefix with the parent's path to get absolute
+            // paths (e.g. "/editor/status_bar/left").
+            return properties
+                .iter()
+                .map(|child| {
+                    let mut child = child.clone();
+                    if !child.path.starts_with(&schema.path) {
+                        child.path = format!("{}{}", schema.path, child.path);
+                    }
+                    if let Some(ref mut sib) = child.dual_list_sibling {
+                        if !sib.starts_with(&schema.path) {
+                            *sib = format!("{}{}", schema.path, sib);
+                        }
+                    }
+                    build_item(&child, ctx)
+                })
+                .collect();
+        }
+    }
+    vec![build_item(schema, ctx)]
 }
 
 /// Build a setting item with its control state initialized from current config
 pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
     // Get current value from config
     let current_value = ctx.config_value.pointer(&schema.path);
+
+    // Detect if the current value is null (inherited/unset) for nullable fields
+    let is_null = schema.nullable
+        && current_value
+            .map(|v| v.is_null())
+            .unwrap_or(schema.default.as_ref().map(|d| d.is_null()).unwrap_or(true));
 
     // Check if this is an auto-managed map (no_add)
     let is_auto_managed = matches!(&schema.setting_type, SettingType::Map { no_add: true, .. });
@@ -669,8 +994,37 @@ pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
                 .or_else(|| schema.default.as_ref().and_then(|d| d.as_str()))
                 .unwrap_or("");
 
-            let state = TextInputState::new(&schema.name).with_value(value);
-            SettingControl::Text(state)
+            // Check for dynamic enum: derive dropdown options from another config field's keys
+            if let Some(ref source_path) = schema.enum_from {
+                let mut options: Vec<String> = ctx
+                    .config_value
+                    .pointer(source_path)
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_default();
+                options.sort();
+
+                // Add empty option for nullable fields (unset/inherit)
+                let mut display_names = Vec::new();
+                let mut values = Vec::new();
+                if schema.nullable {
+                    display_names.push("(none)".to_string());
+                    values.push(String::new());
+                }
+                for key in &options {
+                    display_names.push(key.clone());
+                    values.push(key.clone());
+                }
+
+                let current = if is_null { "" } else { value };
+                let selected = values.iter().position(|v| v == current).unwrap_or(0);
+                let state = DropdownState::with_values(display_names, values, &schema.name)
+                    .with_selected(selected);
+                SettingControl::Dropdown(state)
+            } else {
+                let state = TextInputState::new(&schema.name).with_value(value);
+                SettingControl::Text(state)
+            }
         }
 
         SettingType::Enum { options } => {
@@ -699,25 +1053,25 @@ pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
             SettingControl::Dropdown(state)
         }
 
-        SettingType::StringArray => {
-            let items: Vec<String> = current_value
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .or_else(|| {
-                    schema.default.as_ref().and_then(|d| {
-                        d.as_array().map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                    })
-                })
+        SettingType::DualList {
+            options,
+            sibling_path,
+        } => {
+            let excluded = sibling_path
+                .as_ref()
+                .and_then(|path| ctx.config_value.pointer(path))
+                .map(|v| value_as_string_array(Some(v), None))
                 .unwrap_or_default();
+            SettingControl::DualList(build_dual_list_state(
+                schema,
+                options,
+                current_value,
+                excluded,
+            ))
+        }
 
+        SettingType::StringArray => {
+            let items = value_as_string_array(current_value, schema.default.as_ref());
             let state = TextListState::new(&schema.name).with_items(items);
             SettingControl::TextList(state)
         }
@@ -832,9 +1186,12 @@ pub fn build_item(schema: &SettingSchema, ctx: &BuildContext) -> SettingItem {
         layer_source,
         read_only: schema.read_only,
         is_auto_managed,
+        nullable: schema.nullable,
+        is_null,
         section: schema.section.clone(),
         is_section_start: false, // Set later in build_page after sorting
-        layout_width: 0,
+        style: ItemBoxStyle::default(),
+        dual_list_sibling: schema.dual_list_sibling.clone(),
     }
 }
 
@@ -920,6 +1277,16 @@ pub fn build_item_from_value(
             let state = DropdownState::with_values(display_names, values, &schema.name)
                 .with_selected(selected);
             SettingControl::Dropdown(state)
+        }
+
+        SettingType::DualList { options, .. } => {
+            // Dialog context has no sibling to cross-exclude against
+            SettingControl::DualList(build_dual_list_state(
+                schema,
+                options,
+                current_value,
+                vec![],
+            ))
         }
 
         SettingType::StringArray => {
@@ -1036,6 +1403,11 @@ pub fn build_item_from_value(
     // Check if this is an auto-managed map (no_add)
     let is_auto_managed = matches!(&schema.setting_type, SettingType::Map { no_add: true, .. });
 
+    let is_null = schema.nullable
+        && current_value
+            .map(|v| v.is_null())
+            .unwrap_or(schema.default.as_ref().map(|d| d.is_null()).unwrap_or(true));
+
     SettingItem {
         path: schema.path.clone(),
         name: schema.name.clone(),
@@ -1047,9 +1419,12 @@ pub fn build_item_from_value(
         layer_source: ConfigLayer::System,
         read_only: schema.read_only,
         is_auto_managed,
+        nullable: schema.nullable,
+        is_null,
         section: schema.section.clone(),
         is_section_start: false, // Not used in dialogs
-        layout_width: 0,
+        style: ItemBoxStyle::default(),
+        dual_list_sibling: schema.dual_list_sibling.clone(),
     }
 }
 
@@ -1097,6 +1472,15 @@ pub fn control_to_value(control: &SettingControl) -> serde_json::Value {
                         Some(serde_json::Value::String(s.clone()))
                     }
                 })
+                .collect();
+            serde_json::Value::Array(arr)
+        }
+
+        SettingControl::DualList(state) => {
+            let arr: Vec<serde_json::Value> = state
+                .included
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
                 .collect();
             serde_json::Value::Array(arr)
         }
@@ -1164,6 +1548,10 @@ mod tests {
             default: Some(serde_json::Value::Bool(true)),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
         };
 
         let config = sample_config();
@@ -1193,6 +1581,10 @@ mod tests {
             default: Some(serde_json::Value::Bool(true)),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
         };
 
         let config = sample_config();
@@ -1220,6 +1612,10 @@ mod tests {
             default: Some(serde_json::Value::Number(4.into())),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
         };
 
         let config = sample_config();
@@ -1248,6 +1644,10 @@ mod tests {
             default: Some(serde_json::Value::String("high-contrast".to_string())),
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
         };
 
         let config = sample_config();

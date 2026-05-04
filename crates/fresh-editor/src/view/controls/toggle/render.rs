@@ -52,17 +52,19 @@ pub fn render_toggle_aligned(
         };
     }
 
-    // Use focused_fg for text when focused (not focused, which is the bg color)
+    // When focused/hovered the chip sits on top of the row's highlight bg
+    // (settings_selected_bg / menu_hover_bg). Use `focused_fg` for the
+    // checkmark too — themes guarantee `focused_fg` contrasts with
+    // `focused` (their bg), whereas `checkmark` is green-ish in most
+    // themes and collides with green-tinted highlights (e.g. Nostalgia).
     let (bracket_color, _check_color, label_color) = match state.focus {
         FocusState::Normal => (colors.bracket, colors.checkmark, colors.label),
-        FocusState::Focused => (colors.focused_fg, colors.checkmark, colors.focused_fg),
-        FocusState::Hovered => (colors.focused_fg, colors.checkmark, colors.focused_fg),
+        FocusState::Focused => (colors.focused_fg, colors.focused_fg, colors.focused_fg),
+        FocusState::Hovered => (colors.focused_fg, colors.focused_fg, colors.focused_fg),
         FocusState::Disabled => (colors.disabled, colors.disabled, colors.disabled),
     };
 
-    let checkbox = if state.checked { "[x]" } else { "[ ]" };
-
-    // Format: "Label: [x]" with optional padding
+    // Format: "Label: [✓]" with optional padding
     let actual_label_width = label_width.unwrap_or(state.label.len() as u16);
     let padded_label = format!(
         "{:width$}",
@@ -70,21 +72,41 @@ pub fn render_toggle_aligned(
         width = actual_label_width as usize
     );
 
-    let line = Line::from(vec![
-        Span::styled(padded_label, Style::default().fg(label_color)),
-        Span::styled(": ", Style::default().fg(label_color)),
-        Span::styled(checkbox, Style::default().fg(bracket_color)),
-    ]);
+    // Chip-style toggle. Both states render at the same width so the
+    // surrounding layout doesn't shift when the value flips.
+    //   checked:   [ ✓ ACTIVE ]
+    //   unchecked: [          ]
+    const CHIP_INNER: &str = "          "; // 10 spaces, same width as " ✓ ACTIVE "
+    const CHIP_WIDTH: u16 = 12; // "[" + 10 + "]"
+
+    let line = if state.checked {
+        Line::from(vec![
+            Span::styled(padded_label, Style::default().fg(label_color)),
+            Span::styled(": ", Style::default().fg(label_color)),
+            Span::styled("[ ", Style::default().fg(bracket_color)),
+            Span::styled("✓", Style::default().fg(_check_color)),
+            Span::styled(" ACTIVE ", Style::default().fg(_check_color)),
+            Span::styled("]", Style::default().fg(bracket_color)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(padded_label, Style::default().fg(label_color)),
+            Span::styled(": ", Style::default().fg(label_color)),
+            Span::styled("[", Style::default().fg(bracket_color)),
+            Span::styled(CHIP_INNER, Style::default().fg(bracket_color)),
+            Span::styled("]", Style::default().fg(bracket_color)),
+        ])
+    };
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 
-    // Checkbox position after label
+    // Chip position after label
     let checkbox_start = area.x + actual_label_width + 2; // label + ": "
-    let checkbox_area = Rect::new(checkbox_start, area.y, 3.min(area.width), 1);
+    let checkbox_area = Rect::new(checkbox_start, area.y, CHIP_WIDTH.min(area.width), 1);
 
-    // Full area is label + ": " + checkbox
-    let full_width = (actual_label_width + 2 + 3).min(area.width);
+    // Full area is label + ": " + chip
+    let full_width = (actual_label_width + 2 + CHIP_WIDTH).min(area.width);
     let full_area = Rect::new(area.x, area.y, full_width, 1);
 
     ToggleLayout {

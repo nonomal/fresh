@@ -17,7 +17,13 @@ pub mod git_test_helper;
 pub mod harness;
 #[cfg(test)]
 #[allow(dead_code)]
+pub mod scenario;
+#[cfg(test)]
+#[allow(dead_code)]
 pub mod scrollbar;
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod timing;
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod tracing;

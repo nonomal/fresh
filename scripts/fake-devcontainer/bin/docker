@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# fake `docker` CLI — see docs/internal/FAKE_DEVCONTAINER_CLI.md
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/fake-state.sh
+. "$SCRIPT_DIR/../lib/fake-state.sh"
+
+usage() {
+  cat <<'EOF' >&2
+fake docker CLI (only the surfaces Fresh's devcontainer plugin uses)
+usage:
+  docker exec [-i|-t|-it] [-u <user>] [-w <dir>] <id> <cmd> [args...]
+  docker logs [--tail <n>] <id>
+  docker port <id>
+  docker info | version | ps   (stubs)
+EOF
+}
+
+cmd_exec() {
+  user=""
+  workdir=""
+  exec_env_pairs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i|-t|-it|-ti) shift ;;
+      -u) user="${2:-}"; shift 2 ;;
+      -w) workdir="${2:-}"; shift 2 ;;
+      -e)
+        # `docker exec -e KEY=VAL` — capture for the optional history
+        # log so tests can assert against the env that reached the
+        # container, then export so the child sees it.
+        exec_env_pairs+=("${2:-}")
+        export "${2:-}"
+        shift 2 ;;
+      --) shift; break ;;
+      -*)
+        # Unknown flag — pass through to the child by stopping flag parsing.
+        break ;;
+      *)
+        break ;;
+    esac
+  done
+
+  if [ $# -lt 1 ]; then
+    echo "fake-docker exec: missing container id" >&2
+    exit 64
+  fi
+  container_id="$1"; shift
+  if [ $# -lt 1 ]; then
+    echo "fake-docker exec: missing command" >&2
+    exit 64
+  fi
+
+  state="$(fake_state_dir)"
+  cdir="$state/containers/$container_id"
+
+  # Record this exec invocation to a per-state history file so tests
+  # can assert on which env vars were forwarded via `-e` and which
+  # commands ran. Each line: `<container_id>\t<env_pair>;<env_pair>...\t<cmd> <args...>`.
+  exec_history_file="$state/exec_history"
+  exec_env_joined="$(IFS=';'; printf '%s' "${exec_env_pairs[*]:-}")"
+  printf '%s\t%s\t%s\n' "$container_id" "$exec_env_joined" "$*" >> "$exec_history_file" 2>/dev/null || true
+
+  # Always surface what the editor *requested* via -w, regardless of
+  # whether that path exists on the host. Lets tests assert against
+  # the in-container path the plugin would have sent (which is what
+  # real `docker exec -w` honors), without the fake silently masking
+  # a host-vs-container path mismatch.
+  export FAKE_DC_REQUESTED_CWD="$workdir"
+
+  # Special-case the `userEnvProbe` exec so tests don't depend on
+  # whatever bash exists on the host (a real `bash -lic env` against
+  # the host can take seconds and emit terminal-mode warnings).
+  # Triggered when the *plain* `bash <flags> -c env` shape arrives —
+  # i.e. the captureContainerLoginEnv probe with no env wrapping.
+  #
+  # Lifecycle-style probes that go through `wrapWithEnv` arrive as
+  # `env KEY=VAL bash <flags> -c env`; those still need to hit a real
+  # bash so `BASH_ENV` etc. get honored (B3 in spec_conformance pins
+  # this). Detect by checking $1 — `bash` means plain probe, anything
+  # else (notably `env`) falls through.
+  if [ $# -ge 2 ] && [ "$1" = "bash" ]; then
+    last_two="${@: -2}"
+    if [ "$last_two" = "-c env" ]; then
+      if [ -f "$state/probe_response" ]; then
+        cat "$state/probe_response"
+      else
+        printf 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nHOME=/root\nLANG=C.UTF-8\n'
+      fi
+      exit 0
+    fi
+  fi
+
+  # Special-case `cat <abs-path>` (and `cat <abs-path-1> <abs-path-2>`)
+  # so tests can stash "in-container" files at
+  # `<state>/container_fs/<abs-path>` and have the editor's
+  # container-fetch path (`docker exec <id> cat /home/vscode/.../foo.py`)
+  # resolve them without those paths needing to actually exist on the
+  # host. Production `docker exec <id> cat <path>` reads the file
+  # from the container's namespace; this is the simplest faithful
+  # fake. Files not in the stash dir get the real `cat`'s
+  # "no such file" exit code 1, which is also what production gives
+  # for nonexistent paths.
+  if [ $# -ge 2 ] && [ "$1" = "cat" ]; then
+    stash="$state/container_fs"
+    all_found=1
+    for p in "${@:2}"; do
+      case "$p" in
+        /*)
+          if [ ! -f "$stash$p" ]; then
+            all_found=0
+            break
+          fi
+          ;;
+        *)
+          all_found=0
+          break
+          ;;
+      esac
+    done
+    if [ "$all_found" = "1" ]; then
+      for p in "${@:2}"; do
+        cat "$stash$p"
+      done
+      exit 0
+    fi
+    # Fall through to real cat: it will report "No such file" for
+    # the missing path with the standard exit code 1, which the
+    # editor surfaces as "could not read from container".
+  fi
+
+  if [ -z "$workdir" ] && [ -f "$cdir/workspace" ]; then
+    # Treat the recorded host workspace path as the cwd. In real
+    # devcontainers the workspace is bind-mounted to remoteWorkspaceFolder
+    # 1:1, so cd-ing into the host path is a faithful enough fake.
+    workdir="$(cat "$cdir/workspace")"
+  fi
+
+  if [ -n "$workdir" ] && [ -d "$workdir" ]; then
+    cd "$workdir" || exit 1
+  fi
+  # Note: when -w is non-empty but doesn't exist on the host, the cd
+  # is silently skipped. Real `docker exec -w <missing>` errors with
+  # "no such file or directory". Tests that need the strict behavior
+  # set FAKE_DC_STRICT_CWD=1 (handled below).
+  if [ -n "$workdir" ] && [ ! -d "$workdir" ] && [ "${FAKE_DC_STRICT_CWD:-0}" = "1" ]; then
+    echo "fake-docker exec: -w '$workdir' does not exist (FAKE_DC_STRICT_CWD=1)" >&2
+    exit 126
+  fi
+
+  # Apply containerEnv (set at container creation time in real
+  # devcontainers; here we replay the env file `up` recorded). This
+  # mirrors what a real `docker exec` would inherit from the
+  # container's image-level env.
+  if [ -f "$cdir/container_env" ]; then
+    # Each line: KEY=VALUE. Source via export so the child inherits.
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      export "$line"
+    done < "$cdir/container_env"
+  fi
+
+  # Surface "who" we'd have been so child scripts can assert on it.
+  export FAKE_DC_USER="$user"
+  export FAKE_DC_CONTAINER_ID="$container_id"
+
+  exec "$@"
+}
+
+cmd_logs() {
+  tail_n=1000
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tail) tail_n="${2:-1000}"; shift 2 ;;
+      --tail=*) tail_n="${1#*=}"; shift ;;
+      -f|--follow) shift ;;
+      *) break ;;
+    esac
+  done
+  [ $# -ge 1 ] || { echo "fake-docker logs: missing container id" >&2; exit 64; }
+  id="$1"
+  state="$(fake_state_dir)"
+  log="$state/containers/$id/logs"
+  if [ -f "$log" ]; then
+    if [ "$tail_n" = "all" ]; then
+      cat "$log"
+    else
+      tail -n "$tail_n" "$log"
+    fi
+  else
+    echo "(fake-docker) no logs recorded for $id"
+  fi
+}
+
+cmd_port() {
+  [ $# -ge 1 ] || { echo "fake-docker port: missing container id" >&2; exit 64; }
+  id="$1"
+  state="$(fake_state_dir)"
+  ports="$state/containers/$id/ports"
+  [ -f "$ports" ] && cat "$ports"
+}
+
+cmd_info() {
+  cat <<'EOF'
+Client: fake-docker
+ Version: 0.0.0
+Server: fake-docker
+ (no real daemon — see docs/internal/FAKE_DEVCONTAINER_CLI.md)
+EOF
+}
+
+cmd_version() { echo "fake-docker 0.0.0"; }
+
+cmd_ps() {
+  state="$(fake_state_dir)"
+  printf 'CONTAINER ID  STATUS   WORKSPACE\n'
+  for d in "$state"/containers/*/; do
+    [ -d "$d" ] || continue
+    id="$(basename "$d")"
+    status="$(cat "$d/status" 2>/dev/null || echo ?)"
+    workspace="$(cat "$d/workspace" 2>/dev/null || echo ?)"
+    printf '%s  %s  %s\n' "$id" "$status" "$workspace"
+  done
+}
+
+# `docker stop <id>` flips the recorded status to "stopped". Real
+# `docker stop` sends SIGTERM then SIGKILL; the fake doesn't run a
+# real container, so all we need to record is the lifecycle bit
+# tests assert against (e.g. "shutdownAction=stopContainer must
+# stop the container on Detach").
+cmd_stop() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--time) shift 2 ;;
+      -*) shift ;;
+      *) break ;;
+    esac
+  done
+  [ $# -ge 1 ] || { echo "fake-docker stop: missing container id" >&2; exit 64; }
+  state="$(fake_state_dir)"
+  exit_code=0
+  for id in "$@"; do
+    cdir="$state/containers/$id"
+    if [ ! -d "$cdir" ]; then
+      echo "fake-docker stop: no such container $id" >&2
+      exit_code=1
+      continue
+    fi
+    printf 'stopped\n' > "$cdir/status"
+    printf '%s\n' "$id"
+  done
+  return $exit_code
+}
+
+main() {
+  [ $# -gt 0 ] || { usage; exit 64; }
+  sub="$1"; shift
+  case "$sub" in
+    exec)              cmd_exec "$@" ;;
+    logs)              cmd_logs "$@" ;;
+    port)              cmd_port "$@" ;;
+    info)              cmd_info "$@" ;;
+    version|--version) cmd_version "$@" ;;
+    ps)                cmd_ps "$@" ;;
+    stop)              cmd_stop "$@" ;;
+    --help|-h|help)    usage; exit 0 ;;
+    *)
+      echo "fake-docker: unsupported subcommand: $sub" >&2
+      exit 64
+      ;;
+  esac
+}
+
+main "$@"

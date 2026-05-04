@@ -109,7 +109,7 @@ impl MultiCursorShadow {
             // Insert new text
             new_content.push_str(ins_text);
             // Skip over deleted content
-            read_pos = *edit_pos + *del_len;
+            read_pos = read_pos.max(*edit_pos + *del_len);
         }
         // Copy remaining content after last edit
         if read_pos < self.content.len() {
@@ -179,7 +179,11 @@ impl MultiCursorShadow {
     }
 
     /// Apply Backspace to all cursors atomically.
+    /// Implements smart dedent: if cursor is after only whitespace on the line,
+    /// delete up to TAB_SIZE spaces instead of 1 character (matching editor behavior).
     fn atomic_backspace(&mut self) {
+        const TAB_SIZE: usize = 4;
+        let content = self.content.as_bytes();
         let edits: Vec<(usize, usize, String, usize)> = self
             .cursors
             .iter()
@@ -188,7 +192,35 @@ impl MultiCursorShadow {
                 if let Some(range) = cursor.selection_range() {
                     Some((range.start, range.len(), String::new(), idx))
                 } else if cursor.position > 0 {
-                    Some((cursor.position - 1, 1, String::new(), idx))
+                    // Find line start
+                    let line_start = content[..cursor.position]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    let prefix = &content[line_start..cursor.position];
+                    let all_whitespace =
+                        !prefix.is_empty() && prefix.iter().all(|&b| b == b' ' || b == b'\t');
+
+                    if all_whitespace {
+                        // Smart dedent: delete up to TAB_SIZE trailing spaces
+                        let last_byte = prefix[prefix.len() - 1];
+                        let chars_to_remove = if last_byte == b'\t' {
+                            1
+                        } else {
+                            let trailing_spaces =
+                                prefix.iter().rev().take_while(|&&b| b == b' ').count();
+                            trailing_spaces.min(TAB_SIZE)
+                        };
+                        Some((
+                            cursor.position - chars_to_remove,
+                            chars_to_remove,
+                            String::new(),
+                            idx,
+                        ))
+                    } else {
+                        Some((cursor.position - 1, 1, String::new(), idx))
+                    }
                 } else {
                     None
                 }
@@ -220,22 +252,28 @@ impl MultiCursorShadow {
     }
 
     /// Move all cursors left.
-    /// The editor always moves from cursor.position, clearing any selection.
+    /// With an active selection, collapse to the left edge of the selection
+    /// (issue #1566). Without, move back one byte.
     fn move_left(&mut self) {
         for cursor in &mut self.cursors {
-            cursor.anchor = None;
-            if cursor.position > 0 {
+            if let Some(anchor) = cursor.anchor {
+                cursor.position = cursor.position.min(anchor);
+                cursor.anchor = None;
+            } else if cursor.position > 0 {
                 cursor.position -= 1;
             }
         }
     }
 
     /// Move all cursors right.
-    /// The editor always moves from cursor.position, clearing any selection.
+    /// With an active selection, collapse to the right edge of the selection
+    /// (issue #1566). Without, move forward one byte.
     fn move_right(&mut self) {
         for cursor in &mut self.cursors {
-            cursor.anchor = None;
-            if cursor.position < self.content.len() {
+            if let Some(anchor) = cursor.anchor {
+                cursor.position = cursor.position.max(anchor);
+                cursor.anchor = None;
+            } else if cursor.position < self.content.len() {
                 cursor.position += 1;
             }
         }
@@ -547,6 +585,103 @@ fn test_multi_cursor_select_then_backspace() {
         op.apply_to_editor(&mut harness).unwrap();
         op.apply_to_shadow(&mut shadow);
         verify_content_and_cursors(&harness, &shadow, i, &ops).unwrap();
+    }
+}
+
+/// Debug test: reproduce the exact failing proptest case to trace state
+#[test]
+fn test_debug_proptest_regression() {
+    let (mut harness, mut shadow) = setup_multi_cursor_editor("aaa\nbbb\nccc", 2).unwrap();
+
+    let ops = vec![
+        MultiCursorOp::Backspace,
+        MultiCursorOp::Backspace,
+        MultiCursorOp::Left,
+        MultiCursorOp::Backspace,
+        MultiCursorOp::TypeChar('A'),
+        MultiCursorOp::Backspace,
+        MultiCursorOp::TypeChar('A'),
+        MultiCursorOp::Backspace,
+        MultiCursorOp::Right,
+        MultiCursorOp::Delete,
+        MultiCursorOp::SelectLeft,
+        MultiCursorOp::TypeChar(' '),
+    ];
+
+    for (i, op) in ops.iter().enumerate() {
+        op.apply_to_editor(&mut harness).unwrap();
+        op.apply_to_shadow(&mut shadow);
+
+        let buffer_content = harness.get_buffer_content().unwrap_or_default();
+
+        let mut editor_cursors: Vec<_> = harness
+            .editor()
+            .active_cursors()
+            .iter()
+            .map(|(id, c)| (id, c.position, c.anchor))
+            .collect();
+        editor_cursors.sort_by_key(|&(_, pos, _)| pos);
+
+        eprintln!(
+            "Step {}: {:?}\n  editor content={:?}\n  shadow content={:?}\n  editor cursors={:?}\n  shadow cursors={:?}\n",
+            i, op,
+            &buffer_content, &shadow.content,
+            editor_cursors,
+            shadow.cursors,
+        );
+
+        if buffer_content != shadow.content {
+            panic!(
+                "Content mismatch at step {} ({:?}): editor={:?} shadow={:?}",
+                i, op, buffer_content, shadow.content
+            );
+        }
+    }
+}
+
+/// Debug test: reproduce the 2-cursor proptest regression
+#[test]
+fn test_debug_proptest_regression_2() {
+    let (mut harness, mut shadow) = setup_multi_cursor_editor("aaa\nbbb\nccc", 1).unwrap();
+
+    let ops = vec![
+        MultiCursorOp::SelectLeft,
+        MultiCursorOp::SelectLeft,
+        MultiCursorOp::Left,
+        MultiCursorOp::TypeChar(' '),
+        MultiCursorOp::Delete,
+        MultiCursorOp::Right,
+        MultiCursorOp::Backspace,
+    ];
+
+    for (i, op) in ops.iter().enumerate() {
+        op.apply_to_editor(&mut harness).unwrap();
+        op.apply_to_shadow(&mut shadow);
+
+        let buffer_content = harness.get_buffer_content().unwrap_or_default();
+
+        let mut editor_cursors: Vec<_> = harness
+            .editor()
+            .active_cursors()
+            .iter()
+            .map(|(id, c)| (id, c.position, c.anchor))
+            .collect();
+        editor_cursors.sort_by_key(|&(_, pos, _)| pos);
+
+        eprintln!(
+            "Step {}: {:?}\n  editor content={:?}\n  shadow content={:?}\n  editor cursors={:?}\n  shadow cursors={:?}\n",
+            i, op,
+            &buffer_content, &shadow.content,
+            editor_cursors,
+            shadow.cursors,
+        );
+
+        if buffer_content != shadow.content {
+            panic!(
+                "Content mismatch at step {} ({:?}): editor={:?} shadow={:?}",
+                i, op, buffer_content, shadow.content
+            );
+        }
     }
 }
 

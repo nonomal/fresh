@@ -1,6 +1,6 @@
 // End-to-end tests for buffer lifecycle: save, close, quit with modifications
 
-use crate::common::harness::EditorTestHarness;
+use crate::common::harness::{EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
 
@@ -101,6 +101,221 @@ fn test_quit_with_confirmation_discard() {
 
     // Editor should quit
     assert!(harness.should_quit(), "Editor should quit after confirming");
+}
+
+/// Issue #1839: with hot_exit enabled, the unsaved-changes quit prompt should
+/// offer a "discard and quit" option in addition to the recoverable quit, so
+/// users can throw away accidental changes without flipping the global setting.
+#[test]
+fn test_quit_prompt_offers_discard_when_hot_exit_enabled() {
+    let mut config = Config::default();
+    config.editor.hot_exit = true;
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 24, config).unwrap();
+    let project_dir = harness.project_dir().unwrap();
+
+    let file_path = project_dir.join("notes.txt");
+    std::fs::write(&file_path, "initial\n").unwrap();
+    harness.open_file(&file_path).unwrap();
+
+    harness.type_text("oops").unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // The prompt must list both the discard ("d") and recoverable-quit ("q")
+    // options; previously only the latter appeared in hot_exit mode.
+    harness.assert_screen_contains("(d)iscard and quit");
+    harness.assert_screen_contains("(q)uit (recoverable)");
+}
+
+/// Issue #1839: pressing the discard key in the hot_exit quit prompt must
+/// actually quit the editor (rather than silently being treated as cancel).
+#[test]
+fn test_quit_with_discard_key_works_with_hot_exit() {
+    let mut config = Config::default();
+    config.editor.hot_exit = true;
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 24, config).unwrap();
+    let project_dir = harness.project_dir().unwrap();
+
+    let file_path = project_dir.join("notes.txt");
+    std::fs::write(&file_path, "initial\n").unwrap();
+    harness.open_file(&file_path).unwrap();
+
+    harness.type_text("changes to throw away").unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness.should_quit(),
+        "Editor should quit after pressing 'd' (discard) in hot_exit prompt"
+    );
+}
+
+/// Picking 'save' from the quit prompt while an unnamed buffer is dirty must
+/// not silently drop the buffer. It should walk the user through Save As,
+/// then quit only after the file is named and written.
+#[test]
+fn test_quit_save_chains_save_as_for_unnamed_buffer() {
+    let mut config = Config::default();
+    config.editor.hot_exit = false;
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 24, config).unwrap();
+    let project_dir = harness.project_dir().unwrap();
+
+    harness.new_buffer().unwrap();
+    harness.type_text("scratch content").unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // We should now be sitting on the Save As prompt, not quitting.
+    harness.assert_screen_contains("Save as:");
+    assert!(
+        !harness.should_quit(),
+        "Editor should keep running until the unnamed buffer is named"
+    );
+
+    let target = project_dir.join("scratch.txt");
+    harness.type_text(target.to_str().unwrap()).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness.should_quit(),
+        "Editor should quit after the chained Save As completes"
+    );
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert_eq!(written, "scratch content");
+}
+
+/// Multiple dirty unnamed buffers must each get their own Save As prompt
+/// before the editor quits — the queue should not collapse them or skip any.
+#[test]
+fn test_quit_save_chains_save_as_for_multiple_unnamed_buffers() {
+    let mut config = Config::default();
+    config.editor.hot_exit = false;
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 24, config).unwrap();
+    let project_dir = harness.project_dir().unwrap();
+
+    harness.new_buffer().unwrap();
+    harness.type_text("first scratch").unwrap();
+    harness.render().unwrap();
+
+    harness.new_buffer().unwrap();
+    harness.type_text("second scratch").unwrap();
+    harness.render().unwrap();
+
+    // Initiate save-and-quit.
+    harness
+        .send_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // First Save-As prompt — name the active buffer.
+    harness.assert_screen_contains("Save as:");
+    assert!(!harness.should_quit());
+    let first = project_dir.join("first.txt");
+    harness.type_text(first.to_str().unwrap()).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // The chain should now advance to the second unnamed buffer rather than
+    // quitting.
+    harness.assert_screen_contains("Save as:");
+    assert!(
+        !harness.should_quit(),
+        "Editor should keep prompting until every unnamed buffer is named"
+    );
+    let second = project_dir.join("second.txt");
+    harness.type_text(second.to_str().unwrap()).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness.should_quit(),
+        "Editor should finally quit once both unnamed buffers are saved"
+    );
+    let first_written = std::fs::read_to_string(&first).unwrap();
+    let second_written = std::fs::read_to_string(&second).unwrap();
+    let combined = format!("{first_written}|{second_written}");
+    // The harness order between buffers is not guaranteed, so accept either
+    // ordering as long as both contents reached disk under their own name.
+    assert!(
+        combined == "first scratch|second scratch" || combined == "second scratch|first scratch",
+        "Both unnamed buffers should be saved with distinct content. Got: {combined}"
+    );
+}
+
+/// Cancelling the chained Save As should abort the quit so the user doesn't
+/// lose their unnamed buffer to a stray Escape.
+#[test]
+fn test_quit_save_chain_cancel_aborts_quit() {
+    let mut config = Config::default();
+    config.editor.hot_exit = false;
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 24, config).unwrap();
+
+    harness.new_buffer().unwrap();
+    harness.type_text("draft").unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Save as:");
+
+    // Dismiss the Save As prompt.
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        !harness.should_quit(),
+        "Cancelling the Save As during save-and-quit must keep the editor open"
+    );
 }
 
 /// Test that quitting with confirmation (cancel) cancels quit
@@ -651,5 +866,143 @@ fn test_close_returns_to_previous_focused() {
         screen.contains("CONTENT_A"),
         "After closing B, should return to previously focused A. Screen:\n{}",
         screen
+    );
+}
+
+/// Build a harness with a real temp project root but plugin loading disabled,
+/// so plugin-driven UI (e.g. the welcome plugin's Dashboard) doesn't race
+/// with the editor-core close behavior we want to assert on.
+fn isolated_project_harness(config: Config) -> EditorTestHarness {
+    EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_project_root()
+            .with_empty_plugins_dir()
+            .with_config(config),
+    )
+    .unwrap()
+}
+
+/// Row that the tab bar is rendered on (just below the menu bar).
+const TAB_BAR_ROW: u16 = 1;
+
+/// Default: closing the last buffer auto-opens the file explorer and
+/// auto-creates a fresh `[No Name]` tab. This is the baseline the two
+/// new config flags below opt out of (issue #1753).
+#[test]
+fn test_close_last_buffer_default_opens_explorer_and_empty_tab() {
+    let mut harness = isolated_project_harness(Config::default());
+    let project_root = harness.project_dir().unwrap();
+    let file = project_root.join("only.txt");
+    std::fs::write(&file, "only content").unwrap();
+
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("only content");
+
+    // Close the only buffer.
+    harness.editor_mut().close_tab();
+    // File explorer init is async — wait for the panel to appear.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    // A fresh empty tab is also auto-created in the tab bar.
+    assert!(
+        harness.screen_row_text(TAB_BAR_ROW).contains("[No Name]"),
+        "Expected `[No Name]` tab in tab bar. Tab bar:\n{}",
+        harness.screen_row_text(TAB_BAR_ROW)
+    );
+}
+
+/// `file_explorer.auto_open_on_last_buffer_close = false` keeps the
+/// explorer hidden when the last buffer is closed. The empty `[No Name]`
+/// buffer still appears because that toggle is independent.
+#[test]
+fn test_close_last_buffer_does_not_open_explorer_when_disabled() {
+    let mut config = Config::default();
+    config.file_explorer.auto_open_on_last_buffer_close = false;
+    let mut harness = isolated_project_harness(config);
+    let project_root = harness.project_dir().unwrap();
+    let file = project_root.join("only.txt");
+    std::fs::write(&file, "only content").unwrap();
+
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("only content");
+
+    harness.editor_mut().close_tab();
+    // The `[No Name]` tab appearing is the semantic signal that the close
+    // has fully propagated.
+    harness
+        .wait_until(|h| h.screen_row_text(TAB_BAR_ROW).contains("[No Name]"))
+        .unwrap();
+
+    // Explorer panel is NOT shown.
+    harness.assert_screen_not_contains("File Explorer");
+}
+
+/// `editor.auto_create_empty_buffer_on_last_buffer_close = false` hides
+/// the synthesized `[No Name]` buffer from the tab bar so the workspace
+/// looks blank — the file explorer still opens, which gives us a
+/// semantic wait point.
+#[test]
+fn test_close_last_buffer_hides_empty_tab_when_disabled() {
+    let mut config = Config::default();
+    config.editor.auto_create_empty_buffer_on_last_buffer_close = false;
+    let mut harness = isolated_project_harness(config);
+    let project_root = harness.project_dir().unwrap();
+    let file = project_root.join("only.txt");
+    std::fs::write(&file, "only content").unwrap();
+
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("only content");
+
+    harness.editor_mut().close_tab();
+    // Wait until the explorer (which is still allowed to auto-open here) is
+    // on screen, then assert the `[No Name]` tab is absent from the tab bar.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    let tab_bar = harness.screen_row_text(TAB_BAR_ROW);
+    assert!(
+        !tab_bar.contains("[No Name]"),
+        "Expected no `[No Name]` tab. Tab bar:\n{}",
+        tab_bar
+    );
+}
+
+/// Both options off → fully blank workspace: no file explorer, no
+/// `[No Name]` tab. This is the workflow requested in issue #1753.
+#[test]
+fn test_close_last_buffer_blank_workspace_when_both_disabled() {
+    let mut config = Config::default();
+    config.file_explorer.auto_open_on_last_buffer_close = false;
+    config.editor.auto_create_empty_buffer_on_last_buffer_close = false;
+    let mut harness = isolated_project_harness(config);
+    let project_root = harness.project_dir().unwrap();
+    let file = project_root.join("only.txt");
+    std::fs::write(&file, "only content").unwrap();
+
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("only content");
+
+    harness.editor_mut().close_tab();
+    // Stable-screen wait: the original buffer's contents are gone and
+    // nothing replaces them in the editor pane.
+    harness
+        .wait_until_stable(|h| !h.screen_to_string().contains("only content"))
+        .unwrap();
+
+    harness.assert_screen_not_contains("File Explorer");
+    let tab_bar = harness.screen_row_text(TAB_BAR_ROW);
+    assert!(
+        !tab_bar.contains("[No Name]"),
+        "Expected no `[No Name]` tab. Tab bar:\n{}",
+        tab_bar
     );
 }

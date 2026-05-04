@@ -121,7 +121,7 @@ done
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![],
             enabled: true,
@@ -130,7 +130,11 @@ done
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config and working directory
@@ -240,7 +244,7 @@ fn main() {
     // Wait for LSP to initialize using semantic waiting
     harness.wait_until(|h| {
         let screen = h.screen_to_string();
-        screen.contains("LSP [rust: ready]") || screen.contains("rust: ready")
+        screen.contains(" LSP ") || screen.contains("rust: ready")
     })?;
 
     // Move cursor to the function name "helper_function" on line 1

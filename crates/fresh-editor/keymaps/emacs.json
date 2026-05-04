@@ -133,6 +133,21 @@
       "when": "popup"
     },
     {
+      "comment": "Transfer keyboard focus to the topmost popup (LSP popups appear unfocused so they don't swallow the next keystroke). Scoped to non-modal contexts so a user-overridden alt+t in normal/fileExplorer still wins at the same precedence level.",
+      "key": "t",
+      "modifiers": ["alt"],
+      "action": "popup_focus",
+      "args": {},
+      "when": "normal"
+    },
+    {
+      "key": "t",
+      "modifiers": ["alt"],
+      "action": "popup_focus",
+      "args": {},
+      "when": "fileExplorer"
+    },
+    {
       "key": "g",
       "modifiers": ["ctrl"],
       "action": "focus_editor",
@@ -734,6 +749,62 @@
       "action": "play_last_macro",
       "args": {},
       "when": "normal"
+    },
+    {
+      "comment": "Open the Remote Indicator menu (Local / SSH / Container actions)",
+      "key": "F6",
+      "modifiers": [],
+      "action": "show_remote_indicator_menu",
+      "args": {},
+      "when": "global"
+    },
+    {
+      "comment": "Composite buffer context - Close view (q)",
+      "key": "q",
+      "modifiers": [],
+      "action": "close",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Close view (Esc)",
+      "key": "Escape",
+      "modifiers": [],
+      "action": "close",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Next hunk (n)",
+      "key": "n",
+      "modifiers": [],
+      "action": "composite_next_hunk",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Previous hunk (p)",
+      "key": "p",
+      "modifiers": [],
+      "action": "composite_prev_hunk",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Next hunk (])",
+      "key": "]",
+      "modifiers": [],
+      "action": "composite_next_hunk",
+      "args": {},
+      "when": "compositeBuffer"
+    },
+    {
+      "comment": "Composite buffer context - Previous hunk ([)",
+      "key": "[",
+      "modifiers": [],
+      "action": "composite_prev_hunk",
+      "args": {},
+      "when": "compositeBuffer"
     }
   ]
 }

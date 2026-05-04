@@ -22,6 +22,7 @@ impl Editor {
     pub fn dispatch_terminal_input(&mut self, event: &KeyEvent) -> Option<InputResult> {
         // Skip if we're in a prompt/popup (those need to handle keys normally)
         let in_modal = self.is_prompting()
+            || self.global_popups.is_visible()
             || self.active_state().popups.is_visible()
             || self.menu_state.active_menu.is_some()
             || self.settings_state.as_ref().is_some_and(|s| s.visible)
@@ -34,10 +35,20 @@ impl Editor {
 
         // Handle terminal mode input
         if self.terminal_mode {
+            // If the user navigated away from the terminal buffer (e.g. opened
+            // Review Diff via the command palette), the active buffer is no
+            // longer a terminal. Exit terminal mode so the new buffer's
+            // keybindings work.
+            if !self.is_terminal_buffer(self.active_buffer()) {
+                self.terminal_mode = false;
+                self.key_context = crate::input::keybindings::KeyContext::Normal;
+                return None; // fall through to normal input dispatch
+            }
             let mut ctx = InputContext::new();
-            let mut handler =
-                TerminalModeInputHandler::new(self.keyboard_capture, &self.keybindings);
+            let keybindings = self.keybindings.read().unwrap();
+            let mut handler = TerminalModeInputHandler::new(self.keyboard_capture, &keybindings);
             let result = handler.dispatch_input(event, &mut ctx);
+            drop(keybindings);
             self.process_deferred_actions(ctx);
             return Some(result);
         }
@@ -108,10 +119,11 @@ impl Editor {
                 .contains(crossterm::event::KeyModifiers::ALT)
             {
                 if let crossterm::event::KeyCode::Char(_) = event.code {
-                    if let Some(action) = self.keybindings.resolve_in_context_only(
+                    let prompt_action = self.keybindings.read().unwrap().resolve_in_context_only(
                         event,
                         crate::input::keybindings::KeyContext::Prompt,
-                    ) {
+                    );
+                    if let Some(action) = prompt_action {
                         // For file browser actions, route to handle_file_open_action
                         if self.is_file_open_active() && self.handle_file_open_action(&action) {
                             return Some(InputResult::Consumed);
@@ -161,18 +173,52 @@ impl Editor {
             }
         }
 
-        // Popup is next
-        if self.active_state().popups.is_visible() {
-            let result = self
-                .active_state_mut()
-                .popups
-                .dispatch_input(event, &mut ctx);
-            self.process_deferred_actions(ctx);
-            // If the popup handler returned Ignored (e.g., non-word character,
-            // Ctrl+key, arrow keys), fall through to normal input handling.
-            // The deferred ClosePopup action was already processed above.
-            if result != InputResult::Ignored {
-                return Some(result);
+        // Editor-pane popups (global + buffer) belong to the editor pane and
+        // must not capture input when the file explorer is the focused pane.
+        // Mirrors the priority encoded in `get_key_context()` via the same
+        // `popups_capture_keys()` predicate so the two paths cannot drift —
+        // one source of truth for "is the popup eligible to eat this key?".
+        if self.popups_capture_keys() {
+            // Completion popups consult the keybinding resolver in the
+            // `Completion` context first, so accept/dismiss can be remapped
+            // via the keybinding editor. Falls through to the popup's own
+            // handler for everything else (type-to-filter, navigation, etc.).
+            if let Some(action) = self.resolve_completion_popup_action(event) {
+                self.process_deferred_actions(ctx);
+                if let Err(e) = self.handle_action(action) {
+                    tracing::warn!("Completion popup action failed: {}", e);
+                }
+                return Some(InputResult::Consumed);
+            }
+
+            // Editor-level (global) popups take precedence over buffer popups
+            // so that plugin notifications stay focused even when the active
+            // buffer owns its own popup stack.
+            if self.global_popups.is_visible() {
+                let result = self.global_popups.dispatch_input(event, &mut ctx);
+                self.process_deferred_actions(ctx);
+                if result != InputResult::Ignored {
+                    return Some(result);
+                }
+                // Re-check visibility — the dispatch may have queued a
+                // ClosePopup that the deferred-action processor has now fired.
+                return None;
+            }
+
+            // Popup is next
+            if self.active_state().popups.is_visible() {
+                let result = self
+                    .active_state_mut()
+                    .popups
+                    .dispatch_input(event, &mut ctx);
+                self.process_deferred_actions(ctx);
+                // If the popup handler returned Ignored (e.g., non-word
+                // character, Ctrl+key, arrow keys), fall through to normal
+                // input handling. The deferred ClosePopup action was already
+                // processed above.
+                if result != InputResult::Ignored {
+                    return Some(result);
+                }
             }
         }
 
@@ -278,46 +324,15 @@ impl Editor {
 
             // Popup actions
             DeferredAction::ClosePopup => {
-                self.hide_popup();
+                // Route through handle_popup_cancel so popup-specific
+                // cleanup runs (e.g. the LSP auto-prompt needs to mark
+                // the language as prompted and drop the pending queue
+                // entry — otherwise the render-time drain would just
+                // re-open the popup on the next frame, defeating Esc).
+                self.handle_popup_cancel();
             }
             DeferredAction::ConfirmPopup => {
                 self.handle_action(Action::PopupConfirm)?;
-            }
-            DeferredAction::CompletionEnterKey => {
-                use crate::config::AcceptSuggestionOnEnter;
-                match self.config.editor.accept_suggestion_on_enter {
-                    AcceptSuggestionOnEnter::On => {
-                        // Enter always accepts
-                        self.handle_action(Action::PopupConfirm)?;
-                    }
-                    AcceptSuggestionOnEnter::Off => {
-                        // Enter inserts newline - close popup and insert newline
-                        self.hide_popup();
-                        self.handle_action(Action::InsertNewline)?;
-                    }
-                    AcceptSuggestionOnEnter::Smart => {
-                        // Accept if completion differs from typed text
-                        // For now, we check if there's a selected item with data
-                        // that differs from what's in the buffer
-                        let should_accept = self
-                            .active_state()
-                            .popups
-                            .top()
-                            .and_then(|p| p.selected_item())
-                            .map(|item| {
-                                // If there's selection data, accept the completion
-                                item.data.is_some()
-                            })
-                            .unwrap_or(false);
-
-                        if should_accept {
-                            self.handle_action(Action::PopupConfirm)?;
-                        } else {
-                            self.hide_popup();
-                            self.handle_action(Action::InsertNewline)?;
-                        }
-                    }
-                }
             }
             DeferredAction::PopupTypeChar(c) => {
                 self.handle_popup_type_char(c);

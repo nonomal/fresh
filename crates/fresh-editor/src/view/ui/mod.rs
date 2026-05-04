@@ -22,6 +22,8 @@ pub mod view_pipeline;
 
 // Runtime-only modules (depend on state, services, input, etc.)
 #[cfg(feature = "runtime")]
+pub mod expanded_menus_cache;
+#[cfg(feature = "runtime")]
 pub mod file_browser;
 #[cfg(feature = "runtime")]
 pub mod file_explorer;
@@ -39,6 +41,8 @@ pub mod suggestions;
 pub mod tabs;
 
 // Re-export main types for convenience
+#[cfg(feature = "runtime")]
+pub use expanded_menus_cache::ExpandedMenusCache;
 #[cfg(feature = "runtime")]
 pub use file_browser::{FileBrowserLayout, FileBrowserRenderer};
 #[cfg(feature = "runtime")]

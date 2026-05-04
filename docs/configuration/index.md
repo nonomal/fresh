@@ -1,6 +1,7 @@
 # Configuration
 
 - [Overview](./) - Layered configuration system
+- [Startup Script (init.ts)](./init.md) - Run TypeScript at startup for environment-dependent setup
 - [Keyboard](./keyboard.md) - Keyboard shortcuts and keybinding configuration
 
 ---
@@ -58,6 +59,7 @@ Nested objects are **deep-merged** field by field. Each field follows the same "
 The `languages` map uses **deep merging with field-level override**:
 - Entries from all layers are combined (you can add new languages at any layer)
 - For the same language key, individual fields are merged (not replaced entirely)
+- Editor settings including `line_wrap`, `wrap_column`, `page_view`, and `page_width` can be set per-language — e.g. wrap Markdown at 80 columns while leaving code unwrapped
 
 **Example:** Extending built-in Rust settings in your project:
 ```json
@@ -75,6 +77,8 @@ The `languages` map uses **deep merging with field-level override**:
 ```
 
 ### LSP Map (deep merge)
+
+> For the LSP feature itself (multi-server config, root markers, formatters, `only_features` / `except_features`, etc.), see [LSP Integration](../features/lsp.md). This section only covers how the `lsp` map is merged across config layers.
 
 The `lsp` map uses **deep merging with field-level override**:
 - Entries from all layers are combined
@@ -184,6 +188,24 @@ To add syntax highlighting and LSP support for a new language:
 }
 ```
 
+The `grammar` field accepts a short name like `"bash"` or `"rust"` as well as the full display name. To see every grammar available in your environment — including built-in grammars, user-installed grammars, language packs, bundles, and plugin-registered grammars — run:
+
+```
+fresh --cmd grammar list
+```
+
+### Set a Default Language for Unrecognized Files
+
+When Fresh opens a file whose type it cannot detect (no matching extension, filename, or glob pattern), it shows it as "Plain Text" with no syntax highlighting. Set `default_language` to the name of any entry in the `languages` map and unrecognized files will use that language's full configuration — useful for `.conf`, `.rc`, `.rules`, and other config files that Fresh doesn't recognize.
+
+```json
+{ "default_language": "bash" }
+```
+
+This tells Fresh: "When you don't know what language a file is, treat it as bash." The file picks up bash syntax highlighting, `#` comments, indent rules, and anything else defined for bash in `languages`.
+
+Any language name works — try `yaml`, `json`, `toml`, or a custom entry of your own. To disable (the default), leave `default_language` unset.
+
 ### Customize LSP Settings
 
 Configure initialization options for a language server:
@@ -222,9 +244,19 @@ In the Settings UI, each setting shows where its current value comes from:
 - **(session)** - Temporary session override
 - *(no indicator)* - Using system default
 
+## Status Bar
+
+The left and right sides of the status bar are configurable through the Settings UI. Each side uses a **DualList** picker: items live in an **Available** column or an **Included** column, and you move them back and forth to show or hide them. Use the arrow buttons next to the Included list to reorder. Elements include the filename, cursor position, encoding, LSP indicator, git branch, warning counts, palette hint, a `{clock}` element that shows `HH:MM` with a blinking colon, and a `{remote}` indicator that lights up when you're attached to an SSH remote or a devcontainer.
+
+The `{remote}` indicator is clickable — activate it to open a context-aware menu for the current authority (detach, show container logs, retry attach, etc.). It also reflects connection state: `Connecting`, `Connected`, or `FailedAttach`.
+
+## Save Behavior
+
+If the target directory doesn't exist when you save a file, Fresh prompts to create it for you instead of failing. This applies to both brand-new files and to saving an existing buffer under a new path.
+
 ## Editor Settings Reference
 
-All settings can be changed via the Settings UI (command palette → "Open Settings").
+All settings can be changed via the Settings UI (run **Open Settings** from the palette).
 
 ### Display
 
@@ -240,12 +272,13 @@ All settings can be changed via the Settings UI (command palette → "Open Setti
 | Status bar | Show/hide the status bar | on |
 | Whitespace indicators | Show space/tab characters (leading, inner, trailing) | off |
 | Diagnostics inline text | Show diagnostics at end of line | off |
+| Show tilde | Show `~` markers after end of file | on |
+| Menu bar mnemonics | Enable Alt+key shortcuts for menu bar | on |
 
 ### Editing
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| Tab size | Spaces per indent level | 4 |
 | Auto-close | Auto-close brackets and quotes | on |
 | Auto-surround | Wrap selection when typing a delimiter | on |
 | Trim trailing whitespace on save | Remove trailing whitespace when saving | off |
@@ -258,6 +291,20 @@ All settings can be changed via the Settings UI (command palette → "Open Setti
 | Auto-save | Save modified buffers to disk automatically | off |
 | Auto-save interval | Seconds between auto-saves (when enabled) | 30 |
 | Recovery save interval | Seconds between crash-recovery saves | 2 |
+| Hot exit | Persist all buffers (including scratch) across sessions | on |
+
+### Indentation
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Tab size | Spaces per indent level | 4 |
+| Use tabs | Indent with tabs instead of spaces | off |
+
+### UI
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Show prompt line | Show the prompt line at the bottom | on |
 
 ### Clipboard
 
@@ -287,4 +334,4 @@ To prevent LSP servers from consuming too many resources, Fresh can limit their 
 }
 ```
 
-See `docs/PROCESS_LIMITS.md`.
+The `max_memory_mb` limit is enforced via platform-specific mechanisms. `max_cpu_percent` is relative to one core (e.g. 200 = two full cores).

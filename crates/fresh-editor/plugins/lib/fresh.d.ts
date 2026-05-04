@@ -44,6 +44,61 @@ interface ProcessHandle<T> extends PromiseLike<T> {
 type BufferId = number;
 /** Split identifier */
 type SplitId = number;
+/**
+* Payload delivered to handlers registered with `editor.on("mouse_click", ...)`.
+*
+* All coordinate fields are in cell (terminal character) units. `buffer_*`
+* fields are `null` when the click did not land in any buffer panel.
+*/
+interface MouseClickHookArgs {
+	/** Screen column (0-indexed). */
+	column: number;
+	/** Screen row (0-indexed). */
+	row: number;
+	/** Mouse button: "left", "right", "middle". */
+	button: string;
+	/** Modifier keys (e.g. "shift"). */
+	modifiers: string;
+	/** X offset of the content area the click landed in. */
+	content_x: number;
+	/** Y offset of the content area the click landed in. */
+	content_y: number;
+	/** Buffer under the click, or `null` when outside any buffer panel. */
+	buffer_id: number | null;
+	/** 0-indexed buffer row (line number) of the click, accounting for scroll. */
+	buffer_row: number | null;
+	/** 0-indexed byte column inside the buffer row. */
+	buffer_col: number | null;
+}
+/**
+* Registry of typed plugin APIs surfaced through
+* `editor.exportPluginApi` / `editor.getPluginApi`.
+*
+* Plugins that want their surface to be typed for downstream
+* consumers augment this interface in their own source:
+*
+* ```ts
+* // in my_plugin.ts
+* export type MyPluginApi = { doThing(): void };
+* declare global {
+*   interface FreshPluginRegistry {
+*     "my-plugin": MyPluginApi;
+*   }
+* }
+* ```
+*
+* `editor.getPluginApi("my-plugin")` then returns
+* `MyPluginApi | null` without any `as`-cast on the consumer side.
+* Plugins that skip the augmentation still work — the untyped
+* `getPluginApi<T = unknown>(name: string): T | null` overload
+* takes over.
+*
+* Each plugin's augmentation is emitted to
+* `<config_dir>/types/plugins.d.ts` at load time (via oxc's
+* isolated-declarations), so init.ts sees every loaded plugin's
+* registry entry automatically.
+*/
+interface FreshPluginRegistry {}
 type TextPropertyEntry = {
 	/**
 	* Text content for this entry
@@ -156,6 +211,12 @@ type TsCreateCompositeBufferOptions = {
 	* Diff hunks for alignment (optional)
 	*/
 	hunks: Array<TsCompositeHunk> | null;
+	/**
+	* When set, the first render will scroll to center the Nth hunk (0-indexed).
+	* This avoids timing issues with imperative scroll commands that depend on
+	* render-created state (viewport dimensions, view state).
+	*/
+	initialFocusHunk?: number;
 };
 type ViewportInfo = {
 	/**
@@ -178,6 +239,44 @@ type ViewportInfo = {
 	* Viewport height
 	*/
 	height: number;
+};
+type KeyEventPayload = {
+	/**
+	* Key name (e.g. `"a"`, `"escape"`, `"f1"`).
+	*/
+	key: string;
+	/**
+	* Ctrl held.
+	*/
+	ctrl: boolean;
+	/**
+	* Alt held.
+	*/
+	alt: boolean;
+	/**
+	* Shift held (only meaningful for non-character keys; for
+	* printable characters the case is already encoded in `key`).
+	*/
+	shift: boolean;
+	/**
+	* Super / Cmd / Meta held.
+	*/
+	meta: boolean;
+};
+type SplitSnapshot = {
+	/**
+	* Stable split identifier; matches the values used by
+	* `setSplitBuffer`, `focusSplit`, `getSplitByLabel`, etc.
+	*/
+	splitId: number;
+	/**
+	* Buffer currently shown in this split.
+	*/
+	bufferId: BufferId;
+	/**
+	* Viewport (top byte / dimensions) for this split's active buffer.
+	*/
+	viewport: ViewportInfo;
 };
 type LayoutHints = {
 	/**
@@ -302,6 +401,24 @@ type BufferInfo = {
 	* The detected language for this buffer (e.g., "rust", "markdown", "text")
 	*/
 	language: string;
+	/**
+	* Whether this tab was opened in "preview" (ephemeral) mode — true when
+	* opened via single-click in the file explorer and not yet committed
+	* (no edit, no double-click, no tab-click, no layout change). Plugins
+	* that react to buffer lifecycle events should generally treat preview
+	* buffers as transient; e.g. a diagnostics panel may want to skip
+	* refreshing itself for a preview tab.
+	*/
+	is_preview: boolean;
+	/**
+	* Split ids that currently hold this buffer (empty when the buffer is
+	* open but not visible in any split — e.g. background-opened tabs
+	* that haven't been focused). Lets plugins implement "focus existing
+	* buffer if visible, else open new" without having to track split
+	* ids across editor restarts (which reassign them). The list is a
+	* snapshot at the last `update_plugin_state_snapshot` tick.
+	*/
+	splits: number[];
 };
 type JsDiagnostic = {
 	/**
@@ -393,9 +510,9 @@ type FileExplorerDecoration = {
 	*/
 	symbol: string;
 	/**
-	* Color as RGB array (rquickjs_serde requires array, not tuple)
+	* Color as RGB array or theme key string (e.g., "ui.file_status_added_fg")
 	*/
-	color: [number, number, number];
+	color: OverlayColorSpec;
 	/**
 	* Priority for display when multiple decorations exist (higher wins)
 	*/
@@ -456,6 +573,15 @@ type CreateTerminalOptions = {
 	* Whether to focus the new terminal split (default: true)
 	*/
 	focus?: boolean;
+	/**
+	* Whether this terminal is part of the user's persisted workspace.
+	* Defaults to `false` for plugin-created terminals — they are typically
+	* one-off tool UIs (rebuilds, exec shells, build output) and should
+	* start with empty scrollback on each invocation. Set to `true` only
+	* when the plugin owns a terminal that the user should see restored
+	* across editor restarts.
+	*/
+	persistent?: boolean;
 };
 type CursorInfo = {
 	/**
@@ -525,6 +651,74 @@ type InlineOverlay = {
 	*/
 	properties?: Record<string, any>;
 };
+type GrammarInfoSnapshot = {
+	/**
+	* The grammar name as used in config files (case-insensitive matching)
+	*/
+	name: string;
+	/**
+	* Where this grammar was loaded from (e.g. "built-in", "plugin (myplugin)")
+	*/
+	source: string;
+	/**
+	* File extensions associated with this grammar
+	*/
+	file_extensions: Array<string>;
+	/**
+	* Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+	*/
+	short_name: string | null;
+};
+type AnimationRect = {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+};
+type PluginAnimationEdge = "top" | "bottom" | "left" | "right";
+type PluginAnimationKind = {
+	"kind": "slideIn";
+	from: PluginAnimationEdge;
+	durationMs: number;
+	delayMs: number;
+};
+type AuthorityFilesystem = {
+	kind: "local";
+};
+type AuthoritySpawner = {
+	kind: "local";
+} | {
+	kind: "docker-exec";
+	container_id: string;
+	user?: string | null;
+	workspace?: string | null;
+	env?: [string, string][];
+};
+type AuthorityTerminalWrapper = {
+	kind: "host-shell";
+} | {
+	kind: "explicit";
+	command: string;
+	args: string[];
+	manages_cwd?: boolean;
+};
+type AuthorityPayload = {
+	filesystem: AuthorityFilesystem;
+	spawner: AuthoritySpawner;
+	terminal_wrapper: AuthorityTerminalWrapper;
+	display_label?: string;
+	/**
+	* Optional host↔remote workspace path mapping. The dev-container
+	* authority sets both roots (editor.getCwd() on host;
+	* remoteWorkspaceFolder on container) so LSP URIs translate at the
+	* host/container boundary. Local and SSH authorities omit it.
+	*/
+	path_translation?: PathTranslationSpec;
+};
+type PathTranslationSpec = {
+	host_root: string;
+	remote_root: string;
+};
 type BackgroundProcessResult = {
 	/**
 	* Unique process ID for later reference
@@ -539,7 +733,6 @@ type BackgroundProcessResult = {
 type BufferSavedDiff = {
 	equal: boolean;
 	byte_ranges: Array<[number, number]>;
-	line_ranges: Array<[number, number]> | null;
 };
 type CreateVirtualBufferInExistingSplitOptions = {
 	/**
@@ -628,6 +821,13 @@ type CreateVirtualBufferInSplitOptions = {
 	* Initial content entries with optional properties
 	*/
 	entries?: Array<TextPropertyEntry>;
+	/**
+	* Split role tag. When set to `"utility_dock"`, the dispatcher
+	* routes this buffer to the existing dock leaf if one exists,
+	* instead of creating a new split. See
+	* `docs/internal/tui-editor-layout-design.md` Section 2.
+	*/
+	role?: string;
 };
 type CreateVirtualBufferOptions = {
 	/**
@@ -750,6 +950,21 @@ type LspServerPackConfig = {
 	*/
 	processLimits: ProcessLimitsPackConfig | null;
 };
+type RemoteIndicatorStatePayload = {
+	kind: "local";
+} | {
+	kind: "connecting";
+	label?: string | null;
+} | {
+	kind: "connected";
+	label?: string | null;
+} | {
+	kind: "failed_attach";
+	error?: string | null;
+} | {
+	kind: "disconnected";
+	label?: string | null;
+};
 type ReplaceResult = {
 	/**
 	* Number of replacements made
@@ -802,6 +1017,30 @@ interface EditorAPI {
 	*/
 	apiVersion(): number;
 	/**
+	* The name of the plugin this `editor` handle belongs to. Used by the
+	* M3 plugin-API plane (`exportPluginApi` tags the exporter). Plugin
+	* authors generally don't call this directly.
+	*/
+	pluginName(): string;
+	/**
+	* Publish a typed API surface under `name`. Another plugin (typically
+	* `init.ts`) can reach it later via `getPluginApi(name)`. Calling
+	* again with the same `name` replaces the previous registration
+	* (idempotent — reload works). Exports are auto-dropped when the
+	* calling plugin is unloaded.
+	* 
+	* Returns `true` on success. Rejects with a TypeError if `name` is
+	* empty or `api` is not an object (functions and primitives are not
+	* valid API surfaces — only objects).
+	*/
+	exportPluginApi(name: string, api: unknown): boolean;
+	/**
+	* Look up a plugin API previously published via `exportPluginApi`.
+	* Returns the api object (restored into the caller's context) or
+	* `null` if no plugin exports under that name.
+	*/
+	getPluginApi(name: string): unknown | null;
+	/**
 	* Get the active buffer ID (0 if none)
 	*/
 	getActiveBufferId(): number;
@@ -813,6 +1052,10 @@ interface EditorAPI {
 	* List all open buffers - returns array of BufferInfo objects
 	*/
 	listBuffers(): BufferInfo[];
+	/**
+	* List all available grammars with source info - returns array of GrammarInfo objects
+	*/
+	listGrammars(): GrammarInfoSnapshot[];
 	debug(msg: string): void;
 	info(msg: string): void;
 	warn(msg: string): void;
@@ -895,6 +1138,15 @@ interface EditorAPI {
 	*/
 	getViewport(): ViewportInfo | null;
 	/**
+	* List every split with its active buffer and viewport.
+	* 
+	* Plugins that need to operate on every visible buffer
+	* simultaneously (multi-split flash labels, syncing decorations
+	* across panes, …) iterate this list rather than only seeing
+	* `getViewport()`'s active-split data.  Order is unspecified.
+	*/
+	listSplits(): SplitSnapshot[];
+	/**
 	* Get the line number (0-indexed) of the primary cursor
 	*/
 	getCursorLine(): number;
@@ -919,6 +1171,17 @@ interface EditorAPI {
 	* Line is 0-indexed (0 = first line)
 	*/
 	scrollToLineCenter(splitId: number, bufferId: number, line: number): boolean;
+	/**
+	* Scroll any split/panel showing `buffer_id` so `line` is visible.
+	* Unlike `scrollToLineCenter`, this does not require a split id — it
+	* updates every split's viewport whose active buffer is the given
+	* buffer, including inner leaves of a buffer group. Use this from
+	* a panel plugin to keep the user's "selected" row in view after
+	* arrow-key navigation (the plugin's own selection state isn't
+	* automatically reflected in the buffer cursor, so the core-driven
+	* viewport would otherwise stay put).
+	*/
+	scrollBufferToLine(bufferId: number, line: number): boolean;
 	/**
 	* Find buffer by file path, returns buffer ID or 0 if not found
 	*/
@@ -956,6 +1219,21 @@ interface EditorAPI {
 	*/
 	closeBuffer(bufferId: number): boolean;
 	/**
+	* Start a frame-buffer animation over an arbitrary screen region.
+	* Returns an animation id usable with `cancelAnimation`.
+	*/
+	animateArea(rect: AnimationRect, kind: PluginAnimationKind): number;
+	/**
+	* Start an animation over the on-screen Rect currently occupied by a
+	* virtual buffer. No-op if the buffer is not visible.
+	*/
+	animateVirtualBuffer(bufferId: number, kind: PluginAnimationKind): number;
+	/**
+	* Cancel an animation previously started via `animateArea` or
+	* `animateVirtualBuffer`. No-op if the ID is unknown or already done.
+	*/
+	cancelAnimation(id: number): boolean;
+	/**
 	* Subscribe to an editor event
 	*/
 	on(eventName: string, handlerName: string): void;
@@ -972,8 +1250,26 @@ interface EditorAPI {
 	*/
 	getCwd(): string;
 	/**
+	* Get the active authority's display label.
+	* 
+	* Empty means the local (default) authority. A non-empty value
+	* means a plugin-installed or SSH authority is in effect (e.g.
+	* `"Container:abc123def456"` for a devcontainer). Intended as a
+	* simple "am I already attached?" check that survives editor
+	* restarts — the label lives on the `Editor` state snapshot so it
+	* is fresh after the authority-transition restart flow.
+	*/
+	getAuthorityLabel(): string;
+	/**
 	* Join path components (variadic - accepts multiple string arguments)
 	* Always uses forward slashes for cross-platform consistency (like Node.js path.posix.join)
+	* 
+	* Preserves up to 2 leading slashes, which matters on Windows: Rust's
+	* `Path::canonicalize` returns `\\?\`-prefixed paths, and `editor.getCwd()`
+	* surfaces that to plugin code verbatim. After the backslash→slash
+	* normalization the prefix becomes `//?/C:/...`; collapsing the leading
+	* `//` to a single `/` yields `/?/C:/...`, which every filesystem API on
+	* Windows rejects, breaking `findConfig()`-style plugin logic.
 	*/
 	pathJoin(...parts: string[]): string;
 	/**
@@ -1031,17 +1327,73 @@ interface EditorAPI {
 	*/
 	readDir(path: string): DirEntry[];
 	/**
-	* Get current config as JS object
+	* Create a directory (and all parent directories) recursively.
+	* Returns true if the directory was created or already exists.
+	*/
+	createDir(path: string): boolean;
+	/**
+	* Remove a file or directory by moving it to the OS trash/recycle bin.
+	* For safety, the path must be under the OS temp directory or the Fresh
+	* config directory. Returns true on success.
+	*/
+	removePath(path: string): boolean;
+	/**
+	* Rename/move a file or directory. Returns true on success.
+	* Falls back to copy then trash for cross-filesystem moves.
+	*/
+	renamePath(from: string, to: string): boolean;
+	/**
+	* Copy a file or directory recursively to a new location.
+	* Returns true on success.
+	*/
+	copyPath(from: string, to: string): boolean;
+	/**
+	* Get the OS temporary directory path.
+	*/
+	getTempDir(): string;
+	/**
+	* Parse a JSONC (JSON with comments) string into a JS value.
+	* 
+	* Accepts the JSONC superset: line and block comments, trailing
+	* commas, single-quoted strings, and unquoted object keys — matching
+	* devcontainer.json / tsconfig.json / VS Code settings.json.
+	* 
+	* Throws a JS error (catchable with try/catch) when the input is not
+	* valid JSONC, like `JSON.parse` does for invalid JSON.
+	*/
+	parseJsonc(text: string): unknown;
+	/**
+	* Get current config as JS object.
+	* 
+	* The snapshot holds an `Arc<serde_json::Value>` that was serialized
+	* on the editor side the last time the underlying `Arc<Config>`
+	* changed. Cloning the Arc inside the read lock is a refcount bump;
+	* the actual walk into the JS runtime happens outside the lock.
 	*/
 	getConfig(): unknown;
 	/**
-	* Get user config as JS object
+	* Get user config as JS object. Same Arc-clone pattern as `get_config`.
 	*/
 	getUserConfig(): unknown;
 	/**
 	* Reload configuration from file
 	*/
 	reloadConfig(): void;
+	/**
+	* Set a single config setting in the runtime layer for this session.
+	* 
+	* `path` is dot-separated (e.g. `"editor.tab_size"`). `value` is any JSON
+	* value in the shape the setting expects. The write lives in an
+	* in-memory layer scoped to the calling plugin — it does not modify
+	* `config.json`, and unloading the plugin (or reloading init.ts) drops
+	* it. Intended use is `init.ts` running a conditional:
+	* `if (editor.getEnv("SSH_TTY")) editor.setSetting("terminal.mouse", false);`
+	* 
+	* Returns `true` if the write was queued. The actual update is
+	* asynchronous; a subsequent `getConfig()` will reflect it after the
+	* editor processes the command.
+	*/
+	setSetting(path: string, value: unknown): boolean;
 	/**
 	* Reload theme registry from disk
 	* Call this after installing theme packages or saving new themes
@@ -1071,9 +1423,20 @@ interface EditorAPI {
 	*/
 	reloadGrammars(): Promise<void>;
 	/**
+	* Get the directory where this plugin's files are stored.
+	* For package plugins this is `<plugins_dir>/packages/<plugin_name>/`.
+	*/
+	getPluginDir(): string;
+	/**
 	* Get config directory path
 	*/
 	getConfigDir(): string;
+	/**
+	* Get the persistent data directory path (DirectoryContext::data_dir).
+	* Intended for plugin state that should outlive a single session — e.g.
+	* review-diff comments keyed off git state.
+	*/
+	getDataDir(): string;
 	/**
 	* Get themes directory path
 	*/
@@ -1082,6 +1445,17 @@ interface EditorAPI {
 	* Apply a theme by name
 	*/
 	applyTheme(themeName: string): boolean;
+	/**
+	* Override theme colors in-memory for the running session. `overrides`
+	* is a JS object mapping `"section.field"` keys (same namespace as
+	* `getThemeSchema`) to `[r, g, b]` triplets (0–255 each).
+	* 
+	* Unknown keys are dropped silently; out-of-range values are clamped
+	* to `0..=255`. Overrides survive until the next `applyTheme` call
+	* (which replaces the whole `Theme`). Intended for fast animation
+	* loops from `init.ts` — no disk I/O, no theme-registry rescan.
+	*/
+	overrideThemeColors(overrides: unknown): boolean;
 	/**
 	* Get theme schema as JS object
 	*/
@@ -1140,6 +1514,20 @@ interface EditorAPI {
 	*/
 	closeCompositeBuffer(bufferId: number): boolean;
 	/**
+	* Force-materialize render-dependent state (like `layoutIfNeeded` in UIKit).
+	* After calling this, commands that depend on view state created during
+	* rendering (e.g., `compositeNextHunk`) will work correctly.
+	*/
+	flushLayout(): boolean;
+	/**
+	* Navigate to the next hunk in a composite buffer
+	*/
+	compositeNextHunk(bufferId: number): boolean;
+	/**
+	* Navigate to the previous hunk in a composite buffer
+	*/
+	compositePrevHunk(bufferId: number): boolean;
+	/**
 	* Request syntax highlights for a buffer range (async)
 	*/
 	getHighlights(bufferId: number, start: number, end: number): Promise<TsHighlightSpan[]>;
@@ -1194,6 +1582,17 @@ interface EditorAPI {
 	*/
 	clearConcealsInRange(bufferId: number, start: number, end: number): boolean;
 	/**
+	* Add a collapsed fold range. Hides bytes [start, end) from
+	* rendering — the line containing `start - 1` (the fold "header")
+	* stays visible, while subsequent lines covered by the range are
+	* skipped.
+	*/
+	addFold(bufferId: number, start: number, end: number, placeholder?: string): boolean;
+	/**
+	* Clear every collapsed fold range on the buffer.
+	*/
+	clearFolds(bufferId: number): boolean;
+	/**
 	* Add a soft break point for marker-based line wrapping
 	*/
 	addSoftBreak(bufferId: number, namespace: string, position: number, indent: number): boolean;
@@ -1241,6 +1640,14 @@ interface EditorAPI {
 	*/
 	removeVirtualText(bufferId: number, virtualTextId: string): boolean;
 	/**
+	* Add styled virtual text — richer form of `addVirtualText` whose
+	* `options` accepts an `addOverlay`-style record: `fg`/`bg` may
+	* be RGB arrays or theme-key strings, plus `bold`/`italic`. Theme
+	* keys are resolved at render time so the label follows theme
+	* changes live.
+	*/
+	addVirtualTextStyled(bufferId: number, virtualTextId: string, position: number, text: string, options: Record<string, unknown>, before: boolean): boolean;
+	/**
 	* Remove virtual texts whose ID starts with the given prefix
 	*/
 	removeVirtualTextsByPrefix(bufferId: number, prefix: string): boolean;
@@ -1254,21 +1661,66 @@ interface EditorAPI {
 	clearVirtualTextNamespace(bufferId: number, namespace: string): boolean;
 	/**
 	* Add a virtual line (full line above/below a position)
+	* 
+	* The `options` object accepts:
+	* * `fg`, `bg` — either an `[r, g, b]` array (each `0..=255`) or a
+	* theme-key string (e.g. `"editor.line_number_fg"`).  Theme keys
+	* are resolved at render time so the line follows theme changes.
+	* Both default to `null` (no foreground / transparent background).
 	*/
-	addVirtualLine(bufferId: number, position: number, text: string, fgR: number, fgG: number, fgB: number, bgR: number, bgG: number, bgB: number, above: boolean, namespace: string, priority: number): boolean;
+	addVirtualLine(bufferId: number, position: number, text: string, options: Record<string, unknown>, above: boolean, namespace: string, priority: number): boolean;
 	/**
 	* Show a prompt and wait for user input (async)
 	* Returns the user input or null if cancelled
 	*/
 	prompt(label: string, initialValue: string): Promise<string | null>;
 	/**
-	* Start an interactive prompt
+	* Start an interactive prompt.
+	*
+	* When `floatingOverlay` is true, the editor renders the prompt
+	* and its suggestions inside a centred floating frame instead of
+	* the bottom minibuffer row (issue #1796 — Live Grep). The flag
+	* is rendering-only; confirm/cancel/hooks behave identically to a
+	* non-overlay prompt of the same `promptType`.
 	*/
-	startPrompt(label: string, promptType: string): boolean;
+	startPrompt(label: string, promptType: string, floatingOverlay?: boolean): boolean;
 	/**
-	* Start a prompt with initial value
+	* Begin a key-capture window for the calling plugin.
+	* 
+	* Pair with `endKeyCapture()` around any `getNextKey()` loop.
+	* While capture is active, keys arriving between two
+	* `getNextKey()` calls are buffered in-order rather than
+	* falling through to the buffer / mode bindings, so fast typing,
+	* pastes, or held-key auto-repeat are delivered losslessly.
+	* Without this, a plugin's input loop has a race where keys
+	* typed while the plugin is mid-redraw can leak into the editor.
 	*/
-	startPromptWithInitial(label: string, promptType: string, initialValue: string): boolean;
+	beginKeyCapture(): boolean;
+	/**
+	* End the key-capture window and discard any unconsumed buffered
+	* keys.  Call from a `finally` block so capture is released even
+	* if the plugin's loop throws.
+	*/
+	endKeyCapture(): boolean;
+	/**
+	* Wait for the next keypress and resolve with a `KeyEventPayload`.
+	* 
+	* While the returned promise is pending the editor consumes the
+	* next key and resolves it; the key does not propagate to mode
+	* bindings or other dispatch. Multiple in-flight requests across
+	* plugins are FIFO. Designed for short input loops (flash labels,
+	* vi find-char, replace-char) that would otherwise need to bind
+	* every printable key in `defineMode`.
+	* 
+	* For lossless capture against fast typing or paste, wrap the
+	* loop with `beginKeyCapture()` / `endKeyCapture()`.
+	*/
+	getNextKey(): Promise<KeyEventPayload>;
+	/**
+	* Start a prompt with initial value. See `startPrompt` for the
+	* meaning of `floatingOverlay`.
+	*/
+	startPromptWithInitial(label: string, promptType: string, initialValue: string, floatingOverlay?: boolean): boolean;
 	/**
 	* Set suggestions for the current prompt
 	* 
@@ -1277,9 +1729,16 @@ interface EditorAPI {
 	setPromptSuggestions(suggestions: PromptSuggestion[]): boolean;
 	setPromptInputSync(sync: boolean): boolean;
 	/**
+	* Set the title shown in the floating-overlay prompt's frame
+	* header (issue #1796). Pass `null` or omit the argument to
+	* clear the title and fall back to the default. Has no
+	* visible effect on non-overlay prompts.
+	*/
+	setPromptTitle(title?: string | null): boolean;
+	/**
 	* Define a buffer mode (takes bindings as array of [key, command] pairs)
 	*/
-	defineMode(name: string, bindingsArr: string[][], readOnly?: boolean, allowTextInput?: boolean): boolean;
+	defineMode(name: string, bindingsArr: string[][], readOnly?: boolean, allowTextInput?: boolean, inheritNormalBindings?: boolean): boolean;
 	/**
 	* Set the global editor mode
 	*/
@@ -1328,6 +1787,15 @@ interface EditorAPI {
 	* Set cursor position in a buffer
 	*/
 	setBufferCursor(bufferId: number, position: number): boolean;
+	/**
+	* Toggle whether the editor draws a native caret in this buffer.
+	* 
+	* Buffer-group panel buffers default to `show_cursors = false`, which
+	* also blocks all native movement actions in `action_to_events`. Plugins
+	* that want native cursor motion in a panel (e.g. magit-style row
+	* navigation) call this with `true` after `createBufferGroup` returns.
+	*/
+	setBufferShowCursors(bufferId: number, show: boolean): boolean;
 	/**
 	* Set a line indicator in the gutter
 	*/
@@ -1430,6 +1898,18 @@ interface EditorAPI {
 	*/
 	createVirtualBufferInExistingSplit(opts: CreateVirtualBufferInExistingSplitOptions): Promise<VirtualBufferResult>;
 	/**
+	* Set the content of a panel within a buffer group
+	*/
+	setPanelContent(groupId: number, panelName: string, entriesArr: Record<string, unknown>[]): boolean;
+	/**
+	* Close a buffer group
+	*/
+	closeBufferGroup(groupId: number): boolean;
+	/**
+	* Focus a specific panel within a buffer group
+	*/
+	focusBufferGroupPanel(groupId: number, panelName: string): boolean;
+	/**
 	* Set virtual buffer content (takes array of entry objects)
 	* 
 	* Note: entries should be TextPropertyEntry[] - uses manual parsing for HashMap support
@@ -1443,6 +1923,56 @@ interface EditorAPI {
 	* Spawn a process (async, returns request_id)
 	*/
 	spawnProcess(command: string, args: string[], cwd?: string): ProcessHandle<SpawnResult>;
+	/**
+	* Spawn a process on the host regardless of the active authority.
+	* 
+	* Intended for plugin internals that must run host-side work
+	* (e.g. `devcontainer up`) before installing an authority that
+	* would otherwise route the spawn elsewhere. Same calling shape
+	* as `spawnProcess`.
+	*/
+	spawnHostProcess(command: string, args: string[], cwd?: string): ProcessHandle<SpawnResult>;
+	/**
+	* Install a new authority via an opaque payload.
+	* 
+	* The payload is a JS object describing filesystem + spawner +
+	* terminal wrapper + display label. The canonical schema lives in
+	* the `AuthorityPayload` type in `fresh-editor`; plugins should
+	* hand-build objects that match it. Fire-and-forget: the editor
+	* restarts as part of the transition, so the plugin is reloaded
+	* before any follow-up work can run on this call's return value.
+	*/
+	setAuthority(payload: AuthorityPayload): boolean;
+	/**
+	* Restore the default local authority. Same restart semantics as
+	* `setAuthority`.
+	*/
+	clearAuthority(): void;
+	/**
+	* Override the Remote Indicator's displayed state. Plugins call
+	* this to surface lifecycle transitions that the authority layer
+	* doesn't know about yet — "Connecting" while `devcontainer up`
+	* runs, "FailedAttach" after a non-zero exit, etc.
+	* 
+	* Accepts a tagged JS object:
+	* ```ts
+	* editor.setRemoteIndicatorState({ kind: "connecting", label: "Building" });
+	* editor.setRemoteIndicatorState({ kind: "failed_attach", error: "exit 1" });
+	* editor.setRemoteIndicatorState({ kind: "connected", label: "Container:abc" });
+	* editor.setRemoteIndicatorState({ kind: "local" });
+	* ```
+	* 
+	* The override sticks until replaced or cleared via
+	* `clearRemoteIndicatorState`. Editor restart (e.g. on
+	* `setAuthority`) resets it — plugins must reassert after a
+	* post-restart init if they want the override to persist.
+	*/
+	setRemoteIndicatorState(state: RemoteIndicatorStatePayload): boolean;
+	/**
+	* Drop any active Remote Indicator override. Safe to call even
+	* without a prior `setRemoteIndicatorState`.
+	*/
+	clearRemoteIndicatorState(): void;
 	/**
 	* Wait for a process to complete and get its result (async)
 	*/
@@ -1533,4 +2063,274 @@ interface EditorAPI {
 		path: string;
 		enabled: boolean;
 	}>>;
+}
+/**
+* Typed overload of `editor.getPluginApi`. When the caller passes a
+* key that some loaded plugin declared in `FreshPluginRegistry`, the
+* return type is narrowed to that plugin's API. Unknown names fall
+* through to the untyped `unknown | null` signature.
+*/
+interface EditorAPI {
+	getPluginApi<K extends keyof FreshPluginRegistry>(name: K): FreshPluginRegistry[K] | null;
+}
+/**
+* Maps every hook event name to its payload type.
+*
+* Payloads match the flat JSON produced by `hook_args_to_json` on the Rust
+* side (`HookArgs` is `#[serde(untagged)]`, so each variant serializes as its
+* fields only). The TypeScript types here are derived directly from the Rust
+* field definitions and must be kept in sync with `fresh-core/src/hooks.rs`.
+*
+* `action` in `pre_command`/`post_command` is the serde JSON of the `Action`
+* enum: unit variants serialize as a plain string (e.g. `"MoveLeft"`),
+* tuple variants as a single-key object (e.g. `{"InsertChar": "a"}`).
+*/
+interface HookEventMap {
+	// ── lifecycle ────────────────────────────────────────────────────────────
+	editor_initialized: Record<string, never>;
+	plugins_loaded: Record<string, never>;
+	ready: Record<string, never>;
+	focus_gained: Record<string, never>;
+	authority_changed: {
+		label: string;
+	};
+	// ── buffer lifecycle ─────────────────────────────────────────────────────
+	buffer_activated: {
+		buffer_id: number;
+	};
+	buffer_deactivated: {
+		buffer_id: number;
+	};
+	buffer_closed: {
+		buffer_id: number;
+	};
+	// ── file I/O ─────────────────────────────────────────────────────────────
+	before_file_open: {
+		path: string;
+	};
+	after_file_open: {
+		path: string;
+		buffer_id: number;
+	};
+	before_file_save: {
+		path: string;
+		buffer_id: number;
+	};
+	after_file_save: {
+		path: string;
+		buffer_id: number;
+	};
+	/**
+	 * Fired by the file explorer after a paste/duplicate/etc. mutates
+	 * the filesystem without going through a buffer save. Plugins that
+	 * surface FS-derived state (git status badges, etc.) should
+	 * subscribe in addition to `after_file_save` to refresh on
+	 * explorer-driven changes too.
+	 */
+	after_file_explorer_change: {
+		path: string;
+	};
+	// ── text edits ───────────────────────────────────────────────────────────
+	before_insert: {
+		buffer_id: number;
+		position: number;
+		text: string;
+	};
+	after_insert: {
+		buffer_id: number;
+		position: number;
+		text: string;
+		affected_start: number;
+		affected_end: number;
+		start_line: number;
+		end_line: number;
+		lines_added: number;
+	};
+	before_delete: {
+		buffer_id: number;
+		start: number;
+		end: number;
+	};
+	after_delete: {
+		buffer_id: number;
+		start: number;
+		end: number;
+		deleted_text: string;
+		affected_start: number;
+		deleted_len: number;
+		start_line: number;
+		end_line: number;
+		lines_removed: number;
+	};
+	// ── cursor & viewport ────────────────────────────────────────────────────
+	cursor_moved: {
+		buffer_id: number;
+		cursor_id: number;
+		old_position: number;
+		new_position: number;
+		line: number;
+		text_properties: Record<string, unknown>[];
+	};
+	viewport_changed: {
+		split_id: number;
+		buffer_id: number;
+		top_byte: number;
+		top_line: number | null;
+		width: number;
+		height: number;
+	};
+	// ── rendering ────────────────────────────────────────────────────────────
+	render_start: {
+		buffer_id: number;
+	};
+	render_line: {
+		buffer_id: number;
+		line_number: number;
+		byte_start: number;
+		byte_end: number;
+		content: string;
+	};
+	lines_changed: {
+		buffer_id: number;
+		lines: {
+			line_number: number;
+			byte_start: number;
+			byte_end: number;
+			content: string;
+		}[];
+	};
+	view_transform_request: {
+		buffer_id: number;
+		split_id: number;
+		viewport_start: number;
+		viewport_end: number;
+		tokens: ViewTokenWire[];
+		cursor_positions: number[];
+	};
+	// ── commands ─────────────────────────────────────────────────────────────
+	pre_command: {
+		action: string | Record<string, unknown>;
+	};
+	post_command: {
+		action: string | Record<string, unknown>;
+	};
+	idle: {
+		milliseconds: number;
+	};
+	resize: {
+		width: number;
+		height: number;
+	};
+	// ── prompts ──────────────────────────────────────────────────────────────
+	prompt_changed: {
+		prompt_type: string;
+		input: string;
+	};
+	prompt_confirmed: {
+		prompt_type: string;
+		input: string;
+		selected_index: number | null;
+	};
+	prompt_cancelled: {
+		prompt_type: string;
+		input: string;
+	};
+	prompt_selection_changed: {
+		prompt_type: string;
+		selected_index: number;
+	};
+	// ── mouse ────────────────────────────────────────────────────────────────
+	mouse_click: MouseClickHookArgs;
+	mouse_move: {
+		column: number;
+		row: number;
+		content_x: number;
+		content_y: number;
+	};
+	mouse_scroll: {
+		buffer_id: number;
+		delta: number;
+		col: number;
+		row: number;
+	};
+	// ── LSP ──────────────────────────────────────────────────────────────────
+	diagnostics_updated: {
+		uri: string;
+		count: number;
+	};
+	lsp_references: {
+		symbol: string;
+		locations: {
+			file: string;
+			line: number;
+			column: number;
+		}[];
+	};
+	lsp_server_request: {
+		language: string;
+		method: string;
+		server_command: string;
+		params: string | null;
+	};
+	lsp_server_error: {
+		language: string;
+		server_command: string;
+		error_type: string;
+		message: string;
+	};
+	lsp_status_clicked: {
+		language: string;
+		has_error: boolean;
+		missing_servers: string[];
+		user_dismissed: boolean;
+	};
+	// ── UI events ────────────────────────────────────────────────────────────
+	action_popup_result: {
+		popup_id: string;
+		action_id: string;
+	};
+	process_output: {
+		process_id: number;
+		data: string;
+	};
+	language_changed: {
+		buffer_id: number;
+		language: string;
+	};
+	theme_inspect_key: {
+		theme_name: string;
+		key: string;
+	};
+	keyboard_shortcuts: {
+		bindings: {
+			key: string;
+			action: string;
+		}[];
+	};
+}
+/**
+* Typed overloads of `editor.on` / `editor.off`.
+*
+* When the event name is a key of `HookEventMap` the handler receives a
+* fully-typed payload — TypeScript will flag misspelled field accesses at
+* compile time. Unknown event names fall through to the untyped base
+* signatures in the EditorAPI interface.
+*
+* Both function-value and handler-name forms are supported:
+*
+* ```ts
+* editor.on("buffer_activated", (args) => { /* args.buffer_id is number *\/ });
+* editor.on("buffer_activated", "myHandler");   // registerHandler("myHandler", fn)
+* ```
+*/
+interface EditorAPI {
+	on<K extends keyof HookEventMap>(eventName: K, handler: (args: HookEventMap[K]) => boolean | void | Promise<boolean | void>): void;
+	on<K extends keyof HookEventMap>(eventName: K, handlerName: string): void;
+	off<K extends keyof HookEventMap>(eventName: K, handler: (args: HookEventMap[K]) => boolean | void | Promise<boolean | void>): void;
+	off<K extends keyof HookEventMap>(eventName: K, handlerName: string): void;
+	/**
+	* Create a buffer group: multiple panels appearing as one tab.
+	* This is an async runtime binding (not a direct #[qjs] method).
+	*/
+	createBufferGroup(name: string, mode: string, layout: unknown): Promise<BufferGroupResult>;
 }

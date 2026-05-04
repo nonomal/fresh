@@ -4,13 +4,19 @@
 //! I/O, and async operations.
 
 pub mod async_bridge;
+pub mod authority;
 pub mod clipboard;
+pub mod completion;
+pub mod counters;
 pub mod fs;
 #[cfg(target_os = "linux")]
 pub mod gpm;
+pub mod live_grep_state;
 pub mod log_dirs;
 pub mod lsp;
+pub mod packages;
 pub mod plugins;
+pub mod process_hidden;
 pub mod process_limits;
 pub mod recovery;
 pub mod release_checker;
@@ -21,6 +27,7 @@ pub mod styled_html;
 pub mod telemetry;
 pub mod terminal;
 pub mod terminal_modes;
+pub mod terminal_title;
 pub mod time_source;
 pub mod tracing_setup;
 pub mod warning_log;

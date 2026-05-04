@@ -428,6 +428,91 @@ fn test_settings_number_increment() {
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
 }
 
+/// Reproducer for issue #1825: clicking the `[+]` / `[-]` buttons next to a
+/// Number setting must change the value, and clicking the value between the
+/// brackets must enter inline editing mode (so the user can immediately type
+/// over it). Before the fix, both flows were no-ops.
+#[test]
+fn test_settings_number_mouse_buttons_and_value_click() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    harness.open_settings().unwrap();
+
+    // Search for the "hover delay" Number setting (default 500). Use a
+    // search query specific enough to land directly on this setting.
+    harness
+        .send_key(KeyCode::Char('/'), KeyModifiers::NONE)
+        .unwrap();
+    for c in "mouse hover delay".chars() {
+        harness
+            .send_key(KeyCode::Char(c), KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Locate the value cell rendered as "[500 ]" — anchor every click on
+    // that row so we don't accidentally hit a sibling Number control or a
+    // description line that mentions "500". The value is right-aligned in
+    // a 3-char digit area followed by a 1-char reserved trailing cell
+    // (where the cursor block lives during editing).
+    let (bracket_col, value_row) = harness.find_text_on_screen("[500 ]").unwrap_or_else(|| {
+        panic!(
+            "expected '[500 ]' value cell after navigating to the setting:\n{}",
+            harness.screen_to_string()
+        )
+    });
+
+    // Render: `[500 ] [-] [+]` — bracket_col points to '['. Inner cell is
+    // 4 chars, then `]`, then ` `, then `[-]`, ` `, `[+]`.
+    let value_col = bracket_col + 1; // first inner char ("5")
+    let minus_col = bracket_col + 7; // first '[' of '[-]'
+    let plus_col = bracket_col + 11; // first '[' of '[+]'
+
+    // Click [+] — value cell on this row should change from 500 to 501.
+    harness.mouse_click(plus_col + 1, value_row).unwrap();
+    let after_plus = harness.screen_row_text(value_row);
+    assert!(
+        after_plus.contains("[501 ]"),
+        "[+] click should bump value to 501 on this row:\n{after_plus}"
+    );
+
+    // Click [-] — value should decrement back to 500.
+    harness.mouse_click(minus_col + 1, value_row).unwrap();
+    let after_minus = harness.screen_row_text(value_row);
+    assert!(
+        after_minus.contains("[500 ]"),
+        "[-] click should bring value back to 500:\n{after_minus}"
+    );
+
+    // Click the value between the brackets — should enter editing mode so
+    // typing replaces the value (start_editing selects-all). Type "9" and
+    // confirm with Tab; the value must become 9, right-aligned to "[  9 ]".
+    harness.mouse_click(value_col, value_row).unwrap();
+    harness
+        .send_key(KeyCode::Char('9'), KeyModifiers::NONE)
+        .unwrap();
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    let after_edit = harness.screen_row_text(value_row);
+    assert!(
+        after_edit.contains("[  9 ]"),
+        "click on value area should enter edit mode and accept '9':\n{after_edit}"
+    );
+
+    // Discard changes and close
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+}
+
 /// Test number input decrement with Left arrow
 #[test]
 fn test_settings_number_decrement() {
@@ -1268,90 +1353,234 @@ fn test_map_control_add_new_shows_text_input() {
         .unwrap();
 }
 
-/// Test changing File Explorer Width (a percentage/float setting) and saving
+/// Smoke test: the File Explorer Width field renders with the default
+/// 30% displayed as `"30%"` in the settings UI.
 ///
-/// This tests the bug where percentage values were being saved incorrectly:
-/// - Width is stored as float 0.0-1.0 (e.g., 0.3 = 30%)
-/// - UI displays as integer (30)
-/// - Bug: saved as integer (30) instead of float (0.30)
-/// - Result: on reload, 30 * 100 = 3000 displayed
+/// The field is a free-form string now ("30%" or "24" for columns),
+/// so detailed parse/round-trip behavior lives in config unit tests.
 #[test]
-fn test_settings_percentage_value_saves_correctly() {
+fn test_settings_file_explorer_width_shows_percent_suffix() {
     let mut harness = EditorTestHarness::new(100, 40).unwrap();
     harness.render().unwrap();
 
-    // Get initial width (default is 0.3 = 30%)
-    let initial_width = harness.config().file_explorer.width;
-    assert!(
-        (initial_width - 0.3).abs() < 0.01,
-        "Initial width should be ~0.3, got {}",
-        initial_width
+    assert_eq!(
+        harness.config().file_explorer.width,
+        fresh::config::ExplorerWidth::Percent(30),
     );
 
-    // Open settings
     harness.open_settings().unwrap();
 
-    // Navigate to File Explorer category (down four times from General)
-    // Categories: General, Clipboard, Editor, File Browser, File Explorer, ...
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Clipboard
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Editor
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // File Browser
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // File Explorer
+    // Navigate to File Explorer category.
+    // Categories in order: General, Clipboard, Editor, File Browser, File Explorer, ...
+    for _ in 0..4 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
     harness.render().unwrap();
-
-    // Switch to settings panel
+    // Switch to the settings panel.
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
-
-    // Navigate down to find the Width setting
-    // File Explorer settings: Custom Ignore Patterns, Respect Gitignore, Show Gitignored, Show Hidden, Width
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Respect Gitignore
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Show Gitignored
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Show Hidden
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap(); // Width
+    // File Explorer items (alphabetical): Auto Open On Last Buffer Close,
+    // Custom Ignore Patterns, Preview Tabs, Respect Gitignore, Show Gitignored,
+    // Show Hidden, Side, Width.
+    for _ in 0..7 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
     harness.render().unwrap();
 
-    // Should show Width setting with current value (30 = 0.3 * 100)
     harness.assert_screen_contains("Width");
-    harness.assert_screen_contains("30");
+    harness.assert_screen_contains("30%");
+}
 
-    // Increment the value to 31 (which should become 0.31)
+/// Changing File Explorer Width through the Settings UI must take effect
+/// immediately — the running editor's rendered explorer panel resizes without
+/// a restart. Pre-fix, the Settings save path updated `config.file_explorer
+/// .width` but left `self.file_explorer_width` stale, so the change appeared
+/// to be silently ignored until next launch (and was then clobbered by the
+/// workspace's saved width anyway — so effectively never).
+#[test]
+fn test_settings_file_explorer_width_applies_live() {
+    use fresh::config::ExplorerWidth;
+    let mut harness = EditorTestHarness::new(100, 40).unwrap();
+
+    // Open the file explorer at the default 30% width so it's actually
+    // rendered and measurable before we touch settings.
     harness
-        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .send_key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+    assert!(harness.editor().file_explorer_visible());
+
+    // Sanity: on a 100-col terminal, 30% = 30 cols.
+    let before = find_settings_explorer_border_col(&harness) + 1;
+    assert_eq!(
+        before, 30,
+        "baseline: default 30% should render 30 cols on a 100-col terminal"
+    );
+
+    harness.open_settings().unwrap();
+
+    // Navigate to File Explorer category (see
+    // `test_settings_file_explorer_width_shows_percent_suffix` for the same
+    // navigation pattern).
+    for _ in 0..4 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    // File Explorer items (alphabetical): Auto Open On Last Buffer Close,
+    // Custom Ignore Patterns, Preview Tabs, Respect Gitignore, Show Gitignored,
+    // Show Hidden, Side, Width.
+    for _ in 0..7 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    harness.render().unwrap();
+    harness.assert_screen_contains("Width");
+
+    // Enter editing mode on the Width field, type the columns form "24",
+    // confirm, then save settings with Ctrl+S. The text input arms
+    // replace-on-type when editing starts, so the first printable key
+    // clears "30%" automatically — no separate select-all is needed.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    for c in "24".chars() {
+        harness
+            .send_key(KeyCode::Char(c), KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
         .unwrap();
     harness.render().unwrap();
 
-    // Should now show 31
-    harness.assert_screen_contains("31");
+    assert!(
+        !harness.editor().is_settings_open(),
+        "Ctrl+S should close the settings dialog after saving"
+    );
 
-    // Should show modified indicator
-    harness.assert_screen_contains("modified");
+    // The config record must now reflect the new value…
+    assert_eq!(
+        harness.config().file_explorer.width,
+        ExplorerWidth::Columns(24),
+        "Settings save path must write Columns(24) to config"
+    );
 
-    // Tab to footer (Layer button), then Tab to Save
+    // …and the rendered explorer panel must reflect it too — live, without a
+    // restart.
+    let after = find_settings_explorer_border_col(&harness) + 1;
+    assert_eq!(
+        after, 24,
+        "explorer panel should re-render at 24 columns immediately after saving settings.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// Helper: find the right border column of the file explorer on screen.
+/// (Local copy so this test file doesn't depend on `file_explorer.rs`.)
+fn find_settings_explorer_border_col(harness: &EditorTestHarness) -> u16 {
+    for row in 0..40u16 {
+        let text = harness.get_row_text(row);
+        for (i, ch) in text.chars().enumerate() {
+            if ch == '┐' {
+                return i as u16;
+            }
+        }
+    }
+    for row in (0..40u16).rev() {
+        let text = harness.get_row_text(row);
+        for (i, ch) in text.chars().enumerate() {
+            if ch == '┘' {
+                return i as u16;
+            }
+        }
+    }
+    panic!(
+        "Could not find file explorer border on screen.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// Regression: toggling File Explorer → Show Hidden in the Settings UI and
+/// saving must update the live file explorer's IgnorePatterns, not just the
+/// config on disk. Width must also be propagated to the live explorer width.
+#[test]
+fn test_settings_file_explorer_toggles_propagate_to_runtime() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+
+    // Sanity: both toggles start off.
+    assert!(!harness
+        .editor()
+        .file_explorer()
+        .unwrap()
+        .ignore_patterns()
+        .show_hidden());
+    assert!(!harness
+        .editor()
+        .file_explorer()
+        .unwrap()
+        .ignore_patterns()
+        .show_gitignored());
+
+    harness.open_settings().unwrap();
+
+    // Navigate to File Explorer category. Order (from test_settings_percentage):
+    // General, Clipboard, Editor, File Browser, File Explorer.
+    for _ in 0..4 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap(); // Reset
-    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap(); // Save
     harness.render().unwrap();
 
-    // Press Enter to save
+    // File Explorer items (alphabetical): Auto Open On Last Buffer Close,
+    // Custom Ignore Patterns, Preview Tabs, Respect Gitignore, Show Gitignored,
+    // Show Hidden, Side, Width. Land on Show Gitignored and toggle.
+    for _ in 0..4 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    // Move to Show Hidden and toggle.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
 
-    // Verify settings is closed
+    // Tab to footer then navigate to Save (index 2) and press Enter.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap(); // Reset
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap(); // Save
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
     assert!(
         !harness.editor().is_settings_open(),
         "Settings should be closed after saving"
     );
 
-    // CRITICAL: Verify the width was saved as a float, not an integer
-    // If the bug exists, width would be 31.0 instead of 0.31
-    let new_width = harness.config().file_explorer.width;
+    // Config persisted.
+    assert!(harness.config().file_explorer.show_hidden);
+    assert!(harness.config().file_explorer.show_gitignored);
+
+    // Live IgnorePatterns updated — the bug was that only the config changed
+    // and the running explorer kept its old state until next restart.
+    let patterns = harness.editor().file_explorer().unwrap().ignore_patterns();
     assert!(
-        (new_width - 0.31).abs() < 0.01,
-        "Width should be ~0.31 after saving, got {} (bug: value was saved as integer instead of float)",
-        new_width
+        patterns.show_hidden(),
+        "live IgnorePatterns.show_hidden was not propagated from Settings save"
+    );
+    assert!(
+        patterns.show_gitignored(),
+        "live IgnorePatterns.show_gitignored was not propagated from Settings save"
     );
 }
 
@@ -1781,9 +2010,12 @@ fn test_category_selection_indicator_visible() {
 
     // Categories panel is focused by default, should show ">" before General
     // General may have "●" modified indicator due to test defaults
+    // Category format: "> " + modified_indicator + icon + name
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">● General") || screen.contains(">  General"),
+        screen
+            .lines()
+            .any(|l| l.contains(">") && l.contains("General") && l.find(">") < l.find("General")),
         "Expected '>' indicator on General category when focused. Screen: {}",
         screen
     );
@@ -1795,7 +2027,9 @@ fn test_category_selection_indicator_visible() {
     // Now Clipboard should have the ">" indicator
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">● Clipboard") || screen.contains(">  Clipboard"),
+        screen.lines().any(|l| l.contains(">")
+            && l.contains("Clipboard")
+            && l.find(">") < l.find("Clipboard")),
         "Expected '>' indicator on Clipboard category when focused. Screen: {}",
         screen
     );
@@ -1804,9 +2038,22 @@ fn test_category_selection_indicator_visible() {
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // Now Clipboard should not have the ">" indicator (panel not focused)
-    harness.assert_screen_not_contains(">● Clipboard");
-    harness.assert_screen_not_contains(">  Clipboard");
+    // Now the ">" indicator before Clipboard should be gone (categories panel not focused)
+    // The ">" may still appear as the item selection indicator in the settings panel,
+    // so check that no line has ">" before "Clipboard"
+    let screen = harness.screen_to_string();
+    let has_focused_clipboard = screen.lines().any(|l| {
+        if let (Some(gt_pos), Some(cb_pos)) = (l.find("> "), l.find("Clipboard")) {
+            gt_pos < cb_pos
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_focused_clipboard,
+        "Clipboard should not have '>' indicator when categories panel is unfocused. Screen: {}",
+        screen
+    );
 
     // But Clipboard should still be visible (just highlighted differently)
     harness.assert_screen_contains("Clipboard");
@@ -1887,7 +2134,7 @@ fn test_entry_dialog_focus_indicator() {
     // Navigate down to find a language entry in the Languages list
     // Languages section is after Keybinding Maps and Keybindings sections
     // Navigate down many times to reach Languages
-    for _ in 0..10 {
+    for _ in 0..11 {
         harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     }
     harness.render().unwrap();
@@ -2041,13 +2288,43 @@ fn test_entry_dialog_delete_textlist_item() {
     harness.assert_screen_contains("Edit Value");
 
     // Navigate to Extensions section which has existing items
+    // The ">" focus indicator may be on the section header or on a sub-item line
+    // below it (for composite controls like TextList).
+    let mut attempts = 0;
     loop {
         harness.render().unwrap();
         let screen = harness.screen_to_string();
+        // Check if Extensions header is focused directly
         if screen.contains(">  Extensions") || screen.contains(">● Extensions") {
             break;
         }
+        // Also check if ">" is on a sub-item line near the Extensions header
+        let lines: Vec<&str> = screen.lines().collect();
+        let mut found_near = false;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains(">") && !line.contains("Extensions") {
+                for offset in 1..=3 {
+                    if i >= offset && lines[i - offset].contains("Extensions:") {
+                        found_near = true;
+                        break;
+                    }
+                }
+            }
+            if found_near {
+                break;
+            }
+        }
+        if found_near {
+            break;
+        }
         harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        attempts += 1;
+        assert!(
+            attempts < 100,
+            "Could not find Extensions section after {} Down presses.\nScreen:\n{}",
+            attempts,
+            screen
+        );
     }
 
     // The Extensions section should have items and "[x]" delete buttons
@@ -2135,11 +2412,11 @@ fn test_settings_toggle_persists_after_save_and_reopen() {
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // Verify we're on Check For Updates and it shows as unchecked [ ]
+    // Verify we're on Check For Updates and it shows as unchecked
     // Format is ">  Check For Updates" (3-char indicator area: focus, modified, space)
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">  Check For Updates") && screen.contains(": [ ]"),
+        screen.contains(">  Check For Updates") && screen.contains(": [          ]"),
         "Check For Updates should be focused and unchecked. Screen:\n{}",
         screen
     );
@@ -2150,11 +2427,11 @@ fn test_settings_toggle_persists_after_save_and_reopen() {
         .unwrap();
     harness.render().unwrap();
 
-    // Verify it now shows as checked [x]
+    // Verify it now shows as checked [ ✓ ACTIVE ]
     // After toggling, the item is modified so it shows ">● " (3-char indicator area)
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains(">● Check For Updates") && screen.contains(": [x]"),
+        screen.contains(">● Check For Updates") && screen.contains(": [ ✓ ACTIVE ]"),
         "Check For Updates should now be checked (with modified indicator). Screen:\n{}",
         screen
     );
@@ -2190,15 +2467,14 @@ fn test_settings_toggle_persists_after_save_and_reopen() {
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // This is the key assertion: the toggle should show the SAVED value [x]
-    // not the ORIGINAL value [ ]
-    // Note: The item shows the correct [x] value; the "●" indicator may or may not
-    // appear depending on layer detection
+    // This is the key assertion: the toggle should show the SAVED value
+    // (chip reads "[ ✓ ACTIVE ]") not the ORIGINAL unchecked state.
+    // Note: The "●" indicator may or may not appear depending on layer detection.
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("Check For Updates") && screen.contains(": [x]"),
-        "BUG #474: After save and reopen, Check For Updates should still be checked [x], \
-         but it shows the original value [ ]. Screen:\n{}",
+        screen.contains("Check For Updates") && screen.contains(": [ ✓ ACTIVE ]"),
+        "BUG #474: After save and reopen, Check For Updates should still be checked, \
+         but it shows the original unchecked state. Screen:\n{}",
         screen
     );
 
@@ -2384,6 +2660,13 @@ fn navigate_to_lsp_json_editor(harness: &mut EditorTestHarness) {
 
     // Verify we're in an Edit dialog
     harness.assert_screen_contains("Edit Value");
+
+    // LSP values are now arrays of server configs. The dialog shows the array.
+    // Press Enter to drill into the first server item's nested dialog.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
 
     // Navigate down to "Initialization Options" field
     // Navigate until we see the focus indicator on Initialization Options
@@ -2699,7 +2982,11 @@ fn test_settings_edit_button_keyboard_navigation() {
 /// 3. Show a status message indicating which file was opened
 #[test]
 fn test_settings_edit_button_opens_config_file() {
-    let mut harness = EditorTestHarness::new(100, 40).unwrap();
+    // Width 120 (not 100) because the status bar's right side now includes
+    // the color-coded "LSP (off)" dormant-indicator for any language with
+    // a default LSP config (json has one), which truncates the "Editing
+    // User config" status message to "Editing User ..." at 100 cols.
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
 
     // Open settings
     harness.open_settings().unwrap();
@@ -2748,7 +3035,11 @@ fn test_settings_edit_button_opens_config_file() {
 /// the Edit button should not open the config file and should show a warning.
 #[test]
 fn test_settings_edit_button_blocked_with_pending_changes() {
-    let mut harness = EditorTestHarness::new(100, 40).unwrap();
+    // 140×40 instead of 100×40: with `{remote}` on the default
+    // status bar at 100 cols the "Save or discard pending
+    // changes" message gets truncated. Other settings tests in
+    // this file also use 100×40 but don't read status messages.
+    let mut harness = EditorTestHarness::new(140, 40).unwrap();
 
     // Open settings
     harness.open_settings().unwrap();
@@ -2833,8 +3124,10 @@ fn test_map_add_new_button_clickable_with_mouse() {
         .unwrap();
     harness.render().unwrap();
 
-    // The "[+] Add new" button should be visible
-    harness.assert_screen_contains("[+] Add new");
+    // Wait for the "[+] Add new" button to be visible after search navigation
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[+] Add new"))
+        .unwrap();
 
     // Find the position of "[+] Add new" on screen and click it
     let screen = harness.screen_to_string();
@@ -3523,38 +3816,41 @@ fn test_usability_entry_dialog_button_focus_indicator() {
         .unwrap();
     harness.render().unwrap();
 
-    // Navigate down past all items to reach the buttons
-    loop {
-        harness.render().unwrap();
-        let screen = harness.screen_to_string();
-        if screen.contains("> [ Save ]") || screen.contains(">[ Save ]") {
-            break;
-        }
-        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    }
-
-    // The entry dialog buttons should show ">" focus indicator
-    let screen = harness.screen_to_string();
-    let has_focused_button = screen.contains(">[ Save ]")
-        || screen.contains(">[ Delete ]")
-        || screen.contains(">[ Cancel ]");
-
-    if !has_focused_button {
-        // Try Tab to cycle to buttons (some dialogs use Tab for items<->buttons)
+    // Tab cycles through all fields and buttons — press Tab until we reach a button
+    let mut has_focused_button = false;
+    for _ in 0..60 {
         harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
         harness.render().unwrap();
-    }
 
-    let screen = harness.screen_to_string();
-    // The ">" indicator is rendered with a gap before the button bracket
-    let has_focused_button = screen.contains("> [ Save ]")
-        || screen.contains("> [ Delete ]")
-        || screen.contains("> [ Cancel ]");
+        let screen = harness.screen_to_string();
+        // The ">" indicator is rendered with a gap before the button bracket
+        if screen.contains("> [ Save ]")
+            || screen.contains("> [ Delete ]")
+            || screen.contains("> [ Cancel ]")
+        {
+            has_focused_button = true;
+            break;
+        }
+        // Also check for button focus via REVERSED style (> may be in separate cell)
+        if screen.contains("[ Save ]") || screen.contains("[ Cancel ]") {
+            // Check if any button row has a focus indicator nearby
+            for line in screen.lines() {
+                if (line.contains("[ Save ]") || line.contains("[ Cancel ]")) && line.contains(">")
+                {
+                    has_focused_button = true;
+                    break;
+                }
+            }
+            if has_focused_button {
+                break;
+            }
+        }
+    }
 
     assert!(
         has_focused_button,
-        "Entry dialog buttons should show > focus indicator. Screen:\n{}",
-        screen
+        "Entry dialog buttons should show > focus indicator after Tab cycling. Screen:\n{}",
+        harness.screen_to_string()
     );
 
     // Close the dialog

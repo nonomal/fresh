@@ -24,14 +24,45 @@
 //!   - Performance: O(1) ≈ 1ms
 
 use super::{BufferId, BufferMetadata, Editor};
+use crate::services::authority::TerminalWrapper;
 use crate::services::terminal::TerminalId;
 use crate::state::EditorState;
 use rust_i18n::t;
 
 impl Editor {
-    /// Open a new terminal in the current split
-    pub fn open_terminal(&mut self) {
-        // Get the current split dimensions for the terminal size
+    /// Resolve the terminal wrapper used to spawn a new integrated
+    /// terminal, applying the `terminal.shell` config override on top of
+    /// the authority's wrapper when appropriate.
+    ///
+    /// See `TerminalWrapper::with_user_shell_override` for the override
+    /// rules; this is just the Editor-side wiring that supplies the
+    /// active config.
+    pub(crate) fn resolved_terminal_wrapper(&self) -> TerminalWrapper {
+        self.authority
+            .terminal_wrapper
+            .clone()
+            .with_user_shell_override(self.config.terminal.shell.as_ref())
+    }
+
+    /// Spawn a new PTY-backed terminal session and record its
+    /// log/backing files. Returns the terminal id on success — does
+    /// **not** create a buffer or attach to any split. Callers are
+    /// responsible for the rest of the wiring (creating the terminal
+    /// buffer via `create_terminal_buffer_attached` /
+    /// `create_terminal_buffer_detached`, switching active buffer,
+    /// flipping terminal mode, etc.).
+    ///
+    /// Used by `open_terminal` (regular spawn into the active split)
+    /// and by `Action::OpenTerminalInDock` (which needs the buffer
+    /// id *before* it has a split to attach to, so the dock leaf can
+    /// be seeded with the terminal directly rather than with a
+    /// placeholder buffer that would linger as a phantom tab).
+    pub(crate) fn spawn_terminal_session(&mut self) -> Option<TerminalId> {
+        // Get the current split dimensions for the terminal size.
+        // For dock-creation callers the dock doesn't exist yet, so
+        // these dimensions are an initial guess — `resize_visible_terminals`
+        // (called after attach) will correct it once the dock split
+        // has actual rect dimensions.
         let (cols, rows) = self.get_terminal_dimensions();
 
         // Set up async bridge for terminal manager if not already done
@@ -41,7 +72,7 @@ impl Editor {
 
         // Prepare persistent storage paths under the user's data directory
         let terminal_root = self.dir_context.terminal_dir_for(&self.working_dir);
-        if let Err(e) = self.filesystem.create_dir_all(&terminal_root) {
+        if let Err(e) = self.authority.filesystem.create_dir_all(&terminal_root) {
             tracing::warn!("Failed to create terminal directory: {}", e);
         }
         // Precompute paths using the next terminal ID so we capture from the first byte
@@ -65,12 +96,12 @@ impl Editor {
             Some(self.working_dir.clone()),
             Some(log_path.clone()),
             backing_path_for_spawn,
+            self.resolved_terminal_wrapper(),
         ) {
             Ok(terminal_id) => {
                 // Track log file path (use actual ID in case it differs)
-                let actual_log_path = log_path.clone();
                 self.terminal_log_files
-                    .insert(terminal_id, actual_log_path.clone());
+                    .insert(terminal_id, log_path.clone());
                 // If predicted differs, move backing path entry
                 if terminal_id != predicted_terminal_id {
                     self.terminal_backing_files.remove(&predicted_terminal_id);
@@ -79,47 +110,56 @@ impl Editor {
                     self.terminal_backing_files
                         .insert(terminal_id, backing_path);
                 }
-
-                // Create a buffer for this terminal
-                let buffer_id = self.create_terminal_buffer_attached(
-                    terminal_id,
-                    self.split_manager.active_split(),
-                );
-
-                // Switch to the terminal buffer
-                self.set_active_buffer(buffer_id);
-
-                // Enable terminal mode
-                self.terminal_mode = true;
-                self.key_context = crate::input::keybindings::KeyContext::Terminal;
-
-                // Resize terminal to match actual split content area
-                self.resize_visible_terminals();
-
-                // Get the terminal escape keybinding dynamically
-                let exit_key = self
-                    .keybindings
-                    .find_keybinding_for_action(
-                        "terminal_escape",
-                        crate::input::keybindings::KeyContext::Terminal,
-                    )
-                    .unwrap_or_else(|| "Ctrl+Space".to_string());
-                self.set_status_message(
-                    t!("terminal.opened", id = terminal_id.0, exit_key = exit_key).to_string(),
-                );
-                tracing::info!(
-                    "Opened terminal {:?} with buffer {:?}",
-                    terminal_id,
-                    buffer_id
-                );
+                Some(terminal_id)
             }
             Err(e) => {
                 self.set_status_message(
                     t!("terminal.failed_to_open", error = e.to_string()).to_string(),
                 );
                 tracing::error!("Failed to open terminal: {}", e);
+                None
             }
         }
+    }
+
+    /// Open a new terminal in the current split
+    pub fn open_terminal(&mut self) {
+        let Some(terminal_id) = self.spawn_terminal_session() else {
+            return;
+        };
+
+        // Create a buffer for this terminal, attached to the active split
+        let buffer_id =
+            self.create_terminal_buffer_attached(terminal_id, self.split_manager.active_split());
+
+        // Switch to the terminal buffer
+        self.set_active_buffer(buffer_id);
+
+        // Enable terminal mode
+        self.terminal_mode = true;
+        self.key_context = crate::input::keybindings::KeyContext::Terminal;
+
+        // Resize terminal to match actual split content area
+        self.resize_visible_terminals();
+
+        // Get the terminal escape keybinding dynamically
+        let exit_key = self
+            .keybindings
+            .read()
+            .unwrap()
+            .find_keybinding_for_action(
+                "terminal_escape",
+                crate::input::keybindings::KeyContext::Terminal,
+            )
+            .unwrap_or_else(|| "Ctrl+Space".to_string());
+        self.set_status_message(
+            t!("terminal.opened", id = terminal_id.0, exit_key = exit_key).to_string(),
+        );
+        tracing::info!(
+            "Opened terminal {:?} with buffer {:?}",
+            terminal_id,
+            buffer_id
+        );
     }
 
     /// Create a buffer for a terminal session
@@ -141,7 +181,7 @@ impl Editor {
             .cloned()
             .unwrap_or_else(|| {
                 let root = self.dir_context.terminal_dir_for(&self.working_dir);
-                if let Err(e) = self.filesystem.create_dir_all(&root) {
+                if let Err(e) = self.authority.filesystem.create_dir_all(&root) {
                     tracing::warn!("Failed to create terminal directory: {}", e);
                 }
                 root.join(format!("fresh-terminal-{}.txt", terminal_id.0))
@@ -149,8 +189,8 @@ impl Editor {
 
         // Ensure the file exists - but DON'T truncate if it already has content
         // The PTY read loop may have already started writing scrollback
-        if !self.filesystem.exists(&backing_file) {
-            if let Err(e) = self.filesystem.write_file(&backing_file, &[]) {
+        if !self.authority.filesystem.exists(&backing_file) {
+            if let Err(e) = self.authority.filesystem.write_file(&backing_file, &[]) {
                 tracing::warn!("Failed to create terminal backing file: {}", e);
             }
         }
@@ -162,7 +202,7 @@ impl Editor {
         // Create editor state with the backing file
         let mut state = EditorState::new_with_path(
             large_file_threshold,
-            std::sync::Arc::clone(&self.filesystem),
+            std::sync::Arc::clone(&self.authority.filesystem),
             backing_file.clone(),
         );
         // Terminal buffers should never show line numbers
@@ -187,7 +227,7 @@ impl Editor {
 
         // Set up split view state
         if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-            view_state.open_buffers.push(buffer_id);
+            view_state.add_buffer(buffer_id);
             // Terminal buffers should not wrap lines so escape sequences stay intact
             view_state.viewport.line_wrap_enabled = false;
         }
@@ -209,15 +249,15 @@ impl Editor {
             .cloned()
             .unwrap_or_else(|| {
                 let root = self.dir_context.terminal_dir_for(&self.working_dir);
-                if let Err(e) = self.filesystem.create_dir_all(&root) {
+                if let Err(e) = self.authority.filesystem.create_dir_all(&root) {
                     tracing::warn!("Failed to create terminal directory: {}", e);
                 }
                 root.join(format!("fresh-terminal-{}.txt", terminal_id.0))
             });
 
         // Create the file only if it doesn't exist (preserve existing scrollback for restore)
-        if !self.filesystem.exists(&backing_file) {
-            if let Err(e) = self.filesystem.write_file(&backing_file, &[]) {
+        if !self.authority.filesystem.exists(&backing_file) {
+            if let Err(e) = self.authority.filesystem.write_file(&backing_file, &[]) {
                 tracing::warn!("Failed to create terminal backing file: {}", e);
             }
         }
@@ -225,7 +265,7 @@ impl Editor {
         // Create editor state with the backing file
         let mut state = EditorState::new_with_path(
             large_file_threshold,
-            std::sync::Arc::clone(&self.filesystem),
+            std::sync::Arc::clone(&self.authority.filesystem),
             backing_file.clone(),
         );
         state.margins.configure_for_line_numbers(false);
@@ -252,20 +292,21 @@ impl Editor {
             // Close the terminal
             self.terminal_manager.close(terminal_id);
             self.terminal_buffers.remove(&buffer_id);
+            self.ephemeral_terminals.remove(&terminal_id);
 
             // Clean up backing/rendering file
             let backing_file = self.terminal_backing_files.remove(&terminal_id);
             if let Some(ref path) = backing_file {
                 // Best-effort cleanup of temporary terminal files.
                 #[allow(clippy::let_underscore_must_use)]
-                let _ = self.filesystem.remove_file(path);
+                let _ = self.authority.filesystem.remove_file(path);
             }
             // Clean up raw log file
             if let Some(log_file) = self.terminal_log_files.remove(&terminal_id) {
                 if backing_file.as_ref() != Some(&log_file) {
                     // Best-effort cleanup of temporary terminal files.
                     #[allow(clippy::let_underscore_must_use)]
-                    let _ = self.filesystem.remove_file(&log_file);
+                    let _ = self.authority.filesystem.remove_file(&log_file);
                 }
             }
 
@@ -318,7 +359,13 @@ impl Editor {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
     ) {
-        if let Some(bytes) = crate::services::terminal::pty::key_to_pty_bytes(code, modifiers) {
+        let app_cursor = self
+            .get_active_terminal_state()
+            .map(|s| s.is_app_cursor())
+            .unwrap_or(false);
+        if let Some(bytes) =
+            crate::services::terminal::pty::key_to_pty_bytes(code, modifiers, app_cursor)
+        {
             self.send_terminal_input(&bytes);
         }
     }
@@ -413,7 +460,7 @@ impl Editor {
     pub fn resize_visible_terminals(&mut self) {
         // Get the content area excluding file explorer
         let file_explorer_width = if self.file_explorer_visible {
-            (self.terminal_width as f32 * self.file_explorer_width_percent) as u16
+            self.file_explorer_width.to_cols(self.terminal_width)
         } else {
             0
         };
@@ -496,12 +543,16 @@ impl Editor {
                 if let Ok(mut state) = handle.state.lock() {
                     // Record the current file size as the history end point
                     // (before appending visible screen) so we can truncate back to it
-                    if let Ok(metadata) = self.filesystem.metadata(&backing_file) {
+                    if let Ok(metadata) = self.authority.filesystem.metadata(&backing_file) {
                         state.set_backing_file_history_end(metadata.size);
                     }
 
                     // Open backing file in append mode to add visible screen
-                    if let Ok(mut file) = self.filesystem.open_file_for_append(&backing_file) {
+                    if let Ok(mut file) = self
+                        .authority
+                        .filesystem
+                        .open_file_for_append(&backing_file)
+                    {
                         use std::io::BufWriter;
                         let mut writer = BufWriter::new(&mut *file);
                         if let Err(e) = state.append_visible_screen(&mut writer) {
@@ -523,7 +574,7 @@ impl Editor {
                 large_file_threshold,
                 &self.grammar_registry,
                 &self.config.languages,
-                std::sync::Arc::clone(&self.filesystem),
+                std::sync::Arc::clone(&self.authority.filesystem),
             ) {
                 // Replace buffer state
                 if let Some(state) = self.buffers.get_mut(&buffer_id) {
@@ -599,8 +650,10 @@ impl Editor {
                             let truncate_pos = state.backing_file_history_end();
                             // Always truncate to remove appended visible screen
                             // (even if truncate_pos is 0, meaning no scrollback yet)
-                            if let Err(e) =
-                                self.filesystem.set_file_length(backing_path, truncate_pos)
+                            if let Err(e) = self
+                                .authority
+                                .filesystem
+                                .set_file_length(backing_path, truncate_pos)
                             {
                                 tracing::warn!("Failed to truncate terminal backing file: {}", e);
                             }
@@ -661,7 +714,7 @@ impl Editor {
 
     /// Set terminal jump_to_end_on_output config option (for testing)
     pub fn set_terminal_jump_to_end_on_output(&mut self, value: bool) {
-        self.config.terminal.jump_to_end_on_output = value;
+        self.config_mut().terminal.jump_to_end_on_output = value;
     }
 
     /// Get read-only access to the terminal manager (for testing)
@@ -704,7 +757,8 @@ impl Editor {
                 // Fallback: check active cursors
                 self.split_view_states
                     .values()
-                    .find_map(|vs| Some(vs.cursors.primary().position))
+                    .map(|vs| vs.cursors.primary().position)
+                    .next()
             })
     }
 

@@ -45,8 +45,21 @@ pub enum PopupPosition {
     Fixed { x: u16, y: u16 },
     /// Centered on screen
     Centered,
+    /// Centered floating overlay sized as a percentage of the frame,
+    /// regardless of the content's natural size. Used by Live Grep
+    /// (issue #1796) so the input row and preview pane stay anchored
+    /// while results stream in. Both fields are clamped to 1..=100 by
+    /// the renderer.
+    CenteredOverlay { width_pct: u8, height_pct: u8 },
     /// Bottom right corner (above status bar)
     BottomRight,
+    /// Anchored above the status bar at a specific column (left-aligned at x).
+    /// Used by the LSP-status popup so it appears directly above the LSP
+    /// segment that opened it. `status_row` is the actual row of the status
+    /// bar in the current frame — passing it in lets the popup hug the
+    /// status bar regardless of whether the prompt line is visible (which
+    /// shifts the status bar by a row when it auto-hides).
+    AboveStatusBarAt { x: u16, status_row: u16 },
 }
 
 /// Kind of popup - determines input handling behavior
@@ -62,6 +75,45 @@ pub enum PopupKind {
     List,
     /// Generic text popup
     Text,
+}
+
+/// How `handle_popup_confirm` / `handle_popup_cancel` should resolve the
+/// popup. Each variant names the feature that owns this popup — adding a
+/// new popup flavour is "add a variant + a confirm/cancel branch," with
+/// zero precedence ordering to maintain between unrelated features.
+///
+/// Stored on the `Popup` itself so the confirm dispatcher inspects the
+/// *currently focused* popup (global or buffer) and routes by value. No
+/// out-of-band `Option` on the Editor can silently claim an Enter
+/// belonging to a different popup.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PopupResolver {
+    /// Generic popup with no feature-specific confirm/cancel logic —
+    /// confirm/cancel simply dismiss the popup.
+    #[default]
+    None,
+    /// LSP completion popup. Confirm inserts the selected item's text.
+    Completion,
+    /// "Start LSP server?" confirmation. Confirm dispatches the selected
+    /// row's `data` (e.g. "allow_once") through
+    /// `handle_lsp_confirmation_response`.
+    LspConfirm { language: String },
+    /// LSP server-status / auto-prompt popup. Confirm dispatches the
+    /// selected row's `data` through `handle_lsp_status_action`.
+    LspStatus,
+    /// LSP code-action chooser. Selected row's `data` is the index into
+    /// `Editor::pending_code_actions` (heavy `lsp_types` payload stays
+    /// there to keep the view crate free of LSP types).
+    CodeAction,
+    /// Plugin-requested action popup (`editor.showActionPopup`). Confirm
+    /// fires `action_popup_result` with this popup's id and the selected
+    /// row's `data` as the action id.
+    PluginAction { popup_id: String },
+    /// Remote-authority indicator popup (Local / Connected / Disconnected
+    /// context menu anchored to the status bar's `{remote}` element).
+    /// Confirm dispatches the selected row's `data` through
+    /// `handle_remote_indicator_action`.
+    RemoteIndicator,
 }
 
 /// Content of a popup window
@@ -128,6 +180,8 @@ pub struct PopupListItem {
     pub icon: Option<String>,
     /// User data associated with this item (for completion, etc.)
     pub data: Option<String>,
+    /// If true, item is rendered grayed-out and not selectable.
+    pub disabled: bool,
 }
 
 impl PopupListItem {
@@ -137,6 +191,7 @@ impl PopupListItem {
             detail: None,
             icon: None,
             data: None,
+            disabled: false,
         }
     }
 
@@ -152,6 +207,11 @@ impl PopupListItem {
 
     pub fn with_data(mut self, data: String) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    pub fn disabled(mut self) -> Self {
+        self.disabled = true;
         self
     }
 }
@@ -204,6 +264,30 @@ pub struct Popup {
 
     /// Text selection for copy/paste (None if no selection)
     pub text_selection: Option<PopupTextSelection>,
+
+    /// Key hint shown right-aligned on the selected item (e.g. "(Tab)")
+    pub accept_key_hint: Option<String>,
+
+    /// Feature-specific resolver for confirm/cancel dispatch. Default
+    /// `None` means "no special handling — just dismiss."
+    pub resolver: PopupResolver,
+
+    /// Whether the popup currently has keyboard focus.
+    ///
+    /// LSP-spawned popups (completion, hover, signature help, the
+    /// LSP-server status auto-prompt) are created with `focused = false`
+    /// so a popup that pops up under the user's cursor does not silently
+    /// swallow their next keystroke. The user explicitly transfers
+    /// focus to the popup with the `popup_focus` action (default
+    /// binding `Alt+T`); only then do popup-context bindings apply.
+    pub focused: bool,
+
+    /// Pre-rendered key hint for the `popup_focus` action shown in the
+    /// title when `focused == false` (e.g. `"Alt+T"`). `None` falls back
+    /// to a built-in default at render time. Set by the editor when
+    /// constructing the popup so the hint reflects the user's actual
+    /// keybinding for `popup_focus`.
+    pub focus_key_hint: Option<String>,
 }
 
 impl Popup {
@@ -223,6 +307,10 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
+            resolver: PopupResolver::None,
+            focused: false,
+            focus_key_hint: None,
         }
     }
 
@@ -250,6 +338,10 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
+            resolver: PopupResolver::None,
+            focused: false,
+            focus_key_hint: None,
         }
     }
 
@@ -269,6 +361,10 @@ impl Popup {
             background_style: Style::default().bg(theme.popup_bg),
             scroll_offset: 0,
             text_selection: None,
+            accept_key_hint: None,
+            resolver: PopupResolver::None,
+            focused: false,
+            focus_key_hint: None,
         }
     }
 
@@ -314,6 +410,53 @@ impl Popup {
         self
     }
 
+    /// Attach the confirm/cancel resolver so this popup dispatches to
+    /// the right handler regardless of what other popups are on screen.
+    pub fn with_resolver(mut self, resolver: PopupResolver) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Mark the popup as keyboard-focused (so popup-context bindings
+    /// route through it). LSP popups stay unfocused on creation; the
+    /// user toggles focus with the `popup_focus` action.
+    pub fn with_focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// Pre-render the focus-key hint shown in the popup title when the
+    /// popup is unfocused.
+    pub fn with_focus_key_hint(mut self, hint: String) -> Self {
+        self.focus_key_hint = Some(hint);
+        self
+    }
+
+    /// Compose the title text actually shown on the popup border.
+    ///
+    /// When the popup is unfocused, the focus-key hint (e.g. `"Alt+T"`)
+    /// is appended so the user knows how to grab the popup with the
+    /// keyboard. The hint falls back to a built-in label when no
+    /// `focus_key_hint` is set, so the title never reads as an empty
+    /// parenthetical.
+    pub fn render_title(&self) -> Option<String> {
+        let hint_label = if !self.focused {
+            let hint = self
+                .focus_key_hint
+                .clone()
+                .unwrap_or_else(|| "Alt+T".to_string());
+            Some(format!("[{} to focus]", hint))
+        } else {
+            None
+        };
+        match (&self.title, hint_label) {
+            (Some(title), Some(hint)) => Some(format!("{} {}", title, hint)),
+            (Some(title), None) => Some(title.clone()),
+            (None, Some(hint)) => Some(hint),
+            (None, None) => None,
+        }
+    }
+
     /// Get the currently selected item (if this is a list popup)
     pub fn selected_item(&self) -> Option<&PopupListItem> {
         match &self.content {
@@ -353,6 +496,24 @@ impl Popup {
                 }
             }
         }
+    }
+
+    /// Select a specific item by index. Returns true if the index was valid.
+    pub fn select_index(&mut self, index: usize) -> bool {
+        let visible = self.visible_height();
+        if let PopupContent::List { items, selected } = &mut self.content {
+            if index < items.len() {
+                *selected = index;
+                // Adjust scroll to keep selection visible
+                if *selected >= self.scroll_offset + visible {
+                    self.scroll_offset = (*selected + 1).saturating_sub(visible);
+                } else if *selected < self.scroll_offset {
+                    self.scroll_offset = *selected;
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Scroll down by one page
@@ -786,6 +947,25 @@ impl Popup {
                     height,
                 }
             }
+            PopupPosition::CenteredOverlay {
+                width_pct,
+                height_pct,
+            } => {
+                let w_pct = width_pct.clamp(1, 100) as u32;
+                let h_pct = height_pct.clamp(1, 100) as u32;
+                let width = ((terminal_area.width as u32 * w_pct) / 100) as u16;
+                let height = ((terminal_area.height as u32 * h_pct) / 100) as u16;
+                let width = width.max(1).min(terminal_area.width);
+                let height = height.max(1).min(terminal_area.height);
+                let x = (terminal_area.width.saturating_sub(width)) / 2;
+                let y = (terminal_area.height.saturating_sub(height)) / 2;
+                Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }
+            }
             PopupPosition::BottomRight => {
                 let width = self.width.min(terminal_area.width);
                 let height = self
@@ -798,6 +978,33 @@ impl Popup {
                     .height
                     .saturating_sub(height)
                     .saturating_sub(2);
+                Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }
+            }
+            PopupPosition::AboveStatusBarAt { x, status_row } => {
+                let width = self.width.min(terminal_area.width);
+                let height = self
+                    .content_height()
+                    .min(self.max_height)
+                    .min(terminal_area.height);
+                // Reserve the rightmost column for the editor scrollbar.
+                // Without the reservation, a popup that overflows the
+                // right edge gets clamped flush to `terminal_area.width`
+                // and its right border paints over the scrollbar of the
+                // split underneath.
+                let max_x = terminal_area.width.saturating_sub(width).saturating_sub(1);
+                let x = x.min(max_x);
+                // Sit the popup's bottom border on the row immediately
+                // above the status bar. Anchoring to `status_row` (rather
+                // than `terminal_area.height - 2`) keeps the popup hugging
+                // the status bar in both prompt-visible and prompt-auto-
+                // hide modes — the prompt-line constraint shifts the
+                // status bar's row by one when it disappears.
+                let y = status_row.saturating_sub(height);
                 Rect {
                     x,
                     y,
@@ -833,14 +1040,15 @@ impl Popup {
         // Clear the area behind the popup first to hide underlying text
         frame.render_widget(Clear, area);
 
+        let rendered_title = self.render_title();
         let block = if self.bordered {
             let mut block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(self.border_style)
                 .style(self.background_style);
 
-            if let Some(title) = &self.title {
-                block = block.title(title.as_str());
+            if let Some(title) = rendered_title.as_deref() {
+                block = block.title(title);
             }
 
             block
@@ -850,6 +1058,21 @@ impl Popup {
 
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
+
+        // Close-button overlay on the top border ("[×]", bracketed so the
+        // click target is 3 cells wide and obviously a UI affordance rather
+        // than stray content).  Rendered only for bordered popups that are
+        // big enough to accommodate it without colliding with the title.
+        if self.bordered && area.width >= 5 {
+            let close_x = area.x + area.width - 4;
+            let close_area = Rect {
+                x: close_x,
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new("[×]").style(self.border_style), close_area);
+        }
 
         // Render description if present, and adjust content area
         let content_start_y;
@@ -1073,13 +1296,33 @@ impl Popup {
                             spans.push(Span::raw(format!("{} ", icon)));
                         }
 
-                        // Add main text with underline for clickable items
-                        let text_style = if is_selected {
-                            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                        } else {
-                            Style::default().add_modifier(Modifier::UNDERLINED)
-                        };
-                        spans.push(Span::styled(&item.text, text_style));
+                        // Add main text.  Items are "clickable" when they
+                        // carry a `data` payload and are not disabled — those
+                        // get an underline (like a link) so the user can see
+                        // at a glance which rows act on click.  Header-only
+                        // rows (no data) stay plain; disabled rows are dimmed.
+                        // Leading whitespace is kept separate so the underline
+                        // only sits under the visible text.
+                        let text = &item.text;
+                        let trimmed = text.trim_start();
+                        let indent_len = text.len() - trimmed.len();
+                        if indent_len > 0 {
+                            spans.push(Span::raw(&text[..indent_len]));
+                        }
+                        let is_clickable = item.data.is_some() && !item.disabled;
+                        let mut text_style = Style::default();
+                        if is_selected {
+                            text_style = text_style.add_modifier(Modifier::BOLD);
+                        }
+                        if is_clickable {
+                            text_style = text_style.add_modifier(Modifier::UNDERLINED);
+                        }
+                        if item.disabled {
+                            text_style = text_style
+                                .fg(theme.help_separator_fg)
+                                .add_modifier(Modifier::DIM);
+                        }
+                        spans.push(Span::styled(trimmed, text_style));
 
                         // Add detail if present
                         if let Some(detail) = &item.detail {
@@ -1087,6 +1330,34 @@ impl Popup {
                                 format!(" {}", detail),
                                 Style::default().fg(theme.help_separator_fg),
                             ));
+                        }
+
+                        // Add an empty span without underline so ratatui doesn't
+                        // extend the underline across the remaining row padding.
+                        spans.push(Span::raw(""));
+
+                        // Add right-aligned accept key hint on the selected item
+                        if is_selected {
+                            if let Some(ref hint) = self.accept_key_hint {
+                                let hint_text = format!("({})", hint);
+                                // Calculate used width
+                                let used_width: usize = spans
+                                    .iter()
+                                    .map(|s| {
+                                        unicode_width::UnicodeWidthStr::width(s.content.as_ref())
+                                    })
+                                    .sum();
+                                let available = content_area.width as usize;
+                                let hint_len = hint_text.len();
+                                if used_width + hint_len + 1 < available {
+                                    let padding = available - used_width - hint_len;
+                                    spans.push(Span::raw(" ".repeat(padding)));
+                                    spans.push(Span::styled(
+                                        hint_text,
+                                        Style::default().fg(theme.help_separator_fg),
+                                    ));
+                                }
+                            }
                         }
 
                         // Row style (background only, no underline)
@@ -1152,6 +1423,17 @@ impl PopupManager {
     /// Show a popup (adds to top of stack)
     pub fn show(&mut self, popup: Popup) {
         self.popups.push(popup);
+    }
+
+    /// Show a popup, replacing any existing popup of the same kind.
+    /// If a popup with the same `PopupKind` already exists in the stack,
+    /// it is replaced in-place. Otherwise the new popup is pushed on top.
+    pub fn show_or_replace(&mut self, popup: Popup) {
+        if let Some(pos) = self.popups.iter().position(|p| p.kind == popup.kind) {
+            self.popups[pos] = popup;
+        } else {
+            self.popups.push(popup);
+        }
     }
 
     /// Hide the topmost popup

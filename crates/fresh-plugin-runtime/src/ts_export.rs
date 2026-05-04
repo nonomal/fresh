@@ -15,15 +15,16 @@ use oxc_span::SourceType;
 use ts_rs::{Config as TsConfig, TS};
 
 use fresh_core::api::{
-    ActionPopupAction, ActionPopupOptions, ActionSpec, BackgroundProcessResult, BufferInfo,
-    BufferSavedDiff, CompositeHunk, CompositeLayoutConfig, CompositePaneStyle,
-    CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
+    ActionPopupAction, ActionPopupOptions, ActionSpec, AnimationRect, BackgroundProcessResult,
+    BufferGroupResult, BufferInfo, BufferSavedDiff, CompositeHunk, CompositeLayoutConfig,
+    CompositePaneStyle, CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
     CreateVirtualBufferInExistingSplitOptions, CreateVirtualBufferInSplitOptions,
-    CreateVirtualBufferOptions, CursorInfo, DirEntry, FormatterPackConfig, GrepMatch, JsDiagnostic,
-    JsPosition, JsRange, JsTextPropertyEntry, LanguagePackConfig, LayoutHints, LspServerPackConfig,
-    OverlayColorSpec, OverlayOptions, ProcessLimitsPackConfig, ReplaceResult, SpawnResult,
-    TerminalResult, TextPropertiesAtCursor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire,
-    ViewTokenWireKind, ViewportInfo, VirtualBufferResult,
+    CreateVirtualBufferOptions, CursorInfo, DirEntry, FormatterPackConfig, GrammarInfoSnapshot,
+    GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry, KeyEventPayload,
+    LanguagePackConfig, LayoutHints, LspServerPackConfig, OverlayColorSpec, OverlayOptions,
+    PluginAnimationEdge, PluginAnimationKind, ProcessLimitsPackConfig, ReplaceResult, SpawnResult,
+    SplitSnapshot, TerminalResult, TextPropertiesAtCursor, TsHighlightSpan, ViewTokenStyle,
+    ViewTokenWire, ViewTokenWireKind, ViewportInfo, VirtualBufferResult,
 };
 use fresh_core::command::Suggestion;
 use fresh_core::file_explorer::FileExplorerDecoration;
@@ -38,10 +39,17 @@ fn get_type_decl(type_name: &str) -> Option<String> {
     // Map TypeScript type names to their ts-rs declarations
     // The type name should match either the Rust struct name or the ts(rename = "...") value
     match type_name {
+        // Animation types
+        "AnimationRect" => Some(AnimationRect::decl(&cfg)),
+        "PluginAnimationEdge" => Some(PluginAnimationEdge::decl(&cfg)),
+        "PluginAnimationKind" => Some(PluginAnimationKind::decl(&cfg)),
+
         // Core types
         "BufferInfo" => Some(BufferInfo::decl(&cfg)),
         "CursorInfo" => Some(CursorInfo::decl(&cfg)),
         "ViewportInfo" => Some(ViewportInfo::decl(&cfg)),
+        "KeyEventPayload" => Some(KeyEventPayload::decl(&cfg)),
+        "SplitSnapshot" => Some(SplitSnapshot::decl(&cfg)),
         "ActionSpec" => Some(ActionSpec::decl(&cfg)),
         "BufferSavedDiff" => Some(BufferSavedDiff::decl(&cfg)),
         "LayoutHints" => Some(LayoutHints::decl(&cfg)),
@@ -93,6 +101,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         // Return types
         "TextPropertiesAtCursor" => Some(TextPropertiesAtCursor::decl(&cfg)),
         "VirtualBufferResult" => Some(VirtualBufferResult::decl(&cfg)),
+        "BufferGroupResult" => Some(BufferGroupResult::decl(&cfg)),
 
         // Prompt and directory types
         "PromptSuggestion" | "Suggestion" => Some(Suggestion::decl(&cfg)),
@@ -102,6 +111,9 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "JsDiagnostic" => Some(JsDiagnostic::decl(&cfg)),
         "JsRange" => Some(JsRange::decl(&cfg)),
         "JsPosition" => Some(JsPosition::decl(&cfg)),
+
+        // Grammar info types
+        "GrammarInfoSnapshot" => Some(GrammarInfoSnapshot::decl(&cfg)),
 
         // Language pack types
         "LanguagePackConfig" => Some(LanguagePackConfig::decl(&cfg)),
@@ -114,9 +126,68 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "OverlayColorSpec" => Some(OverlayColorSpec::decl(&cfg)),
         "InlineOverlay" => Some(InlineOverlay::decl(&cfg)),
 
+        // Authority — payload schema for `editor.setAuthority(...)`.
+        // Hand-written because the authoritative struct lives in
+        // `fresh-editor` and this crate must not depend on it
+        // (principle 3: core is opaque to backend kinds). Keep this in
+        // sync with `crates/fresh-editor/src/services/authority/mod.rs`.
+        "AuthorityPayload" => Some(AUTHORITY_PAYLOAD_DECL.to_string()),
+
+        // Remote Indicator override — payload for
+        // `editor.setRemoteIndicatorState(...)`. Same hand-written
+        // rationale: the authoritative enum lives in
+        // `fresh-editor::view::ui::status_bar::RemoteIndicatorOverride`
+        // and this crate must not depend on it. Keep in sync.
+        "RemoteIndicatorStatePayload" => Some(REMOTE_INDICATOR_STATE_DECL.to_string()),
+
         _ => None,
     }
 }
+
+/// Hand-written declaration for `AuthorityPayload` and its helpers.
+/// See the doc comment on the match arm for why this isn't ts-rs.
+///
+/// Emitted as plain `type …` (not `export type …`) to match the rest of
+/// the file — the generated d.ts lives in global scope and plugins
+/// reference types by bare name without importing them.
+const AUTHORITY_PAYLOAD_DECL: &str = r#"type AuthorityFilesystem = { kind: "local" };
+
+type AuthoritySpawner =
+  | { kind: "local" }
+  | {
+      kind: "docker-exec";
+      container_id: string;
+      user?: string | null;
+      workspace?: string | null;
+      env?: [string, string][];
+    };
+
+type AuthorityTerminalWrapper =
+  | { kind: "host-shell" }
+  | {
+      kind: "explicit";
+      command: string;
+      args: string[];
+      manages_cwd?: boolean;
+    };
+
+type AuthorityPayload = {
+  filesystem: AuthorityFilesystem;
+  spawner: AuthoritySpawner;
+  terminal_wrapper: AuthorityTerminalWrapper;
+  display_label?: string;
+};"#;
+
+/// Hand-written declaration for `RemoteIndicatorStatePayload`. Keep in
+/// sync with
+/// `crates/fresh-editor/src/view/ui/status_bar.rs::RemoteIndicatorOverride`
+/// (the struct this crate must not depend on).
+const REMOTE_INDICATOR_STATE_DECL: &str = r#"type RemoteIndicatorStatePayload =
+  | { kind: "local" }
+  | { kind: "connecting"; label?: string | null }
+  | { kind: "connected"; label?: string | null }
+  | { kind: "failed_attach"; error?: string | null }
+  | { kind: "disconnected"; label?: string | null };"#;
 
 /// Types that are dependencies of other types and must always be included.
 /// These are types referenced inside option structs or other complex types
@@ -129,6 +200,8 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "TsCompositeHunk",                // Used in createCompositeBuffer opts.hunks
     "TsCreateCompositeBufferOptions", // Options for createCompositeBuffer
     "ViewportInfo",                   // Used by plugins for viewport queries
+    "KeyEventPayload",                // Used by editor.getNextKey()
+    "SplitSnapshot",                  // Used by editor.listSplits()
     "LayoutHints",                    // Used by plugins for view transforms
     "ViewTokenWire",                  // Used by plugins for view transforms
     "ViewTokenWireKind",              // Used by ViewTokenWire
@@ -151,6 +224,10 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "OverlayOptions",                 // Used by TextPropertyEntry.style and InlineOverlay
     "OverlayColorSpec",               // Used by OverlayOptions.fg/bg
     "InlineOverlay",                  // Used by TextPropertyEntry.inlineOverlays
+    "GrammarInfoSnapshot",            // Used by listGrammars
+    "AnimationRect",                  // Used by animateArea
+    "PluginAnimationEdge",            // Used by PluginAnimationKind
+    "PluginAnimationKind",            // Used by animateArea/animateVirtualBuffer
 ];
 
 /// Collect TypeScript type declarations based on referenced types from proc macro
@@ -241,9 +318,213 @@ pub fn write_fresh_dts() -> Result<(), String> {
 
     let ts_types = collect_ts_types();
 
+    // After the macro-generated EditorAPI interface, merge in a
+    // typed overload of `getPluginApi` that looks through the
+    // `FreshPluginRegistry` interface (declared in the preamble,
+    // augmented by each loaded plugin's `plugins.d.ts`). Declared
+    // AFTER the base interface so TypeScript's overload resolution
+    // prefers the typed form when the name is a known key; the
+    // untyped `getPluginApi(name: string): unknown | null` from the
+    // macro output is the fallback.
+    let plugin_api_trailer = r#"
+
+/**
+ * Typed overload of `editor.getPluginApi`. When the caller passes a
+ * key that some loaded plugin declared in `FreshPluginRegistry`, the
+ * return type is narrowed to that plugin's API. Unknown names fall
+ * through to the untyped `unknown | null` signature.
+ */
+interface EditorAPI {
+  getPluginApi<K extends keyof FreshPluginRegistry>(name: K): FreshPluginRegistry[K] | null;
+}
+
+/**
+ * Maps every hook event name to its payload type.
+ *
+ * Payloads match the flat JSON produced by `hook_args_to_json` on the Rust
+ * side (`HookArgs` is `#[serde(untagged)]`, so each variant serializes as its
+ * fields only). The TypeScript types here are derived directly from the Rust
+ * field definitions and must be kept in sync with `fresh-core/src/hooks.rs`.
+ *
+ * `action` in `pre_command`/`post_command` is the serde JSON of the `Action`
+ * enum: unit variants serialize as a plain string (e.g. `"MoveLeft"`),
+ * tuple variants as a single-key object (e.g. `{"InsertChar": "a"}`).
+ */
+interface HookEventMap {
+  // ── lifecycle ────────────────────────────────────────────────────────────
+  editor_initialized: Record<string, never>;
+  plugins_loaded: Record<string, never>;
+  ready: Record<string, never>;
+  focus_gained: Record<string, never>;
+  authority_changed: { label: string };
+
+  // ── buffer lifecycle ─────────────────────────────────────────────────────
+  buffer_activated: { buffer_id: number };
+  buffer_deactivated: { buffer_id: number };
+  buffer_closed: { buffer_id: number };
+
+  // ── file I/O ─────────────────────────────────────────────────────────────
+  before_file_open: { path: string };
+  after_file_open: { path: string; buffer_id: number };
+  before_file_save: { path: string; buffer_id: number };
+  after_file_save: { path: string; buffer_id: number };
+
+  // ── text edits ───────────────────────────────────────────────────────────
+  before_insert: { buffer_id: number; position: number; text: string };
+  after_insert: {
+    buffer_id: number;
+    position: number;
+    text: string;
+    affected_start: number;
+    affected_end: number;
+    start_line: number;
+    end_line: number;
+    lines_added: number;
+  };
+  before_delete: { buffer_id: number; start: number; end: number };
+  after_delete: {
+    buffer_id: number;
+    start: number;
+    end: number;
+    deleted_text: string;
+    affected_start: number;
+    deleted_len: number;
+    start_line: number;
+    end_line: number;
+    lines_removed: number;
+  };
+
+  // ── cursor & viewport ────────────────────────────────────────────────────
+  cursor_moved: {
+    buffer_id: number;
+    cursor_id: number;
+    old_position: number;
+    new_position: number;
+    line: number;
+    text_properties: Record<string, unknown>[];
+  };
+  viewport_changed: {
+    split_id: number;
+    buffer_id: number;
+    top_byte: number;
+    top_line: number | null;
+    width: number;
+    height: number;
+  };
+
+  // ── rendering ────────────────────────────────────────────────────────────
+  render_start: { buffer_id: number };
+  render_line: {
+    buffer_id: number;
+    line_number: number;
+    byte_start: number;
+    byte_end: number;
+    content: string;
+  };
+  lines_changed: {
+    buffer_id: number;
+    lines: { line_number: number; byte_start: number; byte_end: number; content: string }[];
+  };
+  view_transform_request: {
+    buffer_id: number;
+    split_id: number;
+    viewport_start: number;
+    viewport_end: number;
+    tokens: ViewTokenWire[];
+    cursor_positions: number[];
+  };
+
+  // ── commands ─────────────────────────────────────────────────────────────
+  pre_command: { action: string | Record<string, unknown> };
+  post_command: { action: string | Record<string, unknown> };
+  idle: { milliseconds: number };
+  resize: { width: number; height: number };
+
+  // ── prompts ──────────────────────────────────────────────────────────────
+  prompt_changed: { prompt_type: string; input: string };
+  prompt_confirmed: { prompt_type: string; input: string; selected_index: number | null };
+  prompt_cancelled: { prompt_type: string; input: string };
+  prompt_selection_changed: { prompt_type: string; selected_index: number };
+
+  // ── mouse ────────────────────────────────────────────────────────────────
+  mouse_click: MouseClickHookArgs;
+  mouse_move: { column: number; row: number; content_x: number; content_y: number };
+  mouse_scroll: { buffer_id: number; delta: number; col: number; row: number };
+
+  // ── LSP ──────────────────────────────────────────────────────────────────
+  diagnostics_updated: { uri: string; count: number };
+  lsp_references: {
+    symbol: string;
+    locations: { file: string; line: number; column: number }[];
+  };
+  lsp_server_request: {
+    language: string;
+    method: string;
+    server_command: string;
+    params: string | null;
+  };
+  lsp_server_error: {
+    language: string;
+    server_command: string;
+    error_type: string;
+    message: string;
+  };
+  lsp_status_clicked: {
+    language: string;
+    has_error: boolean;
+    missing_servers: string[];
+    user_dismissed: boolean;
+  };
+
+  // ── UI events ────────────────────────────────────────────────────────────
+  action_popup_result: { popup_id: string; action_id: string };
+  process_output: { process_id: number; data: string };
+  language_changed: { buffer_id: number; language: string };
+  theme_inspect_key: { theme_name: string; key: string };
+  keyboard_shortcuts: { bindings: { key: string; action: string }[] };
+}
+
+/**
+ * Typed overloads of `editor.on` / `editor.off`.
+ *
+ * When the event name is a key of `HookEventMap` the handler receives a
+ * fully-typed payload — TypeScript will flag misspelled field accesses at
+ * compile time. Unknown event names fall through to the untyped base
+ * signatures in the EditorAPI interface.
+ *
+ * Both function-value and handler-name forms are supported:
+ *
+ * ```ts
+ * editor.on("buffer_activated", (args) => { /* args.buffer_id is number *\/ });
+ * editor.on("buffer_activated", "myHandler");   // registerHandler("myHandler", fn)
+ * ```
+ */
+interface EditorAPI {
+  on<K extends keyof HookEventMap>(
+    eventName: K,
+    handler: (args: HookEventMap[K]) => boolean | void | Promise<boolean | void>,
+  ): void;
+  on<K extends keyof HookEventMap>(eventName: K, handlerName: string): void;
+  off<K extends keyof HookEventMap>(
+    eventName: K,
+    handler: (args: HookEventMap[K]) => boolean | void | Promise<boolean | void>,
+  ): void;
+  off<K extends keyof HookEventMap>(eventName: K, handlerName: string): void;
+  /**
+   * Create a buffer group: multiple panels appearing as one tab.
+   * This is an async runtime binding (not a direct #[qjs] method).
+   */
+  createBufferGroup(
+    name: string,
+    mode: string,
+    layout: unknown,
+  ): Promise<BufferGroupResult>;
+}
+"#;
+
     let content = format!(
-        "{}\n{}\n{}",
-        JSEDITORAPI_TS_PREAMBLE, ts_types, JSEDITORAPI_TS_EDITOR_API
+        "{}\n{}\n{}{}",
+        JSEDITORAPI_TS_PREAMBLE, ts_types, JSEDITORAPI_TS_EDITOR_API, plugin_api_trailer
     );
 
     // Validate the generated TypeScript syntax
@@ -356,6 +637,8 @@ mod tests {
             "BufferInfo",
             "CursorInfo",
             "ViewportInfo",
+            "KeyEventPayload",
+            "SplitSnapshot",
             "ActionSpec",
             "BufferSavedDiff",
             "LayoutHints",
@@ -774,6 +1057,9 @@ mod tests {
             "openFileInSplit",
             "showBuffer",
             "closeBuffer",
+            "animateArea",
+            "animateVirtualBuffer",
+            "cancelAnimation",
             "on",
             "off",
             "getEnv",
@@ -788,6 +1074,11 @@ mod tests {
             "readFile",
             "writeFile",
             "readDir",
+            "createDir",
+            "removePath",
+            "renamePath",
+            "copyPath",
+            "getTempDir",
             "getConfig",
             "getUserConfig",
             "reloadConfig",
@@ -798,6 +1089,7 @@ mod tests {
             "registerLspServer",
             "reloadGrammars",
             "getConfigDir",
+            "getDataDir",
             "getThemesDir",
             "applyTheme",
             "getThemeSchema",
@@ -813,6 +1105,9 @@ mod tests {
             "createCompositeBuffer",
             "updateCompositeAlignment",
             "closeCompositeBuffer",
+            "flushLayout",
+            "compositeNextHunk",
+            "compositePrevHunk",
             "getHighlights",
             "addOverlay",
             "clearNamespace",
@@ -879,6 +1174,11 @@ mod tests {
             "getTextPropertiesAtCursor",
             "spawnProcess",
             "spawnProcessWait",
+            "spawnHostProcess",
+            "setAuthority",
+            "clearAuthority",
+            "setRemoteIndicatorState",
+            "clearRemoteIndicatorState",
             "getBufferText",
             "delay",
             "sendLspRequest",

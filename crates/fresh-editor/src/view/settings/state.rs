@@ -7,11 +7,11 @@ use super::entry_dialog::EntryDialogState;
 use super::items::{control_to_value, SettingControl, SettingItem, SettingsPage};
 use super::layout::SettingsHit;
 use super::schema::{parse_schema, SettingCategory, SettingSchema};
-use super::search::{search_settings, SearchResult};
+use super::search::{search_settings, DeepMatch, SearchResult};
 use crate::config::Config;
 use crate::config_io::ConfigLayer;
 use crate::view::controls::FocusState;
-use crate::view::ui::{FocusManager, ScrollablePanel};
+use crate::view::ui::{FocusManager, ScrollItem, ScrollablePanel};
 use std::collections::HashMap;
 
 /// Info needed to open a nested dialog (extracted before mutable borrow)
@@ -117,9 +117,57 @@ pub struct SettingsState {
     /// When a user "resets" a setting, we remove it from the delta rather than
     /// setting it to the schema default.
     pub pending_deletions: std::collections::HashSet<String>,
-    /// Last known layout width for description wrapping.
-    /// Set during render and propagated to items for height calculations.
+    /// Last known layout width for the body panel. Set during render so input
+    /// handlers (which run between renders) can recompute scroll math without
+    /// access to the frame area.
     pub layout_width: u16,
+    /// Visual style applied to every item in this state. Toggle with
+    /// [`Self::set_item_style`] to swap between card / flat presentation.
+    pub item_style: super::items::ItemBoxStyle,
+    /// Categories whose sections are currently expanded in the left-panel
+    /// tree view. Only categories with `sections.len() > 1` are eligible —
+    /// a category with zero or one section stays flat.
+    pub expanded_categories: std::collections::HashSet<usize>,
+    /// Scroll state for the categories panel itself, separate from the body
+    /// panel's `scroll_panel`. Drives mouse-wheel + page-up/down on the left.
+    pub categories_scroll: ScrollablePanel,
+    /// Cursor position inside the currently-selected category's tree row.
+    /// `None` = cursor is on the category row itself (the category row
+    /// shows the `>` indicator).
+    /// `Some(s)` = cursor is on the s-th section row of the current
+    /// category (that section row shows the `>` indicator).
+    ///
+    /// Tracked explicitly so it is independent of the body's scroll
+    /// position — pressing Right to expand a category keeps the cursor
+    /// on the category, pressing Down then walks into the sections,
+    /// and scrolling the body updates this so Up/Down resumes from the
+    /// section the user is actually looking at.
+    pub tree_cursor_section: Option<usize>,
+}
+
+/// One row of the left-panel tree. Either a top-level category, or a section
+/// row that appears under an expanded category.
+///
+/// Sections only appear when their owning category is in
+/// `expanded_categories` AND has more than one section — single-section
+/// categories show their items flat without a tree node.
+#[derive(Debug, Clone, Copy)]
+pub enum TreeRow {
+    Category {
+        idx: usize,
+        expandable: bool,
+        expanded: bool,
+    },
+    Section {
+        cat_idx: usize,
+        section_idx: usize,
+    },
+}
+
+impl crate::view::ui::ScrollItem for TreeRow {
+    fn height(&self, _width: u16) -> u16 {
+        1
+    }
 }
 
 impl SettingsState {
@@ -169,6 +217,10 @@ impl SettingsState {
             layer_sources,
             pending_deletions: std::collections::HashSet::new(),
             layout_width: 0,
+            item_style: super::items::ItemBoxStyle::default(),
+            expanded_categories: std::collections::HashSet::new(),
+            categories_scroll: ScrollablePanel::new(),
+            tree_cursor_section: None,
         })
     }
 
@@ -227,6 +279,276 @@ impl SettingsState {
     /// Get the currently selected page mutably
     pub fn current_page_mut(&mut self) -> Option<&mut SettingsPage> {
         self.pages.get_mut(self.selected_category)
+    }
+
+    /// Index of the item currently sitting at the top of the body
+    /// viewport, computed from the scroll offset and per-item heights. The
+    /// left-panel section indicator follows this so scrolling visibly moves
+    /// the highlight in the tree, not just keyboard navigation.
+    pub fn topmost_visible_item_index(&self) -> Option<usize> {
+        let page = self.pages.get(self.selected_category)?;
+        if page.items.is_empty() {
+            return None;
+        }
+        let target = self.scroll_panel.scroll.offset;
+        let width = self.layout_width;
+        let mut y: u16 = 0;
+        for (idx, item) in page.items.iter().enumerate() {
+            let h = <SettingItem as ScrollItem>::height(item, width);
+            if y + h > target {
+                return Some(idx);
+            }
+            y += h;
+        }
+        Some(page.items.len() - 1)
+    }
+
+    /// Section currently displayed in the body — the section whose item
+    /// range contains either the focused item or the topmost visible item
+    /// (whichever is later). Returns `None` when the page has no sections
+    /// or when the cursor is above the first section.
+    pub fn current_section_index(&self) -> Option<usize> {
+        let page = self.pages.get(self.selected_category)?;
+        if page.sections.is_empty() {
+            return None;
+        }
+        // Drive the section indicator off the topmost visible item — i.e.
+        // strictly what the user is looking at right now, regardless of
+        // where their last click landed. Earlier code did
+        // `topmost.max(selected_item)`, which clamped the indicator so
+        // wheel-UP after a click couldn't move the highlight back to an
+        // earlier section. Falling back to selected_item only when the
+        // body is genuinely empty (no items, no viewport) gives the
+        // expected "tree follows scroll, both directions" behavior.
+        let item_idx = self
+            .topmost_visible_item_index()
+            .unwrap_or(self.selected_item);
+        // Walk sections in order and pick the last one whose first_item_index <= item_idx.
+        let mut current: Option<usize> = None;
+        for (s_idx, section) in page.sections.iter().enumerate() {
+            if section.first_item_index <= item_idx {
+                current = Some(s_idx);
+            } else {
+                break;
+            }
+        }
+        current
+    }
+
+    /// Whether a category should render with a chevron + be expandable in
+    /// the tree view. We require strictly more than one section, since one
+    /// section adds no information beyond the category itself.
+    pub fn is_category_expandable(&self, cat_idx: usize) -> bool {
+        self.pages
+            .get(cat_idx)
+            .is_some_and(|p| p.sections.len() > 1)
+    }
+
+    /// Move the cursor in the categories tree by `delta` rows (positive =
+    /// down, negative = up). The cursor walks every visible row — both
+    /// category rows and the section rows under any expanded category — so
+    /// users can step into discovered sections without leaving the keyboard.
+    ///
+    /// Maps the new row to state:
+    /// * Category row → `selected_category = idx`, `selected_item = 0`.
+    /// * Section row → category + first item of that section (same effect
+    ///   as clicking the section).
+    pub fn tree_step(&mut self, delta: i32) {
+        let rows = self.visible_tree();
+        if rows.is_empty() {
+            return;
+        }
+        let cur = self.tree_cursor_index(&rows);
+        let len = rows.len() as i32;
+        let target = (cur as i32 + delta).clamp(0, len - 1) as usize;
+        if target == cur {
+            return;
+        }
+        let prev_category = self.selected_category;
+        self.update_control_focus(false);
+        match rows[target] {
+            TreeRow::Category { idx, .. } => {
+                // Cursor on a category row: body shows the page's first
+                // item but the tree highlight stays on the category
+                // header (no section is "current" yet).
+                self.selected_category = idx;
+                self.selected_item = 0;
+                self.tree_cursor_section = None;
+                if idx != prev_category {
+                    self.scroll_panel = ScrollablePanel::new();
+                }
+                self.sub_focus = None;
+                self.update_control_focus(true);
+            }
+            TreeRow::Section {
+                cat_idx,
+                section_idx,
+            } => {
+                let first = self.pages[cat_idx].sections[section_idx].first_item_index;
+                self.selected_category = cat_idx;
+                self.selected_item = first;
+                self.tree_cursor_section = Some(section_idx);
+                if cat_idx != prev_category {
+                    self.scroll_panel = ScrollablePanel::new();
+                }
+                self.sub_focus = None;
+                self.init_map_focus(true);
+                self.update_control_focus(true);
+            }
+        }
+        // We deliberately do NOT auto-expand here: Up/Down sequential
+        // navigation should walk through categories without unfolding
+        // each one as you pass over it — that would balloon the tree
+        // every time the user holds Down. Auto-expand fires on
+        // deliberate visits (click, search-jump, Enter on a section).
+        let width = self.layout_width;
+        if let Some(page) = self.pages.get(self.selected_category) {
+            self.scroll_panel.update_content_height(&page.items, width);
+            // When the cursor lands on a section, snap the body's scroll
+            // to that section's first item — same UX as clicking a
+            // section in the tree. Without this, `ensure_focused_visible`
+            // would only scroll *just enough* for the item to be in
+            // view, leaving `topmost_visible_item_index` pointing at an
+            // earlier section and making the cursor visually "stick" on
+            // the previous section row.
+            if matches!(rows[target], TreeRow::Section { .. }) {
+                let item_y =
+                    self.scroll_panel
+                        .item_y_offset(&page.items, self.selected_item, width);
+                self.scroll_panel.scroll.offset = item_y;
+            } else {
+                let selected_item = self.selected_item;
+                let sub_focus = self.sub_focus;
+                self.scroll_panel.ensure_focused_visible(
+                    &page.items,
+                    selected_item,
+                    sub_focus,
+                    width,
+                );
+            }
+        }
+        let new_rows = self.visible_tree();
+        let new_cur = self.tree_cursor_index(&new_rows);
+        self.categories_scroll
+            .ensure_focused_visible(&new_rows, new_cur, None, width);
+    }
+
+    /// Find the visible-tree index for the current selection. Prefers the
+    /// section row matching the explicit `tree_cursor_section` cursor
+    /// (when set), or the category row otherwise. The cursor is
+    /// independent of body scroll position, so pressing Right to expand
+    /// a category does NOT make the cursor jump to the first section.
+    /// `Up`/`Down` walks the visible rows linearly; clicks and section
+    /// jumps update `tree_cursor_section` directly.
+    pub(super) fn tree_cursor_index(&self, rows: &[TreeRow]) -> usize {
+        let cat = self.selected_category;
+        if let Some(s_idx) = self.tree_cursor_section {
+            for (i, row) in rows.iter().enumerate() {
+                if let TreeRow::Section {
+                    cat_idx,
+                    section_idx,
+                } = *row
+                {
+                    if cat_idx == cat && section_idx == s_idx {
+                        return i;
+                    }
+                }
+            }
+        }
+        for (i, row) in rows.iter().enumerate() {
+            if let TreeRow::Category { idx, .. } = *row {
+                if idx == cat {
+                    return i;
+                }
+            }
+        }
+        0
+    }
+
+    /// Toggle whether a category is expanded in the tree view. No-op for
+    /// categories that aren't expandable (zero or one section).
+    /// Ensure the currently selected category is expanded in the tree view
+    /// when it has more than one section. Called on any path that "visits"
+    /// a category (Up/Down to it, click, search-jump) so the user
+    /// immediately sees that the category contains sections — they don't
+    /// have to remember to press Right.
+    ///
+    /// No-op for non-expandable categories (≤ 1 section). Idempotent.
+    pub fn auto_expand_current_category(&mut self) {
+        let idx = self.selected_category;
+        if self.is_category_expandable(idx) {
+            self.expanded_categories.insert(idx);
+        }
+    }
+
+    pub fn toggle_category_expanded(&mut self, cat_idx: usize) {
+        if !self.is_category_expandable(cat_idx) {
+            return;
+        }
+        if !self.expanded_categories.insert(cat_idx) {
+            self.expanded_categories.remove(&cat_idx);
+        }
+    }
+
+    /// Jump the body panel to a specific section within a category. The
+    /// category becomes the selected category, and the body's selected_item
+    /// jumps to the section's first item.
+    pub fn jump_to_section(&mut self, cat_idx: usize, section_idx: usize) {
+        let Some(page) = self.pages.get(cat_idx) else {
+            return;
+        };
+        let Some(section) = page.sections.get(section_idx) else {
+            return;
+        };
+        let target_item = section.first_item_index;
+        self.update_control_focus(false);
+        self.selected_category = cat_idx;
+        self.selected_item = target_item;
+        self.tree_cursor_section = Some(section_idx);
+        self.focus.set(FocusPanel::Settings);
+        let width = self.layout_width;
+        if let Some(page) = self.pages.get(self.selected_category) {
+            self.scroll_panel.update_content_height(&page.items, width);
+            // Snap the body to the top of the section. `ensure_visible`
+            // would only scroll *just enough* to bring the target item
+            // into view, which puts it at the bottom of the viewport
+            // (and on tight viewports clips its body below the footer);
+            // jumping to a section instead means "show this section at
+            // the top".
+            let item_y = self
+                .scroll_panel
+                .item_y_offset(&page.items, target_item, width);
+            self.scroll_panel.scroll.offset = item_y;
+        }
+        self.sub_focus = None;
+        self.init_map_focus(true);
+        self.update_control_focus(true);
+        self.auto_expand_current_category();
+    }
+
+    /// Flatten the categories list + currently expanded sections into the
+    /// row order rendered in the left panel. Single source of truth for
+    /// rendering, hit-testing, and Up/Down navigation in the tree.
+    pub fn visible_tree(&self) -> Vec<TreeRow> {
+        let mut rows = Vec::with_capacity(self.pages.len());
+        for (idx, page) in self.pages.iter().enumerate() {
+            let expandable = page.sections.len() > 1;
+            let expanded = expandable && self.expanded_categories.contains(&idx);
+            rows.push(TreeRow::Category {
+                idx,
+                expandable,
+                expanded,
+            });
+            if expanded {
+                for section_idx in 0..page.sections.len() {
+                    rows.push(TreeRow::Section {
+                        cat_idx: idx,
+                        section_idx,
+                    });
+                }
+            }
+        }
+        rows
     }
 
     /// Get the currently selected item
@@ -294,11 +616,20 @@ impl SettingsState {
             match &mut item.control {
                 SettingControl::Map(ref mut state) => state.focus = focus_state,
                 SettingControl::TextList(ref mut state) => state.focus = focus_state,
+                SettingControl::DualList(ref mut state) => state.focus = focus_state,
                 SettingControl::ObjectArray(ref mut state) => state.focus = focus_state,
                 SettingControl::Toggle(ref mut state) => state.focus = focus_state,
                 SettingControl::Number(ref mut state) => state.focus = focus_state,
                 SettingControl::Dropdown(ref mut state) => state.focus = focus_state,
-                SettingControl::Text(ref mut state) => state.focus = focus_state,
+                SettingControl::Text(ref mut state) => {
+                    state.focus = focus_state;
+                    // Leaving a text input via navigation also exits
+                    // edit mode, so the cursor never lingers on a row
+                    // the user is no longer looking at.
+                    if !focused {
+                        state.editing = false;
+                    }
+                }
                 SettingControl::Json(_) | SettingControl::Complex { .. } => {} // These don't have focus state
             }
         }
@@ -324,14 +655,7 @@ impl SettingsState {
     pub fn select_prev(&mut self) {
         match self.focus_panel() {
             FocusPanel::Categories => {
-                if self.selected_category > 0 {
-                    self.update_control_focus(false); // Unfocus old item
-                    self.selected_category -= 1;
-                    self.selected_item = 0;
-                    self.scroll_panel = ScrollablePanel::new();
-                    self.sub_focus = None;
-                    self.update_control_focus(true); // Focus new item
-                }
+                self.tree_step(-1);
             }
             FocusPanel::Settings => {
                 // Try to navigate within current Map control first
@@ -368,14 +692,7 @@ impl SettingsState {
     pub fn select_next(&mut self) {
         match self.focus_panel() {
             FocusPanel::Categories => {
-                if self.selected_category + 1 < self.pages.len() {
-                    self.update_control_focus(false); // Unfocus old item
-                    self.selected_category += 1;
-                    self.selected_item = 0;
-                    self.scroll_panel = ScrollablePanel::new();
-                    self.sub_focus = None;
-                    self.update_control_focus(true); // Focus new item
-                }
+                self.tree_step(1);
             }
             FocusPanel::Settings => {
                 // Try to navigate within current Map control first
@@ -410,6 +727,22 @@ impl SettingsState {
                     self.footer_button_index += 1;
                 }
             }
+        }
+    }
+
+    /// Move selection down by a page (viewport height worth of items)
+    pub fn select_next_page(&mut self) {
+        let page_size = self.scroll_panel.viewport_height().max(1);
+        for _ in 0..page_size {
+            self.select_next();
+        }
+    }
+
+    /// Move selection up by a page (viewport height worth of items)
+    pub fn select_prev_page(&mut self) {
+        let page_size = self.scroll_panel.viewport_height().max(1);
+        for _ in 0..page_size {
+            self.select_prev();
         }
     }
 
@@ -459,33 +792,49 @@ impl SettingsState {
         self.ensure_visible();
     }
 
-    /// Ensure the selected item is visible in the viewport
-    /// Update layout_width on all items in the current page.
-    /// Called before any scroll calculations so heights are correct.
-    pub fn update_layout_widths(&mut self) {
-        let width = self.layout_width;
-        if width > 0 {
-            if let Some(page) = self.pages.get_mut(self.selected_category) {
-                for item in &mut page.items {
-                    item.layout_width = width;
-                }
+    /// Toggle the visual style applied to every item.
+    ///
+    /// Style is cached per-item so the `ScrollItem::height(width)` trait impl
+    /// can compute the correct height without taking a style parameter; this
+    /// method propagates the change to every item across every page in one
+    /// pass. Recomputes the scroll panel content height too, since heights
+    /// just changed.
+    pub fn set_item_style(&mut self, style: super::items::ItemBoxStyle) {
+        if self.item_style == style {
+            return;
+        }
+        self.item_style = style;
+        for page in &mut self.pages {
+            for item in &mut page.items {
+                item.style = style;
             }
+        }
+        let width = self.layout_width;
+        if let Some(page) = self.pages.get(self.selected_category) {
+            self.scroll_panel.update_content_height(&page.items, width);
         }
     }
 
+    /// Ensure the selected item is visible in the viewport.
     pub fn ensure_visible(&mut self) {
         if self.focus_panel() != FocusPanel::Settings {
             return;
         }
 
-        self.update_layout_widths();
-
         // Need to avoid borrowing self for both page and scroll_panel
         let selected_item = self.selected_item;
         let sub_focus = self.sub_focus;
+        let width = self.layout_width;
+        let prev_offset = self.scroll_panel.scroll.offset;
         if let Some(page) = self.pages.get(self.selected_category) {
             self.scroll_panel
-                .ensure_focused_visible(&page.items, selected_item, sub_focus);
+                .ensure_focused_visible(&page.items, selected_item, sub_focus, width);
+        }
+        // If body Up/Down moved the scroll, the tree cursor must follow
+        // so the left-panel highlight tracks the section the user is
+        // looking at — same contract as wheel/scrollbar scroll.
+        if self.scroll_panel.scroll.offset != prev_offset {
+            self.sync_tree_cursor_to_body_scroll();
         }
     }
 
@@ -649,6 +998,82 @@ impl SettingsState {
         }
     }
 
+    /// Set the current nullable setting to null (inherit value).
+    ///
+    /// This explicitly sets the value to null in the current layer,
+    /// indicating that the setting should be inherited rather than overridden.
+    /// Only applies to nullable settings that are not currently null.
+    pub fn set_current_to_null(&mut self) {
+        let target_layer = self.target_layer;
+        let change_info = self.current_item().and_then(|item| {
+            if !item.nullable || item.is_null || item.read_only {
+                return None;
+            }
+            Some(item.path.clone())
+        });
+
+        if let Some(path) = change_info {
+            // Set value to null (not a deletion — this is an explicit null value)
+            self.pending_changes
+                .insert(path.clone(), serde_json::Value::Null);
+            self.pending_deletions.remove(&path);
+
+            // Update the item's visual state
+            if let Some(item) = self.current_item_mut() {
+                item.is_null = true;
+                item.modified = true;
+                item.layer_source = target_layer;
+            }
+        }
+    }
+
+    /// Clear a nullable category by setting its path to null and updating all items.
+    ///
+    /// This sets the category's root path (e.g., `/fallback`) to null in the target layer,
+    /// effectively removing the entire section. All items within the category are marked
+    /// as null/inherited.
+    pub fn clear_current_category(&mut self) {
+        let target_layer = self.target_layer;
+        let page = match self.current_page() {
+            Some(p) if p.nullable => p,
+            _ => return,
+        };
+        let page_path = page.path.clone();
+
+        // Set the category root to null
+        self.pending_changes
+            .insert(page_path.clone(), serde_json::Value::Null);
+
+        // Also remove any pending changes/deletions for child paths
+        let prefix = format!("{}/", page_path);
+        self.pending_changes
+            .retain(|path, _| !path.starts_with(&prefix));
+        self.pending_deletions
+            .retain(|path| !path.starts_with(&prefix));
+
+        // Update all items on the current page to reflect null/inherited state
+        if let Some(page) = self.current_page_mut() {
+            for item in &mut page.items {
+                if item.nullable {
+                    item.is_null = true;
+                    item.modified = false;
+                    item.layer_source = target_layer;
+                }
+            }
+        }
+    }
+
+    /// Check if any items in the current nullable category have non-null values.
+    pub fn current_category_has_values(&self) -> bool {
+        match self.current_page() {
+            Some(page) if page.nullable => {
+                page.items.iter().any(|item| !item.is_null && item.nullable)
+                    || page.items.iter().any(|item| item.modified)
+            }
+            _ => false,
+        }
+    }
+
     /// Handle a value change from user interaction
     pub fn on_value_changed(&mut self) {
         // Capture target_layer before any borrows
@@ -669,6 +1094,7 @@ impl SettingsState {
             if let Some(item) = self.current_item_mut() {
                 item.modified = true; // New semantic: value is now defined in target layer
                 item.layer_source = target_layer; // Value now comes from target layer
+                item.is_null = false; // Explicit value clears the inherited state
             }
             self.set_pending_change(&path, value);
         }
@@ -695,6 +1121,7 @@ impl SettingsState {
                     SettingControl::Dropdown(state) => state.focus = focus,
                     SettingControl::Text(state) => state.focus = focus,
                     SettingControl::TextList(state) => state.focus = focus,
+                    SettingControl::DualList(state) => state.focus = focus,
                     SettingControl::Map(state) => state.focus = focus,
                     SettingControl::ObjectArray(state) => state.focus = focus,
                     SettingControl::Json(state) => state.focus = focus,
@@ -833,14 +1260,15 @@ impl SettingsState {
     /// Jump to the currently selected search result
     pub fn jump_to_search_result(&mut self) {
         // Extract values first to avoid borrow issues
-        let Some(&SearchResult {
-            page_index,
-            item_index,
-            ..
-        }) = self.search_results.get(self.selected_search_result)
+        let Some(result) = self
+            .search_results
+            .get(self.selected_search_result)
+            .cloned()
         else {
             return;
         };
+        let page_index = result.page_index;
+        let item_index = result.item_index;
 
         // Unfocus old item first
         self.update_control_focus(false);
@@ -850,15 +1278,49 @@ impl SettingsState {
         // Reset scroll offset but preserve viewport for ensure_visible
         self.scroll_panel.scroll.offset = 0;
         // Update content height for the new category's items
-        self.update_layout_widths();
+        let width = self.layout_width;
         if let Some(page) = self.pages.get(self.selected_category) {
-            self.scroll_panel.update_content_height(&page.items);
+            self.scroll_panel.update_content_height(&page.items, width);
         }
         self.sub_focus = None;
         self.init_map_focus(true);
+
+        // Navigate into the deep match target if present
+        if let Some(ref deep_match) = result.deep_match {
+            self.jump_to_deep_match(deep_match);
+        }
+
         self.update_control_focus(true); // Focus the new item
+        self.auto_expand_current_category();
+        // Whichever section the matched item lives in becomes the tree
+        // cursor — so when the user closes search and Tabs to the
+        // categories panel, Up/Down resumes from the right place.
+        self.tree_cursor_section = self.current_section_index();
         self.ensure_visible();
         self.cancel_search();
+    }
+
+    /// Navigate into a composite control to focus a specific deep match
+    fn jump_to_deep_match(&mut self, deep_match: &DeepMatch) {
+        match deep_match {
+            DeepMatch::MapKey { entry_index, .. } | DeepMatch::MapValue { entry_index, .. } => {
+                if let Some(item) = self.current_item_mut() {
+                    if let SettingControl::Map(ref mut map_state) = item.control {
+                        map_state.focused_entry = Some(*entry_index);
+                    }
+                }
+                self.update_map_sub_focus();
+            }
+            DeepMatch::TextListItem { item_index, .. } => {
+                if let Some(item) = self.current_item_mut() {
+                    if let SettingControl::TextList(ref mut list_state) = item.control {
+                        list_state.focused_item = Some(*item_index);
+                    }
+                }
+                // Update sub_focus for TextList
+                self.sub_focus = Some(1 + *item_index);
+            }
+        }
     }
 
     /// Get the currently selected search result
@@ -1022,7 +1484,21 @@ impl SettingsState {
         // Get info from the current dialog's focused field
         let nested_info = self.entry_dialog().and_then(|dialog| {
             let item = dialog.current_item()?;
-            let path = format!("{}/{}", dialog.map_path, item.path.trim_start_matches('/'));
+            // The nested dialog path must root at the current entry's full
+            // path, not just at `map_path`. Otherwise the entry key segment
+            // (e.g. `quicklsp` under `/universal_lsp`) is dropped and the
+            // nested save records a pending change at `/universal_lsp/`,
+            // which eventually writes an empty-string key into the config.
+            let base = dialog.entry_path();
+            let relative = item.path.trim_start_matches('/');
+            let path = if relative.is_empty() {
+                // `is_single_value` dialogs use an empty item path because
+                // the single non-key item IS the entry's value. In that
+                // case the nested dialog lives at the entry path itself.
+                base
+            } else {
+                format!("{}/{}", base, relative)
+            };
 
             match &item.control {
                 SettingControl::Map(map_state) => {
@@ -1199,10 +1675,23 @@ impl SettingsState {
         let is_nested = !self.entry_dialog_stack.is_empty();
 
         if is_nested {
-            // Nested dialog - update the parent dialog's ObjectArray item
-            // Extract the array field name from the path (last segment)
-            let array_field = array_path.rsplit('/').next().unwrap_or("").to_string();
-            let item_path = format!("/{}", array_field);
+            // Nested dialog - update the parent dialog's ObjectArray item.
+            // Extract the item path within the parent dialog by stripping the
+            // parent's full entry path (map_path + "/" + entry_key) from the
+            // nested dialog's array path. For an is_single_value parent (e.g.
+            // a quicklsp entry whose value schema is an array), the inner
+            // ObjectArray item has path "" and the nested dialog lives exactly
+            // at the entry path, so the stripped item path is "".
+            let parent_entry_path = self
+                .entry_dialog_stack
+                .last()
+                .map(|p| p.entry_path())
+                .unwrap_or_default();
+            let item_path = array_path
+                .strip_prefix(parent_entry_path.as_str())
+                .unwrap_or(&array_path)
+                .trim_end_matches('/')
+                .to_string();
 
             // Find and update the ObjectArray in the parent dialog
             if let Some(parent) = self.entry_dialog_stack.last_mut() {
@@ -1314,7 +1803,11 @@ impl SettingsState {
     pub fn scroll_up(&mut self, delta: usize) -> bool {
         let old = self.scroll_panel.scroll.offset;
         self.scroll_panel.scroll_up(delta as u16);
-        old != self.scroll_panel.scroll.offset
+        let changed = old != self.scroll_panel.scroll.offset;
+        if changed {
+            self.sync_tree_cursor_to_body_scroll();
+        }
+        changed
     }
 
     /// Scroll down by a given number of rows
@@ -1322,7 +1815,11 @@ impl SettingsState {
     pub fn scroll_down(&mut self, delta: usize) -> bool {
         let old = self.scroll_panel.scroll.offset;
         self.scroll_panel.scroll_down(delta as u16);
-        old != self.scroll_panel.scroll.offset
+        let changed = old != self.scroll_panel.scroll.offset;
+        if changed {
+            self.sync_tree_cursor_to_body_scroll();
+        }
+        changed
     }
 
     /// Scroll to a position based on a ratio (0.0 to 1.0)
@@ -1330,7 +1827,26 @@ impl SettingsState {
     pub fn scroll_to_ratio(&mut self, ratio: f32) -> bool {
         let old = self.scroll_panel.scroll.offset;
         self.scroll_panel.scroll_to_ratio(ratio);
-        old != self.scroll_panel.scroll.offset
+        let changed = old != self.scroll_panel.scroll.offset;
+        if changed {
+            self.sync_tree_cursor_to_body_scroll();
+        }
+        changed
+    }
+
+    /// After the body scroll position changes, snap the tree cursor to
+    /// the section that now contains the topmost visible item — so the
+    /// left-panel highlight follows wheel/scrollbar interaction in both
+    /// directions, and a subsequent Up/Down on the tree resumes from
+    /// the section the user is actually looking at.
+    pub(super) fn sync_tree_cursor_to_body_scroll(&mut self) {
+        if let Some(section_idx) = self.current_section_index() {
+            self.tree_cursor_section = Some(section_idx);
+        }
+        // No section under the topmost visible item (e.g. above the
+        // first section) → leave the cursor where it is. Forcing it to
+        // None would be a worse UX: the user typically wants the
+        // highlight to *track* something, not blink off entirely.
     }
 
     /// Start text editing mode for TextList, Text, or Map controls
@@ -1345,6 +1861,7 @@ impl SettingsState {
             if matches!(
                 item.control,
                 SettingControl::TextList(_)
+                    | SettingControl::DualList(_)
                     | SettingControl::Text(_)
                     | SettingControl::Map(_)
                     | SettingControl::Json(_)
@@ -1352,19 +1869,47 @@ impl SettingsState {
                 self.editing_text = true;
             }
         }
+        if let Some(item) = self.current_item_mut() {
+            match item.control {
+                SettingControl::DualList(ref mut dl) => {
+                    dl.editing = true;
+                }
+                SettingControl::Text(ref mut state) => {
+                    state.editing = true;
+                    // Mirror the spinner's "select-all on enter edit"
+                    // UX: the first printable keystroke replaces the
+                    // current value. Arrow keys or deletion cancel it
+                    // and the input behaves normally from then on.
+                    state.arm_replace_on_type();
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Stop text editing mode
     pub fn stop_editing(&mut self) {
         self.editing_text = false;
+        if let Some(item) = self.current_item_mut() {
+            match item.control {
+                SettingControl::DualList(ref mut dl) => {
+                    dl.editing = false;
+                }
+                SettingControl::Text(ref mut state) => {
+                    state.editing = false;
+                }
+                _ => {}
+            }
+        }
     }
 
-    /// Check if the current item is editable (TextList, Text, Map, or Json)
+    /// Check if the current item is editable (TextList, DualList, Text, Map, or Json)
     pub fn is_editable_control(&self) -> bool {
         self.current_item().is_some_and(|item| {
             matches!(
                 item.control,
                 SettingControl::TextList(_)
+                    | SettingControl::DualList(_)
                     | SettingControl::Text(_)
                     | SettingControl::Map(_)
                     | SettingControl::Json(_)
@@ -1387,10 +1932,7 @@ impl SettingsState {
         if let Some(item) = self.current_item_mut() {
             match &mut item.control {
                 SettingControl::TextList(state) => state.insert(c),
-                SettingControl::Text(state) => {
-                    state.value.insert(state.cursor, c);
-                    state.cursor += c.len_utf8();
-                }
+                SettingControl::Text(state) => state.insert(c),
                 SettingControl::Map(state) => {
                     state.new_key_text.insert(state.cursor, c);
                     state.cursor += c.len_utf8();
@@ -1406,16 +1948,7 @@ impl SettingsState {
         if let Some(item) = self.current_item_mut() {
             match &mut item.control {
                 SettingControl::TextList(state) => state.backspace(),
-                SettingControl::Text(state) => {
-                    if state.cursor > 0 {
-                        let mut char_start = state.cursor - 1;
-                        while char_start > 0 && !state.value.is_char_boundary(char_start) {
-                            char_start -= 1;
-                        }
-                        state.value.remove(char_start);
-                        state.cursor = char_start;
-                    }
-                }
+                SettingControl::Text(state) => state.backspace(),
                 SettingControl::Map(state) => {
                     if state.cursor > 0 {
                         let mut char_start = state.cursor - 1;
@@ -1437,15 +1970,7 @@ impl SettingsState {
         if let Some(item) = self.current_item_mut() {
             match &mut item.control {
                 SettingControl::TextList(state) => state.move_left(),
-                SettingControl::Text(state) => {
-                    if state.cursor > 0 {
-                        let mut new_pos = state.cursor - 1;
-                        while new_pos > 0 && !state.value.is_char_boundary(new_pos) {
-                            new_pos -= 1;
-                        }
-                        state.cursor = new_pos;
-                    }
-                }
+                SettingControl::Text(state) => state.move_left(),
                 SettingControl::Map(state) => {
                     if state.cursor > 0 {
                         let mut new_pos = state.cursor - 1;
@@ -1466,16 +1991,7 @@ impl SettingsState {
         if let Some(item) = self.current_item_mut() {
             match &mut item.control {
                 SettingControl::TextList(state) => state.move_right(),
-                SettingControl::Text(state) => {
-                    if state.cursor < state.value.len() {
-                        let mut new_pos = state.cursor + 1;
-                        while new_pos < state.value.len() && !state.value.is_char_boundary(new_pos)
-                        {
-                            new_pos += 1;
-                        }
-                        state.cursor = new_pos;
-                    }
-                }
+                SettingControl::Text(state) => state.move_right(),
                 SettingControl::Map(state) => {
                     if state.cursor < state.new_key_text.len() {
                         let mut new_pos = state.cursor + 1;
@@ -1551,6 +2067,81 @@ impl SettingsState {
         }
         // Record the change
         self.on_value_changed();
+    }
+
+    /// Check if currently editing a DualList control
+    pub fn is_editing_dual_list(&self) -> bool {
+        if !self.editing_text {
+            return false;
+        }
+        self.current_item()
+            .map(|item| matches!(&item.control, SettingControl::DualList(_)))
+            .unwrap_or(false)
+    }
+
+    // =========== DualList methods ===========
+
+    /// Access the DualList at `item_idx` in the current page and run `f` on it.
+    /// Returns `None` if the item isn't a DualList or the index is out of bounds.
+    pub fn with_dual_list_mut<R>(
+        &mut self,
+        item_idx: usize,
+        f: impl FnOnce(&mut crate::view::controls::DualListState) -> R,
+    ) -> Option<R> {
+        let page = self.pages.get_mut(self.selected_category)?;
+        let item = page.items.get_mut(item_idx)?;
+        if let SettingControl::DualList(ref mut state) = item.control {
+            Some(f(state))
+        } else {
+            None
+        }
+    }
+
+    /// Access the currently selected DualList and run `f` on it.
+    /// Returns `None` if the current item isn't a DualList.
+    pub fn with_current_dual_list_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::view::controls::DualListState) -> R,
+    ) -> Option<R> {
+        if let Some(item) = self.current_item_mut() {
+            if let SettingControl::DualList(ref mut state) = item.control {
+                return Some(f(state));
+            }
+        }
+        None
+    }
+
+    /// After changing a DualList, refresh the sibling's excluded set.
+    ///
+    /// Assumes the sibling setting lives on the same page as the current item.
+    /// This holds for the current use case (`status_bar.left` and `.right` are both
+    /// flattened into the Editor page under the "Status Bar" section). Cross-category
+    /// siblings would silently no-op until the next `build_pages()`.
+    pub fn refresh_dual_list_sibling(&mut self) {
+        let (new_included, sibling_path) = {
+            let Some(item) = self.current_item() else {
+                return;
+            };
+            let SettingControl::DualList(state) = &item.control else {
+                return;
+            };
+            let Some(ref sib_path) = item.dual_list_sibling else {
+                return;
+            };
+            (state.included.clone(), sib_path.clone())
+        };
+
+        // Find sibling item in same page and update its excluded
+        if let Some(page) = self.pages.get_mut(self.selected_category) {
+            for other in page.items.iter_mut() {
+                if other.path == sibling_path {
+                    if let SettingControl::DualList(ref mut sib_state) = other.control {
+                        sib_state.excluded = new_included;
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     // =========== JSON editing methods ===========
@@ -1700,13 +2291,13 @@ impl SettingsState {
         // When dropdown opens, update content height and ensure it's visible
         if opened {
             // Update content height since item is now taller
-            self.update_layout_widths();
             let selected_item = self.selected_item;
+            let width = self.layout_width;
             if let Some(page) = self.pages.get(self.selected_category) {
-                self.scroll_panel.update_content_height(&page.items);
+                self.scroll_panel.update_content_height(&page.items, width);
                 // Ensure the dropdown item is visible with its new expanded height
                 self.scroll_panel
-                    .ensure_focused_visible(&page.items, selected_item, None);
+                    .ensure_focused_visible(&page.items, selected_item, None, width);
             }
         }
     }
@@ -2077,6 +2668,14 @@ fn update_control_from_value(control: &mut SettingControl, value: &serde_json::V
                             v.as_str().map(String::from)
                         }
                     })
+                    .collect();
+            }
+        }
+        SettingControl::DualList(state) => {
+            if let Some(arr) = value.as_array() {
+                state.included = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
         }
@@ -2453,5 +3052,249 @@ mod tests {
         // Switching layers clears pending changes
         state.cycle_target_layer();
         assert!(!state.has_changes());
+    }
+
+    /// Regression test for the quicklsp settings-save bug.
+    ///
+    /// When editing an existing map entry whose value schema is itself an
+    /// array (the `is_single_value` case — e.g. `universal_lsp.quicklsp`
+    /// where the value schema is `LspLanguageConfig` = array of
+    /// `LspServerConfig`), opening a nested ArrayItem dialog used to
+    /// compute its `map_path` from `parent.map_path + item.path` only —
+    /// dropping the entry key segment whenever `item.path` was `""`.
+    /// The nested dialog's save would then record a pending change at
+    /// `/universal_lsp/`, which downstream wrote an empty-string key
+    /// under `universal_lsp` in the saved config file.
+    ///
+    /// This test exercises the real `open_nested_entry_dialog` + save
+    /// path using a schema shaped like `LspLanguageConfig` and asserts:
+    /// 1. The nested dialog's `map_path` is the full entry path.
+    /// 2. The recorded pending-change path is the full entry path, not
+    ///    `/universal_lsp/` and not any `/universal_lsp/*` path with a
+    ///    trailing slash.
+    #[test]
+    fn nested_array_save_records_full_entry_path() {
+        // EntryDialogState is already re-exported via `use super::*;`.
+        // Pull in SettingType from the sibling schema module explicitly.
+        use crate::view::settings::schema::SettingType;
+
+        let config = test_config();
+        let mut state = SettingsState::new(TEST_SCHEMA, &config).unwrap();
+
+        // LspServerConfig-ish: a single "enabled" boolean field.
+        let item_schema = SettingSchema {
+            path: "/item".to_string(),
+            name: "Server".to_string(),
+            description: None,
+            setting_type: SettingType::Object {
+                properties: vec![SettingSchema {
+                    path: "/enabled".to_string(),
+                    name: "Enabled".to_string(),
+                    description: None,
+                    setting_type: SettingType::Boolean,
+                    default: Some(serde_json::json!(false)),
+                    read_only: false,
+                    section: None,
+                    order: None,
+                    nullable: false,
+                    enum_from: None,
+                    dual_list_sibling: None,
+                }],
+            },
+            default: None,
+            read_only: false,
+            section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
+        };
+
+        // universal_lsp's value schema: ObjectArray of the item schema above.
+        // Note: path is "" just like the real schema parser produces for
+        // `parse_setting("value", "", ...)` — this is what drives the
+        // `is_single_value` code path in EntryDialogState::from_schema.
+        let value_schema = SettingSchema {
+            path: String::new(),
+            name: "value".to_string(),
+            description: None,
+            setting_type: SettingType::ObjectArray {
+                item_schema: Box::new(item_schema.clone()),
+                display_field: None,
+            },
+            default: None,
+            read_only: false,
+            section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
+        };
+
+        // Parent dialog: user is editing the existing "quicklsp" entry
+        // under /universal_lsp. This is the MapEntry dialog the real UI
+        // opens via `open_entry_dialog`.
+        let parent = EntryDialogState::from_schema(
+            "quicklsp".to_string(),
+            &serde_json::json!([{ "enabled": true }]),
+            &value_schema,
+            "/universal_lsp",
+            false, // existing entry
+            false,
+        );
+
+        // Precondition: is_single_value triggers and entry_path is correct.
+        assert!(
+            parent.is_single_value,
+            "array value_schema should trigger is_single_value path"
+        );
+        assert_eq!(parent.entry_path(), "/universal_lsp/quicklsp");
+
+        state.entry_dialog_stack.push(parent);
+
+        // Exercise the REAL open_nested_entry_dialog — this is the code
+        // path that used to produce the wrong path. The outer dialog's
+        // ObjectArray item is already focused with its first entry
+        // selected (init_object_array_focus in from_schema).
+        state.open_nested_entry_dialog();
+
+        // A nested dialog should have been pushed.
+        assert_eq!(
+            state.entry_dialog_stack.len(),
+            2,
+            "open_nested_entry_dialog should have pushed a nested dialog"
+        );
+
+        // CRITICAL (part 1): the nested dialog must root at the full
+        // entry path, not at the parent's map_path alone.
+        let nested_map_path = state
+            .entry_dialog_stack
+            .last()
+            .map(|d| d.map_path.clone())
+            .unwrap();
+        assert_eq!(
+            nested_map_path, "/universal_lsp/quicklsp",
+            "BUG: nested dialog's map_path dropped the 'quicklsp' key segment"
+        );
+
+        // Save the nested dialog via the normal dispatch.
+        state.save_entry_dialog();
+
+        // Nested dialog should be popped, parent still on the stack.
+        assert_eq!(state.entry_dialog_stack.len(), 1);
+
+        // CRITICAL (part 2): the pending change must be rooted at the
+        // full entry path, not at `/universal_lsp/` with a trailing slash.
+        assert!(
+            !state.pending_changes.contains_key("/universal_lsp/"),
+            "regression: pending change recorded under empty-key path /universal_lsp/. \
+             All keys: {:?}",
+            state.pending_changes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !state
+                .pending_changes
+                .keys()
+                .any(|k| k.starts_with("/universal_lsp") && k.ends_with('/')),
+            "no /universal_lsp/* path should end in a trailing slash; got {:?}",
+            state.pending_changes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state
+                .pending_changes
+                .contains_key("/universal_lsp/quicklsp"),
+            "expected pending change at /universal_lsp/quicklsp, got {:?}",
+            state.pending_changes.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_refresh_dual_list_sibling_updates_excluded() {
+        use crate::view::controls::DualListState;
+
+        // Uses the real config schema (which has /editor/status_bar/left and /right
+        // as DualList siblings).
+        let schema = include_str!("../../../plugins/config-schema.json");
+        let config = test_config();
+        let mut state = SettingsState::new(schema, &config).unwrap();
+
+        // Find the Editor page and the status bar left/right items
+        let editor_page_idx = state
+            .pages
+            .iter()
+            .position(|p| p.path == "/editor")
+            .expect("editor page");
+        state.selected_category = editor_page_idx;
+
+        let (left_idx, right_idx) = {
+            let page = &state.pages[editor_page_idx];
+            let l = page
+                .items
+                .iter()
+                .position(|i| i.path == "/editor/status_bar/left")
+                .expect("left item");
+            let r = page
+                .items
+                .iter()
+                .position(|i| i.path == "/editor/status_bar/right")
+                .expect("right item");
+            (l, r)
+        };
+
+        // Sanity: both should be DualList controls
+        assert!(matches!(
+            &state.pages[editor_page_idx].items[left_idx].control,
+            SettingControl::DualList(_)
+        ));
+
+        // Capture the initial left.excluded — should match right's default values.
+        let default_right_items: Vec<String> =
+            match &state.pages[editor_page_idx].items[right_idx].control {
+                SettingControl::DualList(dl) => dl.included.clone(),
+                _ => panic!("right should be DualList"),
+            };
+        let initial_left_excluded: Vec<String> =
+            match &state.pages[editor_page_idx].items[left_idx].control {
+                SettingControl::DualList(dl) => dl.excluded.clone(),
+                _ => panic!("left should be DualList"),
+            };
+        assert_eq!(
+            initial_left_excluded, default_right_items,
+            "left.excluded should mirror right's included on initial build"
+        );
+
+        // Mutate left: add a new element that's not in right
+        let new_element = "{chord}".to_string();
+        state.selected_item = left_idx;
+        state
+            .with_current_dual_list_mut(|dl: &mut DualListState| {
+                if !dl.included.contains(&new_element) {
+                    dl.included.push(new_element.clone());
+                }
+            })
+            .expect("current item is a DualList");
+
+        // Refresh the sibling: right.excluded should now contain the new element
+        state.refresh_dual_list_sibling();
+
+        match &state.pages[editor_page_idx].items[right_idx].control {
+            SettingControl::DualList(dl) => {
+                assert!(
+                    dl.excluded.contains(&new_element),
+                    "right.excluded should be updated to reflect left's new inclusion"
+                );
+            }
+            _ => panic!("right should be DualList"),
+        }
+    }
+
+    #[test]
+    fn test_with_dual_list_mut_returns_none_for_non_dual_list() {
+        let config = test_config();
+        let mut state = SettingsState::new(TEST_SCHEMA, &config).unwrap();
+
+        // TEST_SCHEMA has no DualList items, so all calls should return None
+        let result = state.with_dual_list_mut(0, |_| ());
+        assert!(result.is_none());
     }
 }

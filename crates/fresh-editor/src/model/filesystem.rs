@@ -217,7 +217,11 @@ impl FilePermissions {
         self.mode
     }
 
-    /// Check if readonly
+    /// Check if no write bits are set at all (any user).
+    ///
+    /// NOTE: On Unix, this only checks whether the mode has zero write bits.
+    /// It does NOT check whether the *current user* can write. For that,
+    /// use [`is_readonly_for_user`] with the appropriate uid/gid.
     pub fn is_readonly(&self) -> bool {
         #[cfg(unix)]
         {
@@ -227,6 +231,31 @@ impl FilePermissions {
         {
             self.readonly
         }
+    }
+
+    /// Check if the file is read-only for a specific user identified by
+    /// `user_uid` and a set of group IDs the user belongs to.
+    ///
+    /// On non-Unix platforms, falls back to the simple readonly flag.
+    #[cfg(unix)]
+    pub fn is_readonly_for_user(
+        &self,
+        user_uid: u32,
+        file_uid: u32,
+        file_gid: u32,
+        user_groups: &[u32],
+    ) -> bool {
+        // root can write to anything
+        if user_uid == 0 {
+            return false;
+        }
+        if user_uid == file_uid {
+            return self.mode & 0o200 == 0;
+        }
+        if user_groups.contains(&file_gid) {
+            return self.mode & 0o020 == 0;
+        }
+        self.mode & 0o002 == 0
     }
 }
 
@@ -480,6 +509,32 @@ pub trait FileSystem: Send + Sync {
     /// Remove an empty directory
     fn remove_dir(&self, path: &Path) -> io::Result<()>;
 
+    /// Recursively remove a directory and all its contents
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        for entry in self.read_dir(path)? {
+            if entry.is_dir() {
+                self.remove_dir_all(&entry.path)?;
+            } else {
+                self.remove_file(&entry.path)?;
+            }
+        }
+        self.remove_dir(path)
+    }
+
+    /// Recursively copy a directory and all its contents to dst
+    fn copy_dir_all(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        self.create_dir_all(dst)?;
+        for entry in self.read_dir(src)? {
+            let dst_child = dst.join(&entry.name);
+            if entry.is_dir() {
+                self.copy_dir_all(&entry.path, &dst_child)?;
+            } else {
+                self.copy(&entry.path, &dst_child)?;
+            }
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // Metadata Operations
     // ========================================================================
@@ -505,6 +560,17 @@ pub trait FileSystem: Send + Sync {
 
     /// Check if path is a file
     fn is_file(&self, path: &Path) -> io::Result<bool>;
+
+    /// Check if the current user has write permission to the given path.
+    ///
+    /// On Unix, this considers file ownership, group membership (including
+    /// supplementary groups), and the relevant permission bits. On other
+    /// platforms it falls back to the standard readonly check.
+    ///
+    /// Returns `false` if the path doesn't exist or metadata can't be read.
+    fn is_writable(&self, path: &Path) -> bool {
+        self.metadata(path).map(|m| !m.is_readonly).unwrap_or(false)
+    }
 
     /// Set file permissions
     fn set_permissions(&self, path: &Path, permissions: &FilePermissions) -> io::Result<()>;
@@ -589,6 +655,15 @@ pub trait FileSystem: Send + Sync {
         None
     }
 
+    /// Check if a remote filesystem is currently connected.
+    ///
+    /// Returns `true` for local filesystems (always "connected") and for
+    /// remote filesystems with a healthy connection. Returns `false` when
+    /// the remote connection has been lost (e.g., timeout, SSH disconnect).
+    fn is_remote_connected(&self) -> bool {
+        true
+    }
+
     /// Get the home directory for this filesystem
     ///
     /// For local filesystems, returns the local home directory.
@@ -634,6 +709,40 @@ pub trait FileSystem: Send + Sync {
     /// - `gid`: Owner group ID
     fn sudo_write(&self, path: &Path, data: &[u8], mode: u32, uid: u32, gid: u32)
         -> io::Result<()>;
+
+    // ========================================================================
+    // Directory Walking
+    // ========================================================================
+
+    /// Recursively walk a directory tree, invoking `on_file` for each file.
+    ///
+    /// Skips hidden entries (dot-prefixed names) and directories whose
+    /// basename appears in `skip_dirs`.  The walk stops early when:
+    /// - `on_file` returns `false` (caller reached its limit), or
+    /// - `cancel` is set to `true` (e.g. user closed the dialog).
+    ///
+    /// `on_file` receives `(absolute_path, path_relative_to_root)`.
+    ///
+    /// `skip_dirs` entries are **basenames** matched at every depth
+    /// (e.g. `"node_modules"` skips every `node_modules` directory in the
+    /// tree).
+    ///
+    /// // TODO: support .gitignore-style glob patterns in addition to
+    /// // basename matching, so callers can express richer ignore rules
+    /// // (e.g. `build/`, `*.o`, `vendor/**`).
+    ///
+    /// Each implementation must walk the filesystem it owns.  Local
+    /// implementations should iterate `std::fs::read_dir` lazily (not
+    /// collect into a Vec) so memory stays O(tree depth).  Remote
+    /// implementations should walk server-side and stream results back
+    /// via the channel, avoiding per-directory round-trips.
+    fn walk_files(
+        &self,
+        root: &Path,
+        skip_dirs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_file: &mut dyn FnMut(&Path, &str) -> bool,
+    ) -> io::Result<()>;
 }
 
 // ============================================================================
@@ -775,6 +884,175 @@ pub fn build_search_regex(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
+/// Maximum per-file size for unbounded project-wide search.  Files larger
+/// than this are treated as binary and skipped: searching multi-gigabyte
+/// archives, model weights, or audio files would otherwise lock up the
+/// editor for minutes (issue #1342).  Source files virtually never exceed
+/// this limit; users wanting to search huge text logs should open them
+/// directly so hybrid buffer search applies.
+pub const MAX_PROJECT_SEARCH_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Filename extensions that always represent binary content for project
+/// search.  Files matching this list are skipped before any I/O — no
+/// `stat`, no header read — which both avoids waste on the obvious cases
+/// and removes the dependency on heuristic content detection for formats
+/// whose first 8 KB can occasionally look text-like.
+///
+/// Kept as a sorted ASCII-lowercase list and matched case-insensitively
+/// via `eq_ignore_ascii_case` (no allocation per file).
+pub const BINARY_FILE_EXTENSIONS: &[&str] = &[
+    // Compiled binaries / object code / libraries
+    "a",
+    "class",
+    "dll",
+    "dylib",
+    "exe",
+    "jar",
+    "lib",
+    "o",
+    "obj",
+    "pdb",
+    "pyc",
+    "pyo",
+    "so",
+    "wasm",
+    "war",
+    // Archives / compressed
+    "7z",
+    "br",
+    "bz2",
+    "gz",
+    "lz",
+    "lz4",
+    "lzma",
+    "rar",
+    "tar",
+    "tbz",
+    "tbz2",
+    "tgz",
+    "txz",
+    "xz",
+    "z",
+    "zip",
+    "zst",
+    // Disk images / installers / packages
+    "apk",
+    "deb",
+    "dmg",
+    "img",
+    "ipa",
+    "iso",
+    "msi",
+    "rpm",
+    "vhd",
+    "vmdk",
+    // Images
+    "bmp",
+    "gif",
+    "heic",
+    "heif",
+    "ico",
+    "jp2",
+    "jpe",
+    "jpeg",
+    "jpg",
+    "png",
+    "psd",
+    "raw",
+    "tif",
+    "tiff",
+    "webp",
+    // Audio / video
+    "aac",
+    "aif",
+    "aiff",
+    "avi",
+    "flac",
+    "flv",
+    "m4a",
+    "m4v",
+    "mid",
+    "midi",
+    "mka",
+    "mkv",
+    "mov",
+    "mp3",
+    "mp4",
+    "mpeg",
+    "mpg",
+    "ogg",
+    "opus",
+    "wav",
+    "webm",
+    "wma",
+    "wmv",
+    // Office / compound documents
+    "doc",
+    "docx",
+    "odp",
+    "ods",
+    "odt",
+    "pdf",
+    "ppt",
+    "pptx",
+    "rtf",
+    "xls",
+    "xlsx",
+    // Databases
+    "db",
+    "mdb",
+    "sqlite",
+    "sqlite3",
+    // Fonts
+    "eot",
+    "otf",
+    "ttc",
+    "ttf",
+    "woff",
+    "woff2",
+    // ML / scientific data
+    "ckpt",
+    "h5",
+    "hdf5",
+    "msgpack",
+    "npy",
+    "npz",
+    "onnx",
+    "pb",
+    "pickle",
+    "pkl",
+    "pt",
+    "pth",
+    "safetensors",
+    "tflite",
+    // Generic binary
+    "bin",
+    "dat",
+    "swf",
+];
+
+/// True if `path`'s extension matches a known binary format.
+fn has_binary_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    BINARY_FILE_EXTENSIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+}
+
+/// True if a UTF-8/byte-level regex can meaningfully match content of
+/// this encoding.  UTF-16/UTF-32 carry interleaved NUL bytes for ASCII
+/// characters, so byte-regex search would never find a UTF-8 pattern in
+/// them; correct support requires transcoding the chunk first, which we
+/// don't do yet.  All single-byte ASCII-superset encodings (UTF-8,
+/// Latin-1, Windows-12xx) and CJK encodings (lead+trail bytes ≥ 0x40)
+/// match a UTF-8 pattern in their ASCII portion just fine.
+fn is_byte_searchable_encoding(enc: crate::model::encoding::Encoding) -> bool {
+    use crate::model::encoding::Encoding;
+    !matches!(enc, Encoding::Utf16Le | Encoding::Utf16Be)
+}
+
 /// Default implementation of `FileSystem::search_file` that works for any
 /// filesystem backend.  Reads one chunk via `read_range`, scans with the
 /// given regex, and returns matches with line/column/context.
@@ -792,18 +1070,48 @@ pub fn default_search_file(
     const CHUNK_SIZE: usize = 1_048_576; // 1 MB
     let overlap = pattern.len().max(256);
 
-    let file_len = fs.metadata(path)?.size as usize;
-    let effective_end = cursor.end_offset.unwrap_or(file_len).min(file_len);
-
-    // Binary check on first call (only when starting from offset 0 with no range bound)
+    // Pre-flight checks for unbounded scans.  Bounded scans (hybrid
+    // buffer search) intentionally bypass all of these — they run only
+    // when the user has explicitly opened the file as text, and we trust
+    // the editor's load-time decision.
     if cursor.offset == 0 && cursor.end_offset.is_none() {
-        if file_len == 0 {
+        // Extension fast-path: skip known-binary formats with no I/O at
+        // all (no stat, no header read).
+        if has_binary_extension(path) {
             cursor.done = true;
             return Ok(vec![]);
         }
+    }
+
+    let meta = fs.metadata(path)?;
+    let file_size = meta.size;
+    let file_len = file_size as usize;
+    let effective_end = cursor.end_offset.unwrap_or(file_len).min(file_len);
+
+    if cursor.offset == 0 && cursor.end_offset.is_none() {
+        if file_size == 0 {
+            cursor.done = true;
+            return Ok(vec![]);
+        }
+        // Skip files that exceed the project-search size cap.  Multi-gigabyte
+        // archives, model weights, and audio files would otherwise lock up
+        // the editor (issue #1342).
+        if file_size > MAX_PROJECT_SEARCH_FILE_SIZE {
+            cursor.done = true;
+            return Ok(vec![]);
+        }
+        // Delegate the header sniff to the same encoding detector the
+        // buffer loader uses, so search and editor agree on what's text.
+        // The detector handles BOMs, UTF-16 statistical detection, and
+        // the full set of "non-text control char" indicators.  We then
+        // additionally reject encodings byte-regex can't meaningfully
+        // match (UTF-16/32) until we add transcoding.
         let header_len = file_len.min(8192);
         let header = fs.read_range(path, 0, header_len)?;
-        if header.contains(&0) {
+        let truncated = header_len < file_len;
+        let (encoding, is_binary) =
+            crate::model::encoding::detect_encoding_or_binary(&header, truncated);
+        if is_binary || !is_byte_searchable_encoding(encoding) {
             cursor.done = true;
             return Ok(vec![]);
         }
@@ -822,6 +1130,21 @@ pub fn default_search_file(
     let chunk = fs.read_range(path, read_start as u64, read_end - read_start)?;
 
     let overlap_len = cursor.offset - read_start;
+
+    // Mid-stream binary detection.  The 8 KB header check at the top of
+    // the function only sees the start of the file, but plenty of formats
+    // are text in their first few KB and binary thereafter (self-extracting
+    // installers, mbox files with attachments, log files with embedded
+    // crash dumps).  A NUL byte in any subsequent chunk is the strongest
+    // indicator the file isn't text we should be searching, so bail out
+    // and discard whatever pseudo-matches the regex would have found.
+    // Bounded scans skip this — they're searching a delimited region of
+    // an already-loaded text buffer where NULs may legitimately appear
+    // mid-stream (e.g., cursor sentinels in piece-tree leaves).
+    if cursor.end_offset.is_none() && chunk[overlap_len..].contains(&0) {
+        cursor.done = true;
+        return Ok(vec![]);
+    }
 
     // Incremental line counting (same algorithm as search_scan_next_chunk)
     let newlines_in_overlap = chunk[..overlap_len].iter().filter(|&&b| b == b'\n').count();
@@ -898,19 +1221,81 @@ impl StdFileSystem {
             .is_some_and(|n| n.starts_with('.'))
     }
 
+    /// Get the current user's effective UID and all group IDs (primary + supplementary).
+    #[cfg(unix)]
+    pub fn current_user_groups() -> (u32, Vec<u32>) {
+        // SAFETY: these libc calls are always safe and have no failure modes
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        let mut groups = vec![egid];
+
+        // Get supplementary groups
+        let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if ngroups > 0 {
+            let mut sup_groups = vec![0 as libc::gid_t; ngroups as usize];
+            let n = unsafe { libc::getgroups(ngroups, sup_groups.as_mut_ptr()) };
+            if n > 0 {
+                sup_groups.truncate(n as usize);
+                for g in sup_groups {
+                    if g != egid {
+                        groups.push(g);
+                    }
+                }
+            }
+        }
+
+        (euid, groups)
+    }
+
+    /// Ask the kernel whether the effective user can write to `path`.
+    ///
+    /// Uses `faccessat(AT_FDCWD, path, W_OK, AT_EACCESS)`, which respects POSIX
+    /// ACLs, capabilities, and read-only mounts — all of which a manual mode-bit
+    /// check would miss. Returns `None` if the path can't be encoded as a
+    /// C string; callers should fall back to mode-bit checks in that case.
+    #[cfg(unix)]
+    fn kernel_writable(path: &Path) -> Option<bool> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: c_path is a valid NUL-terminated C string for the lifetime of
+        // this call; AT_FDCWD, W_OK and AT_EACCESS are well-defined constants.
+        let rc = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::W_OK,
+                libc::AT_EACCESS,
+            )
+        };
+        Some(rc == 0)
+    }
+
     /// Build FileMetadata from std::fs::Metadata
     fn build_metadata(path: &Path, meta: &std::fs::Metadata) -> FileMetadata {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let file_uid = meta.uid();
+            let file_gid = meta.gid();
+            let permissions = FilePermissions::from_std(meta.permissions());
+            // Prefer the kernel's view (respects POSIX ACLs, capabilities,
+            // read-only mounts); fall back to mode bits if the syscall can't
+            // be issued for this path.
+            let is_readonly = match Self::kernel_writable(path) {
+                Some(writable) => !writable,
+                None => {
+                    let (euid, user_groups) = Self::current_user_groups();
+                    permissions.is_readonly_for_user(euid, file_uid, file_gid, &user_groups)
+                }
+            };
             FileMetadata {
                 size: meta.len(),
                 modified: meta.modified().ok(),
-                permissions: Some(FilePermissions::from_std(meta.permissions())),
+                permissions: Some(permissions),
                 is_hidden: Self::is_hidden(path),
-                is_readonly: meta.permissions().readonly(),
-                uid: Some(meta.uid()),
-                gid: Some(meta.gid()),
+                is_readonly,
+                uid: Some(file_uid),
+                gid: Some(file_gid),
             }
         }
         #[cfg(not(unix))]
@@ -929,7 +1314,9 @@ impl StdFileSystem {
 impl FileSystem for StdFileSystem {
     // File Content Operations
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        let data = std::fs::read(path)?;
+        crate::services::counters::global().inc_disk_bytes_read(data.len() as u64);
+        Ok(data)
     }
 
     fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -937,6 +1324,7 @@ impl FileSystem for StdFileSystem {
         file.seek(io::SeekFrom::Start(offset))?;
         let mut buffer = vec![0u8; len];
         file.read_exact(&mut buffer)?;
+        crate::services::counters::global().inc_disk_bytes_read(len as u64);
         Ok(buffer)
     }
 
@@ -1095,6 +1483,7 @@ impl FileSystem for StdFileSystem {
         uid: u32,
         gid: u32,
     ) -> io::Result<()> {
+        use crate::services::process_hidden::HideWindow;
         use std::process::{Command, Stdio};
 
         // Write data via sudo tee
@@ -1103,6 +1492,7 @@ impl FileSystem for StdFileSystem {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            .hide_window()
             .spawn()
             .map_err(|e| io::Error::other(format!("failed to spawn sudo: {}", e)))?;
 
@@ -1123,6 +1513,7 @@ impl FileSystem for StdFileSystem {
         // Set permissions via sudo chmod
         let status = Command::new("sudo")
             .args(["chmod", &format!("{:o}", mode), &path.to_string_lossy()])
+            .hide_window()
             .status()?;
         if !status.success() {
             return Err(io::Error::other("sudo chmod failed"));
@@ -1135,6 +1526,7 @@ impl FileSystem for StdFileSystem {
                 &format!("{}:{}", uid, gid),
                 &path.to_string_lossy(),
             ])
+            .hide_window()
             .status()?;
         if !status.success() {
             return Err(io::Error::other("sudo chown failed"));
@@ -1151,6 +1543,64 @@ impl FileSystem for StdFileSystem {
         cursor: &mut FileSearchCursor,
     ) -> io::Result<Vec<SearchMatch>> {
         default_search_file(self, path, pattern, opts, cursor)
+    }
+
+    fn walk_files(
+        &self,
+        root: &Path,
+        skip_dirs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_file: &mut dyn FnMut(&Path, &str) -> bool,
+    ) -> io::Result<()> {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            // Use std::fs::read_dir iterator directly — NOT self.read_dir()
+            // which collects into a Vec.  This keeps memory O(1) per directory
+            // even for directories with millions of entries.
+            let iter = match std::fs::read_dir(&dir) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+
+            for entry in iter {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+
+                // Skip hidden entries
+                if name_str.starts_with('.') {
+                    continue;
+                }
+
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let path = entry.path();
+
+                if ft.is_file() {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !on_file(&path, &rel_str) {
+                            return Ok(());
+                        }
+                    }
+                } else if ft.is_dir() && !skip_dirs.contains(&name_str.as_ref()) {
+                    stack.push(path);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1280,6 +1730,16 @@ impl FileSystem for NoopFileSystem {
         _mode: u32,
         _uid: u32,
         _gid: u32,
+    ) -> io::Result<()> {
+        Self::unsupported()
+    }
+
+    fn walk_files(
+        &self,
+        _root: &Path,
+        _skip_dirs: &[&str],
+        _cancel: &std::sync::atomic::AtomicBool,
+        _on_file: &mut dyn FnMut(&Path, &str) -> bool,
     ) -> io::Result<()> {
         Self::unsupported()
     }
@@ -1603,12 +2063,175 @@ mod tests {
         assert!(matches.is_empty());
     }
 
+    /// Issue #1342 follow-up (A — extension fast-path): a file with a
+    /// known-binary extension is skipped without any I/O even when its
+    /// content happens to be valid UTF-8.  Previously the content
+    /// heuristic was the only gate, so an ASCII `.png` would be scanned.
+    #[test]
+    fn test_search_file_binary_extension_skipped_despite_text_content() {
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("not_actually_binary.png");
+        fs.write_file(&path, b"hello world\nhello again\n").unwrap();
+
+        let opts = make_search_opts(true);
+        let mut cursor = FileSearchCursor::new();
+        let matches = fs.search_file(&path, "hello", &opts, &mut cursor).unwrap();
+
+        assert!(cursor.done);
+        assert!(
+            matches.is_empty(),
+            ".png extension should short-circuit before content scan"
+        );
+    }
+
+    /// Issue #1342 follow-up (A — extension fast-path): the check is
+    /// case-insensitive (Windows/macOS users frequently see uppercase
+    /// extensions) and respects multi-segment names like `archive.tar.gz`.
+    #[test]
+    fn test_search_file_binary_extension_case_insensitive() {
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        for name in ["IMG.JPG", "archive.tar.gz", "weights.SafeTensors"] {
+            let path = temp_dir.path().join(name);
+            fs.write_file(&path, b"definitely text content here\n")
+                .unwrap();
+
+            let opts = make_search_opts(true);
+            let mut cursor = FileSearchCursor::new();
+            let matches = fs
+                .search_file(&path, "definitely", &opts, &mut cursor)
+                .unwrap();
+
+            assert!(cursor.done, "{} should be marked done", name);
+            assert!(
+                matches.is_empty(),
+                "{} matched but extension should have skipped it",
+                name
+            );
+        }
+    }
+
+    /// Issue #1342 follow-up (B — encoding-aware sniff): UTF-16 with BOM
+    /// is recognised as text by the editor, but byte-regex search would
+    /// never match a UTF-8 pattern in interleaved-NUL content.  The
+    /// sniff must skip it explicitly rather than wasting I/O on regex
+    /// passes that find nothing.
+    #[test]
+    fn test_search_file_utf16_skipped_via_encoding_gate() {
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("utf16.txt");
+        // UTF-16 LE BOM + "hello"
+        let mut data = vec![0xFF, 0xFE];
+        for ch in "hello world\nhello again\n".chars() {
+            let n = ch as u32;
+            data.push((n & 0xFF) as u8);
+            data.push(((n >> 8) & 0xFF) as u8);
+        }
+        fs.write_file(&path, &data).unwrap();
+
+        let opts = make_search_opts(true);
+        let mut cursor = FileSearchCursor::new();
+        let matches = fs.search_file(&path, "hello", &opts, &mut cursor).unwrap();
+
+        assert!(cursor.done);
+        assert!(
+            matches.is_empty(),
+            "UTF-16 file must be skipped: byte-regex can't match UTF-8 patterns in it"
+        );
+    }
+
+    /// Issue #1342 follow-up (C — mid-stream NUL check): a file whose
+    /// first 8 KB looks textual but turns binary later (self-extracting
+    /// installers, mbox + attachment, log + crash dump) used to be
+    /// regex-scanned end-to-end.  Once a NUL appears in any subsequent
+    /// chunk, search bails out.
+    #[test]
+    fn test_search_file_midstream_nul_aborts_scan() {
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("mid.dat");
+
+        // 9000 bytes of text — past the 8 KB header window — then a NUL,
+        // then a marker the regex would otherwise find.
+        let mut data = vec![b'a'; 9000];
+        data.push(0);
+        data.extend_from_slice(b"PATTERN_AFTER_NUL\n");
+        fs.write_file(&path, &data).unwrap();
+
+        let opts = make_search_opts(true);
+        let mut cursor = FileSearchCursor::new();
+        let matches = fs
+            .search_file(&path, "PATTERN_AFTER_NUL", &opts, &mut cursor)
+            .unwrap();
+
+        assert!(cursor.done);
+        assert!(
+            matches.is_empty(),
+            "mid-stream NUL should abort scan and discard pseudo-matches"
+        );
+    }
+
     #[test]
     fn test_search_file_empty_file() {
         let fs = StdFileSystem;
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("empty.txt");
         fs.write_file(&path, b"").unwrap();
+
+        let opts = make_search_opts(true);
+        let mut cursor = FileSearchCursor::new();
+        let matches = fs.search_file(&path, "hello", &opts, &mut cursor).unwrap();
+
+        assert!(cursor.done);
+        assert!(matches.is_empty());
+    }
+
+    /// Issue #1342: Search/Replace across project locks up on huge files
+    /// (multi-GB archives, model weights, audio).  Unbounded scans cap the
+    /// per-file size; anything larger is treated as binary and skipped.
+    #[test]
+    fn test_search_file_oversized_skipped() {
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("oversized.txt");
+
+        // File slightly larger than the project-search cap, with the search
+        // pattern only at the very end.  Without the size guard, the scanner
+        // would chew through the whole file and return a match.
+        let mut data = vec![b'a'; (MAX_PROJECT_SEARCH_FILE_SIZE as usize) + 1024];
+        data.extend_from_slice(b"\nUNIQUE_TAIL_MARKER\n");
+        fs.write_file(&path, &data).unwrap();
+
+        let opts = make_search_opts(true);
+        let mut cursor = FileSearchCursor::new();
+        let matches = fs
+            .search_file(&path, "UNIQUE_TAIL_MARKER", &opts, &mut cursor)
+            .unwrap();
+
+        assert!(
+            cursor.done,
+            "oversized file should be marked done in one call"
+        );
+        assert!(matches.is_empty(), "oversized file should yield no matches");
+    }
+
+    /// Issue #1342: Some binary formats (zip-based archives like .pth, ELF
+    /// tail headers, etc.) have non-null control bytes in their first 8 KB
+    /// even when null bytes happen to appear later.  The unbounded scan
+    /// should reject those just like the null-byte case.
+    #[test]
+    fn test_search_file_binary_control_char_skipped() {
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("ctrl.dat");
+        // No null bytes, but a SUB control char (0x1A) — same byte that
+        // identifies PNG headers and many other binary formats.
+        let mut data = b"hello world\n".to_vec();
+        data.push(0x1A);
+        data.extend_from_slice(b"hello again\n");
+        fs.write_file(&path, &data).unwrap();
 
         let opts = make_search_opts(true);
         let mut cursor = FileSearchCursor::new();
@@ -1785,5 +2408,375 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].context, "CCC");
         assert_eq!(matches[0].line, 3);
+    }
+
+    // ====================================================================
+    // walk_files tests
+    // ====================================================================
+
+    /// Helper: create a directory tree for walk_files tests.
+    /// Returns the tempdir (must be kept alive for the duration of the test).
+    fn make_walk_tree() -> tempfile::TempDir {
+        let fs = StdFileSystem;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // root/
+        //   a.txt
+        //   b.txt
+        //   sub/
+        //     c.txt
+        //     deep/
+        //       d.txt
+        //   .hidden_dir/
+        //     secret.txt
+        //   .hidden_file
+        //   node_modules/
+        //     pkg.json
+        //   target/
+        //     debug.o
+        fs.write_file(&root.join("a.txt"), b"a").unwrap();
+        fs.write_file(&root.join("b.txt"), b"b").unwrap();
+        fs.create_dir_all(&root.join("sub/deep")).unwrap();
+        fs.write_file(&root.join("sub/c.txt"), b"c").unwrap();
+        fs.write_file(&root.join("sub/deep/d.txt"), b"d").unwrap();
+        fs.create_dir_all(&root.join(".hidden_dir")).unwrap();
+        fs.write_file(&root.join(".hidden_dir/secret.txt"), b"s")
+            .unwrap();
+        fs.write_file(&root.join(".hidden_file"), b"h").unwrap();
+        fs.create_dir_all(&root.join("node_modules")).unwrap();
+        fs.write_file(&root.join("node_modules/pkg.json"), b"{}")
+            .unwrap();
+        fs.create_dir_all(&root.join("target")).unwrap();
+        fs.write_file(&root.join("target/debug.o"), b"elf").unwrap();
+
+        tmp
+    }
+
+    #[test]
+    fn test_walk_files_std_basic() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        found.sort();
+        assert_eq!(found, vec!["a.txt", "b.txt", "sub/c.txt", "sub/deep/d.txt"]);
+    }
+
+    #[test]
+    fn test_walk_files_std_skips_hidden() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(tmp.path(), &[], &cancel, &mut |_path, rel| {
+            found.push(rel.to_string());
+            true
+        })
+        .unwrap();
+
+        // Hidden files/dirs should be excluded, but node_modules and target
+        // are NOT skipped (empty skip list)
+        assert!(!found.iter().any(|f| f.contains(".hidden")));
+        assert!(found.iter().any(|f| f.contains("node_modules")));
+        assert!(found.iter().any(|f| f.contains("target")));
+    }
+
+    #[test]
+    fn test_walk_files_std_skip_dirs() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target", "deep"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        found.sort();
+        // "deep" dir is also skipped, so d.txt should not appear
+        assert_eq!(found, vec!["a.txt", "b.txt", "sub/c.txt"]);
+    }
+
+    #[test]
+    fn test_walk_files_std_cancel() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                // Cancel after finding the first file
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(found.len(), 1, "Should stop after cancel is set");
+    }
+
+    #[test]
+    fn test_walk_files_std_on_file_returns_false() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut count = 0usize;
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, _rel| {
+                count += 1;
+                count < 2 // stop after 2 files
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 2, "Should stop when on_file returns false");
+    }
+
+    #[test]
+    fn test_walk_files_std_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(tmp.path(), &[], &cancel, &mut |_path, rel| {
+            found.push(rel.to_string());
+            true
+        })
+        .unwrap();
+
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_walk_files_std_nonexistent_root() {
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        // Non-existent root should not panic, just return Ok with no files
+        let result = fs.walk_files(
+            Path::new("/nonexistent/path/that/does/not/exist"),
+            &[],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_walk_files_std_relative_paths_use_forward_slashes() {
+        let tmp = make_walk_tree();
+        let fs = StdFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found: Vec<String> = Vec::new();
+
+        fs.walk_files(
+            tmp.path(),
+            &["node_modules", "target"],
+            &cancel,
+            &mut |_path, rel| {
+                found.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+
+        // All paths should use forward slashes (even on Windows)
+        for path in &found {
+            assert!(!path.contains('\\'), "Path should use / not \\: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_walk_files_noop_returns_error() {
+        let fs = NoopFileSystem;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        let result = fs.walk_files(Path::new("/noop/path"), &[], &cancel, &mut |_path, _rel| {
+            true
+        });
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// `is_writable()` must agree with the kernel's `faccessat(W_OK, AT_EACCESS)`
+    /// on a regular, writable file owned by the current user. This pins down the
+    /// contract that we delegate writability to the kernel — which is what makes
+    /// the fix for #1765 (POSIX ACLs ignored) correct: the kernel honours ACLs,
+    /// capabilities, and read-only mounts, while a manual mode-bit walk does not.
+    #[test]
+    #[cfg(unix)]
+    fn test_is_writable_matches_kernel_for_owner_writable() {
+        use std::os::unix::ffi::OsStrExt;
+        let fs = StdFileSystem;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("writable.txt");
+        fs.write_file(&path, b"x").unwrap();
+        fs.set_permissions(&path, &FilePermissions::from_mode(0o600))
+            .unwrap();
+
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let kernel_writable = unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::W_OK,
+                libc::AT_EACCESS,
+            )
+        } == 0;
+        assert!(
+            kernel_writable,
+            "owner-writable file must be writable per kernel"
+        );
+        assert_eq!(fs.is_writable(&path), kernel_writable);
+    }
+
+    /// Regression test for #1765: a POSIX ACL granting write access to the
+    /// effective user must be honoured by `is_writable`, even when the inode's
+    /// "other" mode bits would say the file is read-only.
+    ///
+    /// The setup needs three things that aren't available in vanilla CI:
+    ///   * `setfacl` (acl userspace)
+    ///   * the ability to chown the test file to a foreign uid (root)
+    ///   * a non-root uid the test child can switch to (we use `nobody`, 65534)
+    ///
+    /// On Linux test runners that have all three, this exercises the exact
+    /// scenario from the bug report: a file owned by uid 999, mode 0o600,
+    /// with a named-user ACL granting our user rw — fixed code reports the
+    /// file writable, the previous mode-bits-only code reported it read-only.
+    ///
+    /// Run manually with:
+    ///   sudo cargo test -p fresh-editor --features runtime \
+    ///       test_is_writable_respects_posix_acl -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires root + setfacl; see test docstring"]
+    #[cfg(target_os = "linux")]
+    fn test_is_writable_respects_posix_acl() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::Command;
+
+        // SAFETY: geteuid is always safe.
+        if unsafe { libc::geteuid() } != 0 {
+            panic!("test must be run as root (need to chown to a foreign uid)");
+        }
+        let setfacl_ok = Command::new("setfacl").arg("--version").output().is_ok();
+        assert!(setfacl_ok, "setfacl must be installed");
+
+        // The non-root uid we drop to in the child. 65534 is the conventional
+        // "nobody" uid on Linux.
+        let test_uid: libc::uid_t = 65534;
+        let test_gid: libc::gid_t = 65534;
+        // A different "foreign" uid for the file's owner so the test user
+        // is neither owner nor a group member — i.e. matches against the
+        // "other" mode bits, which are 0 here.
+        let foreign_uid: libc::uid_t = 9999;
+        let foreign_gid: libc::gid_t = 9999;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Ensure the child can traverse into the test dir.
+        std::fs::set_permissions(
+            temp_dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+
+        let file = temp_dir.path().join("acl_test.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_file is a NUL-terminated path; the uids/gids are valid.
+        let r = unsafe { libc::chown(c_file.as_ptr(), foreign_uid, foreign_gid) };
+        assert_eq!(r, 0, "chown failed: {}", io::Error::last_os_error());
+        std::fs::set_permissions(
+            &file,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+
+        let acl_status = Command::new("setfacl")
+            .args(["-m", &format!("u:{test_uid}:rw")])
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(
+            acl_status.success(),
+            "setfacl failed (does the filesystem support ACLs?)",
+        );
+
+        // Fork + setuid in the child. Keep the child's work to bare syscalls
+        // and exit via _exit (skipping atexit handlers) to stay safe in a
+        // multi-threaded test runner.
+        // SAFETY: fork is allowed, but the child must avoid touching shared
+        // mutable state. We only call setgid/setuid + a single metadata read,
+        // then _exit.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            panic!("fork failed: {}", io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // Child
+            // SAFETY: setgid/setuid are async-signal-safe.
+            if unsafe { libc::setgid(test_gid) } != 0 {
+                unsafe { libc::_exit(2) };
+            }
+            if unsafe { libc::setuid(test_uid) } != 0 {
+                unsafe { libc::_exit(3) };
+            }
+            let writable = StdFileSystem.is_writable(&file);
+            unsafe { libc::_exit(if writable { 0 } else { 1 }) };
+        }
+
+        // Parent
+        let mut status: libc::c_int = 0;
+        // SAFETY: pid is a valid child; status is a writable c_int.
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(r > 0, "waitpid failed: {}", io::Error::last_os_error());
+        let exited_normally = (status & 0x7f) == 0;
+        let exit_code = (status >> 8) & 0xff;
+        assert!(
+            exited_normally,
+            "child terminated abnormally; status={status}"
+        );
+        assert_eq!(
+            exit_code, 0,
+            "child reported file NOT writable (exit_code={exit_code}); ACL was ignored",
+        );
     }
 }

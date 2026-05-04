@@ -38,13 +38,36 @@ impl Editor {
         // Simple state lookups
         let line_numbers = self.is_line_numbers_visible();
         let line_wrap = self.is_line_wrap_enabled();
-        let compose_mode = self.is_compose_mode();
+        let page_view = self.is_page_view();
         let file_explorer_visible = self.file_explorer_visible;
         let file_explorer_focused = self.is_file_explorer_focused();
         let mouse_capture = self.mouse_enabled;
         let mouse_hover = self.config.editor.mouse_hover_enabled;
         let inlay_hints = self.config.editor.enable_inlay_hints;
-        let has_selection = self.has_active_selection();
+        // True for any real buffer; false when the active buffer is the
+        // synthesized placeholder kept alive after a last-buffer close with
+        // `auto_create_empty_buffer_on_last_buffer_close` disabled.
+        let has_buffer = !self
+            .buffer_metadata
+            .get(&self.active_buffer())
+            .map(|m| m.synthetic_placeholder)
+            .unwrap_or(false);
+        let has_selection = has_buffer && self.has_active_selection();
+        let can_copy = has_selection
+            || file_explorer_focused
+            || self
+                .file_explorer
+                .as_ref()
+                .map(|fe| fe.get_selected().is_some())
+                .unwrap_or(false);
+        // Paste is available in the explorer only when a file is in the clipboard,
+        // or in the editor only when no file is in the clipboard. There's no
+        // buffer to paste into in placeholder mode, so suppress it there.
+        let can_paste = if file_explorer_focused {
+            self.file_explorer_clipboard.is_some()
+        } else {
+            has_buffer && self.file_explorer_clipboard.is_none()
+        };
         let menu_bar = self.menu_bar_visible;
         let vertical_scrollbar = self.config.editor.show_vertical_scrollbar;
         let horizontal_scrollbar = self.config.editor.show_horizontal_scrollbar;
@@ -70,13 +93,16 @@ impl Editor {
         // Apply all context values
         self.menu_state
             .context
+            .set(context_keys::HAS_BUFFER, has_buffer)
             .set(context_keys::KEYMAP_DEFAULT, active_keymap == "default")
             .set(context_keys::KEYMAP_EMACS, active_keymap == "emacs")
             .set(context_keys::KEYMAP_VSCODE, active_keymap == "vscode")
             .set(context_keys::KEYMAP_MACOS_GUI, active_keymap == "macos-gui")
             .set(context_keys::LINE_NUMBERS, line_numbers)
             .set(context_keys::LINE_WRAP, line_wrap)
-            .set(context_keys::COMPOSE_MODE, compose_mode)
+            .set(context_keys::PAGE_VIEW, page_view)
+            // Keep backward-compatible key for existing keybindings/menus
+            .set(context_keys::COMPOSE_MODE, page_view)
             .set(context_keys::FILE_EXPLORER, file_explorer_visible)
             .set(context_keys::FILE_EXPLORER_FOCUSED, file_explorer_focused)
             .set(context_keys::MOUSE_CAPTURE, mouse_capture)
@@ -86,6 +112,8 @@ impl Editor {
             .set(context_keys::FILE_EXPLORER_SHOW_HIDDEN, show_hidden)
             .set(context_keys::FILE_EXPLORER_SHOW_GITIGNORED, show_gitignored)
             .set(context_keys::HAS_SELECTION, has_selection)
+            .set(context_keys::CAN_COPY, can_copy)
+            .set(context_keys::CAN_PASTE, can_paste)
             .set(context_keys::MENU_BAR, menu_bar)
             .set(context_keys::FORMATTER_AVAILABLE, formatter_available)
             .set(context_keys::SESSION_MODE, session_mode)
@@ -114,11 +142,11 @@ impl Editor {
     }
 
     /// Check if compose mode is active in the current buffer.
-    fn is_compose_mode(&self) -> bool {
+    fn is_page_view(&self) -> bool {
         let active_split = self.split_manager.active_split();
         self.split_view_states
             .get(&active_split)
-            .map(|vs| vs.view_mode == crate::state::ViewMode::Compose)
+            .map(|vs| vs.view_mode == crate::state::ViewMode::PageView)
             .unwrap_or(false)
     }
 
@@ -172,13 +200,9 @@ impl Editor {
         let active_split = self.split_manager.active_split();
         let active_buf_id = self.split_manager.buffer_for_split(active_split);
         if let Some(buf_id) = active_buf_id {
-            self.split_view_states
-                .keys()
-                .filter(|&&s| {
-                    s != active_split && self.split_manager.buffer_for_split(s) == Some(buf_id)
-                })
-                .next()
-                .is_some()
+            self.split_view_states.keys().any(|&s| {
+                s != active_split && self.split_manager.buffer_for_split(s) == Some(buf_id)
+            })
         } else {
             false
         }

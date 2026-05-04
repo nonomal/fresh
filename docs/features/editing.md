@@ -18,6 +18,14 @@ Some keybindings may not work or may differ on your system due to differences in
 
 Add column rulers at any position via "Add Ruler" from the command palette. Useful for enforcing line length limits. Remove with "Remove Ruler". Rulers are per-buffer. The `rulers` config setting can also set default rulers (e.g. `[80, 120]`).
 
+## Current-Line Highlight
+
+The row the cursor is on is highlighted for quick visual tracking. Enabled by default; toggle via the command palette ("Toggle Current Line Highlight") or in the Settings UI. A matching **Toggle Current Column Highlight** / `highlight_current_column` setting highlights the cursor's column too — useful for visually aligning code with rulers.
+
+## Post-EOF Background
+
+Rows past the end of the buffer render with a distinct background color (`post_eof_bg` theme key) so the "end of file" boundary is obvious even without `~` tildes. Works alongside `show_tilde`.
+
 ## Auto-Save
 
 Enable `auto_save_enabled` in settings to automatically save modified buffers to disk at a configurable interval (default 30 seconds). This is separate from the crash-recovery auto-save, which runs independently every 2 seconds to a recovery directory.
@@ -61,6 +69,7 @@ Edit multiple locations simultaneously:
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+W` | Select word under cursor |
+| Double-click + drag | Extend selection word-by-word (after double-clicking a word) |
 | `Ctrl+L` | Select current line |
 | `Ctrl+A` | Select all |
 | `Shift+Arrow` | Extend selection in direction |
@@ -124,9 +133,9 @@ Configure `trim_trailing_whitespace_on_save` and `ensure_final_newline_on_save` 
 | `Ctrl+R` | Replace in buffer |
 | `Ctrl+Alt+R` | Interactive replace (y/n/!/q for each match) |
 | `F3` | Find next match |
-| `Shift+F3` | Find previous match **TODO - use command palette**|
+| `Shift+F3` | Find previous match |
 | `Alt+N` / `Ctrl+F3` | Find next occurrence of selection |
-| `Alt+P` / `Ctrl+Shift+F3` | Find previous occurrence of selection **TODO - use command palette**|
+| `Alt+P` / `Ctrl+Shift+F3` | Find previous occurrence of selection |
 
 See [Search and Replace](./search-replace.md) for more details.
 
@@ -211,3 +220,17 @@ Run shell commands on your buffer or selection:
 | `Alt+→` | Navigate forward in history |
 
 See [Navigation](./navigation.md) for more details.
+
+## Basic Completions
+
+Fresh offers buffer-word completions without needing a language server — candidates are pulled from the words already present in your open buffers. These appear in the completion popup below any LSP results, so you still get both when an LSP is running.
+
+- Open the popup explicitly with **Trigger Completion** from the command palette (check the Keybinding Editor for the current key — by default `Ctrl+Space`).
+- A setting controls whether the popup also appears automatically as you type (default: explicit only).
+- **Tab** accepts the highlighted completion; **Enter** dismisses the popup and inserts a newline.
+
+See [LSP Integration](./lsp.md) for richer completions when a language server is available.
+
+## Vim Mode
+
+A Vim emulation plugin is available, providing modal editing with normal, insert, and visual modes. To enable it, open the command palette (`Ctrl+P`) and search for "vi mode".

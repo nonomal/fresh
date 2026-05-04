@@ -10,9 +10,11 @@
 //! - No tree-sitter or native code dependencies
 
 use crate::model::buffer::Buffer;
+use crate::model::marker::{MarkerId, MarkerList};
 use crate::primitives::grammar::GrammarRegistry;
 use crate::primitives::highlight_types::{highlight_color, HighlightCategory, HighlightSpan};
 use crate::view::theme::Theme;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,13 +23,20 @@ use syntect::parsing::SyntaxSet;
 /// Maximum bytes to parse in a single operation
 const MAX_PARSE_BYTES: usize = 1024 * 1024;
 
-/// TextMate highlighting engine
+/// Interval between parse state checkpoints (in bytes).
+const CHECKPOINT_INTERVAL: usize = 256;
+
+/// TextMate highlighting engine (WASM-compatible)
 ///
-/// Uses syntect for TextMate grammar-based syntax highlighting.
-/// This is WASM-compatible when syntect uses the `fancy-regex` feature.
+/// Marker-based checkpoint system identical to the runtime engine in
+/// `highlight_engine.rs`. See that file for detailed documentation.
 pub struct TextMateEngine {
     syntax_set: Arc<SyntaxSet>,
     syntax_index: usize,
+    checkpoint_markers: MarkerList,
+    checkpoint_states:
+        HashMap<MarkerId, (syntect::parsing::ParseState, syntect::parsing::ScopeStack)>,
+    dirty_from: Option<usize>,
     cache: Option<TextMateCache>,
     last_buffer_len: usize,
 }
@@ -50,16 +59,22 @@ impl TextMateEngine {
         Self {
             syntax_set,
             syntax_index,
+            checkpoint_markers: MarkerList::new(),
+            checkpoint_states: HashMap::new(),
+            dirty_from: None,
             cache: None,
             last_buffer_len: 0,
         }
     }
 
-    /// Create a TextMate engine for a file path
+    /// Create a TextMate engine for a file path.
+    ///
+    /// Purely metadata-based: resolves the grammar by filename/extension via
+    /// the catalog. Shebang / first-line detection is not applied here —
+    /// callers with buffer content should go through
+    /// `DetectedLanguage::from_path`, which handles that fallback.
     pub fn for_file(path: &Path, registry: &GrammarRegistry) -> Option<Self> {
         let syntax_set = registry.syntax_set_arc();
-
-        // Find syntax by file extension
         let syntax = registry.find_syntax_for_file(path)?;
 
         // Find the index of this syntax in the set
@@ -71,10 +86,17 @@ impl TextMateEngine {
         Some(Self::new(syntax_set, index))
     }
 
-    /// Highlight the visible viewport range
-    ///
-    /// `context_bytes` controls how far before/after the viewport to parse for accurate
-    /// highlighting of multi-line constructs (strings, comments, nested blocks).
+    pub fn notify_insert(&mut self, position: usize, length: usize) {
+        self.checkpoint_markers.adjust_for_insert(position, length);
+        self.dirty_from = Some(self.dirty_from.map_or(position, |d| d.min(position)));
+    }
+
+    pub fn notify_delete(&mut self, position: usize, length: usize) {
+        self.checkpoint_markers.adjust_for_delete(position, length);
+        self.dirty_from = Some(self.dirty_from.map_or(position, |d| d.min(position)));
+    }
+
+    /// Highlight the visible viewport range. See runtime engine for detailed docs.
     pub fn highlight_viewport(
         &mut self,
         buffer: &Buffer,
@@ -83,9 +105,6 @@ impl TextMateEngine {
         theme: &Theme,
         context_bytes: usize,
     ) -> Vec<HighlightSpan> {
-        use syntect::parsing::{ParseState, ScopeStack};
-
-        // Check cache validity
         if let Some(cache) = &self.cache {
             if cache.range.start <= viewport_start
                 && cache.range.end >= viewport_end
@@ -106,52 +125,65 @@ impl TextMateEngine {
             }
         }
 
-        // Cache miss - parse viewport region
-        let parse_start = viewport_start.saturating_sub(context_bytes);
+        let desired_parse_start = viewport_start.saturating_sub(context_bytes);
         let parse_end = (viewport_end + context_bytes).min(buffer.len());
-
-        if parse_end <= parse_start || parse_end - parse_start > MAX_PARSE_BYTES {
+        if parse_end <= desired_parse_start {
             return Vec::new();
         }
 
-        let syntax = &self.syntax_set.syntaxes()[self.syntax_index];
-        let mut state = ParseState::new(syntax);
-        let mut spans = Vec::new();
+        if let Some(dirty) = self.dirty_from {
+            if dirty < parse_end {
+                self.run_convergence_walk(buffer, parse_end);
+            }
+        }
 
-        // Get content
-        let content = buffer.slice_bytes(parse_start..parse_end);
+        let syntax = &self.syntax_set.syntaxes()[self.syntax_index];
+        let (actual_start, mut state, mut current_scopes, create_checkpoints) =
+            self.find_parse_resume_point(desired_parse_start, parse_end, syntax);
+
+        let content = buffer.slice_bytes(actual_start..parse_end);
         let content_str = match std::str::from_utf8(&content) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
 
-        // Parse line by line
+        let mut spans = Vec::new();
         let content_bytes = content_str.as_bytes();
         let mut pos = 0;
-        let mut current_offset = parse_start;
-        let mut current_scopes = ScopeStack::new();
+        let mut current_offset = actual_start;
+        let mut bytes_since_checkpoint: usize = 0;
 
         while pos < content_bytes.len() {
-            let line_start = pos;
-            let mut line_end = pos;
+            if create_checkpoints && bytes_since_checkpoint >= CHECKPOINT_INTERVAL {
+                let nearby = self.checkpoint_markers.query_range(
+                    current_offset.saturating_sub(CHECKPOINT_INTERVAL / 2),
+                    current_offset + CHECKPOINT_INTERVAL / 2,
+                );
+                if nearby.is_empty() {
+                    let marker_id = self.checkpoint_markers.create(current_offset, true);
+                    self.checkpoint_states
+                        .insert(marker_id, (state.clone(), current_scopes.clone()));
+                }
+                bytes_since_checkpoint = 0;
+            }
 
-            // Scan for line ending
+            let mut line_end = pos;
             while line_end < content_bytes.len() {
                 if content_bytes[line_end] == b'\n' {
                     line_end += 1;
                     break;
                 } else if content_bytes[line_end] == b'\r' {
                     if line_end + 1 < content_bytes.len() && content_bytes[line_end + 1] == b'\n' {
-                        line_end += 2; // CRLF
+                        line_end += 2;
                     } else {
-                        line_end += 1; // CR only
+                        line_end += 1;
                     }
                     break;
                 }
                 line_end += 1;
             }
 
-            let line_bytes = &content_bytes[line_start..line_end];
+            let line_bytes = &content_bytes[pos..line_end];
             let actual_line_byte_len = line_bytes.len();
 
             let line_str = match std::str::from_utf8(line_bytes) {
@@ -159,11 +191,11 @@ impl TextMateEngine {
                 Err(_) => {
                     pos = line_end;
                     current_offset += actual_line_byte_len;
+                    bytes_since_checkpoint += actual_line_byte_len;
                     continue;
                 }
             };
 
-            // Prepare line for syntect
             let line_content = line_str.trim_end_matches(&['\r', '\n'][..]);
             let line_for_syntect = if line_end < content_bytes.len() || line_str.ends_with('\n') {
                 format!("{}\n", line_content)
@@ -176,42 +208,43 @@ impl TextMateEngine {
                 Err(_) => {
                     pos = line_end;
                     current_offset += actual_line_byte_len;
+                    bytes_since_checkpoint += actual_line_byte_len;
                     continue;
                 }
             };
 
-            // Convert operations to spans
+            let collect_spans = current_offset + actual_line_byte_len > desired_parse_start;
             let mut syntect_offset = 0;
             let line_content_len = line_content.len();
 
             for (op_offset, op) in ops {
                 let clamped_op_offset = op_offset.min(line_content_len);
-                if clamped_op_offset > syntect_offset {
+                if collect_spans && clamped_op_offset > syntect_offset {
                     if let Some(category) = Self::scope_stack_to_category(&current_scopes) {
                         let byte_start = current_offset + syntect_offset;
                         let byte_end = current_offset + clamped_op_offset;
-                        if byte_start < byte_end {
+                        let clamped_start = byte_start.max(desired_parse_start);
+                        if clamped_start < byte_end {
                             spans.push(CachedSpan {
-                                range: byte_start..byte_end,
+                                range: clamped_start..byte_end,
                                 category,
                             });
                         }
                     }
                 }
                 syntect_offset = clamped_op_offset;
-                // Scope stack errors are non-fatal for highlighting
                 #[allow(clippy::let_underscore_must_use)]
                 let _ = current_scopes.apply(&op);
             }
 
-            // Handle remaining text on line
-            if syntect_offset < line_content_len {
+            if collect_spans && syntect_offset < line_content_len {
                 if let Some(category) = Self::scope_stack_to_category(&current_scopes) {
                     let byte_start = current_offset + syntect_offset;
                     let byte_end = current_offset + line_content_len;
-                    if byte_start < byte_end {
+                    let clamped_start = byte_start.max(desired_parse_start);
+                    if clamped_start < byte_end {
                         spans.push(CachedSpan {
-                            range: byte_start..byte_end,
+                            range: clamped_start..byte_end,
                             category,
                         });
                     }
@@ -220,19 +253,17 @@ impl TextMateEngine {
 
             pos = line_end;
             current_offset += actual_line_byte_len;
+            bytes_since_checkpoint += actual_line_byte_len;
         }
 
-        // Merge adjacent spans
         Self::merge_adjacent_spans(&mut spans);
 
-        // Update cache
         self.cache = Some(TextMateCache {
-            range: parse_start..parse_end,
+            range: desired_parse_start..parse_end,
             spans: spans.clone(),
         });
         self.last_buffer_len = buffer.len();
 
-        // Filter and resolve colors
         spans
             .into_iter()
             .filter(|span| span.range.start < viewport_end && span.range.end > viewport_start)
@@ -247,7 +278,170 @@ impl TextMateEngine {
             .collect()
     }
 
-    /// Map scope stack to highlight category
+    fn run_convergence_walk(&mut self, buffer: &Buffer, walk_end: usize) {
+        let dirty = match self.dirty_from.take() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let syntax = &self.syntax_set.syntaxes()[self.syntax_index];
+
+        let (resume_pos, mut state, mut current_scopes) = {
+            let search_start = dirty.saturating_sub(MAX_PARSE_BYTES);
+            let markers = self.checkpoint_markers.query_range(search_start, dirty);
+            let nearest = markers.into_iter().max_by_key(|(_, start, _)| *start);
+            if let Some((id, cp_pos, _)) = nearest {
+                if let Some((s, sc)) = self.checkpoint_states.get(&id) {
+                    (cp_pos, s.clone(), sc.clone())
+                } else {
+                    self.checkpoint_markers.delete(id);
+                    (
+                        0,
+                        syntect::parsing::ParseState::new(syntax),
+                        syntect::parsing::ScopeStack::new(),
+                    )
+                }
+            } else if walk_end <= MAX_PARSE_BYTES {
+                (
+                    0,
+                    syntect::parsing::ParseState::new(syntax),
+                    syntect::parsing::ScopeStack::new(),
+                )
+            } else {
+                self.dirty_from = Some(dirty);
+                return;
+            }
+        };
+
+        let mut markers_ahead: Vec<(MarkerId, usize)> = self
+            .checkpoint_markers
+            .query_range(dirty, walk_end)
+            .into_iter()
+            .map(|(id, start, _)| (id, start))
+            .collect();
+        markers_ahead.sort_by_key(|(_, pos)| *pos);
+
+        if markers_ahead.is_empty() {
+            return;
+        }
+
+        let content_end = walk_end.min(buffer.len());
+        if resume_pos >= content_end {
+            return;
+        }
+        let content = buffer.slice_bytes(resume_pos..content_end);
+        let content_str = match std::str::from_utf8(&content) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let content_bytes = content_str.as_bytes();
+        let mut pos = 0;
+        let mut current_offset = resume_pos;
+        let mut marker_idx = 0;
+
+        while pos < content_bytes.len() && marker_idx < markers_ahead.len() {
+            let mut line_end = pos;
+            while line_end < content_bytes.len() {
+                if content_bytes[line_end] == b'\n' {
+                    line_end += 1;
+                    break;
+                } else if content_bytes[line_end] == b'\r' {
+                    if line_end + 1 < content_bytes.len() && content_bytes[line_end + 1] == b'\n' {
+                        line_end += 2;
+                    } else {
+                        line_end += 1;
+                    }
+                    break;
+                }
+                line_end += 1;
+            }
+
+            let line_bytes = &content_bytes[pos..line_end];
+            let actual_line_byte_len = line_bytes.len();
+
+            let line_str = match std::str::from_utf8(line_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    pos = line_end;
+                    current_offset += actual_line_byte_len;
+                    continue;
+                }
+            };
+
+            let line_content = line_str.trim_end_matches(&['\r', '\n'][..]);
+            let line_for_syntect = if line_end < content_bytes.len() || line_str.ends_with('\n') {
+                format!("{}\n", line_content)
+            } else {
+                line_content.to_string()
+            };
+
+            if let Ok(ops) = state.parse_line(&line_for_syntect, &self.syntax_set) {
+                for (_op_offset, op) in ops {
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = current_scopes.apply(&op);
+                }
+            }
+
+            pos = line_end;
+            current_offset += actual_line_byte_len;
+
+            while marker_idx < markers_ahead.len() && markers_ahead[marker_idx].1 <= current_offset
+            {
+                let (marker_id, _) = markers_ahead[marker_idx];
+                marker_idx += 1;
+
+                if let Some(stored) = self.checkpoint_states.get(&marker_id) {
+                    if state == stored.0 && current_scopes == stored.1 {
+                        return;
+                    }
+                }
+                self.checkpoint_states
+                    .insert(marker_id, (state.clone(), current_scopes.clone()));
+            }
+        }
+
+        if marker_idx < markers_ahead.len() {
+            self.dirty_from = Some(markers_ahead[marker_idx].1);
+        }
+    }
+
+    fn find_parse_resume_point(
+        &self,
+        desired_start: usize,
+        parse_end: usize,
+        syntax: &syntect::parsing::SyntaxReference,
+    ) -> (
+        usize,
+        syntect::parsing::ParseState,
+        syntect::parsing::ScopeStack,
+        bool,
+    ) {
+        use syntect::parsing::{ParseState, ScopeStack};
+
+        let search_start = desired_start.saturating_sub(MAX_PARSE_BYTES);
+        let markers = self
+            .checkpoint_markers
+            .query_range(search_start, desired_start + 1);
+        let nearest = markers.into_iter().max_by_key(|(_, start, _)| *start);
+
+        if let Some((id, cp_pos, _)) = nearest {
+            if let Some((s, sc)) = self.checkpoint_states.get(&id) {
+                return (cp_pos, s.clone(), sc.clone(), true);
+            }
+        }
+        if parse_end <= MAX_PARSE_BYTES {
+            (0, ParseState::new(syntax), ScopeStack::new(), true)
+        } else {
+            (
+                desired_start,
+                ParseState::new(syntax),
+                ScopeStack::new(),
+                true,
+            )
+        }
+    }
+
     fn scope_stack_to_category(scopes: &syntect::parsing::ScopeStack) -> Option<HighlightCategory> {
         for scope in scopes.as_slice().iter().rev() {
             let scope_str = scope.build_string();
@@ -258,12 +452,10 @@ impl TextMateEngine {
         None
     }
 
-    /// Merge adjacent spans with same category
     fn merge_adjacent_spans(spans: &mut Vec<CachedSpan>) {
         if spans.len() < 2 {
             return;
         }
-
         let mut write_idx = 0;
         for read_idx in 1..spans.len() {
             if spans[write_idx].category == spans[read_idx].category
@@ -280,7 +472,6 @@ impl TextMateEngine {
         spans.truncate(write_idx + 1);
     }
 
-    /// Invalidate cache for edited range
     pub fn invalidate_range(&mut self, edit_range: Range<usize>) {
         if let Some(cache) = &self.cache {
             if edit_range.start < cache.range.end && edit_range.end > cache.range.start {
@@ -289,12 +480,16 @@ impl TextMateEngine {
         }
     }
 
-    /// Invalidate all cache
     pub fn invalidate_all(&mut self) {
         self.cache = None;
+        let ids: Vec<MarkerId> = self.checkpoint_states.keys().copied().collect();
+        for id in ids {
+            self.checkpoint_markers.delete(id);
+        }
+        self.checkpoint_states.clear();
+        self.dirty_from = None;
     }
 
-    /// Get syntax name
     pub fn syntax_name(&self) -> &str {
         &self.syntax_set.syntaxes()[self.syntax_index].name
     }
@@ -338,6 +533,26 @@ fn scope_to_category(scope: &str) -> Option<HighlightCategory> {
     if scope_lower.starts_with("markup.list") {
         return Some(HighlightCategory::Operator);
     }
+    // Diff markup: inserted/deleted lines
+    if scope_lower.starts_with("markup.inserted") {
+        return Some(HighlightCategory::String); // green
+    }
+    if scope_lower.starts_with("markup.deleted") {
+        return Some(HighlightCategory::Keyword); // red/magenta
+    }
+    // Diff metadata (range info like @@ -1,5 +1,6 @@)
+    if scope_lower.starts_with("meta.diff.range")
+        || scope_lower.starts_with("meta.diff.header")
+        || scope_lower.starts_with("meta.diff.index")
+    {
+        return Some(HighlightCategory::Function); // cyan/yellow
+    }
+    // Diff from-file/to-file headers (--- a/file, +++ b/file)
+    if scope_lower.starts_with("punctuation.definition.from-file")
+        || scope_lower.starts_with("punctuation.definition.to-file")
+    {
+        return Some(HighlightCategory::Type); // type color
+    }
 
     // Keywords (but not keyword.operator)
     if scope_lower.starts_with("keyword") && !scope_lower.starts_with("keyword.operator") {
@@ -354,9 +569,34 @@ fn scope_to_category(scope: &str) -> Option<HighlightCategory> {
         return Some(HighlightCategory::String);
     }
 
-    // Operators
-    if scope_lower.starts_with("keyword.operator") || scope_lower.starts_with("punctuation") {
+    // Operators (keyword.operator only)
+    if scope_lower.starts_with("keyword.operator") {
         return Some(HighlightCategory::Operator);
+    }
+
+    // Punctuation brackets ({, }, (, ), [, ], <, >)
+    // Covers punctuation.section.*, punctuation.bracket.*,
+    // and punctuation.definition.{array,block,brackets,group,inline-table,section,table,tag}
+    if scope_lower.starts_with("punctuation.section")
+        || scope_lower.starts_with("punctuation.bracket")
+        || scope_lower.starts_with("punctuation.definition.array")
+        || scope_lower.starts_with("punctuation.definition.block")
+        || scope_lower.starts_with("punctuation.definition.brackets")
+        || scope_lower.starts_with("punctuation.definition.group")
+        || scope_lower.starts_with("punctuation.definition.inline-table")
+        || scope_lower.starts_with("punctuation.definition.section")
+        || scope_lower.starts_with("punctuation.definition.table")
+        || scope_lower.starts_with("punctuation.definition.tag")
+    {
+        return Some(HighlightCategory::PunctuationBracket);
+    }
+
+    // Punctuation delimiters (;, ,, .)
+    if scope_lower.starts_with("punctuation.separator")
+        || scope_lower.starts_with("punctuation.terminator")
+        || scope_lower.starts_with("punctuation.accessor")
+    {
+        return Some(HighlightCategory::PunctuationDelimiter);
     }
 
     // Functions
@@ -471,6 +711,91 @@ mod tests {
         assert_eq!(
             scope_to_category("punctuation.definition.string.end"),
             Some(HighlightCategory::String)
+        );
+    }
+
+    #[test]
+    fn test_diff_scopes_produce_categories() {
+        // Diff-specific scopes should map to categories
+        assert_eq!(
+            scope_to_category("markup.inserted"),
+            Some(HighlightCategory::String)
+        );
+        assert_eq!(
+            scope_to_category("markup.inserted.diff"),
+            Some(HighlightCategory::String)
+        );
+        assert_eq!(
+            scope_to_category("markup.deleted"),
+            Some(HighlightCategory::Keyword)
+        );
+        assert_eq!(
+            scope_to_category("markup.deleted.diff"),
+            Some(HighlightCategory::Keyword)
+        );
+        assert_eq!(
+            scope_to_category("meta.diff.range"),
+            Some(HighlightCategory::Function)
+        );
+        assert_eq!(
+            scope_to_category("meta.diff.header"),
+            Some(HighlightCategory::Function)
+        );
+    }
+
+    #[test]
+    fn test_diff_parsing_produces_scopes() {
+        use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+
+        let ss = SyntaxSet::load_defaults_newlines();
+        let syntax = ss
+            .find_syntax_by_extension("diff")
+            .expect("Diff syntax should exist");
+        let mut state = ParseState::new(syntax);
+
+        let lines = [
+            "--- a/file.txt\n",
+            "+++ b/file.txt\n",
+            "@@ -1,3 +1,4 @@\n",
+            " unchanged\n",
+            "-removed line\n",
+            "+added line\n",
+        ];
+
+        let mut found_inserted = false;
+        let mut found_deleted = false;
+        let mut found_range = false;
+        let mut scopes = ScopeStack::new();
+
+        for line in &lines {
+            let ops = state.parse_line(line, &ss).unwrap();
+            for (_offset, op) in &ops {
+                scopes.apply(op).unwrap();
+                let scope_str = scopes
+                    .as_slice()
+                    .iter()
+                    .map(|s| s.build_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if scope_str.contains("markup.inserted") {
+                    found_inserted = true;
+                }
+                if scope_str.contains("markup.deleted") {
+                    found_deleted = true;
+                }
+                if scope_str.contains("meta.diff") {
+                    found_range = true;
+                }
+            }
+        }
+
+        eprintln!(
+            "found_inserted={}, found_deleted={}, found_range={}",
+            found_inserted, found_deleted, found_range
+        );
+        assert!(
+            found_inserted || found_deleted || found_range,
+            "Diff grammar should produce markup.inserted, markup.deleted, or meta.diff scopes"
         );
     }
 }

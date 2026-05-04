@@ -3,8 +3,24 @@
 Fresh has native support for the Language Server Protocol (LSP), providing features like:
 
 *   **Real-time diagnostics:** See errors and warnings in your code as you type.
-*   **Code completion:** Get intelligent code completion suggestions.
-*   **Go-to-definition:** Quickly jump to the definition of a symbol.
+*   **Code completion:** Auto-imports are applied when you accept a completion. Fresh also provides [basic buffer-word completions](./editing.md#basic-completions) without an LSP.
+*   **Code actions:** Quick fixes, refactorings, and server-initiated file create/rename/delete, all through a single popup that merges actions from every configured server.
+*   **Go-to-definition, hover, rename, find references**, and **signature help**.
+*   **Formatting:** "Format Buffer" from the command palette uses the configured external formatter, falling back to LSP formatting (including range formatting) when none is set.
+
+All LSP operations are available as palette commands (search for "LSP"). Use the [Keybinding Editor](./keybinding-editor.md) to see or change the keys bound to each one.
+
+## Status Bar
+
+The status bar shows a single `LSP` indicator — colour-coded, with a spinner during startup and indexing. Activate it (click, or run **LSP: Server Status** from the command palette) to open a popup with per-server status, live progress, and per-server actions (restart, stop, view log). Servers that are configured but whose binary isn't on `PATH` are flagged so Fresh doesn't quietly spawn failing processes. The popup also shows buffer-skip state when a file is too large for LSP, and the "not installed" copy is container-aware when you're attached to a devcontainer (it points at the container's PATH, not the host's). You can also mute a language from the popup.
+
+## Remote-Aware LSP
+
+Language servers spawn through the editor's current [Authority](../plugins/api/), so attaching to an SSH remote or a devcontainer runs the servers over there. `command_exists` probes and `ProcessLimits` (`max_memory_mb`, `max_cpu_percent`) are threaded through the same authority, so quotas apply whether the server is local or in a container.
+
+## Hover and Diagnostics
+
+Hover popups fuse any overlapping diagnostic with the hover body — severity-coloured and source-tagged (`rustc`, `clippy`, `clangd`, etc.), so you see the error message and the type information together.
 
 ## Diagnostics Panel
 
@@ -19,6 +35,20 @@ Signature help popups render markdown with proper formatting, hanging indent, an
 ## Code Folding
 
 When the LSP server provides `foldingRange`, fold indicators appear in the gutter. See [Editing — Code Folding](./editing.md#code-folding).
+
+## Multi-Server Support
+
+You can configure multiple LSP servers for the same language (e.g., pylsp + pyright for Python). Configure this in the Settings UI (run **Open Settings** from the palette) under the **LSP** section.
+
+Each server can opt into or out of specific features using `only_features` / `except_features` — for example, route completions to one server and diagnostics to another. Fresh merges completions from every eligible server and tracks diagnostics per-server. Servers configured for all languages are spawned once per project rather than once per language.
+
+## C/C++ Header Routing
+
+When you open a `.h` file, Fresh routes to the C++ LSP if there's a clear signal in the project (a sibling `.cpp`, `.hpp`, or `.hxx`), and to the C LSP otherwise.
+
+## Workspace Root Detection
+
+By default, Fresh uses the working directory as the LSP workspace root. You can configure `root_markers` on an LSP server entry (e.g., `Cargo.toml`, `package.json`) so the editor walks upward from the file's directory to find the project root. Configure this in the Settings UI (run **Open Settings** from the palette) under the **LSP** section.
 
 ## Built-in LSP Support
 
@@ -125,7 +155,7 @@ For example, to add C# support:
 }
 ```
 
-The language name (e.g., `"csharp"`) must match in both sections. Fresh includes built-in language definitions for Rust, JavaScript, TypeScript, and Python.
+The language name (e.g., `"csharp"`) must match in both sections. The `grammar` field must be a valid grammar name — run `fresh --cmd grammar list` to see all available grammars. Fresh includes built-in language definitions for many languages, visible in the Settings UI (run **Open Settings** from the palette) under the **Languages** section.
 
 ### Environment Variables
 
@@ -170,7 +200,7 @@ Use "Switch Rust Analyzer Mode" from the command palette to toggle between Full 
 
 You can also configure language detection using the Settings UI instead of editing `config.json` directly:
 
-1. **Open Settings**: Use **Edit → Settings...** or the command palette (`Ctrl+P`) and search for "Settings"
+1. **Open Settings**: Run **Open Settings** from the palette (or **Edit → Settings...** from the menu bar).
 2. **Navigate to Languages**: Go to the **Languages** section
 3. **Add or Edit a Language**: Click on an existing language to edit it, or add a new one
 4. **Configure Detection**: Set the following fields:

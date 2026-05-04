@@ -1,6 +1,6 @@
+use super::lsp_status::compose_lsp_status;
 use super::*;
-use anyhow::Result as AnyhowResult;
-use rust_i18n::t;
+use crate::config::FileExplorerSide;
 
 impl Editor {
     /// Render the editor to the terminal
@@ -8,9 +8,18 @@ impl Editor {
         let _span = tracing::info_span!("render").entered();
         let size = frame.area();
 
+        // Let active animations snapshot the previous frame's buffer
+        // from the runner's own cache. We can't read the live
+        // `frame.buffer_mut()` — ratatui resets it before each draw —
+        // so the runner keeps a post-apply clone from the last frame.
+        self.animations.capture_before_all();
+
         // Save frame dimensions for recompute_layout (used by macro replay)
         self.cached_layout.last_frame_width = size.width;
         self.cached_layout.last_frame_height = size.height;
+
+        // Reset per-cell theme key map for this frame
+        self.cached_layout.reset_cell_theme_map();
 
         // For scroll sync groups, we need to update the active split's viewport position BEFORE
         // calling sync_scroll_groups, so that the sync reads the correct position.
@@ -93,8 +102,16 @@ impl Editor {
             }
         }
 
-        // Determine if we need to show search options bar
-        let show_search_options = self.prompt.as_ref().is_some_and(|p| {
+        // Determine if we need to show search options bar.
+        // (Held in mutable bindings because the in-render
+        // `process_commands` block below can dispatch commands —
+        // e.g. `StartPromptAsync`, `SetPromptSuggestions` — that
+        // mutate `self.prompt`. When that happens we recompute these
+        // flags and re-split `main_chunks` so the bottom-row
+        // rendering uses an up-to-date layout. See the
+        // "Recompute layout if mid-render commands changed state"
+        // block below.)
+        let mut show_search_options = self.prompt.as_ref().is_some_and(|p| {
             matches!(
                 p.prompt_type,
                 PromptType::Search
@@ -105,12 +122,19 @@ impl Editor {
             )
         });
 
-        // Hide status bar when suggestions popup or file browser popup is shown
-        let has_suggestions = self
+        // Hide status bar when suggestions popup or file browser
+        // popup is shown — those popups float just above the prompt
+        // line, and a visible status bar wedged between them looks
+        // wrong. Floating-overlay prompts (Live Grep, issue #1796)
+        // are exempt because their suggestions live inside the
+        // centred frame, not above the bottom row.
+        let mut prompt_is_overlay = self.prompt.as_ref().is_some_and(|p| p.overlay);
+        let mut has_suggestions = self
             .prompt
             .as_ref()
-            .is_some_and(|p| !p.suggestions.is_empty());
-        let has_file_browser = self.prompt.as_ref().is_some_and(|p| {
+            .is_some_and(|p| !p.suggestions.is_empty())
+            && !prompt_is_overlay;
+        let mut has_file_browser = self.prompt.as_ref().is_some_and(|p| {
             matches!(
                 p.prompt_type,
                 PromptType::OpenFile | PromptType::SwitchProject | PromptType::SaveFileAs
@@ -120,23 +144,32 @@ impl Editor {
         // Build main vertical layout: [menu_bar, main_content, status_bar, search_options, prompt_line]
         // Status bar is hidden when suggestions popup is shown
         // Search options bar is shown when in search prompt
-        let constraints = vec![
-            Constraint::Length(if self.menu_bar_visible { 1 } else { 0 }), // Menu bar
-            Constraint::Min(0),                                            // Main content area
-            Constraint::Length(
-                if !self.status_bar_visible || has_suggestions || has_file_browser {
-                    0
-                } else {
-                    1
-                },
-            ), // Status bar (hidden when toggled off or with popups)
-            Constraint::Length(if show_search_options { 1 } else { 0 }),   // Search options bar
-            Constraint::Length(1), // Prompt line (always reserved)
-        ];
-
-        let main_chunks = Layout::default()
+        let mut main_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
+            .constraints(vec![
+                Constraint::Length(if self.menu_bar_visible { 1 } else { 0 }), // Menu bar
+                Constraint::Min(0),                                            // Main content area
+                Constraint::Length(
+                    if !self.status_bar_visible || has_suggestions || has_file_browser {
+                        0
+                    } else {
+                        1
+                    },
+                ), // Status bar (hidden when toggled off or with popups)
+                Constraint::Length(if show_search_options { 1 } else { 0 }),   // Search options bar
+                Constraint::Length(
+                    // Prompt line is auto-hidden when no prompt active.
+                    // Overlay prompts (Live Grep, issue #1796) host the
+                    // input row inside the centred frame, so the
+                    // bottom row stays available for editor content
+                    // rather than being reserved as dead space.
+                    if (self.prompt_line_visible || self.prompt.is_some()) && !prompt_is_overlay {
+                        1
+                    } else {
+                        0
+                    },
+                ), // Prompt line
+            ])
             .split(size);
 
         let menu_bar_area = main_chunks[0];
@@ -152,28 +185,37 @@ impl Editor {
             && (self.file_explorer.is_some() || self.file_explorer_sync_in_progress);
 
         if file_explorer_should_show {
-            // Split horizontally: [file_explorer | editor]
+            // Split horizontally based on side placement
             tracing::trace!(
-                "render: file explorer layout active (present={}, sync_in_progress={})",
+                "render: file explorer layout active (present={}, sync_in_progress={}, side={:?})",
                 self.file_explorer.is_some(),
-                self.file_explorer_sync_in_progress
+                self.file_explorer_sync_in_progress,
+                self.file_explorer_side
             );
-            // Convert f32 percentage (0.0-1.0) to u16 percentage (0-100)
-            let explorer_percent = (self.file_explorer_width_percent * 100.0) as u16;
-            let editor_percent = 100 - explorer_percent;
-            let horizontal_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(explorer_percent), // File explorer
-                    Constraint::Percentage(editor_percent),   // Editor area
-                ])
-                .split(main_content_area);
+            let explorer_cols = self.file_explorer_width.to_cols(main_content_area.width);
 
-            self.cached_layout.file_explorer_area = Some(horizontal_chunks[0]);
-            editor_content_area = horizontal_chunks[1];
+            let (explorer_area, editor_area) = match self.file_explorer_side {
+                FileExplorerSide::Left => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Length(explorer_cols), Constraint::Min(0)])
+                        .split(main_content_area);
+                    (chunks[0], chunks[1])
+                }
+                FileExplorerSide::Right => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Min(0), Constraint::Length(explorer_cols)])
+                        .split(main_content_area);
+                    (chunks[1], chunks[0])
+                }
+            };
 
-            // Get remote connection info before mutable borrow of file_explorer
-            let remote_connection = self.remote_connection_info().map(|s| s.to_string());
+            self.cached_layout.file_explorer_area = Some(explorer_area);
+            editor_content_area = editor_area;
+
+            // Get connection string before mutable borrow of file_explorer.
+            let remote_connection = self.connection_display_string();
 
             // Render file explorer (only if we have it - during sync we just keep the area reserved)
             if let Some(ref mut explorer) = self.file_explorer {
@@ -195,18 +237,27 @@ impl Editor {
                     &self.mouse_state.hover_target,
                     Some(HoverTarget::FileExplorerCloseButton)
                 );
+                let keybindings = self.keybindings.read().unwrap();
+                let empty: Vec<std::path::PathBuf> = Vec::new();
+                let cut_paths = self
+                    .file_explorer_clipboard
+                    .as_ref()
+                    .filter(|cb| cb.is_cut)
+                    .map(|cb| cb.paths.as_slice())
+                    .unwrap_or(empty.as_slice());
                 FileExplorerRenderer::render(
                     explorer,
                     frame,
-                    horizontal_chunks[0],
+                    explorer_area,
                     is_focused,
                     &files_with_unsaved_changes,
                     &self.file_explorer_decoration_cache,
-                    &self.keybindings,
+                    &keybindings,
                     self.key_context.clone(),
                     &self.theme,
                     close_button_hovered,
                     remote_connection.as_deref(),
+                    cut_paths,
                 );
             }
             // Note: if file_explorer is None but sync_in_progress is true,
@@ -355,7 +406,8 @@ impl Editor {
             // at 60fps. The plugin's own refreshLines() call from cursor_moved
             // ensures a follow-up render cycle picks up any missed commands.
             let commands = self.plugin_manager.process_commands();
-            if !commands.is_empty() {
+            let dispatched_any = !commands.is_empty();
+            if dispatched_any {
                 let cmd_names: Vec<String> =
                     commands.iter().map(|c| c.debug_variant_name()).collect();
                 tracing::trace!(count = commands.len(), cmds = ?cmd_names, "process_commands during render");
@@ -368,10 +420,86 @@ impl Editor {
 
             // Flush any deferred grammar rebuilds as a single batch
             self.flush_pending_grammars();
+
+            // Recompute the bottom-row layout if the in-render command
+            // dispatch above mutated state that affects it. Without
+            // this, a `StartPromptAsync` (or similar) processed
+            // mid-render leaves `main_chunks` reflecting the prior
+            // `self.prompt = None` shape — the prompt slot ends up at
+            // (y = size.height, h = 0) and the status bar paints the
+            // bottom row in place of the prompt input. Conservative:
+            // we recompute on *any* dispatched commands rather than
+            // enumerating layout-affecting variants — Layout::split is
+            // cheap, and this avoids a maintenance-burden whitelist
+            // that would silently regress as new `PluginCommand`
+            // variants are added.
+            //
+            // Bounded — single drain + single recompute. We do not
+            // call `process_commands` again, so commands queued by
+            // hooks fired inside the dispatch above wait for the next
+            // render or `editor_tick` (the existing one-frame-late
+            // behaviour the comment above already accepts).
+            //
+            // `main_content_area` (and the file-explorer / split
+            // rendering derived from it earlier in this render) is
+            // intentionally NOT re-derived: those areas were already
+            // painted, and the bottom-row recompute may overwrite a
+            // single row of main content where the new status bar /
+            // prompt now sits. That brief overlap self-corrects on
+            // the next frame, where the layout is built consistently
+            // from the start.
+            if dispatched_any {
+                show_search_options = self.prompt.as_ref().is_some_and(|p| {
+                    matches!(
+                        p.prompt_type,
+                        PromptType::Search
+                            | PromptType::ReplaceSearch
+                            | PromptType::Replace { .. }
+                            | PromptType::QueryReplaceSearch
+                            | PromptType::QueryReplace { .. }
+                    )
+                });
+                prompt_is_overlay = self.prompt.as_ref().is_some_and(|p| p.overlay);
+                has_suggestions = self
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|p| !p.suggestions.is_empty())
+                    && !prompt_is_overlay;
+                has_file_browser = self.prompt.as_ref().is_some_and(|p| {
+                    matches!(
+                        p.prompt_type,
+                        PromptType::OpenFile | PromptType::SwitchProject | PromptType::SaveFileAs
+                    )
+                }) && self.file_open_state.is_some();
+                main_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(vec![
+                        Constraint::Length(if self.menu_bar_visible { 1 } else { 0 }),
+                        Constraint::Min(0),
+                        Constraint::Length(
+                            if !self.status_bar_visible || has_suggestions || has_file_browser {
+                                0
+                            } else {
+                                1
+                            },
+                        ),
+                        Constraint::Length(if show_search_options { 1 } else { 0 }),
+                        Constraint::Length(
+                            if (self.prompt_line_visible || self.prompt.is_some())
+                                && !prompt_is_overlay
+                            {
+                                1
+                            } else {
+                                0
+                            },
+                        ),
+                    ])
+                    .split(size);
+            }
         }
 
         // Render editor content (same for both layouts)
-        let lsp_waiting = self.pending_completion_request.is_some()
+        let lsp_waiting = !self.pending_completion_requests.is_empty()
             || self.pending_goto_definition_request.is_some();
 
         // Hide the hardware cursor when menu is open, file explorer is focused, terminal mode,
@@ -389,10 +517,8 @@ impl Editor {
 
         // Convert HoverTarget to tab hover info for rendering
         let hovered_tab = match &self.mouse_state.hover_target {
-            Some(HoverTarget::TabName(buffer_id, split_id)) => Some((*buffer_id, *split_id, false)),
-            Some(HoverTarget::TabCloseButton(buffer_id, split_id)) => {
-                Some((*buffer_id, *split_id, true))
-            }
+            Some(HoverTarget::TabName(target, split_id)) => Some((*target, *split_id, false)),
+            Some(HoverTarget::TabCloseButton(target, split_id)) => Some((*target, *split_id, true)),
             _ => None,
         };
 
@@ -410,6 +536,14 @@ impl Editor {
 
         let is_maximized = self.split_manager.is_maximized();
 
+        // The active split's buffer renderer records where the hardware
+        // cursor *wants* to appear here; we only commit it to the frame at
+        // the very end of this draw pass, after popups have been rendered,
+        // so a popup covering the cursor cell causes the cursor to be
+        // hidden (otherwise the hardware caret would bleed through the
+        // popup).
+        let mut pending_hardware_cursor: Option<(u16, u16)> = None;
+
         let _content_span = tracing::info_span!("render_content").entered();
         let (
             split_areas,
@@ -418,6 +552,7 @@ impl Editor {
             maximize_split_areas,
             view_line_mappings,
             horizontal_scrollbar_areas,
+            grouped_separator_areas,
         ) = SplitRenderer::render_content(
             frame,
             editor_content_area,
@@ -425,7 +560,7 @@ impl Editor {
             &mut self.buffers,
             &self.buffer_metadata,
             &mut self.event_logs,
-            &self.composite_buffers,
+            &mut self.composite_buffers,
             &mut self.composite_view_states,
             &self.theme,
             self.ansi_background.as_ref(),
@@ -436,6 +571,7 @@ impl Editor {
             self.config.editor.estimated_line_length,
             self.config.editor.highlight_context_bytes,
             Some(&mut self.split_view_states),
+            &self.grouped_subtrees,
             hide_cursor,
             hovered_tab,
             hovered_close_split,
@@ -444,14 +580,26 @@ impl Editor {
             self.config.editor.relative_line_numbers,
             self.tab_bar_visible,
             self.config.editor.use_terminal_bg,
-            self.session_mode || !self.config.editor.cursor_style.is_block(),
+            self.session_mode || !self.software_cursor_only,
             self.software_cursor_only,
             self.config.editor.show_vertical_scrollbar,
             self.config.editor.show_horizontal_scrollbar,
             self.config.editor.diagnostics_inline_text,
+            self.config.editor.show_tilde,
+            self.config.editor.highlight_current_column,
+            &mut self.cached_layout.cell_theme_map,
+            size.width,
+            &mut pending_hardware_cursor,
         );
 
         drop(_content_span);
+
+        // Cursor-jump animation: compare the cursor's screen position to
+        // the prior frame and animate either when the cursor crossed split
+        // panes or moved more than two rows within the same pane. The
+        // trail crosses pane separators when the jump is across splits —
+        // that's the intended "follow the focus" cue.
+        self.maybe_start_cursor_jump_animation(pending_hardware_cursor, active_split);
 
         // Detect viewport changes and fire hooks
         // Compare against previous frame's viewport state (stored in self.previous_viewports)
@@ -533,9 +681,21 @@ impl Editor {
         self.cached_layout.close_split_areas = close_split_areas;
         self.cached_layout.maximize_split_areas = maximize_split_areas;
         self.cached_layout.view_line_mappings = view_line_mappings;
-        self.cached_layout.separator_areas = self
+
+        // Promote any deferred virtual-buffer animations whose Rect is now
+        // known. Done here (after split_areas is recomputed, before
+        // apply_all runs at the end of render) so the first frame of the
+        // effect lands on the same paint that made the buffer visible.
+        self.drain_pending_vb_animations();
+        let mut separator_areas = self
             .split_manager
             .get_separators_with_ids(editor_content_area);
+        // Grouped subtrees live in a side-map outside the main split tree, so
+        // their inner separators are not visited by `get_separators_with_ids`
+        // above. The renderer collected them (using the same content rect it
+        // drew them at) — merge so clicks on those rendered columns register.
+        separator_areas.extend(grouped_separator_areas);
+        self.cached_layout.separator_areas = separator_areas;
         self.cached_layout.editor_content_area = Some(editor_content_area);
 
         // Render hover highlights for separators and scrollbars
@@ -543,6 +703,7 @@ impl Editor {
 
         // Initialize popup/suggestion layout state (rendered after status bar below)
         self.cached_layout.suggestions_area = None;
+        self.cached_layout.suggestions_outer_area = None;
         self.file_browser_layout = None;
 
         // Clone all immutable values before the mutable borrow
@@ -551,12 +712,57 @@ impl Editor {
             .get(&self.active_buffer())
             .map(|m| m.display_name.clone())
             .unwrap_or_else(|| "[No Name]".to_string());
+
+        // Reflect the active buffer in the terminal window/tab title. Only
+        // writes when the title actually changes so we don't flood stdout
+        // with OSC sequences every frame.
+        self.update_terminal_title(&display_name);
+
         let status_message = self.status_message.clone();
         let plugin_status_message = self.plugin_status_message.clone();
         let prompt = self.prompt.clone();
-        let lsp_status = self.lsp_status.clone();
+        // Compute a simple buffer-aware LSP indicator.
+        // Compose the LSP status-bar segment for the active buffer. This
+        // runs every render — the editor has no precomputed LSP-status
+        // string cached anywhere else, so there is a single source of
+        // truth for what the user sees.
+        //
+        // Priority order (first non-empty wins):
+        //
+        //   1. Active `$/progress` work for this language — e.g.
+        //      "LSP (cpp): indexing (42%)". Conveys the transient
+        //      startup/indexing phase.
+        //   2. A running server — "LSP". Short because detail belongs
+        //      in LSP-specific UI, not the compact status bar pill.
+        //   3. Configured `auto_start=true` servers that haven't started
+        //      (error / crashed / pending) — "LSP off".
+        //   4. Configured `enabled && !auto_start` servers that the user
+        //      has to opt into — "LSP: off (N)".
+        //   5. Nothing.
+        //
+        // Rules 3 and 4 address heuristic eval H-1: without them, a
+        // configured-but-dormant server is indistinguishable from "no
+        // LSP at all."
+        let current_language = self
+            .buffers
+            .get(&self.active_buffer())
+            .map(|s| s.language.clone())
+            .unwrap_or_default();
+        let buffer_lsp_disabled_reason = self
+            .buffer_metadata
+            .get(&self.active_buffer())
+            .filter(|m| !m.lsp_enabled)
+            .and_then(|m| m.lsp_disabled_reason.as_deref());
+        let (lsp_status, lsp_indicator_state) = compose_lsp_status(
+            &current_language,
+            buffer_lsp_disabled_reason,
+            &self.lsp_progress,
+            &self.lsp_server_statuses,
+            &self.config.lsp,
+            &self.user_dismissed_lsp_languages,
+        );
         let theme = self.theme.clone();
-        let keybindings_cloned = self.keybindings.clone(); // Clone the keybindings
+        let keybindings_cloned = self.keybindings.read().unwrap().clone(); // Clone the keybindings
         let chord_state_cloned = self.chord_state.clone(); // Clone the chord state
 
         // Get update availability info
@@ -565,12 +771,31 @@ impl Editor {
         // Render status bar (hidden when toggled off, or when suggestions/file browser popup is shown)
         if self.status_bar_visible && !has_suggestions && !has_file_browser {
             // Get warning level for colored indicator (respects config setting)
+            // LSP warning level is scoped to the current buffer's language
             let (warning_level, general_warning_count) =
                 if self.config.warnings.show_status_indicator {
-                    (
-                        self.get_effective_warning_level(),
-                        self.get_general_warning_count(),
-                    )
+                    let lsp_level = {
+                        use crate::services::async_bridge::LspServerStatus;
+                        let mut level = WarningLevel::None;
+                        for ((lang, _), status) in &self.lsp_server_statuses {
+                            if lang == &current_language {
+                                match status {
+                                    LspServerStatus::Error => {
+                                        level = WarningLevel::Error;
+                                        break;
+                                    }
+                                    LspServerStatus::Starting | LspServerStatus::Initializing => {
+                                        if level != WarningLevel::Error {
+                                            level = WarningLevel::Warning;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        level
+                    };
+                    (lsp_level, self.get_general_warning_count())
                 } else {
                     (WarningLevel::None, 0)
                 };
@@ -585,16 +810,16 @@ impl Editor {
                 }
                 Some(HoverTarget::StatusBarEncodingIndicator) => StatusBarHover::EncodingIndicator,
                 Some(HoverTarget::StatusBarLanguageIndicator) => StatusBarHover::LanguageIndicator,
+                Some(HoverTarget::StatusBarRemoteIndicator) => StatusBarHover::RemoteIndicator,
                 _ => StatusBarHover::None,
             };
 
-            // Get remote connection info if editing remote files
-            let remote_connection = self.remote_connection_info().map(|s| s.to_string());
+            let remote_connection = self.connection_display_string();
 
             // Get session name for display (only in session mode)
             let session_name = self.session_name().map(|s| s.to_string());
 
-            let active_split = self.split_manager.active_split();
+            let active_split = self.effective_active_split();
             let active_buf = self.active_buffer();
             let default_cursors = crate::model::cursor::Cursors::new();
             let status_cursors = self
@@ -607,25 +832,42 @@ impl Editor {
                 .get(&active_buf)
                 .map(|m| m.read_only)
                 .unwrap_or(false);
+            let is_synthetic_placeholder = self
+                .buffer_metadata
+                .get(&active_buf)
+                .map(|m| m.synthetic_placeholder)
+                .unwrap_or(false);
+            let mut status_ctx = crate::view::ui::status_bar::StatusBarContext {
+                state: self.buffers.get_mut(&active_buf).unwrap(),
+                cursors: status_cursors,
+                status_message: &status_message,
+                plugin_status_message: &plugin_status_message,
+                lsp_status: &lsp_status,
+                lsp_indicator_state,
+                theme: &theme,
+                display_name: &display_name,
+                keybindings: &keybindings_cloned,
+                chord_state: &chord_state_cloned,
+                update_available: update_available.as_deref(),
+                warning_level,
+                general_warning_count,
+                hover: status_bar_hover,
+                remote_connection: remote_connection.as_deref(),
+                session_name: session_name.as_deref(),
+                read_only: is_read_only,
+                remote_state_override: self.remote_indicator_override.as_ref(),
+                is_synthetic_placeholder,
+                // Filled in by `render_status` from the user's
+                // status_bar config; the value here is just a
+                // safe default for the rare path that builds the
+                // ctx but doesn't run `render_status`.
+                remote_indicator_on_bar: false,
+            };
             let status_bar_layout = StatusBarRenderer::render_status_bar(
                 frame,
                 main_chunks[status_bar_idx],
-                self.buffers.get_mut(&active_buf).unwrap(),
-                status_cursors,
-                &status_message,
-                &plugin_status_message,
-                &lsp_status,
-                &theme,
-                &display_name,
-                &keybindings_cloned,          // Pass the cloned keybindings
-                &chord_state_cloned,          // Pass the cloned chord state
-                update_available.as_deref(),  // Pass update availability
-                warning_level,                // Pass warning level for colored indicator
-                general_warning_count,        // Pass general warning count for badge
-                status_bar_hover,             // Pass hover state for indicator styling
-                remote_connection.as_deref(), // Pass remote connection info
-                session_name.as_deref(),      // Pass session name for status bar display
-                is_read_only,                 // Pass read-only flag from metadata
+                &mut status_ctx,
+                &self.config.editor.status_bar,
             );
 
             // Store status bar layout for click detection
@@ -639,6 +881,7 @@ impl Editor {
             self.cached_layout.status_bar_encoding_area = status_bar_layout.encoding_indicator;
             self.cached_layout.status_bar_language_area = status_bar_layout.language_indicator;
             self.cached_layout.status_bar_message_area = status_bar_layout.message_area;
+            self.cached_layout.status_bar_remote_area = status_bar_layout.remote_indicator;
         }
 
         // Render search options bar when in search prompt
@@ -684,22 +927,34 @@ impl Editor {
             self.cached_layout.search_options_layout = None;
         }
 
-        // Render prompt line if active
+        // Render prompt line if active. Overlay prompts (Live Grep)
+        // skip the bottom-row render entirely — they paint their own
+        // input row inside the centred overlay frame, so the user's
+        // editor view stays unobstructed at the bottom.
         if let Some(prompt) = &prompt {
-            // Use specialized renderer for file/folder open prompt to show colorized path
-            if matches!(
-                prompt.prompt_type,
-                crate::view::prompt::PromptType::OpenFile
-                    | crate::view::prompt::PromptType::SwitchProject
-            ) {
-                if let Some(file_open_state) = &self.file_open_state {
-                    StatusBarRenderer::render_file_open_prompt(
-                        frame,
-                        main_chunks[prompt_line_idx],
-                        prompt,
-                        file_open_state,
-                        &theme,
-                    );
+            if !prompt.overlay {
+                // Use specialized renderer for file/folder open prompt to show colorized path
+                if matches!(
+                    prompt.prompt_type,
+                    crate::view::prompt::PromptType::OpenFile
+                        | crate::view::prompt::PromptType::SwitchProject
+                ) {
+                    if let Some(file_open_state) = &self.file_open_state {
+                        StatusBarRenderer::render_file_open_prompt(
+                            frame,
+                            main_chunks[prompt_line_idx],
+                            prompt,
+                            file_open_state,
+                            &theme,
+                        );
+                    } else {
+                        StatusBarRenderer::render_prompt(
+                            frame,
+                            main_chunks[prompt_line_idx],
+                            prompt,
+                            &theme,
+                        );
+                    }
                 } else {
                     StatusBarRenderer::render_prompt(
                         frame,
@@ -708,14 +963,15 @@ impl Editor {
                         &theme,
                     );
                 }
-            } else {
-                StatusBarRenderer::render_prompt(
-                    frame,
-                    main_chunks[prompt_line_idx],
-                    prompt,
-                    &theme,
-                );
             }
+        }
+
+        // Float-overlay preview: load the selected match's file (if
+        // the file changed) and seed the phantom leaf's cursor before
+        // the renderer reaches it. Done before render_prompt_popups
+        // because that path immediately needs the leaf's view state.
+        if self.prompt.as_ref().is_some_and(|p| p.overlay) {
+            self.prepare_overlay_preview();
         }
 
         // Render file browser popup or suggestions popup AFTER status bar + prompt,
@@ -888,6 +1144,50 @@ impl Editor {
             }
         }
 
+        // Render editor-level popups (e.g. plugin action popups) on top of any
+        // buffer content so they stay visible across buffer switches and over
+        // virtual buffers (Dashboard, diagnostics) that own the whole split.
+        // These don't need cursor-relative positioning — they all use absolute
+        // positions like BottomRight or Centered.
+        //
+        // Queue semantics: concurrent action popups stack in `global_popups`,
+        // but only the top one renders & receives input. Deeper popups
+        // surface as the top is resolved — the alternative (drawing all at
+        // the same BottomRight slot) makes them illegible.
+        self.cached_layout.global_popup_areas.clear();
+        if let Some(popup) = self.global_popups.top() {
+            let top_idx = self.global_popups.all().len() - 1;
+            let popup_area = popup.calculate_area(size, None);
+            let desc_height = popup.description_height();
+            let inner_area = if popup.bordered {
+                ratatui::layout::Rect {
+                    x: popup_area.x + 1,
+                    y: popup_area.y + 1 + desc_height,
+                    width: popup_area.width.saturating_sub(2),
+                    height: popup_area.height.saturating_sub(2 + desc_height),
+                }
+            } else {
+                ratatui::layout::Rect {
+                    x: popup_area.x,
+                    y: popup_area.y + desc_height,
+                    width: popup_area.width,
+                    height: popup_area.height.saturating_sub(desc_height),
+                }
+            };
+            let num_items = match &popup.content {
+                crate::view::popup::PopupContent::List { items, .. } => items.len(),
+                _ => 0,
+            };
+            self.cached_layout.global_popup_areas.push((
+                top_idx,
+                popup_area,
+                inner_area,
+                popup.scroll_offset,
+                num_items,
+            ));
+            popup.render_with_hover(frame, popup_area, &theme_clone, hover_target.as_ref());
+        }
+
         // Render menu bar last so dropdown appears on top of all other content
         // Update menu context with current editor state
         self.update_menu_context();
@@ -947,14 +1247,25 @@ impl Editor {
         }
 
         if self.menu_bar_visible {
+            // Pre-expand DynamicSubmenu items once per registry; without this
+            // MenuRenderer::render rescans + reparses every theme JSON file
+            // on every frame.
+            self.expanded_menus_cache.update(
+                &self.theme_registry,
+                &self.menus,
+                &self.menu_state.themes_dir,
+            );
+            let expanded = self.expanded_menus_cache.get().expect("just updated");
+            let keybindings = self.keybindings.read().unwrap();
             self.cached_layout.menu_layout = Some(crate::view::ui::MenuRenderer::render(
                 frame,
                 menu_bar_area,
-                &self.menus,
+                expanded,
                 &self.menu_state,
-                &self.keybindings,
+                &keybindings,
                 &self.theme,
                 self.mouse_state.hover_target.as_ref(),
+                self.config.editor.menu_bar_mnemonics,
             ));
         } else {
             self.cached_layout.menu_layout = None;
@@ -964,6 +1275,13 @@ impl Editor {
         if let Some(ref menu) = self.tab_context_menu {
             self.render_tab_context_menu(frame, menu);
         }
+
+        if let Some(ref menu) = self.file_explorer_context_menu {
+            self.render_file_explorer_context_menu(frame, menu);
+        }
+
+        // Record non-editor region theme keys for the theme inspector
+        self.record_non_editor_theme_regions();
 
         // Render theme info popup (Ctrl+Right-Click)
         self.render_theme_info_popup(frame);
@@ -1012,11 +1330,161 @@ impl Editor {
             }
         }
 
+        // Commit the active-split hardware cursor (deferred since
+        // `render_content`) unless a popup has been drawn over that cell.
+        // Ratatui draws the hardware caret on top of every cell, so a
+        // popup cannot hide the cursor by painting cells — the only way
+        // to hide it is to leave `Frame::cursor_position` as `None`, which
+        // triggers `Terminal::hide_cursor` at the end of the draw.
+        //
+        // When a prompt is active the prompt renderer already placed the
+        // caret on the prompt line via `frame.set_cursor_position`; don't
+        // override it with the (now-irrelevant) buffer cursor.
+        if let Some((cx, cy)) = pending_hardware_cursor {
+            if self.prompt.is_none() && !self.cursor_obscured_by_overlay(cx, cy) {
+                frame.set_cursor_position((cx, cy));
+            }
+        }
+
         // Convert all colors for terminal capability (256/16 color fallback)
         crate::view::color_support::convert_buffer_colors(
             frame.buffer_mut(),
             self.color_capability,
         );
+
+        // Frame-buffer animations run last so they mutate the final paint.
+        self.animations.apply_all(frame.buffer_mut());
+    }
+
+    /// Compare the hardware cursor's screen position to the previous frame's
+    /// and, if it moved by more than the "jump" threshold, start a
+    /// `CursorJump` animation from the old to the new on-screen position.
+    /// Successive jumps cancel the prior animation so trail effects don't
+    /// pile up.
+    ///
+    /// Cross-split and cross-buffer transitions (focus change, tab switch)
+    /// are also animated — the trail crosses pane separators on its way
+    /// from one buffer's cursor cell to another's.
+    ///
+    /// The threshold is intentionally generous: arrow-key/typing moves
+    /// (small `dx`/`dy`) must NOT trigger the animation, but search jumps,
+    /// goto-line/definition, and pane switches (which always cross several
+    /// rows or many columns) must.
+    fn maybe_start_cursor_jump_animation(
+        &mut self,
+        current_pos: Option<(u16, u16)>,
+        active_split: crate::model::event::LeafId,
+    ) {
+        // Honour the global animations toggle. Tests default to
+        // `animations = false` so single-tick `render()` calls observe the
+        // settled buffer instead of a mid-flight trail; users can also
+        // disable animations entirely from config. The dedicated
+        // `cursor_jump_animation` toggle suppresses just the cursor-jump
+        // trail while leaving ambient animations (tab slides, dashboard,
+        // plugin effects) running.
+        if !self.config.editor.animations || !self.config.editor.cursor_jump_animation {
+            self.previous_cursor_screen_pos = current_pos.map(|p| (p, active_split));
+            return;
+        }
+
+        let Some(current) = current_pos else {
+            // Cursor is hidden this frame (e.g. prompt has focus). Reset the
+            // tracker so the re-emerging cursor doesn't animate from a stale
+            // spot when focus returns to a buffer.
+            self.previous_cursor_screen_pos = None;
+            return;
+        };
+
+        let prev_entry = self.previous_cursor_screen_pos;
+        // Update tracking unconditionally for the next frame.
+        self.previous_cursor_screen_pos = Some((current, active_split));
+
+        let Some((prev, prev_split)) = prev_entry else {
+            return;
+        };
+        if prev == current && prev_split == active_split {
+            return;
+        }
+
+        let dx = (current.0 as i32 - prev.0 as i32).abs();
+        let dy = (current.1 as i32 - prev.1 as i32).abs();
+        // Animate when the cursor crossed split panes, or when it made a
+        // non-incremental move within the same pane: more than two rows
+        // vertically, or — for moves that stay within ±2 rows — at
+        // least 80 columns horizontally. The horizontal threshold is
+        // generous because typing, arrow keys, word-jump, and Home/End
+        // on long source lines can all exceed a smaller bound without
+        // being a genuine "jump".
+        let crossed_panes = prev_split != active_split;
+        let row_jump = dy > 2;
+        let col_jump = dx >= 80;
+        if !crossed_panes && !row_jump && !col_jump {
+            return;
+        }
+
+        // Cancel any prior cursor-jump animation so trails don't stack.
+        if let Some(prev_anim) = self.cursor_jump_animation.take() {
+            self.animations.cancel(prev_anim);
+        }
+
+        let id = self.animations.start(
+            // The bounding box is for runner bookkeeping only — CursorJump
+            // paints at absolute screen coords and ignores `area`.
+            ratatui::layout::Rect {
+                x: prev.0.min(current.0),
+                y: prev.1.min(current.1),
+                width: dx as u16 + 1,
+                height: dy as u16 + 1,
+            },
+            crate::view::animation::AnimationKind::CursorJump {
+                from: prev,
+                to: current,
+                duration: std::time::Duration::from_millis(140),
+                cursor_color: self.theme.cursor,
+                bg_color: self.theme.editor_bg,
+            },
+        );
+        self.cursor_jump_animation = Some(id);
+    }
+
+    /// Returns true if `(x, y)` falls inside any popup-style overlay that
+    /// was rendered this frame. Used to decide whether the hardware cursor
+    /// should be shown or hidden so it does not bleed through a popup.
+    fn cursor_obscured_by_overlay(&self, x: u16, y: u16) -> bool {
+        let inside = |rect: ratatui::layout::Rect| -> bool {
+            x >= rect.x
+                && x < rect.x.saturating_add(rect.width)
+                && y >= rect.y
+                && y < rect.y.saturating_add(rect.height)
+        };
+
+        if self
+            .cached_layout
+            .popup_areas
+            .iter()
+            .any(|entry| inside(entry.1))
+        {
+            return true;
+        }
+        if self
+            .cached_layout
+            .global_popup_areas
+            .iter()
+            .any(|entry| inside(entry.1))
+        {
+            return true;
+        }
+        if let Some((rect, _, _, _)) = self.cached_layout.suggestions_area {
+            if inside(rect) {
+                return true;
+            }
+        }
+        if let Some(ref fb) = self.file_browser_layout {
+            if inside(fb.popup_area) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Render the Quick Open hints line showing available mode prefixes
@@ -1069,11 +1537,19 @@ impl Editor {
     ) {
         let Some(prompt) = &self.prompt else { return };
 
+        // Overlay prompts (Live Grep, issue #1796) get a dedicated
+        // centred floating frame instead of the bottom-anchored popup.
+        if prompt.overlay {
+            let frame_area = frame.area();
+            self.render_overlay_prompt(frame, frame_area);
+            return;
+        }
+
         if matches!(
             prompt.prompt_type,
             PromptType::OpenFile | PromptType::SwitchProject | PromptType::SaveFileAs
         ) {
-            let Some(file_open_state) = &self.file_open_state else {
+            let Some(file_open_state) = &mut self.file_open_state else {
                 return;
             };
             let max_height = prompt_area.y.saturating_sub(1).min(20);
@@ -1083,13 +1559,14 @@ impl Editor {
                 width,
                 height: max_height,
             };
+            let keybindings = self.keybindings.read().unwrap();
             self.file_browser_layout = crate::view::ui::FileBrowserRenderer::render(
                 frame,
                 popup_area,
                 file_open_state,
                 &self.theme,
                 &self.mouse_state.hover_target,
-                Some(&self.keybindings),
+                Some(&*keybindings),
             );
             return;
         }
@@ -1112,6 +1589,13 @@ impl Editor {
 
         frame.render_widget(ratatui::widgets::Clear, suggestions_area);
 
+        // Adjust the prompt's scroll position to keep the selected item
+        // visible, scrolling the minimum amount required.
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.ensure_selected_visible();
+        }
+        let Some(prompt) = &self.prompt else { return };
+
         self.cached_layout.suggestions_area = SuggestionsRenderer::render_with_hover(
             frame,
             suggestions_area,
@@ -1119,6 +1603,9 @@ impl Editor {
             &self.theme,
             self.mouse_state.hover_target.as_ref(),
         );
+        if self.cached_layout.suggestions_area.is_some() {
+            self.cached_layout.suggestions_outer_area = Some(suggestions_area);
+        }
 
         if is_quick_open {
             let hints_area = ratatui::layout::Rect {
@@ -1129,6 +1616,596 @@ impl Editor {
             };
             frame.render_widget(ratatui::widgets::Clear, hints_area);
             Self::render_quick_open_hints(frame, hints_area, &self.theme);
+        }
+    }
+
+    /// Resolve the overlay's currently-selected match into a real
+    /// `Buffer` parked in a phantom `LeafId`, so the preview pane can
+    /// reuse the regular per-leaf renderer (with syntax highlighting,
+    /// gutter, scrollbars, folding). No-op when the prompt has no
+    /// selection or its label is not a `path:line[:col]` triple.
+    fn prepare_overlay_preview(&mut self) {
+        use crate::input::quick_open::parse_path_line_col;
+
+        let (path_str, line, col) = {
+            let Some(prompt) = self.prompt.as_ref() else {
+                return;
+            };
+            let Some(idx) = prompt.selected_suggestion else {
+                return;
+            };
+            let Some(s) = prompt.suggestions.get(idx) else {
+                return;
+            };
+            // Suggestions emitted by the Finder library use `value` as
+            // an opaque index; the parseable label lives in `text`.
+            // Resume-replay is the inverse: `value` carries the full
+            // path:line:col triple.
+            let from_text = parse_path_line_col(&s.text);
+            if !from_text.0.is_empty() && from_text.1.is_some() {
+                from_text
+            } else if let Some(v) = s.value.as_deref() {
+                parse_path_line_col(v)
+            } else {
+                from_text
+            }
+        };
+        if path_str.is_empty() {
+            return;
+        }
+        let line = line.unwrap_or(1).saturating_sub(1);
+        let col = col.unwrap_or(1).saturating_sub(1);
+
+        // Resolve relative to the working directory.
+        let path_buf = std::path::PathBuf::from(&path_str);
+        let abs_path = if path_buf.is_absolute() {
+            path_buf
+        } else {
+            self.working_dir.join(&path_buf)
+        };
+        // Canonicalize for buffer-dedup parity with open_file_no_focus.
+        let abs_path = self
+            .authority
+            .filesystem
+            .canonicalize(&abs_path)
+            .unwrap_or(abs_path);
+
+        // If the standalone state already targets this path, just
+        // re-seed the cursor and skip the file-load roundtrip.
+        let already_target = self.overlay_preview_state.as_ref().is_some_and(|st| {
+            self.buffers
+                .get(&st.buffer_id)
+                .and_then(|s| s.buffer.file_path())
+                .is_some_and(|p| p == abs_path.as_path())
+        });
+
+        let buffer_id = if already_target {
+            self.overlay_preview_state.as_ref().unwrap().buffer_id
+        } else {
+            // Snapshot whether this path was already known so we can
+            // tell "I just loaded it for preview" from "the user had
+            // it open" — only the former gets cleaned up on close.
+            let was_open = self
+                .buffers
+                .iter()
+                .any(|(_, s)| s.buffer.file_path() == Some(abs_path.as_path()));
+            // Capture the active split so we can undo the side
+            // effects of `open_file_no_focus` (it adds the buffer to
+            // the active split's tabs and may switch its active
+            // buffer to the loaded file).
+            let source_split = self.split_manager.active_split();
+            // `open_file_for_preview` always allocates a fresh buffer
+            // — never repurposes the "no name" empty buffer the user
+            // is currently looking at — so the background view stays
+            // intact while we cycle through preview results.
+            let buffer_id = match self.open_file_for_preview(abs_path.as_path()) {
+                Ok(id) => id,
+                Err(_e) => return,
+            };
+            if !was_open {
+                if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+                    meta.hidden_from_tabs = true;
+                }
+                // Drop the buffer from every split's `open_buffers`
+                // list so it doesn't surface as a tab anywhere. The
+                // phantom buffer is rendered exclusively via the
+                // overlay's standalone view-state — it doesn't need
+                // to be in `open_buffers`.
+                let leaf_ids: Vec<_> = self.split_view_states.keys().copied().collect();
+                for leaf_id in leaf_ids {
+                    if let Some(view_state) = self.split_view_states.get_mut(&leaf_id) {
+                        view_state.remove_buffer(buffer_id);
+                    }
+                }
+                // open_file_no_focus may have switched the active
+                // buffer of the source split. Restore it.
+                if let Some(source_state) = self.split_view_states.get_mut(&source_split) {
+                    if source_state.active_buffer == buffer_id {
+                        let preview_loaded: std::collections::HashSet<BufferId> = self
+                            .overlay_preview_state
+                            .as_ref()
+                            .map(|st| st.loaded_buffers.clone())
+                            .unwrap_or_default();
+                        let fallback = source_state
+                            .open_buffers
+                            .iter()
+                            .find_map(|t| t.as_buffer())
+                            .or_else(|| {
+                                self.buffers
+                                    .keys()
+                                    .copied()
+                                    .find(|b| *b != buffer_id && !preview_loaded.contains(b))
+                            });
+                        if let Some(fb) = fallback {
+                            source_state.switch_buffer(fb);
+                            self.split_manager.set_split_buffer(source_split, fb);
+                        }
+                    }
+                }
+                self.split_manager.set_active_split(source_split);
+            }
+            buffer_id
+        };
+
+        // Build (or update) the standalone preview state. Held off
+        // `split_view_states` so cross-cutting iteration never touches
+        // it.
+        let need_init = self.overlay_preview_state.is_none();
+        if need_init {
+            let mut view_state = crate::view::split::SplitViewState::with_buffer(
+                self.terminal_width,
+                self.terminal_height,
+                buffer_id,
+            );
+            view_state.apply_config_defaults(
+                self.config.editor.line_numbers,
+                self.config.editor.highlight_current_line,
+                self.resolve_line_wrap_for_buffer(buffer_id),
+                self.config.editor.wrap_indent,
+                self.resolve_wrap_column_for_buffer(buffer_id),
+                self.config.editor.rulers.clone(),
+            );
+            let mut loaded_buffers = std::collections::HashSet::new();
+            // Whether this *first* preview buffer was newly loaded.
+            // The pre-existing case skips the `was_open` branch so
+            // we re-derive it from buffer_metadata: a buffer with
+            // hidden_from_tabs=true that we just touched is one we
+            // owned. Simpler: track via the existing-target check:
+            // if `already_target` was false above, the buffer was
+            // either pre-open (we left meta alone) or freshly
+            // loaded (we set hidden_from_tabs=true). Re-check.
+            if let Some(meta) = self.buffer_metadata.get(&buffer_id) {
+                if meta.hidden_from_tabs {
+                    loaded_buffers.insert(buffer_id);
+                }
+            }
+            self.overlay_preview_state = Some(crate::app::types::OverlayPreviewState {
+                buffer_id,
+                view_state,
+                loaded_buffers,
+            });
+        } else if let Some(state) = self.overlay_preview_state.as_mut() {
+            if state.buffer_id != buffer_id {
+                state.view_state.switch_buffer(buffer_id);
+                state.buffer_id = buffer_id;
+                if let Some(meta) = self.buffer_metadata.get(&buffer_id) {
+                    if meta.hidden_from_tabs {
+                        state.loaded_buffers.insert(buffer_id);
+                    }
+                }
+            }
+        }
+
+        // Set the cursor to the match position and centre the line.
+        let byte_offset = self
+            .buffers
+            .get(&buffer_id)
+            .map(|s| {
+                s.buffer
+                    .position_to_offset(crate::model::piece_tree::Position { line, column: col })
+            })
+            .unwrap_or(0);
+        let line_start = self
+            .buffers
+            .get(&buffer_id)
+            .and_then(|s| s.buffer.line_start_offset(line))
+            .unwrap_or(byte_offset);
+        if let Some(state) = self.overlay_preview_state.as_mut() {
+            state.view_state.cursors.primary_mut().position = byte_offset;
+            let h = state.view_state.viewport.height.max(1) as usize;
+            let half = h / 2;
+            let target_top_line = line.saturating_sub(half);
+            let top_byte = self
+                .buffers
+                .get(&buffer_id)
+                .and_then(|s| s.buffer.line_start_offset(target_top_line))
+                .unwrap_or(line_start);
+            state.view_state.viewport.top_byte = top_byte;
+        }
+    }
+
+    /// Render the active prompt as a centred floating overlay
+    /// (issue #1796). Layout, top-down inside the overlay frame:
+    ///
+    /// ```text
+    /// ┌─ Live Grep ──────────────────────────────────[Esc to close]┐
+    /// │ Search: split_active|                           12 / 142    │  ← input row
+    /// │ ─────────────────────────────────────────────────────────── │
+    /// │  src/view/split.rs:1117  pub fn split_active(    │ preview │  ← results
+    /// │  src/view/split.rs:1123  self.split_active_pos…  │  pane   │     (+ optional
+    /// │ …                                                │         │      preview)
+    /// └────────────────────────────────────────────────────────────┘
+    /// ```
+    ///
+    /// The overlay does *not* mutate the split tree; it is a pure
+    /// `ratatui` overdraw, so dismissing leaves the user's underlying
+    /// layout exactly as it was (the issue-#1796 acceptance test).
+    fn render_overlay_prompt(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        use crate::view::popup::PopupPosition;
+        use ratatui::layout::Rect;
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+        // Compute the overlay rect via the same percentage logic the
+        // popup engine uses. 80% × 80% of the terminal, centred.
+        let overlay_pos = PopupPosition::CenteredOverlay {
+            width_pct: 80,
+            height_pct: 80,
+        };
+        let overlay_rect = match overlay_pos {
+            PopupPosition::CenteredOverlay {
+                width_pct,
+                height_pct,
+            } => {
+                let w_pct = width_pct.clamp(1, 100) as u32;
+                let h_pct = height_pct.clamp(1, 100) as u32;
+                let w = ((area.width as u32 * w_pct) / 100) as u16;
+                let h = ((area.height as u32 * h_pct) / 100) as u16;
+                let w = w.max(20).min(area.width);
+                let h = h.max(8).min(area.height);
+                Rect {
+                    x: (area.width.saturating_sub(w)) / 2,
+                    y: (area.height.saturating_sub(h)) / 2,
+                    width: w,
+                    height: h,
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        // Snapshot view-relevant state before any mutable borrows.
+        let theme = self.theme.clone();
+        // The suggestion list inside the overlay can be ~30 rows
+        // tall on a typical terminal. Pass the *actual* visible
+        // count to `ensure_selected_visible_within` so the scroll
+        // offset only advances when the selection genuinely passes
+        // the bottom of the visible window — not when it crosses
+        // the bottom-popup default cap of `MAX_VISIBLE_SUGGESTIONS`
+        // (= 10), which would scroll prematurely.
+        //
+        // Geometry: overlay frame border (2) + input row (1) +
+        // separator (1) + suggestions-popup own border (2) = 6
+        // rows of chrome above the suggestion items themselves.
+        // The popup's inner content height is `overlay.height - 6`.
+        let suggestions_visible_rows = (overlay_rect.height as usize).saturating_sub(6);
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.ensure_selected_visible_within(suggestions_visible_rows);
+        }
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let prompt = prompt.clone();
+
+        // Clear and frame. Plugin-owned prompts can publish their
+        // own title via `editor.setPromptTitle(...)`; falls back to
+        // " Live Grep " plus shortcut hints when unset (so a
+        // Resume-replay prompt and freshly-opened plugin prompt look
+        // similar even though they take different code paths).
+        frame.render_widget(Clear, overlay_rect);
+        let default_title_owned: String = {
+            use crate::input::keybindings::KeyContext;
+            let keybindings = self.keybindings.read().unwrap();
+            let mut hints: Vec<String> = Vec::new();
+            if let Some(k) = keybindings
+                .find_keybinding_for_action("cycle_live_grep_provider", KeyContext::Prompt)
+            {
+                hints.push(format!("{k} cycle"));
+            }
+            if let Some(k) = keybindings
+                .find_keybinding_for_action("live_grep_export_quickfix", KeyContext::Prompt)
+            {
+                hints.push(format!("{k} → Quickfix"));
+            }
+            if let Some(k) =
+                keybindings.find_keybinding_for_action("resume_live_grep", KeyContext::Normal)
+            {
+                hints.push(format!("{k} resume"));
+            }
+            if hints.is_empty() {
+                " Live Grep ".to_string()
+            } else {
+                format!(" Live Grep · {} ", hints.join(" · "))
+            }
+        };
+        let title_owned: String;
+        let title: &str = match prompt.title.as_deref() {
+            Some(t) if !t.is_empty() => {
+                // Pad with single spaces so it sits flush with the
+                // frame's corners regardless of length.
+                title_owned = format!(" {} ", t.trim());
+                &title_owned
+            }
+            _ => &default_title_owned,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.popup_border_fg))
+            .style(Style::default().bg(theme.suggestion_bg))
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.prompt_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(overlay_rect);
+        frame.render_widget(block, overlay_rect);
+
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        // Decide whether to split the inner area into results | preview.
+        // Below ~120 cols, stack results-only (preview hidden — see
+        // design doc §5 "preview pane size when terminal is narrow").
+        let preview_min_cols: u16 = 120;
+        let show_preview = overlay_rect.width >= preview_min_cols;
+        let (results_area, preview_area) = if show_preview {
+            let results_w = inner.width / 2;
+            (
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: results_w,
+                    height: inner.height,
+                },
+                Some(Rect {
+                    x: inner.x + results_w,
+                    y: inner.y,
+                    width: inner.width - results_w,
+                    height: inner.height,
+                }),
+            )
+        } else {
+            (inner, None)
+        };
+
+        // Top row of `results_area` is the prompt input.
+        let input_row = Rect {
+            x: results_area.x,
+            y: results_area.y,
+            width: results_area.width,
+            height: 1,
+        };
+        let input_style = Style::default().fg(theme.prompt_fg).bg(theme.prompt_bg);
+        let count_str = if prompt.suggestions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  {} / {}",
+                prompt.selected_suggestion.map(|i| i + 1).unwrap_or(0),
+                prompt.suggestions.len()
+            )
+        };
+        let visible_input_width =
+            results_area.width.saturating_sub(count_str.len() as u16) as usize;
+        let truncated_input: String = prompt
+            .input
+            .chars()
+            .take(visible_input_width.saturating_sub(prompt.message.len()))
+            .collect();
+        let line = Line::from(vec![
+            Span::styled(prompt.message.clone(), input_style),
+            Span::styled(truncated_input, input_style),
+            Span::styled(
+                count_str,
+                Style::default()
+                    .fg(theme.popup_border_fg)
+                    .bg(theme.suggestion_bg),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(input_style), input_row);
+
+        // Cursor position on the input row.
+        use crate::primitives::display_width::str_width;
+        let cursor_x = (str_width(&prompt.message)
+            + str_width(&prompt.input[..prompt.cursor_pos.min(prompt.input.len())]))
+            as u16;
+        if cursor_x < input_row.width {
+            frame.set_cursor_position((input_row.x + cursor_x, input_row.y));
+        }
+
+        // Separator row.
+        if results_area.height >= 2 {
+            let sep = Rect {
+                x: results_area.x,
+                y: results_area.y + 1,
+                width: results_area.width,
+                height: 1,
+            };
+            let sep_style = Style::default()
+                .fg(theme.popup_border_fg)
+                .bg(theme.suggestion_bg);
+            let sep_text = "─".repeat(results_area.width as usize);
+            frame.render_widget(Paragraph::new(sep_text).style(sep_style), sep);
+        }
+
+        // Suggestions list fills the rest of `results_area`. Carve
+        // off the rightmost 1-column lane for a scrollbar so the
+        // user can see how far through the result set the selection
+        // is — important when the visible area only fits ~30 of
+        // 100+ matches. Only carve when the result set actually
+        // exceeds the visible rows; otherwise the scrollbar is
+        // visual noise.
+        if results_area.height > 2 {
+            let inner_rows = (results_area.height - 2).saturating_sub(2) as usize; // popup own border
+            let needs_scrollbar = prompt.suggestions.len() > inner_rows.max(1);
+            let scrollbar_w: u16 = if needs_scrollbar { 1 } else { 0 };
+            let list_area = Rect {
+                x: results_area.x,
+                y: results_area.y + 2,
+                width: results_area.width.saturating_sub(scrollbar_w),
+                height: results_area.height - 2,
+            };
+            self.cached_layout.suggestions_area = SuggestionsRenderer::render_with_hover(
+                frame,
+                list_area,
+                &prompt,
+                &theme,
+                self.mouse_state.hover_target.as_ref(),
+            );
+            if self.cached_layout.suggestions_area.is_some() {
+                self.cached_layout.suggestions_outer_area = Some(list_area);
+            }
+            // Render the scrollbar in the carved lane. Reuses the
+            // shared `view::ui::scrollbar` widget so thumb sizing
+            // and theme colours match scrollbars elsewhere in the
+            // editor (split rendering, file explorer, …).
+            if needs_scrollbar {
+                use crate::view::ui::scrollbar::{
+                    render_scrollbar, ScrollbarColors, ScrollbarState,
+                };
+                // Scrollbar rect aligns with the suggestions popup's
+                // *inner* area (skipping the popup's own top/bottom
+                // border) so the thumb tracks the visible items
+                // exactly.
+                let scrollbar_rect = Rect {
+                    x: results_area.x + results_area.width - 1,
+                    y: list_area.y + 1,
+                    width: 1,
+                    height: list_area.height.saturating_sub(2),
+                };
+                let state = ScrollbarState::new(
+                    prompt.suggestions.len(),
+                    inner_rows.max(1),
+                    prompt.scroll_offset,
+                );
+                render_scrollbar(
+                    frame,
+                    scrollbar_rect,
+                    &state,
+                    &ScrollbarColors::from_theme(&theme),
+                );
+                // Cache the rect for mouse hit testing in
+                // `mouse_input.rs::handle_click_prompt_scrollbar`.
+                self.cached_layout.suggestions_scrollbar_rect = Some(scrollbar_rect);
+            } else {
+                self.cached_layout.suggestions_scrollbar_rect = None;
+            }
+        } else {
+            self.cached_layout.suggestions_scrollbar_rect = None;
+        }
+
+        // Right-half preview pane: a real Buffer rendered via the
+        // same per-leaf pipeline regular splits use. Buffer + cursor
+        // are already seeded by `prepare_overlay_preview` (called
+        // earlier in the render flow). Borrows are split here so we
+        // can hand out independent `&mut` references to the
+        // renderer's internals without going back through `&mut self`.
+        if let Some(preview_rect) = preview_area {
+            // Frame the preview area first (vertical separator) so
+            // the renderer fills the inner rect.
+            use ratatui::widgets::{Block, Borders, Clear};
+            frame.render_widget(Clear, preview_rect);
+            let block = Block::default()
+                .borders(Borders::LEFT)
+                .border_style(Style::default().fg(theme.popup_border_fg))
+                .style(Style::default().bg(theme.suggestion_bg));
+            let inner = block.inner(preview_rect);
+            frame.render_widget(block, preview_rect);
+
+            if inner.height > 0 && inner.width > 0 {
+                // Snapshot scalar config values up front so the
+                // mutable-borrow split below has minimal scope.
+                // AnsiBackground isn't Clone, so it's taken as a
+                // borrow; Rust permits disjoint-field splitting
+                // between `&self.ansi_background` and the `&mut`
+                // accesses below because they touch distinct fields.
+                let bg_fade = self.background_fade;
+                let estimated_line_length = self.config.editor.estimated_line_length;
+                let highlight_context_bytes = self.config.editor.highlight_context_bytes;
+                let relative_line_numbers = self.config.editor.relative_line_numbers;
+                let use_terminal_bg = self.config.editor.use_terminal_bg;
+                let session_mode = self.session_mode || !self.software_cursor_only;
+                let software_cursor_only = self.software_cursor_only;
+                let diagnostics_inline_text = self.config.editor.diagnostics_inline_text;
+                let show_tilde = false; // preview hides tilde markers
+                let highlight_current_column = self.config.editor.highlight_current_column;
+                let screen_width = frame.area().width;
+
+                let ansi_ref = self.ansi_background.as_ref();
+                let buffers = &mut self.buffers;
+                let event_logs = &mut self.event_logs;
+                let cell_theme_map = &mut self.cached_layout.cell_theme_map;
+                let Some(preview_state) = self.overlay_preview_state.as_mut() else {
+                    return;
+                };
+                preview_state
+                    .view_state
+                    .viewport
+                    .resize(inner.width, inner.height);
+                let buffer_id = preview_state.buffer_id;
+
+                if let Some(state) = buffers.get_mut(&buffer_id) {
+                    // Deref the SplitViewState once to a concrete
+                    // `&mut BufferViewState` so disjoint field
+                    // splits (`viewport` + `folds`) are visible
+                    // to the borrow checker.
+                    let buf_state = preview_state.view_state.active_state_mut();
+                    let cursors = buf_state.cursors.clone();
+                    let view_mode = buf_state.view_mode.clone();
+                    let compose_width = buf_state.compose_width;
+                    let compose_column_guides = buf_state.compose_column_guides.clone();
+                    let view_transform = buf_state.view_transform.clone();
+                    let rulers = buf_state.rulers.clone();
+                    let show_line_numbers = buf_state.show_line_numbers;
+                    let highlight_current_line = buf_state.highlight_current_line;
+                    let viewport_ref = &mut buf_state.viewport;
+                    let folds_ref = &mut buf_state.folds;
+                    let event_log = event_logs.get_mut(&buffer_id);
+                    let _ = crate::view::ui::SplitRenderer::render_phantom_leaf(
+                        frame,
+                        state,
+                        &cursors,
+                        viewport_ref,
+                        folds_ref,
+                        event_log,
+                        inner,
+                        &theme,
+                        ansi_ref,
+                        bg_fade,
+                        view_mode,
+                        compose_width,
+                        compose_column_guides,
+                        view_transform,
+                        estimated_line_length,
+                        highlight_context_bytes,
+                        buffer_id,
+                        relative_line_numbers,
+                        use_terminal_bg,
+                        session_mode,
+                        software_cursor_only,
+                        &rulers,
+                        show_line_numbers,
+                        highlight_current_line,
+                        diagnostics_inline_text,
+                        show_tilde,
+                        highlight_current_column,
+                        cell_theme_map,
+                        screen_width,
+                    );
+                }
+            }
         }
     }
 
@@ -1189,34 +2266,24 @@ impl Editor {
                     }
                 }
             }
-            Some(HoverTarget::ScrollbarTrack(split_id)) => {
-                // Highlight scrollbar track but preserve the thumb
-                for (sid, _buffer_id, _content_rect, scrollbar_rect, thumb_start, thumb_end) in
+            Some(HoverTarget::ScrollbarTrack(split_id, hovered_row)) => {
+                // Highlight only the hovered cell on the scrollbar track
+                for (sid, _buffer_id, _content_rect, scrollbar_rect, _thumb_start, _thumb_end) in
                     &self.cached_layout.split_areas
                 {
                     if sid == split_id {
                         let track_hover_style =
                             Style::default().bg(self.theme.scrollbar_track_hover_fg);
-                        let thumb_style = Style::default().bg(self.theme.scrollbar_thumb_fg);
-                        for row_offset in 0..scrollbar_rect.height {
-                            let is_thumb = (row_offset as usize) >= *thumb_start
-                                && (row_offset as usize) < *thumb_end;
-                            let style = if is_thumb {
-                                thumb_style
-                            } else {
-                                track_hover_style
-                            };
-                            let paragraph = Paragraph::new(Span::styled(" ", style));
-                            frame.render_widget(
-                                paragraph,
-                                ratatui::layout::Rect::new(
-                                    scrollbar_rect.x,
-                                    scrollbar_rect.y + row_offset,
-                                    1,
-                                    1,
-                                ),
-                            );
-                        }
+                        let paragraph = Paragraph::new(Span::styled(" ", track_hover_style));
+                        frame.render_widget(
+                            paragraph,
+                            ratatui::layout::Rect::new(
+                                scrollbar_rect.x,
+                                scrollbar_rect.y + hovered_row,
+                                1,
+                                1,
+                            ),
+                        );
                     }
                 }
             }
@@ -1293,6 +2360,55 @@ impl Editor {
             // Pad the label to fill the menu width
             let label = item.label();
             let content_width = (menu_width as usize).saturating_sub(2); // -2 for borders
+            let padded_label = format!(" {:<width$}", label, width = content_width - 1);
+
+            lines.push(Line::from(vec![Span::styled(padded_label, style)]));
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.menu_border_fg))
+            .style(Style::default().bg(self.theme.menu_dropdown_bg));
+
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, area);
+    }
+
+    /// Render the file explorer context menu
+    fn render_file_explorer_context_menu(
+        &self,
+        frame: &mut Frame,
+        menu: &super::types::FileExplorerContextMenu,
+    ) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+        let items = menu.items();
+        let menu_width = super::types::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
+        let menu_height = menu.height();
+        let (menu_x, menu_y) = menu.clamped_position(frame.area().width, frame.area().height);
+
+        let area = ratatui::layout::Rect::new(menu_x, menu_y, menu_width, menu_height);
+
+        frame.render_widget(Clear, area);
+
+        let mut lines = Vec::new();
+        for (idx, item) in items.iter().enumerate() {
+            let is_highlighted = idx == menu.highlighted;
+
+            let style = if is_highlighted {
+                Style::default()
+                    .fg(self.theme.menu_highlight_fg)
+                    .bg(self.theme.menu_highlight_bg)
+            } else {
+                Style::default()
+                    .fg(self.theme.menu_dropdown_fg)
+                    .bg(self.theme.menu_dropdown_bg)
+            };
+
+            let label = item.label();
+            let content_width = (menu_width as usize).saturating_sub(2);
             let padded_label = format!(" {:<width$}", label, width = content_width - 1);
 
             lines.push(Line::from(vec![Span::styled(padded_label, style)]));
@@ -1446,2883 +2562,6 @@ impl Editor {
         }
     }
 
-    // === Overlay Management (Event-Driven) ===
-
-    /// Add an overlay for decorations (underlines, highlights, etc.)
-    pub fn add_overlay(
-        &mut self,
-        namespace: Option<crate::view::overlay::OverlayNamespace>,
-        range: Range<usize>,
-        face: crate::model::event::OverlayFace,
-        priority: i32,
-        message: Option<String>,
-    ) -> crate::view::overlay::OverlayHandle {
-        let event = Event::AddOverlay {
-            namespace,
-            range,
-            face,
-            priority,
-            message,
-            extend_to_line_end: false,
-            url: None,
-        };
-        self.apply_event_to_active_buffer(&event);
-        // Return the handle of the last added overlay
-        let state = self.active_state();
-        state
-            .overlays
-            .all()
-            .last()
-            .map(|o| o.handle.clone())
-            .unwrap_or_default()
-    }
-
-    /// Remove an overlay by handle
-    pub fn remove_overlay(&mut self, handle: crate::view::overlay::OverlayHandle) {
-        let event = Event::RemoveOverlay { handle };
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    /// Remove all overlays in a range
-    pub fn remove_overlays_in_range(&mut self, range: Range<usize>) {
-        let event = Event::RemoveOverlaysInRange { range };
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    /// Clear all overlays
-    pub fn clear_overlays(&mut self) {
-        let event = Event::ClearOverlays;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    // === Popup Management (Event-Driven) ===
-
-    /// Show a popup window
-    pub fn show_popup(&mut self, popup: crate::model::event::PopupData) {
-        let event = Event::ShowPopup { popup };
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    /// Hide the topmost popup
-    pub fn hide_popup(&mut self) {
-        let event = Event::HidePopup;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-
-        // Complete --wait tracking if this buffer had a popup-based wait
-        let active = self.active_buffer();
-        if let Some((wait_id, true)) = self.wait_tracking.remove(&active) {
-            self.completed_waits.push(wait_id);
-        }
-
-        // Clear hover symbol highlight if present
-        if let Some(handle) = self.hover_symbol_overlay.take() {
-            let remove_overlay_event = crate::model::event::Event::RemoveOverlay { handle };
-            self.apply_event_to_active_buffer(&remove_overlay_event);
-        }
-        self.hover_symbol_range = None;
-    }
-
-    /// Dismiss transient popups if present
-    /// These popups should be dismissed on scroll or other user actions
-    pub(super) fn dismiss_transient_popups(&mut self) {
-        let is_transient_popup = self
-            .active_state()
-            .popups
-            .top()
-            .is_some_and(|p| p.transient);
-
-        if is_transient_popup {
-            self.hide_popup();
-            tracing::trace!("Dismissed transient popup");
-        }
-    }
-
-    /// Scroll any popup content by delta lines
-    /// Positive delta scrolls down, negative scrolls up
-    pub(super) fn scroll_popup(&mut self, delta: i32) {
-        if let Some(popup) = self.active_state_mut().popups.top_mut() {
-            popup.scroll_by(delta);
-            tracing::debug!(
-                "Scrolled popup by {}, new offset: {}",
-                delta,
-                popup.scroll_offset
-            );
-        }
-    }
-
-    /// Called when the editor buffer loses focus (e.g., switching buffers,
-    /// opening prompts/menus, focusing file explorer, etc.)
-    ///
-    /// This is the central handler for focus loss that:
-    /// - Dismisses transient popups (Hover, Signature Help)
-    /// - Clears LSP hover state and pending requests
-    /// - Removes hover symbol highlighting
-    pub(super) fn on_editor_focus_lost(&mut self) {
-        // Dismiss transient popups via EditorState
-        self.active_state_mut().on_focus_lost();
-
-        // Clear hover state
-        self.mouse_state.lsp_hover_state = None;
-        self.mouse_state.lsp_hover_request_sent = false;
-        self.pending_hover_request = None;
-
-        // Clear hover symbol highlight if present
-        if let Some(handle) = self.hover_symbol_overlay.take() {
-            let remove_overlay_event = crate::model::event::Event::RemoveOverlay { handle };
-            self.apply_event_to_active_buffer(&remove_overlay_event);
-        }
-        self.hover_symbol_range = None;
-    }
-
-    /// Clear all popups
-    pub fn clear_popups(&mut self) {
-        let event = Event::ClearPopups;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    // === LSP Confirmation Popup ===
-
-    /// Show the LSP confirmation popup for a language server
-    ///
-    /// This displays a centered popup asking the user to confirm whether
-    /// they want to start the LSP server for the given language.
-    pub fn show_lsp_confirmation_popup(&mut self, language: &str) {
-        use crate::model::event::{
-            PopupContentData, PopupData, PopupKindHint, PopupListItemData, PopupPositionData,
-        };
-
-        // Store the pending confirmation
-        self.pending_lsp_confirmation = Some(language.to_string());
-
-        // Get the server command for display
-        let server_info = if let Some(lsp) = &self.lsp {
-            if let Some(config) = lsp.get_config(language) {
-                if !config.command.is_empty() {
-                    format!("{} ({})", language, config.command)
-                } else {
-                    language.to_string()
-                }
-            } else {
-                language.to_string()
-            }
-        } else {
-            language.to_string()
-        };
-
-        let popup = PopupData {
-            kind: PopupKindHint::List,
-            title: Some(format!("Start LSP Server: {}?", server_info)),
-            description: None,
-            transient: false,
-            content: PopupContentData::List {
-                items: vec![
-                    PopupListItemData {
-                        text: "Allow this time".to_string(),
-                        detail: Some("Start the LSP server for this session".to_string()),
-                        icon: None,
-                        data: Some("allow_once".to_string()),
-                    },
-                    PopupListItemData {
-                        text: "Always allow".to_string(),
-                        detail: Some("Always start this LSP server automatically".to_string()),
-                        icon: None,
-                        data: Some("allow_always".to_string()),
-                    },
-                    PopupListItemData {
-                        text: "Don't start".to_string(),
-                        detail: Some("Cancel LSP server startup".to_string()),
-                        icon: None,
-                        data: Some("deny".to_string()),
-                    },
-                ],
-                selected: 0,
-            },
-            position: PopupPositionData::Centered,
-            width: 50,
-            max_height: 8,
-            bordered: true,
-        };
-
-        self.show_popup(popup);
-    }
-
-    /// Handle the LSP confirmation popup response
-    ///
-    /// This is called when the user confirms their selection in the LSP
-    /// confirmation popup. It processes the response and starts the LSP
-    /// server if approved.
-    ///
-    /// Returns true if a response was handled, false if there was no pending confirmation.
-    pub fn handle_lsp_confirmation_response(&mut self, action: &str) -> bool {
-        let Some(language) = self.pending_lsp_confirmation.take() else {
-            return false;
-        };
-
-        match action {
-            "allow_once" => {
-                // Spawn the LSP server just this once (don't add to always-allowed)
-                if let Some(lsp) = &mut self.lsp {
-                    // Temporarily allow this language for spawning
-                    lsp.allow_language(&language);
-                    // Use force_spawn since user explicitly confirmed
-                    if lsp.force_spawn(&language).is_some() {
-                        tracing::info!("LSP server for {} started (allowed once)", language);
-                        self.set_status_message(
-                            t!("lsp.server_started", language = language).to_string(),
-                        );
-                    } else {
-                        self.set_status_message(
-                            t!("lsp.failed_to_start", language = language).to_string(),
-                        );
-                    }
-                }
-                // Notify LSP about the current file
-                self.notify_lsp_current_file_opened(&language);
-            }
-            "allow_always" => {
-                // Spawn the LSP server and remember the preference
-                if let Some(lsp) = &mut self.lsp {
-                    lsp.allow_language(&language);
-                    // Use force_spawn since user explicitly confirmed
-                    if lsp.force_spawn(&language).is_some() {
-                        tracing::info!("LSP server for {} started (always allowed)", language);
-                        self.set_status_message(
-                            t!("lsp.server_started_auto", language = language).to_string(),
-                        );
-                    } else {
-                        self.set_status_message(
-                            t!("lsp.failed_to_start", language = language).to_string(),
-                        );
-                    }
-                }
-                // Notify LSP about the current file
-                self.notify_lsp_current_file_opened(&language);
-            }
-            _ => {
-                // User declined - don't start the server
-                tracing::info!("LSP server for {} startup declined by user", language);
-                self.set_status_message(
-                    t!("lsp.startup_cancelled", language = language).to_string(),
-                );
-            }
-        }
-
-        true
-    }
-
-    /// Notify LSP about the currently open file
-    ///
-    /// This is called after an LSP server is started to notify it about
-    /// the current file so it can provide features like diagnostics.
-    fn notify_lsp_current_file_opened(&mut self, language: &str) {
-        // Get buffer metadata for the active buffer
-        let metadata = match self.buffer_metadata.get(&self.active_buffer()) {
-            Some(m) => m,
-            None => {
-                tracing::debug!(
-                    "notify_lsp_current_file_opened: no metadata for buffer {:?}",
-                    self.active_buffer()
-                );
-                return;
-            }
-        };
-
-        if !metadata.lsp_enabled {
-            tracing::debug!("notify_lsp_current_file_opened: LSP disabled for this buffer");
-            return;
-        }
-
-        // Get the URI (computed once in with_file)
-        let uri = match metadata.file_uri() {
-            Some(u) => u.clone(),
-            None => {
-                tracing::debug!(
-                    "notify_lsp_current_file_opened: no URI for buffer (not a file or URI creation failed)"
-                );
-                return;
-            }
-        };
-
-        // Get the buffer text and line count before borrowing lsp
-        let active_buffer = self.active_buffer();
-
-        // Use buffer's stored language to verify it matches the LSP server
-        let file_language = match self.buffers.get(&active_buffer).map(|s| s.language.clone()) {
-            Some(l) => l,
-            None => {
-                tracing::debug!("notify_lsp_current_file_opened: no buffer state");
-                return;
-            }
-        };
-
-        // Only notify if the file's language matches the LSP server we just started
-        if file_language != language {
-            tracing::debug!(
-                "notify_lsp_current_file_opened: file language {} doesn't match server {}",
-                file_language,
-                language
-            );
-            return;
-        }
-        let (text, line_count) = if let Some(state) = self.buffers.get(&active_buffer) {
-            let text = match state.buffer.to_string() {
-                Some(t) => t,
-                None => {
-                    tracing::debug!("notify_lsp_current_file_opened: buffer not fully loaded");
-                    return;
-                }
-            };
-            let line_count = state.buffer.line_count().unwrap_or(1000);
-            (text, line_count)
-        } else {
-            tracing::debug!("notify_lsp_current_file_opened: no buffer state");
-            return;
-        };
-
-        // Send didOpen to LSP (use force_spawn since this is called after user confirmation)
-        if let Some(lsp) = &mut self.lsp {
-            if let Some(client) = lsp.force_spawn(language) {
-                tracing::info!("Sending didOpen to newly started LSP for: {}", uri.as_str());
-                if let Err(e) = client.did_open(uri.clone(), text, file_language) {
-                    tracing::warn!("Failed to send didOpen to LSP: {}", e);
-                } else {
-                    tracing::info!("Successfully sent didOpen to LSP after confirmation");
-
-                    // Request pull diagnostics
-                    let previous_result_id = self.diagnostic_result_ids.get(uri.as_str()).cloned();
-                    let request_id = self.next_lsp_request_id;
-                    self.next_lsp_request_id += 1;
-
-                    if let Err(e) =
-                        client.document_diagnostic(request_id, uri.clone(), previous_result_id)
-                    {
-                        tracing::debug!(
-                            "Failed to request pull diagnostics (server may not support): {}",
-                            e
-                        );
-                    }
-
-                    // Request inlay hints if enabled
-                    if self.config.editor.enable_inlay_hints {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_inlay_hints_request = Some(request_id);
-
-                        let last_line = line_count.saturating_sub(1) as u32;
-                        let last_char = 10000u32;
-
-                        if let Err(e) =
-                            client.inlay_hints(request_id, uri.clone(), 0, 0, last_line, last_char)
-                        {
-                            tracing::debug!(
-                                "Failed to request inlay hints (server may not support): {}",
-                                e
-                            );
-                            self.pending_inlay_hints_request = None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check if there's a pending LSP confirmation
-    pub fn has_pending_lsp_confirmation(&self) -> bool {
-        self.pending_lsp_confirmation.is_some()
-    }
-
-    /// Navigate popup selection (next item)
-    pub fn popup_select_next(&mut self) {
-        let event = Event::PopupSelectNext;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    /// Navigate popup selection (previous item)
-    pub fn popup_select_prev(&mut self) {
-        let event = Event::PopupSelectPrev;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    /// Navigate popup (page down)
-    pub fn popup_page_down(&mut self) {
-        let event = Event::PopupPageDown;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    /// Navigate popup (page up)
-    pub fn popup_page_up(&mut self) {
-        let event = Event::PopupPageUp;
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-    }
-
-    // === LSP Diagnostics Display ===
-    // NOTE: Diagnostics are now applied automatically via process_async_messages()
-    // when received from the LSP server asynchronously. No manual polling needed!
-
-    /// Collect all LSP text document changes from an event (recursively for batches)
-    pub(super) fn collect_lsp_changes(&self, event: &Event) -> Vec<TextDocumentContentChangeEvent> {
-        match event {
-            Event::Insert { position, text, .. } => {
-                tracing::trace!(
-                    "collect_lsp_changes: processing Insert at position {}",
-                    position
-                );
-                // For insert: create a zero-width range at the insertion point
-                let (line, character) = self
-                    .active_state()
-                    .buffer
-                    .position_to_lsp_position(*position);
-                let lsp_pos = Position::new(line as u32, character as u32);
-                let lsp_range = LspRange::new(lsp_pos, lsp_pos);
-                vec![TextDocumentContentChangeEvent {
-                    range: Some(lsp_range),
-                    range_length: None,
-                    text: text.clone(),
-                }]
-            }
-            Event::Delete { range, .. } => {
-                tracing::trace!("collect_lsp_changes: processing Delete range {:?}", range);
-                // For delete: create a range from start to end, send empty string
-                let (start_line, start_char) = self
-                    .active_state()
-                    .buffer
-                    .position_to_lsp_position(range.start);
-                let (end_line, end_char) = self
-                    .active_state()
-                    .buffer
-                    .position_to_lsp_position(range.end);
-                let lsp_range = LspRange::new(
-                    Position::new(start_line as u32, start_char as u32),
-                    Position::new(end_line as u32, end_char as u32),
-                );
-                vec![TextDocumentContentChangeEvent {
-                    range: Some(lsp_range),
-                    range_length: None,
-                    text: String::new(),
-                }]
-            }
-            Event::Batch { events, .. } => {
-                // Collect all changes from sub-events into a single vector
-                // This allows sending all changes in one didChange notification
-                tracing::trace!(
-                    "collect_lsp_changes: processing Batch with {} events",
-                    events.len()
-                );
-                let mut all_changes = Vec::new();
-                for sub_event in events {
-                    all_changes.extend(self.collect_lsp_changes(sub_event));
-                }
-                all_changes
-            }
-            _ => Vec::new(), // Ignore cursor movements and other events
-        }
-    }
-
-    /// Calculate line information for an event (before buffer modification)
-    /// This provides accurate line numbers for plugin hooks to track changes.
-    ///
-    /// ## Design Alternatives for Line Tracking
-    ///
-    /// **Approach 1: Re-diff on every edit (VSCode style)**
-    /// - Store original file content, re-run diff algorithm after each edit
-    /// - Simpler conceptually, but O(n) per edit for diff computation
-    /// - Better for complex scenarios (multi-cursor, large batch edits)
-    ///
-    /// **Approach 2: Track line shifts (our approach)**
-    /// - Calculate line info BEFORE applying edit (like LSP does)
-    /// - Pass `lines_added`/`lines_removed` to plugins via hooks
-    /// - Plugins shift their stored line numbers accordingly
-    /// - O(1) per edit, but requires careful bookkeeping
-    ///
-    /// We use Approach 2 because:
-    /// - Matches existing LSP infrastructure (`collect_lsp_changes`)
-    /// - More efficient for typical editing patterns
-    /// - Plugins can choose to re-diff if they need more accuracy
-    ///
-    pub(super) fn calculate_event_line_info(&self, event: &Event) -> super::types::EventLineInfo {
-        match event {
-            Event::Insert { position, text, .. } => {
-                // Get line number at insert position (from original buffer)
-                let start_line = self.active_state().buffer.get_line_number(*position);
-
-                // Count newlines in inserted text to determine lines added
-                let lines_added = text.matches('\n').count();
-                let end_line = start_line + lines_added;
-
-                super::types::EventLineInfo {
-                    start_line,
-                    end_line,
-                    line_delta: lines_added as i32,
-                }
-            }
-            Event::Delete {
-                range,
-                deleted_text,
-                ..
-            } => {
-                // Get line numbers for the deleted range (from original buffer)
-                let start_line = self.active_state().buffer.get_line_number(range.start);
-                let end_line = self.active_state().buffer.get_line_number(range.end);
-
-                // Count newlines in deleted text to determine lines removed
-                let lines_removed = deleted_text.matches('\n').count();
-
-                super::types::EventLineInfo {
-                    start_line,
-                    end_line,
-                    line_delta: -(lines_removed as i32),
-                }
-            }
-            Event::Batch { events, .. } => {
-                // For batches, compute cumulative line info
-                // This is a simplification - we report the range covering all changes
-                let mut min_line = usize::MAX;
-                let mut max_line = 0usize;
-                let mut total_delta = 0i32;
-
-                for sub_event in events {
-                    let info = self.calculate_event_line_info(sub_event);
-                    min_line = min_line.min(info.start_line);
-                    max_line = max_line.max(info.end_line);
-                    total_delta += info.line_delta;
-                }
-
-                if min_line == usize::MAX {
-                    min_line = 0;
-                }
-
-                super::types::EventLineInfo {
-                    start_line: min_line,
-                    end_line: max_line,
-                    line_delta: total_delta,
-                }
-            }
-            _ => super::types::EventLineInfo::default(),
-        }
-    }
-
-    /// Notify LSP of a file save
-    pub(super) fn notify_lsp_save(&mut self) {
-        let buffer_id = self.active_buffer();
-        self.notify_lsp_save_buffer(buffer_id);
-    }
-
-    /// Notify LSP of a file save for a specific buffer
-    pub(super) fn notify_lsp_save_buffer(&mut self, buffer_id: BufferId) {
-        // Check if LSP is enabled for this buffer
-        let metadata = match self.buffer_metadata.get(&buffer_id) {
-            Some(m) => m,
-            None => {
-                tracing::debug!(
-                    "notify_lsp_save_buffer: no metadata for buffer {:?}",
-                    buffer_id
-                );
-                return;
-            }
-        };
-
-        if !metadata.lsp_enabled {
-            tracing::debug!(
-                "notify_lsp_save_buffer: LSP disabled for buffer {:?}",
-                buffer_id
-            );
-            return;
-        }
-
-        // Get the URI
-        let uri = match metadata.file_uri() {
-            Some(u) => u.clone(),
-            None => {
-                tracing::debug!("notify_lsp_save_buffer: no URI for buffer {:?}", buffer_id);
-                return;
-            }
-        };
-
-        // Get the file path for language detection
-        // Use buffer's stored language
-        let language = match self
-            .buffers
-            .get(&self.active_buffer())
-            .map(|s| s.language.clone())
-        {
-            Some(l) => l,
-            None => {
-                tracing::debug!("notify_lsp_save: no buffer state");
-                return;
-            }
-        };
-
-        // Get the full text to send with didSave
-        let full_text = match self.active_state().buffer.to_string() {
-            Some(t) => t,
-            None => {
-                tracing::debug!("notify_lsp_save: buffer not fully loaded");
-                return;
-            }
-        };
-        tracing::debug!(
-            "notify_lsp_save: sending didSave to {} (text length: {} bytes)",
-            uri.as_str(),
-            full_text.len()
-        );
-
-        // Only send didSave if LSP is already running (respect auto_start setting)
-        if let Some(lsp) = &mut self.lsp {
-            use crate::services::lsp::manager::LspSpawnResult;
-            if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
-                tracing::debug!(
-                    "notify_lsp_save: LSP not running for {} (auto_start disabled)",
-                    language
-                );
-                return;
-            }
-            if let Some(client) = lsp.get_handle_mut(&language) {
-                // Send didSave with the full text content
-                if let Err(e) = client.did_save(uri, Some(full_text)) {
-                    tracing::warn!("Failed to send didSave to LSP: {}", e);
-                } else {
-                    tracing::info!("Successfully sent didSave to LSP");
-                }
-            } else {
-                tracing::warn!("notify_lsp_save: failed to get LSP client for {}", language);
-            }
-        } else {
-            tracing::debug!("notify_lsp_save: no LSP manager available");
-        }
-    }
-
-    /// Convert an action into a list of events to apply to the active buffer
-    /// Returns None for actions that don't generate events (like Quit)
-    pub fn action_to_events(&mut self, action: Action) -> Option<Vec<Event>> {
-        let auto_indent = self.config.editor.auto_indent;
-        let estimated_line_length = self.config.editor.estimated_line_length;
-
-        // Get viewport height from SplitViewState (the authoritative source)
-        let active_split = self.split_manager.active_split();
-        let viewport_height = self
-            .split_view_states
-            .get(&active_split)
-            .map(|vs| vs.viewport.height)
-            .unwrap_or(24);
-
-        // Always try visual line movement first — it uses the cached layout to
-        // move through soft-wrapped rows.  Returns None when the layout can't
-        // resolve the movement, falling through to logical movement below.
-        if let Some(events) =
-            self.handle_visual_line_movement(&action, active_split, estimated_line_length)
-        {
-            return Some(events);
-        }
-
-        let buffer_id = self.active_buffer();
-        let state = self.buffers.get_mut(&buffer_id).unwrap();
-
-        // Use per-buffer settings which respect language overrides and user changes
-        let tab_size = state.buffer_settings.tab_size;
-        let auto_close = state.buffer_settings.auto_close;
-        let auto_surround = state.buffer_settings.auto_surround;
-
-        let cursors = &mut self
-            .split_view_states
-            .get_mut(&active_split)
-            .unwrap()
-            .cursors;
-        convert_action_to_events(
-            state,
-            cursors,
-            action,
-            tab_size,
-            auto_indent,
-            auto_close,
-            auto_surround,
-            estimated_line_length,
-            viewport_height,
-        )
-    }
-
-    /// Handle visual line movement actions using the cached layout
-    /// Returns Some(events) if the action was handled, None if it should fall through
-    fn handle_visual_line_movement(
-        &mut self,
-        action: &Action,
-        split_id: LeafId,
-        _estimated_line_length: usize,
-    ) -> Option<Vec<Event>> {
-        // Classify the action
-        enum VisualAction {
-            UpDown { direction: i8, is_select: bool },
-            LineEnd { is_select: bool },
-            LineStart { is_select: bool },
-        }
-
-        // Note: We don't intercept BlockSelectUp/Down because block selection has
-        // special semantics (setting block_anchor) that require the default handler
-        let visual_action = match action {
-            Action::MoveUp => VisualAction::UpDown {
-                direction: -1,
-                is_select: false,
-            },
-            Action::MoveDown => VisualAction::UpDown {
-                direction: 1,
-                is_select: false,
-            },
-            Action::SelectUp => VisualAction::UpDown {
-                direction: -1,
-                is_select: true,
-            },
-            Action::SelectDown => VisualAction::UpDown {
-                direction: 1,
-                is_select: true,
-            },
-            // When line wrapping is off, Home/End should move to the physical line
-            // start/end, not the visual (horizontally-scrolled) row boundary.
-            // Fall through to the standard handler which uses line_iterator.
-            Action::MoveLineEnd if self.config.editor.line_wrap => {
-                VisualAction::LineEnd { is_select: false }
-            }
-            Action::SelectLineEnd if self.config.editor.line_wrap => {
-                VisualAction::LineEnd { is_select: true }
-            }
-            Action::MoveLineStart if self.config.editor.line_wrap => {
-                VisualAction::LineStart { is_select: false }
-            }
-            Action::SelectLineStart if self.config.editor.line_wrap => {
-                VisualAction::LineStart { is_select: true }
-            }
-            _ => return None, // Not a visual line action
-        };
-
-        // First, collect cursor data we need (to avoid borrow conflicts)
-        let cursor_data: Vec<_> = {
-            let active_split = self.split_manager.active_split();
-            let active_buffer = self.split_manager.active_buffer_id().unwrap();
-            let cursors = &self.split_view_states.get(&active_split).unwrap().cursors;
-            let state = self.buffers.get(&active_buffer).unwrap();
-            cursors
-                .iter()
-                .map(|(cursor_id, cursor)| {
-                    // Check if cursor is at a physical line boundary:
-                    // - at_line_ending: byte at cursor position is a newline or at buffer end
-                    // - at_line_start: cursor is at position 0 or preceded by a newline
-                    let at_line_ending = if cursor.position < state.buffer.len() {
-                        let bytes = state
-                            .buffer
-                            .slice_bytes(cursor.position..cursor.position + 1);
-                        bytes.first() == Some(&b'\n') || bytes.first() == Some(&b'\r')
-                    } else {
-                        true // end of buffer is a boundary
-                    };
-                    let at_line_start = if cursor.position == 0 {
-                        true
-                    } else {
-                        let prev = state
-                            .buffer
-                            .slice_bytes(cursor.position - 1..cursor.position);
-                        prev.first() == Some(&b'\n')
-                    };
-                    (
-                        cursor_id,
-                        cursor.position,
-                        cursor.anchor,
-                        cursor.sticky_column,
-                        cursor.deselect_on_move,
-                        at_line_ending,
-                        at_line_start,
-                    )
-                })
-                .collect()
-        };
-
-        let mut events = Vec::new();
-
-        for (
-            cursor_id,
-            position,
-            anchor,
-            sticky_column,
-            deselect_on_move,
-            at_line_ending,
-            at_line_start,
-        ) in cursor_data
-        {
-            let (new_pos, new_sticky) = match &visual_action {
-                VisualAction::UpDown { direction, .. } => {
-                    // Calculate current visual column from cached layout
-                    let current_visual_col = self
-                        .cached_layout
-                        .byte_to_visual_column(split_id, position)?;
-
-                    let goal_visual_col = if sticky_column > 0 {
-                        sticky_column
-                    } else {
-                        current_visual_col
-                    };
-
-                    match self.cached_layout.move_visual_line(
-                        split_id,
-                        position,
-                        goal_visual_col,
-                        *direction,
-                    ) {
-                        Some(result) => result,
-                        None => continue, // At boundary, skip this cursor
-                    }
-                }
-                VisualAction::LineEnd { .. } => {
-                    // Allow advancing to next visual segment only if not at a physical line ending
-                    let allow_advance = !at_line_ending;
-                    match self
-                        .cached_layout
-                        .visual_line_end(split_id, position, allow_advance)
-                    {
-                        Some(end_pos) => (end_pos, 0),
-                        None => return None,
-                    }
-                }
-                VisualAction::LineStart { .. } => {
-                    // Allow advancing to previous visual segment only if not at a physical line start
-                    let allow_advance = !at_line_start;
-                    match self
-                        .cached_layout
-                        .visual_line_start(split_id, position, allow_advance)
-                    {
-                        Some(start_pos) => (start_pos, 0),
-                        None => return None,
-                    }
-                }
-            };
-
-            let is_select = match &visual_action {
-                VisualAction::UpDown { is_select, .. } => *is_select,
-                VisualAction::LineEnd { is_select } => *is_select,
-                VisualAction::LineStart { is_select } => *is_select,
-            };
-
-            let new_anchor = if is_select {
-                Some(anchor.unwrap_or(position))
-            } else if deselect_on_move {
-                None
-            } else {
-                anchor
-            };
-
-            events.push(Event::MoveCursor {
-                cursor_id,
-                old_position: position,
-                new_position: new_pos,
-                old_anchor: anchor,
-                new_anchor,
-                old_sticky_column: sticky_column,
-                new_sticky_column: new_sticky,
-            });
-        }
-
-        if events.is_empty() {
-            None // Let the default handler deal with it
-        } else {
-            Some(events)
-        }
-    }
-
-    // === Search and Replace Methods ===
-
-    /// Clear all search highlights from the active buffer and reset search state
-    pub(super) fn clear_search_highlights(&mut self) {
-        self.clear_search_overlays();
-        // Also clear search state
-        self.search_state = None;
-    }
-
-    /// Clear only the visual search overlays, preserving search state for F3/Shift+F3
-    /// This is used when the buffer is modified - highlights become stale but F3 should still work
-    pub(super) fn clear_search_overlays(&mut self) {
-        let ns = self.search_namespace.clone();
-        let state = self.active_state_mut();
-        state.overlays.clear_namespace(&ns, &mut state.marker_list);
-    }
-
-    /// Update search highlights in visible viewport only (for incremental search)
-    /// This is called as the user types in the search prompt for real-time feedback
-    pub(super) fn update_search_highlights(&mut self, query: &str) {
-        // If query is empty, clear highlights and return
-        if query.is_empty() {
-            self.clear_search_highlights();
-            return;
-        }
-
-        // Get theme colors and search settings before borrowing state
-        let search_bg = self.theme.search_match_bg;
-        let search_fg = self.theme.search_match_fg;
-        let case_sensitive = self.search_case_sensitive;
-        let whole_word = self.search_whole_word;
-        let use_regex = self.search_use_regex;
-        let ns = self.search_namespace.clone();
-
-        // Build regex pattern if regex mode is enabled, or escape for literal search
-        let regex_pattern = if use_regex {
-            if whole_word {
-                format!(r"\b{}\b", query)
-            } else {
-                query.to_string()
-            }
-        } else {
-            let escaped = regex::escape(query);
-            if whole_word {
-                format!(r"\b{}\b", escaped)
-            } else {
-                escaped
-            }
-        };
-
-        // Build regex with case sensitivity
-        let regex = regex::RegexBuilder::new(&regex_pattern)
-            .case_insensitive(!case_sensitive)
-            .build();
-
-        let regex = match regex {
-            Ok(r) => r,
-            Err(_) => {
-                // Invalid regex, clear highlights and return
-                self.clear_search_highlights();
-                return;
-            }
-        };
-
-        // Get viewport from active split's SplitViewState
-        let active_split = self.split_manager.active_split();
-        let (top_byte, visible_height) = self
-            .split_view_states
-            .get(&active_split)
-            .map(|vs| (vs.viewport.top_byte, vs.viewport.height.saturating_sub(2)))
-            .unwrap_or((0, 20));
-
-        let state = self.active_state_mut();
-
-        // Clear any existing search highlights
-        state.overlays.clear_namespace(&ns, &mut state.marker_list);
-
-        // Get the visible content by iterating through visible lines
-        let visible_start = top_byte;
-        let mut visible_end = top_byte;
-
-        {
-            let mut line_iter = state.buffer.line_iterator(top_byte, 80);
-            for _ in 0..visible_height {
-                if let Some((line_start, line_content)) = line_iter.next_line() {
-                    visible_end = line_start + line_content.len();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Ensure we don't go past buffer end
-        visible_end = visible_end.min(state.buffer.len());
-
-        // Get the visible text
-        let visible_text = state.get_text_range(visible_start, visible_end);
-
-        // Find all matches using regex
-        for mat in regex.find_iter(&visible_text) {
-            let absolute_pos = visible_start + mat.start();
-            let match_len = mat.end() - mat.start();
-
-            // Add overlay for this match
-            let search_style = ratatui::style::Style::default().fg(search_fg).bg(search_bg);
-            let overlay = crate::view::overlay::Overlay::with_namespace(
-                &mut state.marker_list,
-                absolute_pos..(absolute_pos + match_len),
-                crate::view::overlay::OverlayFace::Style {
-                    style: search_style,
-                },
-                ns.clone(),
-            )
-            .with_priority_value(10); // Priority - above syntax highlighting
-
-            state.overlays.add(overlay);
-        }
-    }
-
-    /// Build a compiled regex from the current search settings and query.
-    fn build_search_regex(&self, query: &str) -> Result<regex::Regex, String> {
-        let regex_pattern = if self.search_use_regex {
-            if self.search_whole_word {
-                format!(r"\b{}\b", query)
-            } else {
-                query.to_string()
-            }
-        } else {
-            let escaped = regex::escape(query);
-            if self.search_whole_word {
-                format!(r"\b{}\b", escaped)
-            } else {
-                escaped
-            }
-        };
-
-        regex::RegexBuilder::new(&regex_pattern)
-            .case_insensitive(!self.search_case_sensitive)
-            .build()
-            .map_err(|e| e.to_string())
-    }
-
-    /// Perform a search and update search state.
-    ///
-    /// For large files (lazy-loaded buffers), this starts an incremental
-    /// chunked search that runs a few pieces per render frame so the UI
-    /// stays responsive.  For normal-sized files the search runs inline.
-    ///
-    /// Matches are capped at `MAX_SEARCH_MATCHES` to bound memory usage,
-    /// and overlays are only created for the visible viewport.
-    pub(super) fn perform_search(&mut self, query: &str) {
-        if query.is_empty() {
-            self.search_state = None;
-            self.set_status_message(t!("search.cancelled").to_string());
-            return;
-        }
-
-        let search_range = self.pending_search_range.take();
-
-        // Build the regex early so we can bail on invalid patterns
-        let regex = match self.build_search_regex(query) {
-            Ok(r) => r,
-            Err(e) => {
-                self.search_state = None;
-                self.set_status_message(t!("error.invalid_regex", error = e).to_string());
-                return;
-            }
-        };
-
-        // For large files, start an incremental (non-blocking) search scan
-        let is_large = self.active_state().buffer.is_large_file();
-        if is_large && search_range.is_none() {
-            self.start_search_scan(query, regex);
-            return;
-        }
-
-        // --- Normal (small-file) path: search inline with match cap ---
-
-        let buffer_content = {
-            let state = self.active_state_mut();
-            let total_bytes = state.buffer.len();
-            match state.buffer.get_text_range_mut(0, total_bytes) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(e) => {
-                    tracing::warn!("Failed to load buffer for search: {}", e);
-                    self.set_status_message(t!("error.buffer_not_loaded").to_string());
-                    return;
-                }
-            }
-        };
-
-        let (search_start, search_end) = if let Some(ref range) = search_range {
-            (range.start, range.end)
-        } else {
-            (0, buffer_content.len())
-        };
-
-        let search_slice = &buffer_content[search_start..search_end];
-
-        // Collect matches with a cap to bound memory
-        let mut match_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut capped = false;
-        for m in regex.find_iter(search_slice) {
-            if match_ranges.len() >= SearchState::MAX_MATCHES {
-                capped = true;
-                break;
-            }
-            match_ranges.push((search_start + m.start(), m.end() - m.start()));
-        }
-
-        if match_ranges.is_empty() {
-            self.search_state = None;
-            let msg = if search_range.is_some() {
-                format!("No matches found for '{}' in selection", query)
-            } else {
-                format!("No matches found for '{}'", query)
-            };
-            self.set_status_message(msg);
-            return;
-        }
-
-        self.finalize_search(query, match_ranges, capped, search_range);
-    }
-
-    /// Common finalization after all matches have been collected (inline or
-    /// from the incremental scan).  Sets `search_state`, moves the cursor to
-    /// the nearest match, creates overlays, and updates the status message.
-    ///
-    /// For small files, overlays are created for ALL matches so that marker-
-    /// based position tracking keeps F3 correct across edits.  For large
-    /// files (`viewport_only == true`), only visible-viewport overlays are
-    /// created to avoid multi-GB overlay allocations.
-    pub(super) fn finalize_search(
-        &mut self,
-        query: &str,
-        match_ranges: Vec<(usize, usize)>,
-        capped: bool,
-        search_range: Option<std::ops::Range<usize>>,
-    ) {
-        let matches: Vec<usize> = match_ranges.iter().map(|(pos, _)| *pos).collect();
-        let match_lengths: Vec<usize> = match_ranges.iter().map(|(_, len)| *len).collect();
-        let is_large = self.active_state().buffer.is_large_file();
-
-        // Find the first match at or after the current cursor position
-        let cursor_pos = self.active_cursors().primary().position;
-        let current_match_index = matches
-            .iter()
-            .position(|&pos| pos >= cursor_pos)
-            .unwrap_or(0);
-
-        // Move cursor to the first match
-        let match_pos = matches[current_match_index];
-        {
-            let active_split = self.split_manager.active_split();
-            let active_buffer = self.active_buffer();
-            if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                view_state.cursors.primary_mut().position = match_pos;
-                view_state.cursors.primary_mut().anchor = None;
-                let state = self.buffers.get_mut(&active_buffer).unwrap();
-                view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-            }
-        }
-
-        let num_matches = matches.len();
-
-        self.search_state = Some(SearchState {
-            query: query.to_string(),
-            matches,
-            match_lengths: match_lengths.clone(),
-            current_match_index: Some(current_match_index),
-            wrap_search: search_range.is_none(),
-            search_range,
-            capped,
-        });
-
-        if is_large {
-            // Large file: viewport-only overlays to avoid O(matches) memory
-            self.refresh_search_overlays();
-        } else {
-            // Small file: overlays for ALL matches so markers auto-track edits
-            let search_bg = self.theme.search_match_bg;
-            let search_fg = self.theme.search_match_fg;
-            let ns = self.search_namespace.clone();
-            let state = self.active_state_mut();
-            state.overlays.clear_namespace(&ns, &mut state.marker_list);
-
-            for (&pos, &len) in match_ranges
-                .iter()
-                .map(|(p, _)| p)
-                .zip(match_lengths.iter())
-            {
-                let search_style = ratatui::style::Style::default().fg(search_fg).bg(search_bg);
-                let overlay = crate::view::overlay::Overlay::with_namespace(
-                    &mut state.marker_list,
-                    pos..(pos + len),
-                    crate::view::overlay::OverlayFace::Style {
-                        style: search_style,
-                    },
-                    ns.clone(),
-                )
-                .with_priority_value(10);
-                state.overlays.add(overlay);
-            }
-        }
-
-        let cap_suffix = if capped { "+" } else { "" };
-        let msg = if self.search_state.as_ref().unwrap().search_range.is_some() {
-            format!(
-                "Found {}{} match{} for '{}' in selection",
-                num_matches,
-                cap_suffix,
-                if num_matches == 1 { "" } else { "es" },
-                query
-            )
-        } else {
-            format!(
-                "Found {}{} match{} for '{}'",
-                num_matches,
-                cap_suffix,
-                if num_matches == 1 { "" } else { "es" },
-                query
-            )
-        };
-        self.set_status_message(msg);
-    }
-
-    /// Create search-highlight overlays only for matches visible in the current
-    /// viewport.  Uses binary search on the sorted `search_state.matches` vec
-    /// so it is O(log N + visible_matches) regardless of total match count.
-    pub(super) fn refresh_search_overlays(&mut self) {
-        let _span = tracing::info_span!("refresh_search_overlays").entered();
-        let search_bg = self.theme.search_match_bg;
-        let search_fg = self.theme.search_match_fg;
-        let ns = self.search_namespace.clone();
-
-        // Determine the visible byte range from the active viewport
-        let active_split = self.split_manager.active_split();
-        let (top_byte, visible_height) = self
-            .split_view_states
-            .get(&active_split)
-            .map(|vs| (vs.viewport.top_byte, vs.viewport.height.saturating_sub(2)))
-            .unwrap_or((0, 20));
-
-        // Remember the viewport we computed overlays for so we can detect
-        // scrolling in check_search_overlay_refresh().
-        self.search_overlay_top_byte = Some(top_byte);
-
-        let state = self.active_state_mut();
-
-        // Clear existing search overlays
-        state.overlays.clear_namespace(&ns, &mut state.marker_list);
-
-        // Walk visible lines to find the visible byte range
-        let visible_start = top_byte;
-        let mut visible_end = top_byte;
-        {
-            let mut line_iter = state.buffer.line_iterator(top_byte, 80);
-            for _ in 0..visible_height {
-                if let Some((line_start, line_content)) = line_iter.next_line() {
-                    visible_end = line_start + line_content.len();
-                } else {
-                    break;
-                }
-            }
-        }
-        visible_end = visible_end.min(state.buffer.len());
-
-        // Collect viewport matches into a local vec to avoid holding an
-        // immutable borrow on self.search_state while we need &mut self for
-        // the buffer state.
-        let _ = state;
-
-        let viewport_matches: Vec<(usize, usize)> = match &self.search_state {
-            Some(ss) => {
-                let start_idx = ss.matches.partition_point(|&pos| pos < visible_start);
-                ss.matches[start_idx..]
-                    .iter()
-                    .zip(ss.match_lengths[start_idx..].iter())
-                    .take_while(|(&pos, _)| pos <= visible_end)
-                    .map(|(&pos, &len)| (pos, len))
-                    .collect()
-            }
-            None => return,
-        };
-
-        let state = self.active_state_mut();
-
-        for (pos, len) in &viewport_matches {
-            let search_style = ratatui::style::Style::default().fg(search_fg).bg(search_bg);
-            let overlay = crate::view::overlay::Overlay::with_namespace(
-                &mut state.marker_list,
-                *pos..(*pos + *len),
-                crate::view::overlay::OverlayFace::Style {
-                    style: search_style,
-                },
-                ns.clone(),
-            )
-            .with_priority_value(10);
-            state.overlays.add(overlay);
-        }
-    }
-
-    /// Check whether the viewport has scrolled since we last created search
-    /// overlays. If so, refresh them. Called from `editor_tick()`.
-    ///
-    /// Only applies to large files where overlays are viewport-scoped.
-    /// Small files already have overlays for ALL matches (created by
-    /// `finalize_search`), so replacing them with viewport-only overlays
-    /// would lose matches outside the visible area.
-    pub(super) fn check_search_overlay_refresh(&mut self) -> bool {
-        if self.search_state.is_none() {
-            return false;
-        }
-        // Only refresh viewport-scoped overlays for large files
-        if !self.active_state().buffer.is_large_file() {
-            return false;
-        }
-        let active_split = self.split_manager.active_split();
-        let current_top = self
-            .split_view_states
-            .get(&active_split)
-            .map(|vs| vs.viewport.top_byte);
-        if current_top != self.search_overlay_top_byte {
-            self.refresh_search_overlays();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Start an incremental search scan for a large file.
-    /// Splits the piece tree into ≤1 MB chunks and sets up the scan state
-    /// that `process_search_scan()` (called from `editor_tick()`) will
-    /// consume a few chunks per frame.
-    fn start_search_scan(&mut self, query: &str, regex: regex::Regex) {
-        let buffer_id = self.active_buffer();
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            let leaves = state.buffer.piece_tree_leaves();
-            // Build a bytes::Regex from the same pattern for the chunked scanner
-            let bytes_regex = regex::bytes::RegexBuilder::new(regex.as_str())
-                .case_insensitive(!self.search_case_sensitive)
-                .build()
-                .expect("regex already validated");
-            let scan = state.buffer.search_scan_init(
-                bytes_regex,
-                super::SearchState::MAX_MATCHES,
-                query.len(),
-            );
-            self.search_scan_state = Some(super::SearchScanState {
-                buffer_id,
-                leaves,
-                scan,
-                query: query.to_string(),
-                search_range: None,
-                case_sensitive: self.search_case_sensitive,
-                whole_word: self.search_whole_word,
-                use_regex: self.search_use_regex,
-            });
-            self.set_status_message(t!("goto.scanning_progress", percent = 0).to_string());
-        }
-    }
-
-    /// Get current match positions from search overlays (which use markers
-    /// that auto-track edits).  Only useful for small files where we create
-    /// overlays for ALL matches.
-    fn get_search_match_positions(&self) -> Vec<usize> {
-        let ns = &self.search_namespace;
-        let state = self.active_state();
-
-        let mut positions: Vec<usize> = state
-            .overlays
-            .all()
-            .iter()
-            .filter(|o| o.namespace.as_ref() == Some(ns))
-            .filter_map(|o| state.marker_list.get_position(o.start_marker))
-            .collect();
-
-        positions.sort_unstable();
-        positions.dedup();
-        positions
-    }
-
-    /// Find the next match.
-    ///
-    /// For small files, overlay markers are used as the source of truth
-    /// (they auto-track buffer edits).  For large files, `search_state.matches`
-    /// is used directly and viewport overlays are refreshed after the cursor
-    /// moves.
-    pub(super) fn find_next(&mut self) {
-        // For small files, try overlay-based positions first (auto-updated)
-        let overlay_positions = self.get_search_match_positions();
-        let is_large = self.active_state().buffer.is_large_file();
-
-        if let Some(ref mut search_state) = self.search_state {
-            // Use overlay positions for small files (they auto-track edits),
-            // otherwise reference search_state.matches directly to avoid cloning.
-            let use_overlays =
-                !is_large && !overlay_positions.is_empty() && search_state.search_range.is_none();
-            let match_positions: &[usize] = if use_overlays {
-                &overlay_positions
-            } else {
-                &search_state.matches
-            };
-
-            if match_positions.is_empty() {
-                return;
-            }
-
-            let current_index = search_state.current_match_index.unwrap_or(0);
-            let next_index = if current_index + 1 < match_positions.len() {
-                current_index + 1
-            } else if search_state.wrap_search {
-                0 // Wrap to beginning
-            } else {
-                self.set_status_message(t!("search.no_matches").to_string());
-                return;
-            };
-
-            search_state.current_match_index = Some(next_index);
-            let match_pos = match_positions[next_index];
-            let matches_len = match_positions.len();
-
-            {
-                let active_split = self.split_manager.active_split();
-                let active_buffer = self.active_buffer();
-                if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                    view_state.cursors.primary_mut().position = match_pos;
-                    view_state.cursors.primary_mut().anchor = None;
-                    let state = self.buffers.get_mut(&active_buffer).unwrap();
-                    view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-                }
-            }
-
-            self.set_status_message(
-                t!(
-                    "search.match_of",
-                    current = next_index + 1,
-                    total = matches_len
-                )
-                .to_string(),
-            );
-
-            if is_large {
-                self.refresh_search_overlays();
-            }
-        } else {
-            let find_key = self
-                .get_keybinding_for_action("find")
-                .unwrap_or_else(|| "Ctrl+F".to_string());
-            self.set_status_message(t!("search.no_active", find_key = find_key).to_string());
-        }
-    }
-
-    /// Find the previous match.
-    ///
-    /// For small files, overlay markers are used as the source of truth
-    /// (they auto-track buffer edits).  For large files, `search_state.matches`
-    /// is used directly and viewport overlays are refreshed.
-    pub(super) fn find_previous(&mut self) {
-        let overlay_positions = self.get_search_match_positions();
-        let is_large = self.active_state().buffer.is_large_file();
-
-        if let Some(ref mut search_state) = self.search_state {
-            let use_overlays =
-                !is_large && !overlay_positions.is_empty() && search_state.search_range.is_none();
-            let match_positions: &[usize] = if use_overlays {
-                &overlay_positions
-            } else {
-                &search_state.matches
-            };
-
-            if match_positions.is_empty() {
-                return;
-            }
-
-            let current_index = search_state.current_match_index.unwrap_or(0);
-            let prev_index = if current_index > 0 {
-                current_index - 1
-            } else if search_state.wrap_search {
-                match_positions.len() - 1 // Wrap to end
-            } else {
-                self.set_status_message(t!("search.no_matches").to_string());
-                return;
-            };
-
-            search_state.current_match_index = Some(prev_index);
-            let match_pos = match_positions[prev_index];
-            let matches_len = match_positions.len();
-
-            {
-                let active_split = self.split_manager.active_split();
-                let active_buffer = self.active_buffer();
-                if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                    view_state.cursors.primary_mut().position = match_pos;
-                    view_state.cursors.primary_mut().anchor = None;
-                    let state = self.buffers.get_mut(&active_buffer).unwrap();
-                    view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-                }
-            }
-
-            self.set_status_message(
-                t!(
-                    "search.match_of",
-                    current = prev_index + 1,
-                    total = matches_len
-                )
-                .to_string(),
-            );
-
-            if is_large {
-                self.refresh_search_overlays();
-            }
-        } else {
-            let find_key = self
-                .get_keybinding_for_action("find")
-                .unwrap_or_else(|| "Ctrl+F".to_string());
-            self.set_status_message(t!("search.no_active", find_key = find_key).to_string());
-        }
-    }
-
-    /// Find the next occurrence of the current selection (or word under cursor).
-    /// This is a "quick find" that doesn't require opening the search panel.
-    /// The search term is stored so subsequent Alt+N/Alt+P/F3 navigation works.
-    ///
-    /// If there's already an active search, this continues with the same search term.
-    /// Otherwise, it starts a new search with the current selection or word under cursor.
-    pub(super) fn find_selection_next(&mut self) {
-        // If there's already a search active AND cursor is at a match position,
-        // just continue to next match. Otherwise, clear and start fresh.
-        if let Some(ref search_state) = self.search_state {
-            let cursor_pos = self.active_cursors().primary().position;
-            if search_state.matches.binary_search(&cursor_pos).is_ok() {
-                self.find_next();
-                return;
-            }
-            // Cursor moved away from a match - clear search state
-        }
-        self.search_state = None;
-
-        // No active search - start a new one with selection or word under cursor
-        let (search_text, selection_start) = self.get_selection_or_word_for_search_with_pos();
-
-        match search_text {
-            Some(text) if !text.is_empty() => {
-                // Record cursor position before search
-                let cursor_before = self.active_cursors().primary().position;
-
-                // Perform the search to set up search state
-                self.perform_search(&text);
-
-                // Check if we need to move to next match
-                if let Some(ref search_state) = self.search_state {
-                    let cursor_after = self.active_cursors().primary().position;
-
-                    // If we started at a match (selection_start matches a search result),
-                    // and perform_search didn't move us (or moved us to the same match),
-                    // then we need to find_next
-                    let started_at_match = selection_start
-                        .map(|start| search_state.matches.binary_search(&start).is_ok())
-                        .unwrap_or(false);
-
-                    let landed_at_start = selection_start
-                        .map(|start| cursor_after == start)
-                        .unwrap_or(false);
-
-                    // Only call find_next if:
-                    // 1. We started at a match AND landed back at it, OR
-                    // 2. We didn't move at all
-                    if ((started_at_match && landed_at_start) || cursor_before == cursor_after)
-                        && search_state.matches.len() > 1
-                    {
-                        self.find_next();
-                    }
-                }
-            }
-            _ => {
-                self.set_status_message(t!("search.no_text").to_string());
-            }
-        }
-    }
-
-    /// Find the previous occurrence of the current selection (or word under cursor).
-    /// This is a "quick find" that doesn't require opening the search panel.
-    ///
-    /// If there's already an active search, this continues with the same search term.
-    /// Otherwise, it starts a new search with the current selection or word under cursor.
-    pub(super) fn find_selection_previous(&mut self) {
-        // If there's already a search active AND cursor is at a match position,
-        // just continue to previous match. Otherwise, clear and start fresh.
-        if let Some(ref search_state) = self.search_state {
-            let cursor_pos = self.active_cursors().primary().position;
-            if search_state.matches.binary_search(&cursor_pos).is_ok() {
-                self.find_previous();
-                return;
-            }
-            // Cursor moved away from a match - clear search state
-        }
-        self.search_state = None;
-
-        // No active search - start a new one with selection or word under cursor
-        let (search_text, selection_start) = self.get_selection_or_word_for_search_with_pos();
-
-        match search_text {
-            Some(text) if !text.is_empty() => {
-                // Record cursor position before search
-                let cursor_before = self.active_cursors().primary().position;
-
-                // Perform the search to set up search state
-                self.perform_search(&text);
-
-                // If we found matches, navigate to previous
-                if let Some(ref search_state) = self.search_state {
-                    let cursor_after = self.active_cursors().primary().position;
-
-                    // Check if we started at a match
-                    let started_at_match = selection_start
-                        .map(|start| search_state.matches.binary_search(&start).is_ok())
-                        .unwrap_or(false);
-
-                    let landed_at_start = selection_start
-                        .map(|start| cursor_after == start)
-                        .unwrap_or(false);
-
-                    // For find previous, we always need to call find_previous at least once.
-                    // If we landed at our starting match, we need to go back once to get previous.
-                    // If we landed at a different match (because cursor was past start of selection),
-                    // we still want to find_previous to get to where we should be.
-                    if started_at_match && landed_at_start {
-                        // We're at the same match we started at, go to previous
-                        self.find_previous();
-                    } else if cursor_before != cursor_after {
-                        // perform_search moved us, now go back to find the actual previous
-                        // from our original position (which is before where we landed)
-                        self.find_previous();
-                    } else {
-                        // Cursor didn't move, just find previous
-                        self.find_previous();
-                    }
-                }
-            }
-            _ => {
-                self.set_status_message(t!("search.no_text").to_string());
-            }
-        }
-    }
-
-    /// Get the text to search for from selection or word under cursor,
-    /// along with the start position of that text (for determining if we're at a match).
-    fn get_selection_or_word_for_search_with_pos(&mut self) -> (Option<String>, Option<usize>) {
-        use crate::primitives::word_navigation::{find_word_end, find_word_start};
-
-        // First get selection range and cursor position with immutable borrow
-        let (selection_range, cursor_pos) = {
-            let primary = self.active_cursors().primary();
-            (primary.selection_range(), primary.position)
-        };
-
-        // Check if there's a selection
-        if let Some(range) = selection_range {
-            let state = self.active_state_mut();
-            let text = state.get_text_range(range.start, range.end);
-            if !text.is_empty() {
-                return (Some(text), Some(range.start));
-            }
-        }
-
-        // No selection - try to get word under cursor
-        let (word_start, word_end) = {
-            let state = self.active_state();
-            let word_start = find_word_start(&state.buffer, cursor_pos);
-            let word_end = find_word_end(&state.buffer, cursor_pos);
-            (word_start, word_end)
-        };
-
-        if word_start < word_end {
-            let state = self.active_state_mut();
-            (
-                Some(state.get_text_range(word_start, word_end)),
-                Some(word_start),
-            )
-        } else {
-            (None, None)
-        }
-    }
-
-    /// Perform a replace-all operation
-    /// Build a compiled byte-regex for replace operations using current search settings.
-    /// Returns None when regex mode is off (plain text matching should be used).
-    fn build_replace_regex(&self, search: &str) -> Option<regex::bytes::Regex> {
-        super::regex_replace::build_regex(
-            search,
-            self.search_use_regex,
-            self.search_whole_word,
-            self.search_case_sensitive,
-        )
-    }
-
-    /// Get the length of a regex match at a given position in the buffer.
-    fn get_regex_match_len(&mut self, regex: &regex::bytes::Regex, pos: usize) -> Option<usize> {
-        let state = self.active_state_mut();
-        let remaining = state.buffer.len().saturating_sub(pos);
-        if remaining == 0 {
-            return None;
-        }
-        let bytes = state.buffer.get_text_range_mut(pos, remaining).ok()?;
-        regex.find(&bytes).map(|m| m.len())
-    }
-
-    /// Expand capture group references (e.g. $1, $2, ${name}) in the replacement string
-    /// for a regex match at the given buffer position. Returns the expanded replacement.
-    fn expand_regex_replacement(
-        &mut self,
-        regex: &regex::bytes::Regex,
-        pos: usize,
-        match_len: usize,
-        replacement: &str,
-    ) -> String {
-        let state = self.active_state_mut();
-        if let Ok(bytes) = state.buffer.get_text_range_mut(pos, match_len) {
-            return super::regex_replace::expand_replacement(regex, &bytes, replacement);
-        }
-        replacement.to_string()
-    }
-
-    /// Replaces all occurrences of the search query with the replacement text
-    ///
-    /// OPTIMIZATION: Uses BulkEdit for O(n) tree operations instead of O(n²)
-    /// This directly edits the piece tree without loading the entire buffer into memory
-    pub(super) fn perform_replace(&mut self, search: &str, replacement: &str) {
-        if search.is_empty() {
-            self.set_status_message(t!("replace.empty_query").to_string());
-            return;
-        }
-
-        let compiled_regex = self.build_replace_regex(search);
-
-        // Find all matches first (before making any modifications)
-        // Each match is (position, length, expanded_replacement)
-        let matches: Vec<(usize, usize, String)> = if let Some(ref regex) = compiled_regex {
-            // Regex mode: load buffer content as bytes and find all matches
-            // with capture group expansion in the replacement template
-            let buffer_bytes = {
-                let state = self.active_state_mut();
-                let total_bytes = state.buffer.len();
-                match state.buffer.get_text_range_mut(0, total_bytes) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!("Failed to load buffer for replace: {}", e);
-                        self.set_status_message(t!("error.buffer_not_loaded").to_string());
-                        return;
-                    }
-                }
-            };
-            super::regex_replace::collect_regex_matches(regex, &buffer_bytes, replacement)
-                .into_iter()
-                .map(|m| (m.offset, m.len, m.replacement))
-                .collect()
-        } else {
-            // Plain text mode - replacement is used literally
-            let state = self.active_state();
-            let buffer_len = state.buffer.len();
-            let mut matches = Vec::new();
-            let mut current_pos = 0;
-
-            while current_pos < buffer_len {
-                if let Some(offset) = state.buffer.find_next_in_range(
-                    search,
-                    current_pos,
-                    Some(current_pos..buffer_len),
-                ) {
-                    matches.push((offset, search.len(), replacement.to_string()));
-                    current_pos = offset + search.len();
-                } else {
-                    break;
-                }
-            }
-            matches
-        };
-
-        let count = matches.len();
-
-        if count == 0 {
-            self.set_status_message(t!("search.no_occurrences", search = search).to_string());
-            return;
-        }
-
-        // Get cursor info for the event
-        let cursor_id = self.active_cursors().primary_id();
-
-        // Create Delete+Insert events for each match
-        // Events will be processed in reverse order by apply_events_as_bulk_edit
-        let mut events = Vec::with_capacity(count * 2);
-        for (match_pos, match_len, expanded_replacement) in &matches {
-            // Get the actual matched text for the delete event
-            let deleted_text = self
-                .active_state_mut()
-                .get_text_range(*match_pos, match_pos + match_len);
-            // Delete the matched text
-            events.push(Event::Delete {
-                range: *match_pos..match_pos + match_len,
-                deleted_text,
-                cursor_id,
-            });
-            // Insert the replacement (with capture groups expanded)
-            events.push(Event::Insert {
-                position: *match_pos,
-                text: expanded_replacement.clone(),
-                cursor_id,
-            });
-        }
-
-        // Apply all replacements using BulkEdit for O(n) performance
-        let description = format!("Replace all '{}' with '{}'", search, replacement);
-        if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, description) {
-            self.active_event_log_mut().append(bulk_edit);
-        }
-
-        // Clear search state since positions are now invalid
-        self.search_state = None;
-
-        // Clear any search highlight overlays
-        let ns = self.search_namespace.clone();
-        let state = self.active_state_mut();
-        state.overlays.clear_namespace(&ns, &mut state.marker_list);
-
-        // Set status message
-        self.set_status_message(
-            t!(
-                "search.replaced",
-                count = count,
-                search = search,
-                replace = replacement
-            )
-            .to_string(),
-        );
-    }
-
-    /// Start interactive replace mode (query-replace)
-    pub(super) fn start_interactive_replace(&mut self, search: &str, replacement: &str) {
-        if search.is_empty() {
-            self.set_status_message(t!("replace.query_empty").to_string());
-            return;
-        }
-
-        let compiled_regex = self.build_replace_regex(search);
-
-        // Find the first match lazily (don't find all matches upfront)
-        let start_pos = self.active_cursors().primary().position;
-        let (first_match_pos, first_match_len) = if let Some(ref regex) = compiled_regex {
-            let state = self.active_state();
-            let buffer_len = state.buffer.len();
-            // Try from cursor to end, then wrap from beginning
-            let found = state
-                .buffer
-                .find_next_regex_in_range(regex, start_pos, Some(start_pos..buffer_len))
-                .or_else(|| {
-                    if start_pos > 0 {
-                        state
-                            .buffer
-                            .find_next_regex_in_range(regex, 0, Some(0..start_pos))
-                    } else {
-                        None
-                    }
-                });
-            let Some(pos) = found else {
-                self.set_status_message(t!("search.no_occurrences", search = search).to_string());
-                return;
-            };
-            // Determine the match length by re-matching at the found position
-            let match_len = self.get_regex_match_len(regex, pos).unwrap_or(search.len());
-            (pos, match_len)
-        } else {
-            let state = self.active_state();
-            let Some(pos) = state.buffer.find_next(search, start_pos) else {
-                self.set_status_message(t!("search.no_occurrences", search = search).to_string());
-                return;
-            };
-            (pos, search.len())
-        };
-
-        // Initialize interactive replace state with just the current match
-        self.interactive_replace_state = Some(InteractiveReplaceState {
-            search: search.to_string(),
-            replacement: replacement.to_string(),
-            current_match_pos: first_match_pos,
-            current_match_len: first_match_len,
-            start_pos: first_match_pos,
-            has_wrapped: false,
-            replacements_made: 0,
-            regex: compiled_regex,
-        });
-
-        // Move cursor to first match
-        let active_split = self.split_manager.active_split();
-        let active_buffer = self.active_buffer();
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-            view_state.cursors.primary_mut().position = first_match_pos;
-            view_state.cursors.primary_mut().anchor = None;
-            // Ensure cursor is visible
-            let state = self.buffers.get_mut(&active_buffer).unwrap();
-            view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-        }
-
-        // Show the query-replace prompt
-        self.prompt = Some(Prompt::new(
-            "Replace? (y)es (n)o (a)ll (c)ancel: ".to_string(),
-            PromptType::QueryReplaceConfirm,
-        ));
-    }
-
-    /// Handle interactive replace key press (y/n/a/c)
-    pub(super) fn handle_interactive_replace_key(&mut self, c: char) -> AnyhowResult<()> {
-        let state = self.interactive_replace_state.clone();
-        let Some(mut ir_state) = state else {
-            return Ok(());
-        };
-
-        match c {
-            'y' | 'Y' => {
-                // Replace current match
-                self.replace_current_match(&ir_state)?;
-                ir_state.replacements_made += 1;
-
-                // Find next match lazily (after the replacement)
-                let search_pos = ir_state.current_match_pos + ir_state.replacement.len();
-                if let Some((next_match, match_len, wrapped)) =
-                    self.find_next_match_for_replace(&ir_state, search_pos)
-                {
-                    ir_state.current_match_pos = next_match;
-                    ir_state.current_match_len = match_len;
-                    if wrapped {
-                        ir_state.has_wrapped = true;
-                    }
-                    self.interactive_replace_state = Some(ir_state.clone());
-                    self.move_to_current_match(&ir_state);
-                } else {
-                    self.finish_interactive_replace(ir_state.replacements_made);
-                }
-            }
-            'n' | 'N' => {
-                // Skip current match and find next
-                let search_pos = ir_state.current_match_pos + ir_state.current_match_len;
-                if let Some((next_match, match_len, wrapped)) =
-                    self.find_next_match_for_replace(&ir_state, search_pos)
-                {
-                    ir_state.current_match_pos = next_match;
-                    ir_state.current_match_len = match_len;
-                    if wrapped {
-                        ir_state.has_wrapped = true;
-                    }
-                    self.interactive_replace_state = Some(ir_state.clone());
-                    self.move_to_current_match(&ir_state);
-                } else {
-                    self.finish_interactive_replace(ir_state.replacements_made);
-                }
-            }
-            'a' | 'A' | '!' => {
-                // Replace all remaining matches with SINGLE confirmation
-                // Undo behavior: ONE undo step undoes ALL remaining replacements
-                //
-                // OPTIMIZATION: Uses BulkEdit for O(n) tree operations instead of O(n²)
-                // This directly edits the piece tree without loading the entire buffer
-
-                // Collect ALL match positions and lengths including the current match
-                // Start from the current match position
-                let all_matches: Vec<(usize, usize)> = {
-                    let mut matches = Vec::new();
-                    let mut temp_state = ir_state.clone();
-                    temp_state.has_wrapped = false; // Reset wrap state to find current match
-
-                    // First, include the current match
-                    matches.push((ir_state.current_match_pos, ir_state.current_match_len));
-                    let mut current_pos = ir_state.current_match_pos + ir_state.current_match_len;
-
-                    // Find all remaining matches
-                    while let Some((next_match, match_len, wrapped)) =
-                        self.find_next_match_for_replace(&temp_state, current_pos)
-                    {
-                        matches.push((next_match, match_len));
-                        current_pos = next_match + match_len;
-                        if wrapped {
-                            temp_state.has_wrapped = true;
-                        }
-                    }
-                    matches
-                };
-
-                let total_count = all_matches.len();
-
-                if total_count > 0 {
-                    // Get cursor info for the event
-                    let cursor_id = self.active_cursors().primary_id();
-
-                    // Create Delete+Insert events for each match
-                    let mut events = Vec::with_capacity(total_count * 2);
-                    for &(match_pos, match_len) in &all_matches {
-                        let deleted_text = self
-                            .active_state_mut()
-                            .get_text_range(match_pos, match_pos + match_len);
-                        // Expand capture group references if in regex mode
-                        let replacement_text = if let Some(ref regex) = ir_state.regex {
-                            self.expand_regex_replacement(
-                                regex,
-                                match_pos,
-                                match_len,
-                                &ir_state.replacement,
-                            )
-                        } else {
-                            ir_state.replacement.clone()
-                        };
-                        events.push(Event::Delete {
-                            range: match_pos..match_pos + match_len,
-                            deleted_text,
-                            cursor_id,
-                        });
-                        events.push(Event::Insert {
-                            position: match_pos,
-                            text: replacement_text,
-                            cursor_id,
-                        });
-                    }
-
-                    // Apply all replacements using BulkEdit for O(n) performance
-                    let description = format!(
-                        "Replace all {} occurrences of '{}' with '{}'",
-                        total_count, ir_state.search, ir_state.replacement
-                    );
-                    if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, description) {
-                        self.active_event_log_mut().append(bulk_edit);
-                    }
-
-                    ir_state.replacements_made += total_count;
-                }
-
-                self.finish_interactive_replace(ir_state.replacements_made);
-            }
-            'c' | 'C' | 'q' | 'Q' | '\x1b' => {
-                // Cancel/quit interactive replace
-                self.finish_interactive_replace(ir_state.replacements_made);
-            }
-            _ => {
-                // Unknown key - ignored (prompt shows valid options)
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Find the next match for interactive replace (lazy search with wrap-around)
-    /// Returns (match_position, match_length, wrapped)
-    pub(super) fn find_next_match_for_replace(
-        &mut self,
-        ir_state: &InteractiveReplaceState,
-        start_pos: usize,
-    ) -> Option<(usize, usize, bool)> {
-        if let Some(ref regex) = ir_state.regex {
-            // Regex mode
-            let regex = regex.clone();
-            let state = self.active_state();
-            let buffer_len = state.buffer.len();
-
-            if ir_state.has_wrapped {
-                let search_range = Some(start_pos..ir_state.start_pos);
-                if let Some(match_pos) =
-                    state
-                        .buffer
-                        .find_next_regex_in_range(&regex, start_pos, search_range)
-                {
-                    let match_len = self.get_regex_match_len(&regex, match_pos).unwrap_or(0);
-                    return Some((match_pos, match_len, true));
-                }
-                None
-            } else {
-                let search_range = Some(start_pos..buffer_len);
-                if let Some(match_pos) =
-                    state
-                        .buffer
-                        .find_next_regex_in_range(&regex, start_pos, search_range)
-                {
-                    let match_len = self.get_regex_match_len(&regex, match_pos).unwrap_or(0);
-                    return Some((match_pos, match_len, false));
-                }
-
-                // Wrap to beginning
-                let wrap_range = Some(0..ir_state.start_pos);
-                let state = self.active_state();
-                if let Some(match_pos) =
-                    state.buffer.find_next_regex_in_range(&regex, 0, wrap_range)
-                {
-                    let match_len = self.get_regex_match_len(&regex, match_pos).unwrap_or(0);
-                    return Some((match_pos, match_len, true));
-                }
-
-                None
-            }
-        } else {
-            // Plain text mode
-            let search_len = ir_state.search.len();
-            let state = self.active_state();
-
-            if ir_state.has_wrapped {
-                let search_range = Some(start_pos..ir_state.start_pos);
-                if let Some(match_pos) =
-                    state
-                        .buffer
-                        .find_next_in_range(&ir_state.search, start_pos, search_range)
-                {
-                    return Some((match_pos, search_len, true));
-                }
-                None
-            } else {
-                let buffer_len = state.buffer.len();
-                let search_range = Some(start_pos..buffer_len);
-                if let Some(match_pos) =
-                    state
-                        .buffer
-                        .find_next_in_range(&ir_state.search, start_pos, search_range)
-                {
-                    return Some((match_pos, search_len, false));
-                }
-
-                let wrap_range = Some(0..ir_state.start_pos);
-                if let Some(match_pos) =
-                    state
-                        .buffer
-                        .find_next_in_range(&ir_state.search, 0, wrap_range)
-                {
-                    return Some((match_pos, search_len, true));
-                }
-
-                None
-            }
-        }
-    }
-
-    /// Replace the current match in interactive replace mode
-    pub(super) fn replace_current_match(
-        &mut self,
-        ir_state: &InteractiveReplaceState,
-    ) -> AnyhowResult<()> {
-        let match_pos = ir_state.current_match_pos;
-        let match_len = ir_state.current_match_len;
-        let range = match_pos..(match_pos + match_len);
-
-        // Expand capture group references if in regex mode
-        let replacement_text = if let Some(ref regex) = ir_state.regex {
-            self.expand_regex_replacement(regex, match_pos, match_len, &ir_state.replacement)
-        } else {
-            ir_state.replacement.clone()
-        };
-
-        // Get the deleted text for the event
-        let deleted_text = self
-            .active_state_mut()
-            .get_text_range(range.start, range.end);
-
-        // Capture current cursor state for undo
-        let cursor_id = self.active_cursors().primary_id();
-        let cursor = *self.active_cursors().primary();
-        let old_position = cursor.position;
-        let old_anchor = cursor.anchor;
-        let old_sticky_column = cursor.sticky_column;
-
-        // Create events: MoveCursor, Delete, Insert
-        // The MoveCursor saves the cursor position so undo can restore it
-        let events = vec![
-            Event::MoveCursor {
-                cursor_id,
-                old_position,
-                new_position: match_pos,
-                old_anchor,
-                new_anchor: None,
-                old_sticky_column,
-                new_sticky_column: 0,
-            },
-            Event::Delete {
-                range: range.clone(),
-                deleted_text,
-                cursor_id,
-            },
-            Event::Insert {
-                position: match_pos,
-                text: replacement_text,
-                cursor_id,
-            },
-        ];
-
-        // Wrap in batch for atomic undo
-        let batch = Event::Batch {
-            events,
-            description: format!(
-                "Query replace '{}' with '{}'",
-                ir_state.search, ir_state.replacement
-            ),
-        };
-
-        // Apply the batch through the event log
-        self.active_event_log_mut().append(batch.clone());
-        self.apply_event_to_active_buffer(&batch);
-
-        Ok(())
-    }
-
-    /// Move cursor to the current match in interactive replace
-    pub(super) fn move_to_current_match(&mut self, ir_state: &InteractiveReplaceState) {
-        let match_pos = ir_state.current_match_pos;
-        let active_split = self.split_manager.active_split();
-        let active_buffer = self.active_buffer();
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-            view_state.cursors.primary_mut().position = match_pos;
-            view_state.cursors.primary_mut().anchor = None;
-            // Ensure cursor is visible
-            let state = self.buffers.get_mut(&active_buffer).unwrap();
-            view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-        }
-
-        // Update the prompt message (show [Wrapped] if we've wrapped around)
-        let msg = if ir_state.has_wrapped {
-            "[Wrapped] Replace? (y)es (n)o (a)ll (c)ancel: ".to_string()
-        } else {
-            "Replace? (y)es (n)o (a)ll (c)ancel: ".to_string()
-        };
-        if let Some(ref mut prompt) = self.prompt {
-            if prompt.prompt_type == PromptType::QueryReplaceConfirm {
-                prompt.message = msg;
-                prompt.input.clear();
-                prompt.cursor_pos = 0;
-            }
-        }
-    }
-
-    /// Finish interactive replace and show summary
-    pub(super) fn finish_interactive_replace(&mut self, replacements_made: usize) {
-        self.interactive_replace_state = None;
-        self.prompt = None; // Clear the query-replace prompt
-
-        // Clear search highlights
-        let ns = self.search_namespace.clone();
-        let state = self.active_state_mut();
-        state.overlays.clear_namespace(&ns, &mut state.marker_list);
-
-        self.set_status_message(t!("search.replaced_count", count = replacements_made).to_string());
-    }
-
-    /// Smart home: toggle between line start and first non-whitespace character
-    pub(super) fn smart_home(&mut self) {
-        let estimated_line_length = self.config.editor.estimated_line_length;
-        let cursor = *self.active_cursors().primary();
-        let cursor_id = self.active_cursors().primary_id();
-
-        // When line wrap is on, use the visual (soft-wrapped) line boundaries
-        if self.config.editor.line_wrap {
-            let split_id = self.split_manager.active_split();
-            if let Some(new_pos) =
-                self.smart_home_visual_line(split_id, cursor.position, estimated_line_length)
-            {
-                let event = Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: None,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0,
-                };
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
-                return;
-            }
-            // Fall through to physical line logic if visual lookup fails
-        }
-
-        let state = self.active_state_mut();
-
-        // Get physical line information
-        let mut iter = state
-            .buffer
-            .line_iterator(cursor.position, estimated_line_length);
-        if let Some((line_start, line_content)) = iter.next_line() {
-            // Find first non-whitespace character
-            let first_non_ws = line_content
-                .chars()
-                .take_while(|c| *c != '\n')
-                .position(|c| !c.is_whitespace())
-                .map(|offset| line_start + offset)
-                .unwrap_or(line_start);
-
-            // Toggle: if at first non-ws, go to line start; otherwise go to first non-ws
-            let new_pos = if cursor.position == first_non_ws {
-                line_start
-            } else {
-                first_non_ws
-            };
-
-            let event = Event::MoveCursor {
-                cursor_id,
-                old_position: cursor.position,
-                new_position: new_pos,
-                old_anchor: cursor.anchor,
-                new_anchor: None,
-                old_sticky_column: cursor.sticky_column,
-                new_sticky_column: 0,
-            };
-
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
-        }
-    }
-
-    /// Compute the smart-home target for a visual (soft-wrapped) line.
-    ///
-    /// On the **first** visual row of a physical line the cursor toggles between
-    /// the first non-whitespace character and position 0 (standard smart-home).
-    ///
-    /// On a **continuation** (wrapped) row the cursor moves to the visual row
-    /// start; if already there it advances to the previous visual row's start
-    /// so that repeated Home presses walk all the way back to position 0.
-    fn smart_home_visual_line(
-        &mut self,
-        split_id: LeafId,
-        cursor_pos: usize,
-        estimated_line_length: usize,
-    ) -> Option<usize> {
-        let visual_start = self
-            .cached_layout
-            .visual_line_start(split_id, cursor_pos, false)?;
-
-        // Determine the physical line start to tell first-row from continuation.
-        let buffer_id = self.split_manager.active_buffer_id()?;
-        let state = self.buffers.get_mut(&buffer_id)?;
-        let mut iter = state
-            .buffer
-            .line_iterator(visual_start, estimated_line_length);
-        let (phys_line_start, content) = iter.next_line()?;
-
-        let is_first_visual_row = visual_start == phys_line_start;
-
-        if is_first_visual_row {
-            // First visual row: toggle first-non-ws ↔ physical line start
-            let visual_end = self
-                .cached_layout
-                .visual_line_end(split_id, cursor_pos, false)
-                .unwrap_or(visual_start);
-            let visual_len = visual_end.saturating_sub(visual_start);
-            let first_non_ws = content
-                .chars()
-                .take(visual_len)
-                .take_while(|c| *c != '\n')
-                .position(|c| !c.is_whitespace())
-                .map(|offset| visual_start + offset)
-                .unwrap_or(visual_start);
-
-            if cursor_pos == first_non_ws {
-                Some(visual_start)
-            } else {
-                Some(first_non_ws)
-            }
-        } else {
-            // Continuation row: go to visual line start, or advance backward
-            if cursor_pos == visual_start {
-                // Already at start – advance to previous visual row's start
-                self.cached_layout
-                    .visual_line_start(split_id, cursor_pos, true)
-            } else {
-                Some(visual_start)
-            }
-        }
-    }
-
-    /// Toggle comment on the current line or selection
-    pub(super) fn toggle_comment(&mut self) {
-        // Determine comment prefix from language config
-        // If no language detected or no comment prefix configured, do nothing
-        let language = &self.active_state().language;
-        let comment_prefix = self
-            .config
-            .languages
-            .get(language)
-            .and_then(|lang_config| lang_config.comment_prefix.clone());
-
-        let comment_prefix: String = match comment_prefix {
-            Some(prefix) => {
-                // Ensure there's a trailing space for consistent formatting
-                if prefix.ends_with(' ') {
-                    prefix
-                } else {
-                    format!("{} ", prefix)
-                }
-            }
-            None => return, // No comment prefix for this language, do nothing
-        };
-
-        let estimated_line_length = self.config.editor.estimated_line_length;
-
-        let cursor = *self.active_cursors().primary();
-        let cursor_id = self.active_cursors().primary_id();
-        let state = self.active_state_mut();
-
-        // Save original selection info to restore after edit
-        let original_anchor = cursor.anchor;
-        let original_position = cursor.position;
-        let had_selection = original_anchor.is_some();
-
-        let (start_pos, end_pos) = if let Some(range) = cursor.selection_range() {
-            (range.start, range.end)
-        } else {
-            let iter = state
-                .buffer
-                .line_iterator(cursor.position, estimated_line_length);
-            let line_start = iter.current_position();
-            (line_start, cursor.position)
-        };
-
-        // Find all line starts in the range
-        let buffer_len = state.buffer.len();
-        let mut line_starts = Vec::new();
-        let mut iter = state.buffer.line_iterator(start_pos, estimated_line_length);
-        let mut current_pos = iter.current_position();
-        line_starts.push(current_pos);
-
-        while let Some((_, content)) = iter.next_line() {
-            current_pos += content.len();
-            if current_pos >= end_pos || current_pos >= buffer_len {
-                break;
-            }
-            let next_iter = state
-                .buffer
-                .line_iterator(current_pos, estimated_line_length);
-            let next_start = next_iter.current_position();
-            if next_start != *line_starts.last().unwrap() {
-                line_starts.push(next_start);
-            }
-            iter = state
-                .buffer
-                .line_iterator(current_pos, estimated_line_length);
-        }
-
-        // Determine if we should comment or uncomment
-        // If all lines are commented, uncomment; otherwise comment
-        let all_commented = line_starts.iter().all(|&line_start| {
-            let line_bytes = state
-                .buffer
-                .slice_bytes(line_start..buffer_len.min(line_start + comment_prefix.len() + 10));
-            let line_str = String::from_utf8_lossy(&line_bytes);
-            let trimmed = line_str.trim_start();
-            trimmed.starts_with(comment_prefix.trim())
-        });
-
-        let mut events = Vec::new();
-        // Track (edit_position, byte_delta) for calculating new cursor positions
-        // delta is positive for insertions, negative for deletions
-        let mut position_deltas: Vec<(usize, isize)> = Vec::new();
-
-        if all_commented {
-            // Uncomment: remove comment prefix from each line
-            for &line_start in line_starts.iter().rev() {
-                let line_bytes = state
-                    .buffer
-                    .slice_bytes(line_start..buffer_len.min(line_start + 100));
-                let line_str = String::from_utf8_lossy(&line_bytes);
-
-                // Find where the comment prefix starts (after leading whitespace)
-                let leading_ws: usize = line_str
-                    .chars()
-                    .take_while(|c| c.is_whitespace() && *c != '\n')
-                    .map(|c| c.len_utf8())
-                    .sum();
-                let rest = &line_str[leading_ws..];
-
-                if rest.starts_with(comment_prefix.trim()) {
-                    let remove_len = if rest.starts_with(&comment_prefix) {
-                        comment_prefix.len()
-                    } else {
-                        comment_prefix.trim().len()
-                    };
-                    let deleted_text = String::from_utf8_lossy(&state.buffer.slice_bytes(
-                        line_start + leading_ws..line_start + leading_ws + remove_len,
-                    ))
-                    .to_string();
-                    events.push(Event::Delete {
-                        range: (line_start + leading_ws)..(line_start + leading_ws + remove_len),
-                        deleted_text,
-                        cursor_id,
-                    });
-                    position_deltas.push((line_start, -(remove_len as isize)));
-                }
-            }
-        } else {
-            // Comment: add comment prefix to each line
-            let prefix_len = comment_prefix.len();
-            for &line_start in line_starts.iter().rev() {
-                events.push(Event::Insert {
-                    position: line_start,
-                    text: comment_prefix.to_string(),
-                    cursor_id,
-                });
-                position_deltas.push((line_start, prefix_len as isize));
-            }
-        }
-
-        if events.is_empty() {
-            return;
-        }
-
-        let action_desc = if all_commented {
-            "Uncomment"
-        } else {
-            "Comment"
-        };
-
-        // If there was a selection, add a MoveCursor event to restore it
-        if had_selection {
-            // Sort deltas by position ascending for calculation
-            position_deltas.sort_by_key(|(pos, _)| *pos);
-
-            // Calculate cumulative shift for a position based on edits at or before that position
-            let calc_shift = |original_pos: usize| -> isize {
-                let mut shift: isize = 0;
-                for (edit_pos, delta) in &position_deltas {
-                    if *edit_pos < original_pos {
-                        shift += delta;
-                    }
-                }
-                shift
-            };
-
-            let anchor_shift = calc_shift(original_anchor.unwrap_or(0));
-            let position_shift = calc_shift(original_position);
-
-            let new_anchor = (original_anchor.unwrap_or(0) as isize + anchor_shift).max(0) as usize;
-            let new_position = (original_position as isize + position_shift).max(0) as usize;
-
-            events.push(Event::MoveCursor {
-                cursor_id,
-                old_position: original_position,
-                new_position,
-                old_anchor: original_anchor,
-                new_anchor: Some(new_anchor),
-                old_sticky_column: 0,
-                new_sticky_column: 0,
-            });
-        }
-
-        // Use optimized bulk edit for multi-line comment toggle
-        let description = format!("{} lines", action_desc);
-        if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, description) {
-            self.active_event_log_mut().append(bulk_edit);
-        }
-
-        self.set_status_message(
-            t!(
-                "lines.action",
-                action = action_desc,
-                count = line_starts.len()
-            )
-            .to_string(),
-        );
-    }
-
-    /// Go to matching bracket
-    pub(super) fn goto_matching_bracket(&mut self) {
-        let cursor = *self.active_cursors().primary();
-        let cursor_id = self.active_cursors().primary_id();
-        let state = self.active_state_mut();
-
-        let pos = cursor.position;
-        if pos >= state.buffer.len() {
-            self.set_status_message(t!("diagnostics.bracket_none").to_string());
-            return;
-        }
-
-        let bytes = state.buffer.slice_bytes(pos..pos + 1);
-        if bytes.is_empty() {
-            self.set_status_message(t!("diagnostics.bracket_none").to_string());
-            return;
-        }
-
-        let ch = bytes[0] as char;
-        let (opening, closing, forward) = match ch {
-            '(' => ('(', ')', true),
-            ')' => ('(', ')', false),
-            '[' => ('[', ']', true),
-            ']' => ('[', ']', false),
-            '{' => ('{', '}', true),
-            '}' => ('{', '}', false),
-            '<' => ('<', '>', true),
-            '>' => ('<', '>', false),
-            _ => {
-                self.set_status_message(t!("diagnostics.bracket_none").to_string());
-                return;
-            }
-        };
-
-        // Find matching bracket
-        let buffer_len = state.buffer.len();
-        let mut depth = 1;
-        let matching_pos = if forward {
-            let mut search_pos = pos + 1;
-            let mut found = None;
-            while search_pos < buffer_len && depth > 0 {
-                let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
-                if !b.is_empty() {
-                    let c = b[0] as char;
-                    if c == opening {
-                        depth += 1;
-                    } else if c == closing {
-                        depth -= 1;
-                        if depth == 0 {
-                            found = Some(search_pos);
-                        }
-                    }
-                }
-                search_pos += 1;
-            }
-            found
-        } else {
-            let mut search_pos = pos.saturating_sub(1);
-            let mut found = None;
-            loop {
-                let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
-                if !b.is_empty() {
-                    let c = b[0] as char;
-                    if c == closing {
-                        depth += 1;
-                    } else if c == opening {
-                        depth -= 1;
-                        if depth == 0 {
-                            found = Some(search_pos);
-                            break;
-                        }
-                    }
-                }
-                if search_pos == 0 {
-                    break;
-                }
-                search_pos -= 1;
-            }
-            found
-        };
-
-        if let Some(new_pos) = matching_pos {
-            let event = Event::MoveCursor {
-                cursor_id,
-                old_position: cursor.position,
-                new_position: new_pos,
-                old_anchor: cursor.anchor,
-                new_anchor: None,
-                old_sticky_column: cursor.sticky_column,
-                new_sticky_column: 0,
-            };
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
-        } else {
-            self.set_status_message(t!("diagnostics.bracket_no_match").to_string());
-        }
-    }
-
-    /// Jump to next error/diagnostic
-    pub(super) fn jump_to_next_error(&mut self) {
-        let diagnostic_ns = self.lsp_diagnostic_namespace.clone();
-        let cursor_pos = self.active_cursors().primary().position;
-        let cursor_id = self.active_cursors().primary_id();
-        let cursor = *self.active_cursors().primary();
-        let state = self.active_state_mut();
-
-        // Get all diagnostic overlay positions
-        let mut diagnostic_positions: Vec<usize> = state
-            .overlays
-            .all()
-            .iter()
-            .filter_map(|overlay| {
-                // Only consider LSP diagnostics (those in the diagnostic namespace)
-                if overlay.namespace.as_ref() == Some(&diagnostic_ns) {
-                    Some(overlay.range(&state.marker_list).start)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if diagnostic_positions.is_empty() {
-            self.set_status_message(t!("diagnostics.none").to_string());
-            return;
-        }
-
-        // Sort positions
-        diagnostic_positions.sort_unstable();
-        diagnostic_positions.dedup();
-
-        // Find next diagnostic after cursor position
-        let next_pos = diagnostic_positions
-            .iter()
-            .find(|&&pos| pos > cursor_pos)
-            .or_else(|| diagnostic_positions.first()) // Wrap around
-            .copied();
-
-        if let Some(new_pos) = next_pos {
-            let event = Event::MoveCursor {
-                cursor_id,
-                old_position: cursor.position,
-                new_position: new_pos,
-                old_anchor: cursor.anchor,
-                new_anchor: None,
-                old_sticky_column: cursor.sticky_column,
-                new_sticky_column: 0,
-            };
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
-
-            // Show diagnostic message in status bar
-            let state = self.active_state();
-            if let Some(msg) = state.overlays.all().iter().find_map(|overlay| {
-                let range = overlay.range(&state.marker_list);
-                if range.start == new_pos && overlay.namespace.as_ref() == Some(&diagnostic_ns) {
-                    overlay.message.clone()
-                } else {
-                    None
-                }
-            }) {
-                self.set_status_message(msg);
-            }
-        }
-    }
-
-    /// Jump to previous error/diagnostic
-    pub(super) fn jump_to_previous_error(&mut self) {
-        let diagnostic_ns = self.lsp_diagnostic_namespace.clone();
-        let cursor_pos = self.active_cursors().primary().position;
-        let cursor_id = self.active_cursors().primary_id();
-        let cursor = *self.active_cursors().primary();
-        let state = self.active_state_mut();
-
-        // Get all diagnostic overlay positions
-        let mut diagnostic_positions: Vec<usize> = state
-            .overlays
-            .all()
-            .iter()
-            .filter_map(|overlay| {
-                // Only consider LSP diagnostics (those in the diagnostic namespace)
-                if overlay.namespace.as_ref() == Some(&diagnostic_ns) {
-                    Some(overlay.range(&state.marker_list).start)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if diagnostic_positions.is_empty() {
-            self.set_status_message(t!("diagnostics.none").to_string());
-            return;
-        }
-
-        // Sort positions
-        diagnostic_positions.sort_unstable();
-        diagnostic_positions.dedup();
-
-        // Find previous diagnostic before cursor position
-        let prev_pos = diagnostic_positions
-            .iter()
-            .rev()
-            .find(|&&pos| pos < cursor_pos)
-            .or_else(|| diagnostic_positions.last()) // Wrap around
-            .copied();
-
-        if let Some(new_pos) = prev_pos {
-            let event = Event::MoveCursor {
-                cursor_id,
-                old_position: cursor.position,
-                new_position: new_pos,
-                old_anchor: cursor.anchor,
-                new_anchor: None,
-                old_sticky_column: cursor.sticky_column,
-                new_sticky_column: 0,
-            };
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
-
-            // Show diagnostic message in status bar
-            let state = self.active_state();
-            if let Some(msg) = state.overlays.all().iter().find_map(|overlay| {
-                let range = overlay.range(&state.marker_list);
-                if range.start == new_pos && overlay.namespace.as_ref() == Some(&diagnostic_ns) {
-                    overlay.message.clone()
-                } else {
-                    None
-                }
-            }) {
-                self.set_status_message(msg);
-            }
-        }
-    }
-
-    /// Toggle macro recording for the given register
-    pub(super) fn toggle_macro_recording(&mut self, key: char) {
-        if let Some(state) = &self.macro_recording {
-            if state.key == key {
-                // Stop recording
-                self.stop_macro_recording();
-            } else {
-                // Recording to a different key, stop current and start new
-                self.stop_macro_recording();
-                self.start_macro_recording(key);
-            }
-        } else {
-            // Start recording
-            self.start_macro_recording(key);
-        }
-    }
-
-    /// Start recording a macro
-    pub(super) fn start_macro_recording(&mut self, key: char) {
-        self.macro_recording = Some(MacroRecordingState {
-            key,
-            actions: Vec::new(),
-        });
-
-        // Build the stop hint dynamically from keybindings
-        let stop_hint = self.build_macro_stop_hint(key);
-        self.set_status_message(
-            t!(
-                "macro.recording_with_hint",
-                key = key,
-                stop_hint = stop_hint
-            )
-            .to_string(),
-        );
-    }
-
-    /// Build a hint message for how to stop macro recording
-    fn build_macro_stop_hint(&self, _key: char) -> String {
-        let mut hints = Vec::new();
-
-        // Check for F5 (stop_macro_recording)
-        if let Some(stop_key) = self.get_keybinding_for_action("stop_macro_recording") {
-            hints.push(stop_key);
-        }
-
-        // Get command palette keybinding
-        let palette_key = self
-            .get_keybinding_for_action("command_palette")
-            .unwrap_or_else(|| "Ctrl+P".to_string());
-
-        if hints.is_empty() {
-            // No keybindings found, just mention command palette
-            format!("{} → Stop Recording Macro", palette_key)
-        } else {
-            // Show keybindings and command palette
-            format!("{} or {} → Stop Recording", hints.join("/"), palette_key)
-        }
-    }
-
-    /// Stop recording and save the macro
-    pub(super) fn stop_macro_recording(&mut self) {
-        if let Some(state) = self.macro_recording.take() {
-            let action_count = state.actions.len();
-            let key = state.key;
-            self.macros.insert(key, state.actions);
-            self.last_macro_register = Some(key);
-
-            // Build play hint
-            let play_hint = self.build_macro_play_hint();
-            self.set_status_message(
-                t!(
-                    "macro.saved",
-                    key = key,
-                    count = action_count,
-                    play_hint = play_hint
-                )
-                .to_string(),
-            );
-        } else {
-            self.set_status_message(t!("macro.not_recording").to_string());
-        }
-    }
-
-    /// Build a hint message for how to play a macro
-    fn build_macro_play_hint(&self) -> String {
-        // Check for play_last_macro keybinding (e.g. F4)
-        if let Some(play_key) = self.get_keybinding_for_action("play_last_macro") {
-            return format!("{} → Play Last Macro", play_key);
-        }
-
-        // Fall back to command palette hint
-        let palette_key = self
-            .get_keybinding_for_action("command_palette")
-            .unwrap_or_else(|| "Ctrl+P".to_string());
-
-        format!("{} → Play Macro", palette_key)
-    }
-
     /// Recompute the view_line_mappings layout without drawing.
     /// Used during macro replay so that visual-line movements (MoveLineEnd,
     /// MoveUp, MoveDown on wrapped lines) see correct, up-to-date layout
@@ -4342,7 +2581,7 @@ impl Editor {
             Constraint::Min(0),
             Constraint::Length(if self.status_bar_visible { 1 } else { 0 }), // status bar
             Constraint::Length(0), // search options (doesn't matter for layout)
-            Constraint::Length(1), // prompt line
+            Constraint::Length(if self.prompt_line_visible { 1 } else { 0 }), // prompt line
         ];
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -4354,14 +2593,10 @@ impl Editor {
         let file_explorer_should_show = self.file_explorer_visible
             && (self.file_explorer.is_some() || self.file_explorer_sync_in_progress);
         let editor_content_area = if file_explorer_should_show {
-            let explorer_percent = (self.file_explorer_width_percent * 100.0) as u16;
-            let editor_percent = 100 - explorer_percent;
+            let explorer_cols = self.file_explorer_width.to_cols(main_content_area.width);
             let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(explorer_percent),
-                    Constraint::Percentage(editor_percent),
-                ])
+                .constraints([Constraint::Length(explorer_cols), Constraint::Min(0)])
                 .split(main_content_area);
             horizontal_chunks[1]
         } else {
@@ -4380,327 +2615,16 @@ impl Editor {
             self.config.editor.highlight_context_bytes,
             self.config.editor.relative_line_numbers,
             self.config.editor.use_terminal_bg,
-            self.session_mode || !self.config.editor.cursor_style.is_block(),
+            self.session_mode || !self.software_cursor_only,
             self.software_cursor_only,
             self.tab_bar_visible,
             self.config.editor.show_vertical_scrollbar,
             self.config.editor.show_horizontal_scrollbar,
             self.config.editor.diagnostics_inline_text,
+            self.config.editor.show_tilde,
         );
 
         self.cached_layout.view_line_mappings = view_line_mappings;
-    }
-
-    /// Play back a recorded macro synchronously.
-    ///
-    /// All actions are executed in a tight loop. Between each action,
-    /// `recompute_layout` is called so that visual-line movements
-    /// (MoveLineEnd, etc.) see correct, up-to-date layout information.
-    /// Drawing is deferred until the next render cycle.
-    pub(super) fn play_macro(&mut self, key: char) {
-        // Prevent recursive macro playback
-        if self.macro_playing {
-            return;
-        }
-
-        if let Some(actions) = self.macros.get(&key).cloned() {
-            if actions.is_empty() {
-                self.set_status_message(t!("macro.empty", key = key).to_string());
-                return;
-            }
-
-            self.macro_playing = true;
-            let action_count = actions.len();
-            let width = self.cached_layout.last_frame_width;
-            let height = self.cached_layout.last_frame_height;
-            for action in actions {
-                if let Err(e) = self.handle_action(action) {
-                    tracing::warn!("Macro action failed: {}", e);
-                }
-                self.recompute_layout(width, height);
-            }
-            self.macro_playing = false;
-
-            self.set_status_message(
-                t!("macro.played", key = key, count = action_count).to_string(),
-            );
-        } else {
-            self.set_status_message(t!("macro.not_found", key = key).to_string());
-        }
-    }
-
-    /// Record an action to the current macro (if recording)
-    pub(super) fn record_macro_action(&mut self, action: &Action) {
-        // Don't record actions that are being played back from a macro
-        if self.macro_playing {
-            return;
-        }
-        if let Some(state) = &mut self.macro_recording {
-            // Don't record macro control actions themselves
-            match action {
-                Action::StartMacroRecording
-                | Action::StopMacroRecording
-                | Action::PlayMacro(_)
-                | Action::ToggleMacroRecording(_)
-                | Action::ShowMacro(_)
-                | Action::ListMacros
-                | Action::PromptRecordMacro
-                | Action::PromptPlayMacro
-                | Action::PlayLastMacro => {}
-                // When recording PromptConfirm, capture the current prompt text
-                // so it can be replayed correctly
-                Action::PromptConfirm => {
-                    if let Some(prompt) = &self.prompt {
-                        let text = prompt.get_text().to_string();
-                        state.actions.push(Action::PromptConfirmWithText(text));
-                    } else {
-                        state.actions.push(action.clone());
-                    }
-                }
-                _ => {
-                    state.actions.push(action.clone());
-                }
-            }
-        }
-    }
-
-    /// Show a macro in a buffer as JSON
-    pub(super) fn show_macro_in_buffer(&mut self, key: char) {
-        // Get macro data and cache what we need before any mutable borrows
-        let (json, actions_len) = match self.macros.get(&key) {
-            Some(actions) => {
-                let json = match serde_json::to_string_pretty(actions) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        self.set_status_message(
-                            t!("macro.serialize_failed", error = e.to_string()).to_string(),
-                        );
-                        return;
-                    }
-                };
-                (json, actions.len())
-            }
-            None => {
-                self.set_status_message(t!("macro.not_found", key = key).to_string());
-                return;
-            }
-        };
-
-        // Create header with macro info
-        let content = format!(
-            "// Macro '{}' ({} actions)\n// This buffer can be saved as a .json file for persistence\n\n{}",
-            key,
-            actions_len,
-            json
-        );
-
-        // Create a new buffer for the macro
-        let buffer_id = BufferId(self.next_buffer_id);
-        self.next_buffer_id += 1;
-
-        let mut state = EditorState::new(
-            self.terminal_width,
-            self.terminal_height,
-            self.config.editor.large_file_threshold_bytes as usize,
-            std::sync::Arc::clone(&self.filesystem),
-        );
-        state
-            .margins
-            .configure_for_line_numbers(self.config.editor.line_numbers);
-
-        self.buffers.insert(buffer_id, state);
-        self.event_logs.insert(buffer_id, EventLog::new());
-
-        // Set buffer content
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            state.buffer = crate::model::buffer::Buffer::from_str(
-                &content,
-                self.config.editor.large_file_threshold_bytes as usize,
-                std::sync::Arc::clone(&self.filesystem),
-            );
-        }
-
-        // Set metadata
-        let metadata = BufferMetadata {
-            kind: BufferKind::Virtual {
-                mode: "macro-view".to_string(),
-            },
-            display_name: format!("*Macro {}*", key),
-            lsp_enabled: false,
-            lsp_disabled_reason: Some("Virtual macro buffer".to_string()),
-            read_only: false, // Allow editing for saving
-            binary: false,
-            lsp_opened_with: std::collections::HashSet::new(),
-            hidden_from_tabs: false,
-            recovery_id: None,
-        };
-        self.buffer_metadata.insert(buffer_id, metadata);
-
-        // Switch to the new buffer
-        self.set_active_buffer(buffer_id);
-        self.set_status_message(
-            t!("macro.shown_buffer", key = key, count = actions_len).to_string(),
-        );
-    }
-
-    /// List all recorded macros in a buffer
-    pub(super) fn list_macros_in_buffer(&mut self) {
-        if self.macros.is_empty() {
-            self.set_status_message(t!("macro.none_recorded").to_string());
-            return;
-        }
-
-        // Build a summary of all macros
-        let mut content =
-            String::from("// Recorded Macros\n// Use ShowMacro(key) to see details\n\n");
-
-        let mut keys: Vec<char> = self.macros.keys().copied().collect();
-        keys.sort();
-
-        for key in keys {
-            if let Some(actions) = self.macros.get(&key) {
-                content.push_str(&format!("Macro '{}': {} actions\n", key, actions.len()));
-
-                // Show all actions
-                for (i, action) in actions.iter().enumerate() {
-                    content.push_str(&format!("  {}. {:?}\n", i + 1, action));
-                }
-                content.push('\n');
-            }
-        }
-
-        // Create a new buffer for the macro list
-        let buffer_id = BufferId(self.next_buffer_id);
-        self.next_buffer_id += 1;
-
-        let mut state = EditorState::new(
-            self.terminal_width,
-            self.terminal_height,
-            self.config.editor.large_file_threshold_bytes as usize,
-            std::sync::Arc::clone(&self.filesystem),
-        );
-        state
-            .margins
-            .configure_for_line_numbers(self.config.editor.line_numbers);
-
-        self.buffers.insert(buffer_id, state);
-        self.event_logs.insert(buffer_id, EventLog::new());
-
-        // Set buffer content
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            state.buffer = crate::model::buffer::Buffer::from_str(
-                &content,
-                self.config.editor.large_file_threshold_bytes as usize,
-                std::sync::Arc::clone(&self.filesystem),
-            );
-        }
-
-        // Set metadata
-        let metadata = BufferMetadata {
-            kind: BufferKind::Virtual {
-                mode: "macro-list".to_string(),
-            },
-            display_name: "*Macros*".to_string(),
-            lsp_enabled: false,
-            lsp_disabled_reason: Some("Virtual macro list buffer".to_string()),
-            read_only: true,
-            binary: false,
-            lsp_opened_with: std::collections::HashSet::new(),
-            hidden_from_tabs: false,
-            recovery_id: None,
-        };
-        self.buffer_metadata.insert(buffer_id, metadata);
-
-        // Switch to the new buffer
-        self.set_active_buffer(buffer_id);
-        self.set_status_message(t!("macro.showing", count = self.macros.len()).to_string());
-    }
-
-    /// Set a bookmark at the current position
-    pub(super) fn set_bookmark(&mut self, key: char) {
-        let buffer_id = self.active_buffer();
-        let position = self.active_cursors().primary().position;
-        self.bookmarks.insert(
-            key,
-            Bookmark {
-                buffer_id,
-                position,
-            },
-        );
-        self.set_status_message(t!("bookmark.set", key = key).to_string());
-    }
-
-    /// Jump to a bookmark
-    pub(super) fn jump_to_bookmark(&mut self, key: char) {
-        if let Some(bookmark) = self.bookmarks.get(&key).cloned() {
-            // Switch to the buffer if needed
-            if bookmark.buffer_id != self.active_buffer() {
-                if self.buffers.contains_key(&bookmark.buffer_id) {
-                    self.set_active_buffer(bookmark.buffer_id);
-                } else {
-                    self.set_status_message(t!("bookmark.buffer_gone", key = key).to_string());
-                    self.bookmarks.remove(&key);
-                    return;
-                }
-            }
-
-            // Move cursor to bookmark position
-            let cursor = *self.active_cursors().primary();
-            let cursor_id = self.active_cursors().primary_id();
-            let state = self.active_state_mut();
-            let new_pos = bookmark.position.min(state.buffer.len());
-
-            let event = Event::MoveCursor {
-                cursor_id,
-                old_position: cursor.position,
-                new_position: new_pos,
-                old_anchor: cursor.anchor,
-                new_anchor: None,
-                old_sticky_column: cursor.sticky_column,
-                new_sticky_column: 0,
-            };
-
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
-            self.set_status_message(t!("bookmark.jumped", key = key).to_string());
-        } else {
-            self.set_status_message(t!("bookmark.not_set", key = key).to_string());
-        }
-    }
-
-    /// Clear a bookmark
-    pub(super) fn clear_bookmark(&mut self, key: char) {
-        if self.bookmarks.remove(&key).is_some() {
-            self.set_status_message(t!("bookmark.cleared", key = key).to_string());
-        } else {
-            self.set_status_message(t!("bookmark.not_set", key = key).to_string());
-        }
-    }
-
-    /// List all bookmarks
-    pub(super) fn list_bookmarks(&mut self) {
-        if self.bookmarks.is_empty() {
-            self.set_status_message(t!("bookmark.none_set").to_string());
-            return;
-        }
-
-        let mut bookmark_list: Vec<_> = self.bookmarks.iter().collect();
-        bookmark_list.sort_by_key(|(k, _)| *k);
-
-        let list_str: String = bookmark_list
-            .iter()
-            .map(|(k, bm)| {
-                let buffer_name = self
-                    .buffer_metadata
-                    .get(&bm.buffer_id)
-                    .map(|m| m.display_name.as_str())
-                    .unwrap_or("unknown");
-                format!("'{}': {} @ {}", k, buffer_name, bm.position)
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        self.set_status_message(t!("bookmark.list", list = list_str).to_string());
     }
 
     /// Clear the search history
@@ -4711,11 +2635,36 @@ impl Editor {
         }
     }
 
+    /// Emit an OSC 2 escape sequence to set the host terminal's window/tab
+    /// title based on the active buffer's display name and the project name
+    /// (the working directory's last path component). Deduplicated against
+    /// the last title we wrote so we don't spam stdout every frame.
+    ///
+    /// Gated by `editor.set_window_title` (default on). Terminals that
+    /// don't implement OSC 2 silently drop the sequence.
+    fn update_terminal_title(&mut self, display_name: &str) {
+        if !self.config.editor.set_window_title {
+            return;
+        }
+        let project_name = self.working_dir.file_name().and_then(|s| s.to_str());
+        let new_title =
+            crate::services::terminal_title::build_window_title(display_name, project_name);
+        if self.last_window_title.as_deref() == Some(new_title.as_str()) {
+            return;
+        }
+        crate::services::terminal_title::write_terminal_title(&new_title);
+        self.last_window_title = Some(new_title);
+    }
+
     /// Save all prompt histories to disk
     /// Called on shutdown to persist history across sessions
     pub fn save_histories(&self) {
         // Ensure data directory exists
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.data_dir) {
+        if let Err(e) = self
+            .authority
+            .filesystem
+            .create_dir_all(&self.dir_context.data_dir)
+        {
             tracing::warn!("Failed to create data directory: {}", e);
             return;
         }
@@ -4727,320 +2676,6 @@ impl Editor {
                 tracing::warn!("Failed to save {} history: {}", key, e);
             } else {
                 tracing::debug!("Saved {} history to {:?}", key, path);
-            }
-        }
-    }
-
-    /// Ensure the active tab in a split is visible by adjusting its scroll offset.
-    /// This function recalculates the required scroll_offset based on the active tab's position
-    /// and the available width, and updates the SplitViewState.
-    pub(super) fn ensure_active_tab_visible(
-        &mut self,
-        split_id: LeafId,
-        active_buffer: BufferId,
-        available_width: u16,
-    ) {
-        tracing::debug!(
-            "ensure_active_tab_visible called: split={:?}, buffer={:?}, width={}",
-            split_id,
-            active_buffer,
-            available_width
-        );
-        let Some(view_state) = self.split_view_states.get_mut(&split_id) else {
-            tracing::debug!("  -> no view_state for split");
-            return;
-        };
-
-        let split_buffers = view_state.open_buffers.clone();
-
-        // Use the shared function to calculate tab widths (same as render_for_split)
-        let (tab_widths, rendered_buffer_ids) = crate::view::ui::tabs::calculate_tab_widths(
-            &split_buffers,
-            &self.buffers,
-            &self.buffer_metadata,
-            &self.composite_buffers,
-        );
-
-        let total_tabs_width: usize = tab_widths.iter().sum();
-        let max_visible_width = available_width as usize;
-
-        // Find the active tab index among rendered buffers
-        // Note: tab_widths includes separators, so we need to map buffer index to width index
-        let active_tab_index = rendered_buffer_ids
-            .iter()
-            .position(|id| *id == active_buffer);
-
-        // Map buffer index to width index (accounting for separators)
-        // Widths are: [sep?, tab0, sep, tab1, sep, tab2, ...]
-        // First tab has no separator before it, subsequent tabs have separator before
-        let active_width_index = active_tab_index.map(|buf_idx| {
-            if buf_idx == 0 {
-                0
-            } else {
-                // Each tab after the first has a separator before it
-                // So tab N is at position 2*N (sep before tab1 is at 1, tab1 at 2, sep before tab2 at 3, tab2 at 4, etc.)
-                // Wait, the structure is: [tab0, sep, tab1, sep, tab2]
-                // So tab N (0-indexed) is at position 2*N
-                buf_idx * 2
-            }
-        });
-
-        // Calculate offset to bring active tab into view
-        let old_offset = view_state.tab_scroll_offset;
-        let new_scroll_offset = if let Some(idx) = active_width_index {
-            crate::view::ui::tabs::scroll_to_show_tab(
-                &tab_widths,
-                idx,
-                view_state.tab_scroll_offset,
-                max_visible_width,
-            )
-        } else {
-            view_state
-                .tab_scroll_offset
-                .min(total_tabs_width.saturating_sub(max_visible_width))
-        };
-
-        tracing::debug!(
-            "  -> offset: {} -> {} (idx={:?}, max_width={}, total={})",
-            old_offset,
-            new_scroll_offset,
-            active_width_index,
-            max_visible_width,
-            total_tabs_width
-        );
-        view_state.tab_scroll_offset = new_scroll_offset;
-    }
-
-    /// Synchronize viewports for all scroll sync groups
-    ///
-    /// This syncs the inactive split's viewport to match the active split's position.
-    /// By deriving from the active split's actual viewport, we capture all viewport
-    /// changes regardless of source (scroll events, cursor movements, etc.).
-    fn sync_scroll_groups(&mut self) {
-        let active_split = self.split_manager.active_split();
-        let group_count = self.scroll_sync_manager.groups().len();
-
-        if group_count > 0 {
-            tracing::debug!(
-                "sync_scroll_groups: active_split={:?}, {} groups",
-                active_split,
-                group_count
-            );
-        }
-
-        // Collect sync info: for each group where active split participates,
-        // get the active split's current line position
-        let sync_info: Vec<_> = self
-            .scroll_sync_manager
-            .groups()
-            .iter()
-            .filter_map(|group| {
-                tracing::debug!(
-                    "sync_scroll_groups: checking group {}, left={:?}, right={:?}",
-                    group.id,
-                    group.left_split,
-                    group.right_split
-                );
-
-                if !group.contains_split(active_split.into()) {
-                    tracing::debug!(
-                        "sync_scroll_groups: active split {:?} not in group",
-                        active_split
-                    );
-                    return None;
-                }
-
-                // Get active split's current viewport top_byte
-                let active_top_byte = self
-                    .split_view_states
-                    .get(&active_split)?
-                    .viewport
-                    .top_byte;
-
-                // Get active split's buffer to convert bytes → line
-                let active_buffer_id = self.split_manager.buffer_for_split(active_split)?;
-                let buffer_state = self.buffers.get(&active_buffer_id)?;
-                let buffer_len = buffer_state.buffer.len();
-                let active_line = buffer_state.buffer.get_line_number(active_top_byte);
-
-                tracing::debug!(
-                    "sync_scroll_groups: active_split={:?}, buffer_id={:?}, top_byte={}, buffer_len={}, active_line={}",
-                    active_split,
-                    active_buffer_id,
-                    active_top_byte,
-                    buffer_len,
-                    active_line
-                );
-
-                // Determine the other split and compute its target line
-                let (other_split, other_line) = if group.is_left_split(active_split.into()) {
-                    // Active is left, sync right
-                    (group.right_split, group.left_to_right_line(active_line))
-                } else {
-                    // Active is right, sync left
-                    (group.left_split, group.right_to_left_line(active_line))
-                };
-
-                tracing::debug!(
-                    "sync_scroll_groups: syncing other_split={:?} to line {}",
-                    other_split,
-                    other_line
-                );
-
-                Some((other_split, other_line))
-            })
-            .collect();
-
-        // Apply sync to other splits
-        for (other_split, target_line) in sync_info {
-            let other_leaf = LeafId(other_split);
-            if let Some(buffer_id) = self.split_manager.buffer_for_split(other_leaf) {
-                if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                    let buffer = &mut state.buffer;
-                    if let Some(view_state) = self.split_view_states.get_mut(&other_leaf) {
-                        view_state.viewport.scroll_to(buffer, target_line);
-                    }
-                }
-            }
-        }
-
-        // Same-buffer scroll sync: when two splits show the same buffer (e.g., source
-        // vs compose mode), sync the inactive split's viewport to match the active
-        // split's scroll position.  Gated on the user-togglable scroll sync flag.
-        //
-        // We copy top_byte directly for the general case.  At the bottom edge the
-        // two splits may disagree because compose mode has soft-break virtual lines.
-        // Rather than computing the correct position here (where view lines aren't
-        // available), we set a flag and let `render_buffer_in_split` fix it up using
-        // the same view-line-based logic that `ensure_visible_in_layout` uses.
-        let active_buffer_id = if self.same_buffer_scroll_sync {
-            self.split_manager.buffer_for_split(active_split)
-        } else {
-            None
-        };
-        if let Some(active_buf_id) = active_buffer_id {
-            let active_top_byte = self
-                .split_view_states
-                .get(&active_split)
-                .map(|vs| vs.viewport.top_byte);
-            let active_viewport_height = self
-                .split_view_states
-                .get(&active_split)
-                .map(|vs| vs.viewport.visible_line_count())
-                .unwrap_or(0);
-
-            if let Some(top_byte) = active_top_byte {
-                // Find other splits showing the same buffer (not in an explicit sync group)
-                let other_splits: Vec<_> = self
-                    .split_view_states
-                    .keys()
-                    .filter(|&&s| {
-                        s != active_split
-                            && self.split_manager.buffer_for_split(s) == Some(active_buf_id)
-                            && !self.scroll_sync_manager.is_split_synced(s.into())
-                    })
-                    .copied()
-                    .collect();
-
-                if !other_splits.is_empty() {
-                    // Detect whether the active split is at the bottom of the
-                    // buffer (remaining lines fit within the viewport).
-                    let at_bottom = if let Some(state) = self.buffers.get_mut(&active_buf_id) {
-                        let mut iter = state.buffer.line_iterator(top_byte, 80);
-                        let mut lines_remaining = 0;
-                        while iter.next_line().is_some() {
-                            lines_remaining += 1;
-                            if lines_remaining > active_viewport_height {
-                                break;
-                            }
-                        }
-                        lines_remaining <= active_viewport_height
-                    } else {
-                        false
-                    };
-
-                    for other_split in other_splits {
-                        if let Some(view_state) = self.split_view_states.get_mut(&other_split) {
-                            view_state.viewport.top_byte = top_byte;
-                            // At the bottom edge, tell the render pass to
-                            // adjust using view lines (soft-break-aware).
-                            view_state.viewport.sync_scroll_to_end = at_bottom;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Pre-sync ensure_visible for scroll sync groups
-    ///
-    /// When the active split is in a scroll sync group, we need to update its viewport
-    /// BEFORE sync_scroll_groups runs. This ensures cursor movements like 'G' (go to end)
-    /// properly sync to the other split.
-    ///
-    /// After updating the active split's viewport, we mark the OTHER splits in the group
-    /// to skip ensure_visible so the sync position isn't undone during rendering.
-    fn pre_sync_ensure_visible(&mut self, active_split: LeafId) {
-        // Check if active split is in any scroll sync group
-        let group_info = self
-            .scroll_sync_manager
-            .find_group_for_split(active_split.into())
-            .map(|g| (g.left_split, g.right_split));
-
-        if let Some((left_split, right_split)) = group_info {
-            // Get the active split's buffer and update its viewport
-            if let Some(buffer_id) = self.split_manager.buffer_for_split(active_split) {
-                if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                    if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-                        // Update viewport to show cursor
-                        view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-
-                        tracing::debug!(
-                            "pre_sync_ensure_visible: updated active split {:?} viewport, top_byte={}",
-                            active_split,
-                            view_state.viewport.top_byte
-                        );
-                    }
-                }
-            }
-
-            // Mark the OTHER split to skip ensure_visible so the sync position isn't undone
-            let active_sid: SplitId = active_split.into();
-            let other_split: SplitId = if active_sid == left_split {
-                right_split
-            } else {
-                left_split
-            };
-
-            if let Some(view_state) = self.split_view_states.get_mut(&LeafId(other_split)) {
-                view_state.viewport.set_skip_ensure_visible();
-                tracing::debug!(
-                    "pre_sync_ensure_visible: marked other split {:?} to skip ensure_visible",
-                    other_split
-                );
-            }
-        }
-
-        // Same-buffer scroll sync: also mark other splits showing the same buffer
-        // to skip ensure_visible, so our sync_scroll_groups position isn't undone.
-        if !self.same_buffer_scroll_sync {
-            // Scroll sync disabled — don't interfere with other splits.
-        } else if let Some(active_buf_id) = self.split_manager.buffer_for_split(active_split) {
-            let other_same_buffer_splits: Vec<_> = self
-                .split_view_states
-                .keys()
-                .filter(|&&s| {
-                    s != active_split
-                        && self.split_manager.buffer_for_split(s) == Some(active_buf_id)
-                        && !self.scroll_sync_manager.is_split_synced(s.into())
-                })
-                .copied()
-                .collect();
-
-            for other_split in other_same_buffer_splits {
-                if let Some(view_state) = self.split_view_states.get_mut(&other_split) {
-                    view_state.viewport.set_skip_ensure_visible();
-                }
             }
         }
     }

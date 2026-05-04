@@ -1,5 +1,6 @@
 //! Data types for the keybinding editor.
 
+use crate::config::Keybinding;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 
@@ -50,6 +51,12 @@ pub struct ResolvedBinding {
     pub is_chord: bool,
     /// Plugin name this binding belongs to (None = builtin)
     pub plugin_name: Option<String>,
+    /// Human-friendly command name from the CommandRegistry (e.g., "Titlecase").
+    /// Present for plugin commands so the keybinding editor can display and search
+    /// by the same name shown in the command palette.
+    pub command_name: Option<String>,
+    /// Original config-level Keybinding (preserved for Custom bindings loaded from config)
+    pub original_config: Option<Keybinding>,
 }
 
 /// Mode for the edit/add dialog
@@ -102,6 +109,9 @@ pub struct EditBindingState {
     pub autocomplete_visible: bool,
     /// Error message for invalid action name (shown when trying to save)
     pub action_error: Option<String>,
+    /// When true, the next keypress in the key field is captured raw
+    /// (including Esc, Tab, Enter). Resets to false after one capture.
+    pub capturing_special: bool,
 }
 
 impl EditBindingState {
@@ -111,6 +121,7 @@ impl EditBindingState {
             "normal".to_string(),
             "prompt".to_string(),
             "popup".to_string(),
+            "completion".to_string(),
             "file_explorer".to_string(),
             "menu".to_string(),
             "terminal".to_string(),
@@ -143,6 +154,7 @@ impl EditBindingState {
             autocomplete_selected: None,
             autocomplete_visible: false,
             action_error: None,
+            capturing_special: false,
         }
     }
 
@@ -181,6 +193,7 @@ impl EditBindingState {
             autocomplete_selected: None,
             autocomplete_visible: false,
             action_error: None,
+            capturing_special: false,
         }
     }
 }
@@ -247,4 +260,6 @@ pub struct KeybindingEditorLayout {
     pub confirm_buttons: Option<(Rect, Rect, Rect)>,
     /// Search bar area (for clicking to focus)
     pub search_bar: Option<Rect>,
+    /// Vertical scrollbar area for the table (1 column wide), if rendered
+    pub table_scrollbar: Option<Rect>,
 }

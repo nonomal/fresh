@@ -1,22 +1,378 @@
 use super::*;
-use crate::model::event::LeafId;
-use crate::services::plugins::hooks::HookArgs;
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
+
+/// Convert a crossterm `KeyEvent` into the `KeyEventPayload` shape
+/// delivered to plugin `editor.getNextKey()` callers.
+///
+/// `key` matches the naming used by `defineMode` bindings:
+///   - named keys are lowercase (`"escape"`, `"enter"`, `"tab"`,
+///     `"space"`, `"backspace"`, arrows, `"f1"`–`"f12"`, …)
+///   - printable characters are returned as-is (`"a"`, `"!"`, `" "`)
+///   - unsupported / unknown keys yield an empty `key` string
+fn key_event_to_payload(ev: &crossterm::event::KeyEvent) -> fresh_core::api::KeyEventPayload {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let key = match ev.code {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Esc => "escape".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "backtab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::F(n) => format!("f{}", n),
+        _ => String::new(),
+    };
+    fresh_core::api::KeyEventPayload {
+        key,
+        ctrl: ev.modifiers.contains(KeyModifiers::CONTROL),
+        alt: ev.modifiers.contains(KeyModifiers::ALT),
+        shift: ev.modifiers.contains(KeyModifiers::SHIFT),
+        meta: ev.modifiers.contains(KeyModifiers::SUPER),
+    }
+}
+
 impl Editor {
+    /// If a plugin is awaiting the next keypress (via
+    /// `editor.getNextKey()`), resolve the front-most pending
+    /// callback with this key and return `true` so the caller can
+    /// short-circuit further dispatch. The key is consumed by the
+    /// resolution; mode bindings and editor actions do not see it.
+    ///
+    /// If no callback is pending but the plugin has declared key
+    /// capture active (`editor.beginKeyCapture()`), buffer the key
+    /// instead of dispatching it. The next `AwaitNextKey` will pop
+    /// from the buffer immediately. This closes the race between
+    /// fast typing/paste and the plugin re-arming `getNextKey`
+    /// between iterations.
+    fn try_resolve_next_key_callback(&mut self, key_event: &crossterm::event::KeyEvent) -> bool {
+        let payload = key_event_to_payload(key_event);
+        if let Some(callback_id) = self.pending_next_key_callbacks.pop_front() {
+            let json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
+            self.plugin_manager.resolve_callback(callback_id, json);
+            return true;
+        }
+        if self.key_capture_active {
+            self.pending_key_capture_buffer.push_back(payload);
+            return true;
+        }
+        false
+    }
+}
+
+impl Editor {
+    /// Install (or update) a Quickfix list inside the Utility Dock.
+    ///
+    /// One global Quickfix buffer per workspace, keyed by
+    /// `panel_id = "quickfix"`. Subsequent exports replace its
+    /// content. The buffer is parked in the dock leaf via
+    /// `role = "utility_dock"` so it shares the dock with diagnostics,
+    /// search-replace, etc. — exactly one bottom-strip leaf for all
+    /// dock-aware utilities.
+    fn install_quickfix_in_dock(
+        &mut self,
+        query: String,
+        matches: Vec<crate::services::live_grep_state::GrepMatch>,
+    ) {
+        use crate::model::event::SplitDirection;
+        use crate::primitives::text_property::TextPropertyEntry;
+        use crate::view::split::SplitRole;
+
+        // Build the buffer's text content. One match per line:
+        //   path:line:col  ⎯  context
+        let mut entries = Vec::with_capacity(matches.len() + 2);
+        let header = format!("Quickfix: {} ({} matches)\n", query, matches.len());
+        entries.push(TextPropertyEntry::text(header));
+        for m in &matches {
+            let line = format!("{}:{}:{}  {}\n", m.file, m.line, m.column, m.content.trim());
+            entries.push(TextPropertyEntry::text(line));
+        }
+
+        // If a Quickfix buffer already exists (panel_id "quickfix"),
+        // update its content in place. Otherwise create one.
+        let panel_key = "quickfix".to_string();
+        if let Some(&existing) = self.panel_ids.get(&panel_key) {
+            if self.buffers.contains_key(&existing) {
+                if let Err(e) = self.set_virtual_buffer_content(existing, entries) {
+                    tracing::error!("Failed to update quickfix buffer: {}", e);
+                    return;
+                }
+                // Make sure the dock displays the quickfix buffer.
+                if let Some(dock_leaf) =
+                    self.split_manager.find_leaf_by_role(SplitRole::UtilityDock)
+                {
+                    self.split_manager.set_active_split(dock_leaf);
+                    self.set_pane_buffer(dock_leaf, existing);
+                }
+                self.set_status_message(format!("Quickfix updated: {} matches", matches.len()));
+                return;
+            }
+            // Stale entry — remove and fall through to create.
+            self.panel_ids.remove(&panel_key);
+        }
+
+        // Create the virtual buffer detached — `create_virtual_buffer`
+        // would add the buffer as a tab to whatever the currently
+        // active split is (the user's editor pane), and we'd then
+        // have to clean up that phantom tab after moving the buffer
+        // to the dock. Detached creation skips the phantom entirely.
+        let buffer_id = self.create_virtual_buffer_detached(
+            "*Quickfix*".to_string(),
+            "quickfix-list".to_string(),
+            true,
+        );
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            state.margins.configure_for_line_numbers(false);
+            state.show_cursors = true;
+            state.editing_disabled = true;
+        }
+        self.panel_ids.insert(panel_key, buffer_id);
+        if let Err(e) = self.set_virtual_buffer_content(buffer_id, entries) {
+            tracing::error!("Failed to set quickfix buffer content: {}", e);
+            return;
+        }
+
+        // Place the buffer in the dock — reuse the existing dock leaf
+        // if any; otherwise create one at the bottom (horizontal,
+        // ratio 0.3) and tag it as the dock.
+        if let Some(dock_leaf) = self.split_manager.find_leaf_by_role(SplitRole::UtilityDock) {
+            self.split_manager.set_active_split(dock_leaf);
+            self.set_pane_buffer(dock_leaf, buffer_id);
+            // The buffer was created detached, so its per-split view
+            // state hasn't been initialized in the dock's view_state
+            // yet. set_pane_buffer adds the buffer as a tab and sets
+            // it active; we still need to apply defaults for line
+            // numbers / wrap / rulers / etc. to its keyed state.
+            // Resolve config values up front so the &self lookups
+            // don't conflict with the &mut view_state borrow.
+            let line_numbers = self.config.editor.line_numbers;
+            let highlight_current_line = self.config.editor.highlight_current_line;
+            let line_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+            let wrap_indent = self.config.editor.wrap_indent;
+            let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
+            let rulers = self.config.editor.rulers.clone();
+            if let Some(view_state) = self.split_view_states.get_mut(&dock_leaf) {
+                let buf_state = view_state.ensure_buffer_state(buffer_id);
+                buf_state.apply_config_defaults(
+                    line_numbers,
+                    highlight_current_line,
+                    line_wrap,
+                    wrap_indent,
+                    wrap_column,
+                    rulers,
+                );
+                buf_state.show_line_numbers = false;
+            }
+        } else {
+            // Split at the root so the dock spans the full width
+            // below any pre-existing side-by-side panes.
+            match self.split_manager.split_root_positioned(
+                SplitDirection::Horizontal,
+                buffer_id,
+                0.7,
+                false, /* place dock after = bottom */
+            ) {
+                Ok(new_leaf) => {
+                    let mut view_state = crate::view::split::SplitViewState::with_buffer(
+                        self.terminal_width,
+                        self.terminal_height,
+                        buffer_id,
+                    );
+                    view_state.apply_config_defaults(
+                        self.config.editor.line_numbers,
+                        self.config.editor.highlight_current_line,
+                        self.resolve_line_wrap_for_buffer(buffer_id),
+                        self.config.editor.wrap_indent,
+                        self.resolve_wrap_column_for_buffer(buffer_id),
+                        self.config.editor.rulers.clone(),
+                    );
+                    view_state.ensure_buffer_state(buffer_id).show_line_numbers = false;
+                    self.split_view_states.insert(new_leaf, view_state);
+                    self.split_manager
+                        .set_leaf_role(new_leaf, Some(SplitRole::UtilityDock));
+                    self.split_manager.set_active_split(new_leaf);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create dock split for quickfix: {}", e);
+                    return;
+                }
+            }
+        }
+
+        self.set_status_message(format!(
+            "Quickfix exported: {} matches in dock",
+            matches.len()
+        ));
+    }
+
+    /// Whether editor-pane popups (LSP completion, hover, signature help,
+    /// global plugin popups, …) should intercept keyboard input.
+    ///
+    /// Returns `false` when:
+    ///   - the user has focus on the file explorer pane (popups belong
+    ///     to the editor pane, and the explorer must own its own
+    ///     keystrokes), or
+    ///   - the topmost visible popup is unfocused (LSP popups appear
+    ///     unfocused so they don't silently swallow the next keystroke;
+    ///     the user grabs focus explicitly with `popup_focus`,
+    ///     default `Alt+T`).
+    ///
+    /// Buffer-switch handlers (e.g. `open_file_preview`) clear stale
+    /// popups so a popup tied to the previous preview doesn't follow the
+    /// user across buffers.
+    ///
+    /// Single source of truth for both `get_key_context` (binding resolution)
+    /// and `dispatch_modal_input` (handler routing) so the two cannot drift.
+    pub(crate) fn popups_capture_keys(&self) -> bool {
+        use crate::input::keybindings::KeyContext;
+        if matches!(self.key_context, KeyContext::FileExplorer) {
+            return false;
+        }
+        self.topmost_popup_focused()
+    }
+
+    /// Whether the topmost visible popup (global stack first, then the
+    /// active buffer's stack) has been marked focused. Returns `false`
+    /// when no popup is visible — the caller is responsible for
+    /// short-circuiting that case.
+    pub(crate) fn topmost_popup_focused(&self) -> bool {
+        if let Some(popup) = self.global_popups.top() {
+            return popup.focused;
+        }
+        if let Some(popup) = self.active_state().popups.top() {
+            return popup.focused;
+        }
+        // No popup → no capture. Returning `false` here is safe because
+        // every caller gates on visibility before reaching this path.
+        false
+    }
+
+    /// When an *unfocused* popup is on screen, resolve the key event
+    /// against `KeyContext::Popup`/`Global` so the user's bound
+    /// `popup_cancel` (default Esc) and `popup_focus` (default Alt+T)
+    /// keys still take effect even though the popup isn't claiming the
+    /// keyboard. Without this, dismissing an LSP auto-prompt with Esc
+    /// would silently fall through to the buffer.
+    ///
+    /// Returns `None` for any other action so type-to-filter, cursor
+    /// motion, etc. continue to drive the buffer.
+    pub(crate) fn resolve_unfocused_popup_action(
+        &self,
+        event: &crossterm::event::KeyEvent,
+    ) -> Option<crate::input::keybindings::Action> {
+        use crate::input::keybindings::{Action, KeyContext};
+
+        let popup_visible =
+            self.global_popups.is_visible() || self.active_state().popups.is_visible();
+        if !popup_visible || self.topmost_popup_focused() {
+            return None;
+        }
+
+        // Higher-priority modal contexts (Settings, Menu, Prompt) own the
+        // keyboard regardless of whether a buffer popup happens to be
+        // visible underneath. Skip the unfocused-popup interception so
+        // pressing Esc in a settings dialog still closes the dialog
+        // rather than reaching past it to dismiss a stale popup.
+        if self.settings_state.as_ref().is_some_and(|s| s.visible)
+            || self.menu_state.active_menu.is_some()
+            || self.is_prompting()
+        {
+            return None;
+        }
+
+        let kb = self.keybindings.read().ok()?;
+
+        // `popup_focus` lives in the Normal/FileExplorer context defaults
+        // (not Global) so a user's own binding for the same key in those
+        // contexts wins at the same precedence level. If the resolution
+        // here returns anything other than `PopupFocus`, it's the user's
+        // override — let the normal dispatcher handle it. Don't claim
+        // `popup_cancel` from Normal because Normal's default `Esc`
+        // resolves to `remove_secondary_cursors`, which would shadow the
+        // popup-dismiss intent here.
+        let popup_focus_match = matches!(
+            kb.resolve_in_context_only(event, self.key_context.clone()),
+            Some(Action::PopupFocus),
+        );
+        if popup_focus_match {
+            return Some(Action::PopupFocus);
+        }
+
+        // Fall back to the Popup context for `popup_cancel`. Esc
+        // (the default `popup_cancel` binding) should still dismiss
+        // an unfocused popup even though the popup itself isn't
+        // claiming the keyboard — that matches every other popup-
+        // dismissal affordance in the editor.
+        let resolved_popup = kb.resolve_in_context_only(event, KeyContext::Popup);
+        match resolved_popup {
+            Some(action @ (Action::PopupCancel | Action::PopupFocus)) => Some(action),
+            _ => None,
+        }
+    }
+
+    /// Resolve a key event against `KeyContext::Completion` when the topmost
+    /// visible popup is a completion popup. Only `CompletionAccept` and
+    /// `CompletionDismiss` are recognised here — every other key falls
+    /// through to the popup's own handler so type-to-filter, navigation, and
+    /// the "any other key dismisses + passthrough" behaviours stay intact.
+    pub(crate) fn resolve_completion_popup_action(
+        &self,
+        event: &crossterm::event::KeyEvent,
+    ) -> Option<crate::input::keybindings::Action> {
+        use crate::input::keybindings::{Action, KeyContext};
+        use crate::view::popup::PopupKind;
+
+        let topmost_kind = if self.global_popups.is_visible() {
+            self.global_popups.top().map(|p| p.kind)
+        } else if self.active_state().popups.is_visible() {
+            self.active_state().popups.top().map(|p| p.kind)
+        } else {
+            None
+        };
+
+        if topmost_kind != Some(PopupKind::Completion) {
+            return None;
+        }
+
+        match self
+            .keybindings
+            .read()
+            .unwrap()
+            .resolve_in_context_only(event, KeyContext::Completion)
+        {
+            Some(action @ (Action::CompletionAccept | Action::CompletionDismiss)) => Some(action),
+            _ => None,
+        }
+    }
+
     /// Determine the current keybinding context based on UI state
     pub fn get_key_context(&self) -> crate::input::keybindings::KeyContext {
         use crate::input::keybindings::KeyContext;
 
-        // Priority order: Settings > Menu > Prompt > Popup > Rename > Current context (FileExplorer or Normal)
+        // Priority order: Settings > Menu > Prompt > Popup (only when
+        // editor-pane focused) > CompositeBuffer > Current context
+        // (FileExplorer or Normal).
         if self.settings_state.as_ref().is_some_and(|s| s.visible) {
             KeyContext::Settings
         } else if self.menu_state.active_menu.is_some() {
             KeyContext::Menu
         } else if self.is_prompting() {
             KeyContext::Prompt
-        } else if self.active_state().popups.is_visible() {
+        } else if self.popups_capture_keys()
+            && (self.global_popups.is_visible() || self.active_state().popups.is_visible())
+        {
             KeyContext::Popup
+        } else if self.is_composite_buffer(self.active_buffer()) {
+            KeyContext::CompositeBuffer
         } else {
             // Use the current context (can be FileExplorer or Normal)
             self.key_context.clone()
@@ -56,9 +412,25 @@ impl Editor {
             return Ok(());
         }
 
+        // If a plugin is awaiting the next keypress (`editor.getNextKey()`),
+        // hand this key to the front-most pending callback and consume it.
+        // This must run before any other dispatch so the awaiting plugin —
+        // typically running a short input loop (flash labels, vi
+        // find-char/replace-char) — can drive its own state machine
+        // without binding every printable key in `defineMode`.
+        if self.try_resolve_next_key_callback(&key_event) {
+            return Ok(());
+        }
+
         // Clear skip_ensure_visible flag so cursor becomes visible after key press
-        // (scroll actions will set it again if needed)
-        let active_split = self.split_manager.active_split();
+        // (scroll actions will set it again if needed). Use the *effective*
+        // active split so this clears the flag on a focused buffer-group
+        // panel's own view state, not the group host's — without this, a
+        // scroll action in the panel (mouse scrollbar click, plugin
+        // scrollBufferToLine, etc.) sets `skip_ensure_visible` on the panel
+        // and subsequent key presses never clear it, so cursor motion stops
+        // scrolling the viewport.
+        let active_split = self.effective_active_split();
         if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
             view_state.viewport.clear_skip_ensure_visible();
         }
@@ -68,15 +440,35 @@ impl Editor {
             self.theme_info_popup = None;
         }
 
+        if self.file_explorer_context_menu.is_some() {
+            if let Some(result) = self.handle_file_explorer_context_menu_key(code, modifiers) {
+                return result;
+            }
+        }
+
         // Determine the current context first
         let mut context = self.get_key_context();
 
         // Special case: Hover and Signature Help popups should be dismissed on any key press
-        // EXCEPT for Ctrl+C when the popup has a text selection (allow copy first)
-        if matches!(context, crate::input::keybindings::KeyContext::Popup) {
-            // Check if the current popup is transient (hover, signature help)
+        // EXCEPT for Ctrl+C when the popup has a text selection (allow copy first).
+        //
+        // Fires for both focused and unfocused popups: an unfocused
+        // hover popup that floats over the buffer must still vanish when
+        // the user starts typing — otherwise it lingers indefinitely
+        // because no key event reaches it. The focused-popup path also
+        // covers the legacy case where a transient popup was given
+        // focus (e.g. via the focus-popup keybinding).
+        let popup_visible_on_screen =
+            self.global_popups.is_visible() || self.active_state().popups.is_visible();
+        if popup_visible_on_screen {
+            // Check if the current popup is transient (hover, signature help).
+            // Editor-level popups always take precedence over buffer popups
+            // when both are visible — they're effectively modal overlays.
             let (is_transient_popup, has_selection) = {
-                let popup = self.active_state().popups.top();
+                let popup = self
+                    .global_popups
+                    .top()
+                    .or_else(|| self.active_state().popups.top());
                 (
                     popup.is_some_and(|p| p.transient),
                     popup.is_some_and(|p| p.has_selection()),
@@ -89,13 +481,37 @@ impl Editor {
                     .modifiers
                     .contains(crossterm::event::KeyModifiers::CONTROL);
 
-            if is_transient_popup && !(has_selection && is_copy_key) {
+            // Skip the dismiss when the user is *transferring* focus to
+            // the popup — otherwise pressing the focus-popup key while
+            // a transient popup is on screen would close the popup
+            // before its handler ever sees the focus action.
+            let resolved_action = self
+                .keybindings
+                .read()
+                .ok()
+                .map(|kb| kb.resolve(&key_event, context.clone()));
+            let is_focus_popup_key = matches!(
+                resolved_action,
+                Some(crate::input::keybindings::Action::PopupFocus)
+            );
+
+            if is_transient_popup && !(has_selection && is_copy_key) && !is_focus_popup_key {
                 // Dismiss the popup on any key press (except Ctrl+C with selection)
                 self.hide_popup();
                 tracing::debug!("Dismissed transient popup on key press");
                 // Recalculate context now that popup is gone
                 context = self.get_key_context();
             }
+        }
+
+        // Unfocused popup control: even though an unfocused popup
+        // doesn't claim the keyboard, the user's bound popup-cancel
+        // (default Esc) and popup-focus (default Alt+T) keys must
+        // still affect it. Resolved here, *before* the modal
+        // dispatcher routes the key to the buffer/explorer/etc.
+        if let Some(action) = self.resolve_unfocused_popup_action(&key_event) {
+            self.handle_action(action)?;
+            return Ok(());
         }
 
         // Try hierarchical modal input dispatch first (Settings, Menu, Prompt, Popup)
@@ -109,13 +525,11 @@ impl Editor {
             context = self.get_key_context();
         }
 
-        // Only check buffer mode keybindings if we're not in a higher-priority context
-        // (Menu, Prompt, Popup should take precedence over mode bindings)
-        let should_check_mode_bindings = matches!(
-            context,
-            crate::input::keybindings::KeyContext::Normal
-                | crate::input::keybindings::KeyContext::FileExplorer
-        );
+        // Only check buffer mode keybindings when the editor buffer has focus.
+        // FileExplorer, Menu, Prompt, Popup contexts should not trigger mode bindings
+        // (e.g. markdown-source's Enter handler should not fire while the explorer is focused).
+        let should_check_mode_bindings =
+            matches!(context, crate::input::keybindings::KeyContext::Normal);
 
         if should_check_mode_bindings {
             // effective_mode() returns buffer-local mode if present, else global mode.
@@ -127,9 +541,13 @@ impl Editor {
                 let key_event = crossterm::event::KeyEvent::new(code, modifiers);
 
                 // Mode chord resolution (via KeybindingResolver)
-                let chord_result =
-                    self.keybindings
-                        .resolve_chord(&self.chord_state, &key_event, mode_ctx.clone());
+                let (chord_result, resolved_action) = {
+                    let keybindings = self.keybindings.read().unwrap();
+                    let chord_result =
+                        keybindings.resolve_chord(&self.chord_state, &key_event, mode_ctx.clone());
+                    let resolved = keybindings.resolve(&key_event, mode_ctx);
+                    (chord_result, resolved)
+                };
                 match chord_result {
                     crate::input::keybindings::ChordResolution::Complete(action) => {
                         tracing::debug!("Mode chord resolved to action: {:?}", action);
@@ -150,9 +568,8 @@ impl Editor {
                 }
 
                 // Mode single-key resolution (custom > keymap > plugin defaults)
-                let resolved = self.keybindings.resolve(&key_event, mode_ctx);
-                if resolved != Action::None {
-                    return self.handle_action(resolved);
+                if resolved_action != Action::None {
+                    return self.handle_action(resolved_action);
                 }
             }
 
@@ -196,11 +613,33 @@ impl Editor {
             }
         }
 
+        // --- Composite buffer input routing ---
+        // If the active buffer is a composite buffer (side-by-side diff),
+        // route remaining composite-specific keys (scroll, pane switch, close)
+        // through CompositeInputRouter before falling through to regular
+        // keybinding resolution. Hunk navigation (n/p/]/[) is handled by the
+        // Action system via CompositeBuffer context bindings.
+        {
+            let active_buf = self.active_buffer();
+            let active_split = self.effective_active_split();
+            if self.is_composite_buffer(active_buf) {
+                if let Some(handled) =
+                    self.try_route_composite_key(active_split, active_buf, &key_event)
+                {
+                    return handled;
+                }
+            }
+        }
+
         // Check for chord sequence matches first
         let key_event = crossterm::event::KeyEvent::new(code, modifiers);
-        let chord_result =
-            self.keybindings
-                .resolve_chord(&self.chord_state, &key_event, context.clone());
+        let (chord_result, action) = {
+            let keybindings = self.keybindings.read().unwrap();
+            let chord_result =
+                keybindings.resolve_chord(&self.chord_state, &key_event, context.clone());
+            let action = keybindings.resolve(&key_event, context.clone());
+            (chord_result, action)
+        };
 
         match chord_result {
             crate::input::keybindings::ChordResolution::Complete(action) => {
@@ -224,9 +663,7 @@ impl Editor {
             }
         }
 
-        // Regular single-key resolution
-        let action = self.keybindings.resolve(&key_event, context.clone());
-
+        // Regular single-key resolution (already resolved above)
         tracing::trace!("Context: {:?} -> Action: {:?}", context, action);
 
         // Cancel pending LSP requests on user actions (except LSP actions themselves)
@@ -259,6 +696,11 @@ impl Editor {
         // Record action to macro if recording
         self.record_macro_action(&action);
 
+        // Reset dabbrev cycling session on any non-dabbrev action.
+        if !matches!(action, Action::DabbrevExpand) {
+            self.reset_dabbrev_state();
+        }
+
         match action {
             Action::Quit => self.quit(),
             Action::ForceQuit => {
@@ -282,8 +724,9 @@ impl Editor {
                         t!("file.file_changed_prompt").to_string(),
                         PromptType::ConfirmSaveConflict,
                     );
-                } else {
-                    self.save()?;
+                } else if let Err(e) = self.save() {
+                    let msg = format!("{}", e);
+                    self.status_message = Some(t!("file.save_failed", error = &msg).to_string());
                 }
             }
             Action::SaveAs => {
@@ -409,9 +852,12 @@ impl Editor {
                 }
             },
             Action::Copy => {
-                // Check if there's an active popup with text selection
-                let state = self.active_state();
-                if let Some(popup) = state.popups.top() {
+                // Editor-level popups take precedence over everything, including the file explorer.
+                let popup = self
+                    .global_popups
+                    .top()
+                    .or_else(|| self.active_state().popups.top());
+                if let Some(popup) = popup {
                     if popup.has_selection() {
                         if let Some(text) = popup.get_selected_text() {
                             self.clipboard.copy(text);
@@ -419,6 +865,10 @@ impl Editor {
                             return Ok(());
                         }
                     }
+                }
+                if self.key_context == crate::input::keybindings::KeyContext::FileExplorer {
+                    self.file_explorer_copy();
+                    return Ok(());
                 }
                 // Check if active buffer is a composite buffer
                 let buffer_id = self.active_buffer();
@@ -430,7 +880,13 @@ impl Editor {
                 self.copy_selection()
             }
             Action::CopyWithTheme(theme) => self.copy_selection_with_theme(&theme),
+            Action::CopyFilePath => self.copy_active_buffer_path(false),
+            Action::CopyRelativeFilePath => self.copy_active_buffer_path(true),
             Action::Cut => {
+                if self.key_context == crate::input::keybindings::KeyContext::FileExplorer {
+                    self.file_explorer_cut();
+                    return Ok(());
+                }
                 if self.is_editing_disabled() {
                     self.set_status_message(t!("buffer.editing_disabled").to_string());
                     return Ok(());
@@ -438,6 +894,10 @@ impl Editor {
                 self.cut_selection()
             }
             Action::Paste => {
+                if self.key_context == crate::input::keybindings::KeyContext::FileExplorer {
+                    self.file_explorer_paste();
+                    return Ok(());
+                }
                 if self.is_editing_disabled() {
                     self.set_status_message(t!("buffer.editing_disabled").to_string());
                     return Ok(());
@@ -448,6 +908,7 @@ impl Editor {
             Action::YankWordBackward => self.yank_word_backward(),
             Action::YankToLineEnd => self.yank_to_line_end(),
             Action::YankToLineStart => self.yank_to_line_start(),
+            Action::YankViWordEnd => self.yank_vi_word_end(),
             Action::Undo => {
                 self.handle_undo();
             }
@@ -469,46 +930,22 @@ impl Editor {
             Action::ShowLspStatus => {
                 self.show_lsp_status_popup();
             }
+            Action::ShowRemoteIndicatorMenu => {
+                self.show_remote_indicator_popup();
+            }
             Action::ClearWarnings => {
                 self.clear_warnings();
             }
             Action::CommandPalette => {
-                // Toggle command palette: close if already open, otherwise open it
+                // CommandPalette now delegates to QuickOpen (which starts with ">" prefix
+                // for command mode). Toggle if already open.
                 if let Some(prompt) = &self.prompt {
-                    if prompt.prompt_type == PromptType::Command {
+                    if prompt.prompt_type == PromptType::QuickOpen {
                         self.cancel_prompt();
                         return Ok(());
                     }
                 }
-
-                // Use the current context for filtering commands
-                let active_buffer_mode = self
-                    .buffer_metadata
-                    .get(&self.active_buffer())
-                    .and_then(|m| m.virtual_mode());
-                let has_lsp_config = {
-                    let language = self
-                        .buffers
-                        .get(&self.active_buffer())
-                        .map(|s| s.language.as_str());
-                    language
-                        .and_then(|lang| self.lsp.as_ref().and_then(|lsp| lsp.get_config(lang)))
-                        .is_some()
-                };
-                let suggestions = self.command_registry.read().unwrap().filter(
-                    "",
-                    self.key_context.clone(),
-                    &self.keybindings,
-                    self.has_active_selection(),
-                    &self.active_custom_contexts,
-                    active_buffer_mode,
-                    has_lsp_config,
-                );
-                self.start_prompt_with_suggestions(
-                    t!("file.command_prompt").to_string(),
-                    PromptType::Command,
-                    suggestions,
-                );
+                self.start_quick_open();
             }
             Action::QuickOpen => {
                 // Toggle Quick Open: close if already open, otherwise open it
@@ -522,13 +959,340 @@ impl Editor {
                 // Start Quick Open with file suggestions (default mode)
                 self.start_quick_open();
             }
+            Action::QuickOpenBuffers => {
+                if let Some(prompt) = &self.prompt {
+                    if prompt.prompt_type == PromptType::QuickOpen {
+                        self.cancel_prompt();
+                        return Ok(());
+                    }
+                }
+                self.start_quick_open_with_prefix("#");
+            }
+            Action::QuickOpenFiles => {
+                if let Some(prompt) = &self.prompt {
+                    if prompt.prompt_type == PromptType::QuickOpen {
+                        self.cancel_prompt();
+                        return Ok(());
+                    }
+                }
+                self.start_quick_open_with_prefix("");
+            }
+            Action::OpenLiveGrep => {
+                // Invoke the live_grep plugin's start_live_grep handler.
+                // This still produces the bottom-anchored Finder UI today
+                // — Phase 2/3 of issue #1796 will swap in the floating
+                // overlay rendering. The Action exists now so users get a
+                // direct keybinding (Alt+/) instead of palette-only access.
+                #[cfg(feature = "plugins")]
+                {
+                    if let Some(result) =
+                        self.plugin_manager.execute_action_async("start_live_grep")
+                    {
+                        match result {
+                            Ok(receiver) => {
+                                self.pending_plugin_actions
+                                    .push(("start_live_grep".to_string(), receiver));
+                            }
+                            Err(e) => {
+                                self.set_status_message(format!("Live Grep unavailable: {}", e));
+                            }
+                        }
+                    } else {
+                        self.set_status_message("Live Grep plugin not loaded".to_string());
+                    }
+                }
+                #[cfg(not(feature = "plugins"))]
+                {
+                    self.set_status_message("Live Grep requires the plugins feature".to_string());
+                }
+            }
+            Action::ResumeLiveGrep => {
+                // Re-open Live Grep with the cached query and the
+                // suggestions snapshot — does NOT re-run ripgrep
+                // (issue #1796: "restore / re-show without re-running
+                // the search"). If no cache exists, fall through to a
+                // fresh Live Grep invocation.
+                let cached = self.live_grep_last_state.clone();
+                match cached {
+                    Some(state) if state.cached_results.as_ref().is_some_and(|r| !r.is_empty()) => {
+                        let results = state.cached_results.unwrap_or_default();
+                        // Map cached GrepMatch records back into prompt
+                        // Suggestions. The text is "file:line", the
+                        // value carries "file:line:column" for the
+                        // PromptType::LiveGrep confirm handler.
+                        let suggestions: Vec<crate::input::commands::Suggestion> = results
+                            .into_iter()
+                            .map(|m| {
+                                let label = format!("{}:{}", m.file, m.line);
+                                let value = format!("{}:{}:{}", m.file, m.line, m.column);
+                                let mut s = crate::input::commands::Suggestion::new(label);
+                                s.description = Some(m.content);
+                                s.value = Some(value);
+                                s
+                            })
+                            .collect();
+                        // Build the prompt directly so we can seed
+                        // input + selection + suggestions in one shot.
+                        // Label string mirrors the live_grep plugin's
+                        // i18n bundle. Resume is core-driven (no
+                        // plugin), so we hardcode rather than route
+                        // through plugin-scoped translations.
+                        let mut prompt = crate::view::prompt::Prompt::with_suggestions(
+                            "Live grep: ".to_string(),
+                            PromptType::LiveGrep,
+                            suggestions,
+                        );
+                        prompt.input = state.query;
+                        prompt.cursor_pos = prompt.input.len();
+                        if let Some(idx) = state.selected_index {
+                            if idx < prompt.suggestions.len() {
+                                prompt.selected_suggestion = Some(idx);
+                            }
+                        }
+                        prompt.suggestions_set_for_input = Some(prompt.input.clone());
+                        // Render Resume in the floating overlay too.
+                        prompt.overlay = true;
+                        self.prompt = Some(prompt);
+                    }
+                    _ => {
+                        // No cache — kick off a fresh Live Grep.
+                        #[cfg(feature = "plugins")]
+                        if let Some(result) =
+                            self.plugin_manager.execute_action_async("start_live_grep")
+                        {
+                            match result {
+                                Ok(receiver) => {
+                                    self.pending_plugin_actions
+                                        .push(("start_live_grep".to_string(), receiver));
+                                }
+                                Err(e) => {
+                                    self.set_status_message(format!(
+                                        "Live Grep unavailable: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::LiveGrepExportQuickfix => {
+                // Snapshot the current Live Grep prompt's suggestions
+                // into a virtual buffer parked in the Utility Dock.
+                // Active when the prompt is either PromptType::LiveGrep
+                // or the live_grep plugin's Plugin{custom_type}.
+                let is_grep = self
+                    .prompt
+                    .as_ref()
+                    .map(|p| match &p.prompt_type {
+                        PromptType::LiveGrep => true,
+                        PromptType::Plugin { custom_type } => custom_type == "live-grep",
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if !is_grep {
+                    self.set_status_message(
+                        "Quickfix export is only available inside Live Grep".to_string(),
+                    );
+                    return Ok(());
+                }
+                let (query, matches) = {
+                    let prompt = self.prompt.as_ref().unwrap();
+                    (
+                        prompt.input.clone(),
+                        self.snapshot_prompt_results_for_grep(prompt),
+                    )
+                };
+                if matches.is_empty() {
+                    self.set_status_message("No Live Grep results to export".to_string());
+                    return Ok(());
+                }
+                // Dismiss the prompt before mutating split tree.
+                self.cancel_prompt();
+                // Hand off to the dock-installer.
+                self.install_quickfix_in_dock(query, matches);
+            }
+            Action::ToggleUtilityDock => {
+                use crate::view::split::SplitRole;
+                if let Some(dock_leaf) =
+                    self.split_manager.find_leaf_by_role(SplitRole::UtilityDock)
+                {
+                    let active = self.split_manager.active_split();
+                    if active == dock_leaf {
+                        // Already focused — no editor-leaf history yet,
+                        // so just cycle to the next leaf via the
+                        // existing Alt+] command. Phase 7 will track a
+                        // proper "previous editor split" pointer.
+                        self.next_split();
+                    } else {
+                        self.split_manager.set_active_split(dock_leaf);
+                    }
+                } else {
+                    self.set_status_message(
+                        "No Utility Dock open — invoke a dock-aware utility (Diagnostics, Search/Replace, …)"
+                            .to_string(),
+                    );
+                }
+            }
+            Action::CycleLiveGrepProvider => {
+                // Only meaningful while the Live Grep overlay is
+                // open. Detect via prompt state — both
+                // `PromptType::LiveGrep` (Resume's pre-seeded
+                // overlay) and `Plugin{custom_type:"live-grep"}`
+                // (the live-running plugin's prompt) qualify.
+                let in_live_grep = self
+                    .prompt
+                    .as_ref()
+                    .map(|p| match &p.prompt_type {
+                        PromptType::LiveGrep => true,
+                        PromptType::Plugin { custom_type } => custom_type == "live-grep",
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if !in_live_grep {
+                    self.set_status_message(
+                        "Cycle Live Grep provider only works inside Live Grep".to_string(),
+                    );
+                    return Ok(());
+                }
+                #[cfg(feature = "plugins")]
+                {
+                    if let Some(result) = self
+                        .plugin_manager
+                        .execute_action_async("live_grep_cycle_provider")
+                    {
+                        match result {
+                            Ok(receiver) => {
+                                self.pending_plugin_actions
+                                    .push(("live_grep_cycle_provider".to_string(), receiver));
+                            }
+                            Err(e) => {
+                                self.set_status_message(format!("Live Grep cycle failed: {}", e));
+                            }
+                        }
+                    } else {
+                        self.set_status_message("Live Grep plugin not loaded".to_string());
+                    }
+                }
+                #[cfg(not(feature = "plugins"))]
+                {
+                    self.set_status_message(
+                        "Live Grep cycle requires the plugins feature".to_string(),
+                    );
+                }
+            }
+            Action::OpenTerminalInDock => {
+                use crate::model::event::SplitDirection;
+                use crate::view::split::SplitRole;
+                if let Some(dock_leaf) =
+                    self.split_manager.find_leaf_by_role(SplitRole::UtilityDock)
+                {
+                    // Existing dock — focus it and let the regular
+                    // open_terminal path attach a new terminal tab.
+                    self.split_manager.set_active_split(dock_leaf);
+                    self.open_terminal();
+                } else {
+                    // No dock yet. Spawn the PTY first so we have a
+                    // real terminal buffer to seed the new dock leaf
+                    // with — otherwise the leaf would carry the
+                    // user's previously-active buffer as a placeholder
+                    // and that buffer would linger as a phantom tab in
+                    // the dock alongside the terminal.
+                    let Some(terminal_id) = self.spawn_terminal_session() else {
+                        return Ok(());
+                    };
+                    let buffer_id = self.create_terminal_buffer_detached(terminal_id);
+                    // Split at the root so the dock spans the full
+                    // width below any pre-existing side-by-side panes.
+                    match self.split_manager.split_root_positioned(
+                        SplitDirection::Horizontal,
+                        buffer_id,
+                        0.7,
+                        false,
+                    ) {
+                        Ok(new_leaf) => {
+                            let mut view_state = crate::view::split::SplitViewState::with_buffer(
+                                self.terminal_width,
+                                self.terminal_height,
+                                buffer_id,
+                            );
+                            view_state.apply_config_defaults(
+                                self.config.editor.line_numbers,
+                                self.config.editor.highlight_current_line,
+                                self.resolve_line_wrap_for_buffer(buffer_id),
+                                self.config.editor.wrap_indent,
+                                self.resolve_wrap_column_for_buffer(buffer_id),
+                                self.config.editor.rulers.clone(),
+                            );
+                            // Terminals don't wrap — keep escape
+                            // sequences intact, mirroring the regular
+                            // open_terminal path.
+                            view_state.viewport.line_wrap_enabled = false;
+                            self.split_view_states.insert(new_leaf, view_state);
+                            self.split_manager
+                                .set_leaf_role(new_leaf, Some(SplitRole::UtilityDock));
+                            self.split_manager.set_active_split(new_leaf);
+                            // Mirror open_terminal's post-attach
+                            // bookkeeping. Skip set_active_buffer —
+                            // the leaf already shows the terminal and
+                            // its tab list contains only the terminal,
+                            // exactly the desired final state.
+                            self.terminal_mode = true;
+                            self.key_context = crate::input::keybindings::KeyContext::Terminal;
+                            self.resize_visible_terminals();
+                            let exit_key = self
+                                .keybindings
+                                .read()
+                                .unwrap()
+                                .find_keybinding_for_action(
+                                    "terminal_escape",
+                                    crate::input::keybindings::KeyContext::Terminal,
+                                )
+                                .unwrap_or_else(|| "Ctrl+Space".to_string());
+                            self.set_status_message(
+                                rust_i18n::t!(
+                                    "terminal.opened",
+                                    id = terminal_id.0,
+                                    exit_key = exit_key
+                                )
+                                .to_string(),
+                            );
+                            tracing::info!(
+                                "Opened terminal {:?} into new dock leaf {:?} (buffer {:?})",
+                                terminal_id,
+                                new_leaf,
+                                buffer_id
+                            );
+                        }
+                        Err(e) => {
+                            self.set_status_message(format!(
+                                "Failed to create dock for terminal: {}",
+                                e
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             Action::ToggleLineWrap => {
-                self.config.editor.line_wrap = !self.config.editor.line_wrap;
+                let new_value = !self.config.editor.line_wrap;
+                self.config_mut().editor.line_wrap = new_value;
 
-                // Update all viewports to reflect the new line wrap setting
-                for view_state in self.split_view_states.values_mut() {
-                    view_state.viewport.line_wrap_enabled = self.config.editor.line_wrap;
-                    view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                // Update all viewports to reflect the new line wrap setting,
+                // respecting per-language overrides
+                let leaf_ids: Vec<_> = self.split_view_states.keys().copied().collect();
+                for leaf_id in leaf_ids {
+                    let buffer_id = self
+                        .split_manager
+                        .get_buffer_id(leaf_id.into())
+                        .unwrap_or(BufferId(0));
+                    let effective_wrap = self.resolve_line_wrap_for_buffer(buffer_id);
+                    let wrap_column = self.resolve_wrap_column_for_buffer(buffer_id);
+                    if let Some(view_state) = self.split_view_states.get_mut(&leaf_id) {
+                        view_state.viewport.line_wrap_enabled = effective_wrap;
+                        view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
+                        view_state.viewport.wrap_column = wrap_column;
+                    }
                 }
 
                 let state = if self.config.editor.line_wrap {
@@ -537,6 +1301,28 @@ impl Editor {
                     t!("view.state_disabled").to_string()
                 };
                 self.set_status_message(t!("view.line_wrap_state", state = state).to_string());
+            }
+            Action::ToggleCurrentLineHighlight => {
+                let new_value = !self.config.editor.highlight_current_line;
+                self.config_mut().editor.highlight_current_line = new_value;
+
+                // Update all splits
+                let leaf_ids: Vec<_> = self.split_view_states.keys().copied().collect();
+                for leaf_id in leaf_ids {
+                    if let Some(view_state) = self.split_view_states.get_mut(&leaf_id) {
+                        view_state.highlight_current_line =
+                            self.config.editor.highlight_current_line;
+                    }
+                }
+
+                let state = if self.config.editor.highlight_current_line {
+                    t!("view.state_enabled").to_string()
+                } else {
+                    t!("view.state_disabled").to_string()
+                };
+                self.set_status_message(
+                    t!("view.current_line_highlight_state", state = state).to_string(),
+                );
             }
             Action::ToggleReadOnly => {
                 let buffer_id = self.active_buffer();
@@ -554,10 +1340,10 @@ impl Editor {
                 };
                 self.set_status_message(t!("view.read_only_state", state = state_str).to_string());
             }
-            Action::ToggleComposeMode => {
-                self.handle_toggle_compose_mode();
+            Action::TogglePageView => {
+                self.handle_toggle_page_view();
             }
-            Action::SetComposeWidth => {
+            Action::SetPageWidth => {
                 let active_split = self.split_manager.active_split();
                 let current = self
                     .split_view_states
@@ -565,8 +1351,8 @@ impl Editor {
                     .and_then(|v| v.compose_width.map(|w| w.to_string()))
                     .unwrap_or_default();
                 self.start_prompt_with_initial_text(
-                    "Compose width (empty = viewport): ".to_string(),
-                    PromptType::SetComposeWidth,
+                    "Page width (empty = viewport): ".to_string(),
+                    PromptType::SetPageWidth,
                     current,
                 );
             }
@@ -597,6 +1383,9 @@ impl Editor {
             }
             Action::LspCompletion => {
                 self.request_completion();
+            }
+            Action::DabbrevExpand => {
+                self.dabbrev_expand();
             }
             Action::LspGotoDefinition => {
                 self.request_goto_definition()?;
@@ -630,6 +1419,9 @@ impl Editor {
             }
             Action::DumpConfig => {
                 self.dump_config();
+            }
+            Action::RedrawScreen => {
+                self.request_full_redraw();
             }
             Action::SelectTheme => {
                 self.start_select_theme_prompt();
@@ -740,6 +1532,7 @@ impl Editor {
             Action::ToggleMenuBar => self.toggle_menu_bar(),
             Action::ToggleTabBar => self.toggle_tab_bar(),
             Action::ToggleStatusBar => self.toggle_status_bar(),
+            Action::TogglePromptLine => self.toggle_prompt_line(),
             Action::ToggleVerticalScrollbar => self.toggle_vertical_scrollbar(),
             Action::ToggleHorizontalScrollbar => self.toggle_horizontal_scrollbar(),
             Action::ToggleLineNumbers => self.toggle_line_numbers(),
@@ -820,6 +1613,16 @@ impl Editor {
             Action::FileExplorerToggleGitignored => self.file_explorer_toggle_gitignored(),
             Action::FileExplorerSearchClear => self.file_explorer_search_clear(),
             Action::FileExplorerSearchBackspace => self.file_explorer_search_pop_char(),
+            Action::FileExplorerCopy => self.file_explorer_copy(),
+            Action::FileExplorerCut => self.file_explorer_cut(),
+            Action::FileExplorerPaste => self.file_explorer_paste(),
+            Action::FileExplorerDuplicate => self.file_explorer_duplicate(),
+            Action::FileExplorerCopyFullPath => self.file_explorer_copy_path(false),
+            Action::FileExplorerCopyRelativePath => self.file_explorer_copy_path(true),
+            Action::FileExplorerExtendSelectionUp => self.file_explorer_extend_selection_up(),
+            Action::FileExplorerExtendSelectionDown => self.file_explorer_extend_selection_down(),
+            Action::FileExplorerToggleSelect => self.file_explorer_toggle_select(),
+            Action::FileExplorerSelectAll => self.file_explorer_select_all(),
             Action::RemoveSecondaryCursors => {
                 // Convert action to events and apply them
                 if let Some(events) = self.action_to_events(Action::RemoveSecondaryCursors) {
@@ -866,7 +1669,9 @@ impl Editor {
                 }
             }
             Action::MenuOpen(menu_name) => {
-                self.handle_menu_open(&menu_name);
+                if self.config.editor.menu_bar_mnemonics {
+                    self.handle_menu_open(&menu_name);
+                }
             }
 
             Action::SwitchKeybindingMap(map_name) => {
@@ -877,10 +1682,10 @@ impl Editor {
 
                 if is_builtin || is_user_defined {
                     // Update the active keybinding map in config
-                    self.config.active_keybinding_map = map_name.clone().into();
+                    self.config_mut().active_keybinding_map = map_name.clone().into();
 
                     // Reload the keybinding resolver with the new map
-                    self.keybindings =
+                    *self.keybindings.write().unwrap() =
                         crate::input::keybindings::KeybindingResolver::new(&self.config);
 
                     self.set_status_message(
@@ -1050,7 +1855,7 @@ impl Editor {
                 self.start_prompt("Play macro (0-9): ".to_string(), PromptType::PlayMacro);
             }
             Action::PlayLastMacro => {
-                if let Some(key) = self.last_macro_register {
+                if let Some(key) = self.macros.last_register() {
                     self.play_macro(key);
                 } else {
                     self.set_status_message(t!("status.no_macro_recorded").to_string());
@@ -1064,6 +1869,14 @@ impl Editor {
                     "Jump to bookmark (0-9): ".to_string(),
                     PromptType::JumpToBookmark,
                 );
+            }
+            Action::CompositeNextHunk => {
+                let buf = self.active_buffer();
+                self.composite_next_hunk_active(buf);
+            }
+            Action::CompositePrevHunk => {
+                let buf = self.active_buffer();
+                self.composite_prev_hunk_active(buf);
             }
             Action::None => {}
             Action::DeleteBackward => {
@@ -1170,6 +1983,70 @@ impl Editor {
                     );
                 }
             }
+            Action::InitReload => {
+                // Same code path as auto-load: read init.ts and push it
+                // through the existing plugin pipeline. The runtime's
+                // hot-reload semantics drop prior commands / handlers /
+                // event subs / settings before the new source runs.
+                self.load_init_script(true);
+                // Re-fire plugins_loaded so handlers expecting a "fresh"
+                // post-load environment (M2) see it.
+                self.fire_plugins_loaded_hook();
+            }
+            Action::InitEdit => {
+                // Ensure the file exists (create from template if absent),
+                // then open it in the editor so users can edit + reload.
+                let config_dir = self.dir_context.config_dir.clone();
+                match crate::init_script::ensure_starter(&config_dir) {
+                    Ok(path) => {
+                        // Regenerate `types/plugins.d.ts` from the live plugin
+                        // set. It's written once at editor startup, but any
+                        // plugin loaded/reloaded/unloaded since then would
+                        // leave the aggregate stale (or missing, in builds
+                        // where the plugins feature was off at boot but the
+                        // user has since enabled a plugin). The user's
+                        // tsconfig.json lists this file in `files`, so a
+                        // stale copy is exactly when `getPluginApi("foo")`
+                        // loses its typed overload.
+                        let declarations = self.plugin_manager.plugin_declarations();
+                        crate::init_script::write_plugin_declarations(&config_dir, &declarations);
+                        match self.open_file(&path) {
+                            Ok(_) => {
+                                self.set_status_message(format!("init.ts: {}", path.display()));
+                            }
+                            Err(e) => {
+                                self.set_status_message(format!("init.ts: open failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.set_status_message(format!("init.ts: create failed: {e}"));
+                    }
+                }
+            }
+            Action::InitCheck => {
+                // Run the same parse check as `fresh --cmd init check` but
+                // surface results in the status bar.
+                let report = crate::init_script::check(&self.dir_context.config_dir);
+                if report.ok && report.diagnostics.is_empty() {
+                    self.set_status_message("init.ts: ok".into());
+                } else if !report.ok {
+                    let first = report
+                        .diagnostics
+                        .first()
+                        .map(|d| format!("{}:{}: {}", d.line, d.column, d.message))
+                        .unwrap_or_else(|| "unknown error".into());
+                    self.set_status_message(format!(
+                        "init.ts: {} error(s) — first: {first}",
+                        report.diagnostics.len()
+                    ));
+                } else {
+                    self.set_status_message(format!(
+                        "init.ts: {} warning(s)",
+                        report.diagnostics.len()
+                    ));
+                }
+            }
             Action::OpenTerminal => {
                 self.open_terminal();
             }
@@ -1250,6 +2127,11 @@ impl Editor {
                     state.reset_current_to_default();
                 }
             }
+            Action::SettingsInherit => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.set_current_to_null();
+                }
+            }
             Action::SettingsToggleFocus => {
                 if let Some(ref mut state) = self.settings_state {
                     state.toggle_focus();
@@ -1279,6 +2161,9 @@ impl Editor {
             }
             Action::EventDebug => {
                 self.open_event_debug();
+            }
+            Action::SuspendProcess => {
+                self.request_suspend();
             }
             Action::OpenKeybindingEditor => {
                 self.open_keybinding_editor();
@@ -1323,6 +2208,18 @@ impl Editor {
                 }
             }
             Action::PopupCancel => {
+                self.handle_popup_cancel();
+            }
+            Action::PopupFocus => {
+                self.handle_popup_focus();
+            }
+            Action::CompletionAccept => {
+                use super::popup_actions::PopupConfirmResult;
+                if let PopupConfirmResult::EarlyReturn = self.handle_popup_confirm() {
+                    return Ok(());
+                }
+            }
+            Action::CompletionDismiss => {
                 self.handle_popup_cancel();
             }
             Action::InsertChar(c) => {
@@ -1380,2435 +2277,5 @@ impl Editor {
         }
 
         Ok(())
-    }
-
-    /// Handle mouse wheel scroll event
-    pub(super) fn handle_mouse_scroll(
-        &mut self,
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> AnyhowResult<()> {
-        // Notify plugins of mouse scroll so they can handle it for virtual buffers
-        let buffer_id = self.active_buffer();
-        self.plugin_manager.run_hook(
-            "mouse_scroll",
-            fresh_core::hooks::HookArgs::MouseScroll {
-                buffer_id,
-                delta,
-                col,
-                row,
-            },
-        );
-
-        // Check if scroll is over the file explorer
-        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
-            if col >= explorer_area.x
-                && col < explorer_area.x + explorer_area.width
-                && row >= explorer_area.y
-                && row < explorer_area.y + explorer_area.height
-            {
-                // Scroll the file explorer
-                if let Some(explorer) = &mut self.file_explorer {
-                    let count = explorer.visible_count();
-                    if count == 0 {
-                        return Ok(());
-                    }
-
-                    // Get current selected index
-                    let current_index = explorer.get_selected_index().unwrap_or(0);
-
-                    // Calculate new index based on scroll delta
-                    let new_index = if delta < 0 {
-                        // Scroll up (negative delta)
-                        current_index.saturating_sub(delta.unsigned_abs() as usize)
-                    } else {
-                        // Scroll down (positive delta)
-                        (current_index + delta as usize).min(count - 1)
-                    };
-
-                    // Set the new selection
-                    if let Some(node_id) = explorer.get_node_at_index(new_index) {
-                        explorer.set_selected(Some(node_id));
-                        explorer.update_scroll_for_selection();
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        // Otherwise, scroll the editor in the active split
-        // Use SplitViewState's viewport (View events go to SplitViewState, not EditorState)
-        let active_split = self.split_manager.active_split();
-        let buffer_id = self.active_buffer();
-
-        // Check if this is a composite buffer - if so, use composite scroll
-        if self.is_composite_buffer(buffer_id) {
-            let max_row = self
-                .composite_buffers
-                .get(&buffer_id)
-                .map(|c| c.row_count().saturating_sub(1))
-                .unwrap_or(0);
-            if let Some(view_state) = self
-                .composite_view_states
-                .get_mut(&(active_split, buffer_id))
-            {
-                view_state.scroll(delta as isize, max_row);
-                tracing::trace!(
-                    "handle_mouse_scroll (composite): delta={}, scroll_row={}",
-                    delta,
-                    view_state.scroll_row
-                );
-            }
-            return Ok(());
-        }
-
-        // Get view_transform tokens from SplitViewState (if any)
-        let view_transform_tokens = self
-            .split_view_states
-            .get(&active_split)
-            .and_then(|vs| vs.view_transform.as_ref())
-            .map(|vt| vt.tokens.clone());
-
-        // Get mutable references to both buffer state and view state
-        let state = self.buffers.get_mut(&buffer_id);
-        let view_state = self.split_view_states.get_mut(&active_split);
-
-        if let (Some(state), Some(view_state)) = (state, view_state) {
-            let buffer = &mut state.buffer;
-            let top_byte_before = view_state.viewport.top_byte;
-            if let Some(tokens) = view_transform_tokens {
-                // Use view-aware scrolling with the transform's tokens
-                use crate::view::ui::view_pipeline::ViewLineIterator;
-                let tab_size = self.config.editor.tab_size;
-                let view_lines: Vec<_> =
-                    ViewLineIterator::new(&tokens, false, false, tab_size, false).collect();
-                view_state
-                    .viewport
-                    .scroll_view_lines(&view_lines, delta as isize);
-            } else {
-                // No view transform - use traditional buffer-based scrolling
-                if delta < 0 {
-                    // Scroll up
-                    let lines_to_scroll = delta.unsigned_abs() as usize;
-                    view_state.viewport.scroll_up(buffer, lines_to_scroll);
-                } else {
-                    // Scroll down
-                    let lines_to_scroll = delta as usize;
-                    view_state.viewport.scroll_down(buffer, lines_to_scroll);
-                }
-            }
-            // Skip ensure_visible so the scroll position isn't undone during render
-            view_state.viewport.set_skip_ensure_visible();
-
-            if let Some(folds) = view_state.keyed_states.get(&buffer_id).map(|bs| &bs.folds) {
-                if !folds.is_empty() {
-                    let top_line = buffer.get_line_number(view_state.viewport.top_byte);
-                    if let Some(range) = folds
-                        .resolved_ranges(buffer, &state.marker_list)
-                        .iter()
-                        .find(|r| top_line >= r.start_line && top_line <= r.end_line)
-                    {
-                        let target_line = if delta >= 0 {
-                            range.end_line.saturating_add(1)
-                        } else {
-                            range.header_line
-                        };
-                        let target_byte = buffer
-                            .line_start_offset(target_line)
-                            .unwrap_or_else(|| buffer.len());
-                        view_state.viewport.top_byte = target_byte;
-                        view_state.viewport.top_view_line_offset = 0;
-                    }
-                }
-            }
-            tracing::trace!(
-                "handle_mouse_scroll: delta={}, top_byte {} -> {}",
-                delta,
-                top_byte_before,
-                view_state.viewport.top_byte
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Handle horizontal scroll (Shift+ScrollWheel or native ScrollLeft/ScrollRight)
-    pub(super) fn handle_horizontal_scroll(
-        &mut self,
-        _col: u16,
-        _row: u16,
-        delta: i32,
-    ) -> AnyhowResult<()> {
-        let active_split = self.split_manager.active_split();
-
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-            // Don't scroll horizontally when line wrap is enabled
-            if view_state.viewport.line_wrap_enabled {
-                return Ok(());
-            }
-
-            let columns_to_scroll = delta.unsigned_abs() as usize;
-            if delta < 0 {
-                // Scroll left
-                view_state.viewport.left_column = view_state
-                    .viewport
-                    .left_column
-                    .saturating_sub(columns_to_scroll);
-            } else {
-                // Scroll right - clamp to max_line_length_seen
-                let visible_width = view_state.viewport.width as usize;
-                let max_scroll = view_state
-                    .viewport
-                    .max_line_length_seen
-                    .saturating_sub(visible_width);
-                let new_left = view_state
-                    .viewport
-                    .left_column
-                    .saturating_add(columns_to_scroll);
-                view_state.viewport.left_column = new_left.min(max_scroll);
-            }
-            // Skip ensure_visible so the scroll position isn't undone during render
-            view_state.viewport.set_skip_ensure_visible();
-        }
-
-        Ok(())
-    }
-
-    /// Handle scrollbar drag with relative movement (when dragging from thumb)
-    pub(super) fn handle_scrollbar_drag_relative(
-        &mut self,
-        row: u16,
-        split_id: LeafId,
-        buffer_id: BufferId,
-        scrollbar_rect: ratatui::layout::Rect,
-    ) -> AnyhowResult<()> {
-        let drag_start_row = match self.mouse_state.drag_start_row {
-            Some(r) => r,
-            None => return Ok(()), // No drag start, shouldn't happen
-        };
-
-        // Handle composite buffers - use row-based scrolling
-        if self.is_composite_buffer(buffer_id) {
-            return self.handle_composite_scrollbar_drag_relative(
-                row,
-                drag_start_row,
-                split_id,
-                buffer_id,
-                scrollbar_rect,
-            );
-        }
-
-        let drag_start_top_byte = match self.mouse_state.drag_start_top_byte {
-            Some(b) => b,
-            None => return Ok(()), // No drag start, shouldn't happen
-        };
-
-        let drag_start_view_line_offset = self.mouse_state.drag_start_view_line_offset.unwrap_or(0);
-
-        // Calculate the offset in rows (still used for large files)
-        let row_offset = (row as i32) - (drag_start_row as i32);
-
-        // Get viewport height from SplitViewState
-        let viewport_height = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.height as usize)
-            .unwrap_or(10);
-
-        // Check if line wrapping is enabled
-        let line_wrap_enabled = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.line_wrap_enabled)
-            .unwrap_or(false);
-
-        let viewport_width = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.width as usize)
-            .unwrap_or(80);
-
-        // Get the buffer state and calculate target position using RELATIVE movement
-        // Returns (byte_position, view_line_offset) for proper positioning within wrapped lines
-        let scroll_position = if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            let scrollbar_height = scrollbar_rect.height as usize;
-            if scrollbar_height == 0 {
-                return Ok(());
-            }
-
-            let buffer_len = state.buffer.len();
-            let large_file_threshold = self.config.editor.large_file_threshold_bytes as usize;
-
-            // Use relative movement: calculate scroll change based on row_offset from drag start
-            if buffer_len <= large_file_threshold {
-                // When line wrapping is enabled, use visual row calculations
-                if line_wrap_enabled {
-                    Self::calculate_scrollbar_drag_relative_visual(
-                        &mut state.buffer,
-                        row,
-                        scrollbar_rect.y,
-                        scrollbar_height,
-                        drag_start_row,
-                        drag_start_top_byte,
-                        drag_start_view_line_offset,
-                        viewport_height,
-                        viewport_width,
-                    )
-                } else {
-                    // Small file without line wrap: thumb follows mouse
-                    let total_lines = if buffer_len > 0 {
-                        state.buffer.get_line_number(buffer_len.saturating_sub(1)) + 1
-                    } else {
-                        1
-                    };
-
-                    let max_scroll_line = total_lines.saturating_sub(viewport_height);
-
-                    if max_scroll_line == 0 || scrollbar_height <= 1 {
-                        // File fits in viewport, no scrolling
-                        (0, 0)
-                    } else {
-                        // Find the starting line number from drag_start_top_byte
-                        let start_line = state.buffer.get_line_number(drag_start_top_byte);
-
-                        // Calculate thumb size (same formula as scrollbar rendering)
-                        let thumb_size_raw = (viewport_height as f64 / total_lines as f64
-                            * scrollbar_height as f64)
-                            .ceil() as usize;
-                        let max_thumb_size = (scrollbar_height as f64 * 0.8).floor() as usize;
-                        let thumb_size = thumb_size_raw
-                            .max(1)
-                            .min(max_thumb_size)
-                            .min(scrollbar_height);
-
-                        // Calculate max thumb start position (same as scrollbar rendering)
-                        let max_thumb_start = scrollbar_height.saturating_sub(thumb_size);
-
-                        if max_thumb_start == 0 {
-                            // Thumb fills the track, no dragging possible
-                            (0, 0)
-                        } else {
-                            // Calculate where the thumb was at drag start
-                            let start_scroll_ratio =
-                                start_line.min(max_scroll_line) as f64 / max_scroll_line as f64;
-                            let thumb_row_at_start = scrollbar_rect.y as f64
-                                + start_scroll_ratio * max_thumb_start as f64;
-
-                            // Calculate click offset (where on thumb we clicked)
-                            let click_offset = drag_start_row as f64 - thumb_row_at_start;
-
-                            // Target thumb position based on current mouse position
-                            let target_thumb_row = row as f64 - click_offset;
-
-                            // Map target thumb position to scroll ratio
-                            let target_scroll_ratio = ((target_thumb_row
-                                - scrollbar_rect.y as f64)
-                                / max_thumb_start as f64)
-                                .clamp(0.0, 1.0);
-
-                            // Map scroll ratio to target line
-                            let target_line =
-                                (target_scroll_ratio * max_scroll_line as f64).round() as usize;
-                            let target_line = target_line.min(max_scroll_line);
-
-                            // Find byte position of target line
-                            let target_byte = state
-                                .buffer
-                                .line_start_offset(target_line)
-                                .unwrap_or(drag_start_top_byte);
-
-                            (target_byte, 0)
-                        }
-                    }
-                }
-            } else {
-                // Large file: use byte-based relative movement
-                let bytes_per_pixel = buffer_len as f64 / scrollbar_height as f64;
-                let byte_offset = (row_offset as f64 * bytes_per_pixel) as i64;
-
-                let new_top_byte = if byte_offset >= 0 {
-                    drag_start_top_byte.saturating_add(byte_offset as usize)
-                } else {
-                    drag_start_top_byte.saturating_sub((-byte_offset) as usize)
-                };
-
-                // Clamp to valid range using byte-based max (avoid iterating entire buffer)
-                let new_top_byte = new_top_byte.min(buffer_len.saturating_sub(1));
-
-                // Find the line start for this byte position
-                let iter = state.buffer.line_iterator(new_top_byte, 80);
-                (iter.current_position(), 0)
-            }
-        } else {
-            return Ok(());
-        };
-
-        // Set viewport top to this position in SplitViewState
-        if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-            view_state.viewport.top_byte = scroll_position.0;
-            view_state.viewport.top_view_line_offset = scroll_position.1;
-            // Skip ensure_visible so the scroll position isn't undone during render
-            view_state.viewport.set_skip_ensure_visible();
-        }
-
-        // Move cursor to be visible in the new viewport (after releasing the state borrow)
-        self.move_cursor_to_visible_area(split_id, buffer_id);
-
-        Ok(())
-    }
-
-    /// Handle scrollbar jump (clicking on track or absolute positioning)
-    pub(super) fn handle_scrollbar_jump(
-        &mut self,
-        _col: u16,
-        row: u16,
-        split_id: LeafId,
-        buffer_id: BufferId,
-        scrollbar_rect: ratatui::layout::Rect,
-    ) -> AnyhowResult<()> {
-        // Calculate which line to scroll to based on mouse position
-        let scrollbar_height = scrollbar_rect.height as usize;
-        if scrollbar_height == 0 {
-            return Ok(());
-        }
-
-        // Get relative position in scrollbar (0.0 to 1.0)
-        // Divide by (height - 1) to map first row to 0.0 and last row to 1.0
-        let relative_row = row.saturating_sub(scrollbar_rect.y);
-        let ratio = if scrollbar_height > 1 {
-            ((relative_row as f64) / ((scrollbar_height - 1) as f64)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        // Handle composite buffers - use row-based scrolling
-        if self.is_composite_buffer(buffer_id) {
-            return self.handle_composite_scrollbar_jump(
-                ratio,
-                split_id,
-                buffer_id,
-                scrollbar_rect,
-            );
-        }
-
-        // Get viewport height from SplitViewState
-        let viewport_height = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.height as usize)
-            .unwrap_or(10);
-
-        // Check if line wrapping is enabled
-        let line_wrap_enabled = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.line_wrap_enabled)
-            .unwrap_or(false);
-
-        let viewport_width = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.width as usize)
-            .unwrap_or(80);
-
-        // Get the buffer state and calculate scroll position
-        // Returns (byte_position, view_line_offset) for proper positioning within wrapped lines
-        let scroll_position = if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            let buffer_len = state.buffer.len();
-            let large_file_threshold = self.config.editor.large_file_threshold_bytes as usize;
-
-            // For small files, use precise line-based calculations
-            // For large files, fall back to byte-based estimation
-            if buffer_len <= large_file_threshold {
-                // When line wrapping is enabled, use visual row calculations
-                if line_wrap_enabled {
-                    // calculate_scrollbar_jump_visual already handles max scroll limiting
-                    // and returns both byte position and view line offset
-                    Self::calculate_scrollbar_jump_visual(
-                        &mut state.buffer,
-                        ratio,
-                        viewport_height,
-                        viewport_width,
-                    )
-                } else {
-                    // Small file without line wrap: use line-based calculation for precision
-                    let total_lines = if buffer_len > 0 {
-                        state.buffer.get_line_number(buffer_len.saturating_sub(1)) + 1
-                    } else {
-                        1
-                    };
-
-                    let max_scroll_line = total_lines.saturating_sub(viewport_height);
-
-                    let target_byte = if max_scroll_line == 0 {
-                        // File fits in viewport, no scrolling
-                        0
-                    } else {
-                        // Map ratio to target line
-                        let target_line = (ratio * max_scroll_line as f64).round() as usize;
-                        let target_line = target_line.min(max_scroll_line);
-
-                        // Find byte position of target line
-                        // We need to iterate 'target_line' times to skip past lines 0..target_line-1,
-                        // then one more time to get the position of line 'target_line'
-                        let mut iter = state.buffer.line_iterator(0, 80);
-                        let mut line_byte = 0;
-
-                        for _ in 0..target_line {
-                            if let Some((pos, _content)) = iter.next_line() {
-                                line_byte = pos;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Get the position of the target line
-                        if let Some((pos, _)) = iter.next_line() {
-                            pos
-                        } else {
-                            line_byte // Reached end of buffer
-                        }
-                    };
-
-                    // Find the line start for this byte position
-                    let iter = state.buffer.line_iterator(target_byte, 80);
-                    let line_start = iter.current_position();
-
-                    // Apply scroll limiting
-                    let max_top_byte =
-                        Self::calculate_max_scroll_position(&mut state.buffer, viewport_height);
-                    (line_start.min(max_top_byte), 0)
-                }
-            } else {
-                // Large file: use byte-based estimation (original logic)
-                let target_byte = (buffer_len as f64 * ratio) as usize;
-                let target_byte = target_byte.min(buffer_len.saturating_sub(1));
-
-                // Find the line start for this byte position
-                let iter = state.buffer.line_iterator(target_byte, 80);
-                let line_start = iter.current_position();
-
-                (line_start.min(buffer_len.saturating_sub(1)), 0)
-            }
-        } else {
-            return Ok(());
-        };
-
-        // Set viewport top to this position in SplitViewState
-        if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-            view_state.viewport.top_byte = scroll_position.0;
-            view_state.viewport.top_view_line_offset = scroll_position.1;
-            // Skip ensure_visible so the scroll position isn't undone during render
-            view_state.viewport.set_skip_ensure_visible();
-        }
-
-        // Move cursor to be visible in the new viewport (after releasing the state borrow)
-        self.move_cursor_to_visible_area(split_id, buffer_id);
-
-        Ok(())
-    }
-
-    /// Handle scrollbar jump (click on track) for composite buffers.
-    /// Maps the click ratio to a row-based scroll position.
-    fn handle_composite_scrollbar_jump(
-        &mut self,
-        ratio: f64,
-        split_id: LeafId,
-        buffer_id: BufferId,
-        scrollbar_rect: ratatui::layout::Rect,
-    ) -> AnyhowResult<()> {
-        let total_rows = self
-            .composite_buffers
-            .get(&buffer_id)
-            .map(|c| c.row_count())
-            .unwrap_or(0);
-        let content_height = scrollbar_rect.height.saturating_sub(1) as usize;
-        let max_scroll_row = total_rows.saturating_sub(content_height);
-        let target_row = (ratio * max_scroll_row as f64).round() as usize;
-        let target_row = target_row.min(max_scroll_row);
-
-        if let Some(view_state) = self.composite_view_states.get_mut(&(split_id, buffer_id)) {
-            view_state.set_scroll_row(target_row, max_scroll_row);
-        }
-        Ok(())
-    }
-
-    /// Handle scrollbar thumb drag for composite buffers.
-    /// Uses relative movement from the drag start position.
-    fn handle_composite_scrollbar_drag_relative(
-        &mut self,
-        row: u16,
-        drag_start_row: u16,
-        split_id: LeafId,
-        buffer_id: BufferId,
-        scrollbar_rect: ratatui::layout::Rect,
-    ) -> AnyhowResult<()> {
-        let drag_start_scroll_row = match self.mouse_state.drag_start_composite_scroll_row {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-
-        let total_rows = self
-            .composite_buffers
-            .get(&buffer_id)
-            .map(|c| c.row_count())
-            .unwrap_or(0);
-        let content_height = scrollbar_rect.height.saturating_sub(1) as usize;
-        let max_scroll_row = total_rows.saturating_sub(content_height);
-
-        if max_scroll_row == 0 {
-            return Ok(());
-        }
-
-        let scrollbar_height = scrollbar_rect.height as usize;
-        if scrollbar_height <= 1 {
-            return Ok(());
-        }
-
-        // Calculate thumb size (same formula as render_composite_scrollbar)
-        let thumb_size_raw =
-            (content_height as f64 / total_rows as f64 * scrollbar_height as f64).ceil() as usize;
-        let max_thumb_size = (scrollbar_height as f64 * 0.8).floor() as usize;
-        let thumb_size = thumb_size_raw
-            .max(1)
-            .min(max_thumb_size)
-            .min(scrollbar_height);
-        let max_thumb_start = scrollbar_height.saturating_sub(thumb_size);
-
-        if max_thumb_start == 0 {
-            return Ok(());
-        }
-
-        // Calculate where the thumb was at drag start
-        let start_scroll_ratio =
-            drag_start_scroll_row.min(max_scroll_row) as f64 / max_scroll_row as f64;
-        let thumb_row_at_start =
-            scrollbar_rect.y as f64 + start_scroll_ratio * max_thumb_start as f64;
-
-        // Calculate click offset (where on thumb we clicked)
-        let click_offset = drag_start_row as f64 - thumb_row_at_start;
-
-        // Target thumb position based on current mouse position
-        let target_thumb_row = row as f64 - click_offset;
-
-        // Map target thumb position to scroll ratio
-        let target_scroll_ratio =
-            ((target_thumb_row - scrollbar_rect.y as f64) / max_thumb_start as f64).clamp(0.0, 1.0);
-
-        // Map scroll ratio to target row
-        let target_row = (target_scroll_ratio * max_scroll_row as f64).round() as usize;
-        let target_row = target_row.min(max_scroll_row);
-
-        if let Some(view_state) = self.composite_view_states.get_mut(&(split_id, buffer_id)) {
-            view_state.set_scroll_row(target_row, max_scroll_row);
-        }
-        Ok(())
-    }
-
-    /// Move the cursor to a visible position within the current viewport
-    /// This is called after scrollbar operations to ensure the cursor is in view
-    pub(super) fn move_cursor_to_visible_area(&mut self, split_id: LeafId, buffer_id: BufferId) {
-        // Get viewport info from SplitViewState
-        let (top_byte, viewport_height) =
-            if let Some(view_state) = self.split_view_states.get(&split_id) {
-                (
-                    view_state.viewport.top_byte,
-                    view_state.viewport.height as usize,
-                )
-            } else {
-                return;
-            };
-
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            let buffer_len = state.buffer.len();
-
-            // Find the bottom byte of the viewport
-            // We iterate through viewport_height lines starting from top_byte
-            let mut iter = state.buffer.line_iterator(top_byte, 80);
-            let mut bottom_byte = buffer_len;
-
-            // Consume viewport_height lines to find where the visible area ends
-            for _ in 0..viewport_height {
-                if let Some((pos, line)) = iter.next_line() {
-                    // The bottom of this line is at pos + line.len()
-                    bottom_byte = pos + line.len();
-                } else {
-                    // Reached end of buffer
-                    bottom_byte = buffer_len;
-                    break;
-                }
-            }
-
-            // Check if cursor is outside visible range and move it if needed
-            if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-                let cursor_pos = view_state.cursors.primary().position;
-                if cursor_pos < top_byte || cursor_pos > bottom_byte {
-                    // Move cursor to the top of the viewport
-                    let cursor = view_state.cursors.primary_mut();
-                    cursor.position = top_byte;
-                    // Keep the existing sticky_column value so vertical navigation preserves column
-                }
-            }
-        }
-    }
-
-    /// Calculate the maximum allowed scroll position
-    /// Ensures the last line is always at the bottom unless the buffer is smaller than viewport
-    pub(super) fn calculate_max_scroll_position(
-        buffer: &mut crate::model::buffer::Buffer,
-        viewport_height: usize,
-    ) -> usize {
-        if viewport_height == 0 {
-            return 0;
-        }
-
-        let buffer_len = buffer.len();
-        if buffer_len == 0 {
-            return 0;
-        }
-
-        // Count total lines in buffer
-        let mut line_count = 0;
-        let mut iter = buffer.line_iterator(0, 80);
-        while iter.next_line().is_some() {
-            line_count += 1;
-        }
-
-        // If buffer has fewer lines than viewport, can't scroll at all
-        if line_count <= viewport_height {
-            return 0;
-        }
-
-        // Calculate how many lines from the start we can scroll
-        // We want to be able to scroll so that the last line is at the bottom
-        let scrollable_lines = line_count.saturating_sub(viewport_height);
-
-        // Find the byte position of the line at scrollable_lines offset
-        let mut iter = buffer.line_iterator(0, 80);
-        let mut current_line = 0;
-        let mut max_byte_pos = 0;
-
-        while current_line < scrollable_lines {
-            if let Some((pos, _content)) = iter.next_line() {
-                max_byte_pos = pos;
-                current_line += 1;
-            } else {
-                break;
-            }
-        }
-
-        max_byte_pos
-    }
-
-    /// Calculate scrollbar jump position using visual rows (for line-wrapped content)
-    /// Returns the byte position to scroll to based on the scroll ratio
-    /// Calculate scroll position for visual-row-aware scrollbar jump.
-    /// Returns (byte_position, view_line_offset) for proper positioning within wrapped lines.
-    fn calculate_scrollbar_jump_visual(
-        buffer: &mut crate::model::buffer::Buffer,
-        ratio: f64,
-        viewport_height: usize,
-        viewport_width: usize,
-    ) -> (usize, usize) {
-        use crate::primitives::line_wrapping::{wrap_line, WrapConfig};
-
-        let buffer_len = buffer.len();
-        if buffer_len == 0 || viewport_height == 0 {
-            return (0, 0);
-        }
-
-        // Calculate gutter width (estimate based on line count)
-        let line_count = buffer.line_count().unwrap_or(1);
-        let digits = (line_count as f64).log10().floor() as usize + 1;
-        let gutter_width = 1 + digits.max(4) + 3; // indicator + digits + separator
-
-        let wrap_config = WrapConfig::new(viewport_width, gutter_width, true, true);
-
-        // Count total visual rows and build a map of visual row -> (line_byte, offset_in_line)
-        let mut total_visual_rows = 0;
-        let mut visual_row_positions: Vec<(usize, usize)> = Vec::new(); // (line_start_byte, visual_row_offset)
-
-        let mut iter = buffer.line_iterator(0, 80);
-        while let Some((line_start, content)) = iter.next_line() {
-            let line_content = content.trim_end_matches(['\n', '\r']).to_string();
-            let segments = wrap_line(&line_content, &wrap_config);
-            let visual_rows_in_line = segments.len().max(1);
-
-            for offset in 0..visual_rows_in_line {
-                visual_row_positions.push((line_start, offset));
-            }
-            total_visual_rows += visual_rows_in_line;
-        }
-
-        if total_visual_rows == 0 {
-            return (0, 0);
-        }
-
-        // Calculate max scroll visual row (leave viewport_height rows visible at bottom)
-        let max_scroll_row = total_visual_rows.saturating_sub(viewport_height);
-
-        if max_scroll_row == 0 {
-            // Content fits in viewport, no scrolling needed
-            return (0, 0);
-        }
-
-        // Map ratio to target visual row
-        let target_row = (ratio * max_scroll_row as f64).round() as usize;
-        let target_row = target_row.min(max_scroll_row);
-
-        // Get the byte position and offset for this visual row
-        if target_row < visual_row_positions.len() {
-            visual_row_positions[target_row]
-        } else {
-            // Fallback to last position
-            visual_row_positions.last().copied().unwrap_or((0, 0))
-        }
-    }
-
-    /// Calculate scroll position for visual-row-aware scrollbar drag.
-    /// The thumb follows the mouse position, accounting for where on the thumb the user clicked.
-    /// Returns (byte_position, view_line_offset) for proper positioning within wrapped lines.
-    fn calculate_scrollbar_drag_relative_visual(
-        buffer: &mut crate::model::buffer::Buffer,
-        current_row: u16,
-        scrollbar_y: u16,
-        scrollbar_height: usize,
-        drag_start_row: u16,
-        drag_start_top_byte: usize,
-        drag_start_view_line_offset: usize,
-        viewport_height: usize,
-        viewport_width: usize,
-    ) -> (usize, usize) {
-        use crate::primitives::line_wrapping::{wrap_line, WrapConfig};
-
-        let buffer_len = buffer.len();
-        if buffer_len == 0 || viewport_height == 0 || scrollbar_height <= 1 {
-            return (0, 0);
-        }
-
-        // Calculate gutter width (estimate based on line count)
-        let line_count = buffer.line_count().unwrap_or(1);
-        let digits = (line_count as f64).log10().floor() as usize + 1;
-        let gutter_width = 1 + digits.max(4) + 3; // indicator + digits + separator
-
-        let wrap_config = WrapConfig::new(viewport_width, gutter_width, true, true);
-
-        // Build visual row positions map
-        let mut total_visual_rows = 0;
-        let mut visual_row_positions: Vec<(usize, usize)> = Vec::new();
-
-        let mut iter = buffer.line_iterator(0, 80);
-        while let Some((line_start, content)) = iter.next_line() {
-            let line_content = content.trim_end_matches(['\n', '\r']).to_string();
-            let segments = wrap_line(&line_content, &wrap_config);
-            let visual_rows_in_line = segments.len().max(1);
-
-            for offset in 0..visual_rows_in_line {
-                visual_row_positions.push((line_start, offset));
-            }
-            total_visual_rows += visual_rows_in_line;
-        }
-
-        if total_visual_rows == 0 {
-            return (0, 0);
-        }
-
-        let max_scroll_row = total_visual_rows.saturating_sub(viewport_height);
-        if max_scroll_row == 0 {
-            return (0, 0);
-        }
-
-        // Find the visual row corresponding to drag_start_top_byte + view_line_offset
-        // First find the line start, then add the offset for wrapped lines
-        let line_start_visual_row = visual_row_positions
-            .iter()
-            .position(|(byte, _)| *byte >= drag_start_top_byte)
-            .unwrap_or(0);
-        let start_visual_row =
-            (line_start_visual_row + drag_start_view_line_offset).min(max_scroll_row);
-
-        // Calculate thumb size (same formula as scrollbar rendering)
-        let thumb_size_raw = (viewport_height as f64 / total_visual_rows as f64
-            * scrollbar_height as f64)
-            .ceil() as usize;
-        let max_thumb_size = (scrollbar_height as f64 * 0.8).floor() as usize;
-        let thumb_size = thumb_size_raw
-            .max(1)
-            .min(max_thumb_size)
-            .min(scrollbar_height);
-
-        // Calculate max thumb start position (same as scrollbar rendering)
-        let max_thumb_start = scrollbar_height.saturating_sub(thumb_size);
-
-        // Calculate where the thumb was (in scrollbar coordinates) at drag start
-        // Using the same formula as scrollbar rendering: thumb_start = scroll_ratio * max_thumb_start
-        let start_scroll_ratio = start_visual_row as f64 / max_scroll_row as f64;
-        let thumb_row_at_start = scrollbar_y as f64 + start_scroll_ratio * max_thumb_start as f64;
-
-        // Calculate click offset (where on the thumb we clicked)
-        let click_offset = drag_start_row as f64 - thumb_row_at_start;
-
-        // Calculate target thumb position based on current mouse position
-        let target_thumb_row = current_row as f64 - click_offset;
-
-        // Map target thumb position to scroll ratio (inverse of thumb_start formula)
-        let target_scroll_ratio = if max_thumb_start > 0 {
-            ((target_thumb_row - scrollbar_y as f64) / max_thumb_start as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        // Map scroll ratio to visual row
-        let target_row = (target_scroll_ratio * max_scroll_row as f64).round() as usize;
-        let target_row = target_row.min(max_scroll_row);
-
-        // Get the byte position and offset for this visual row
-        if target_row < visual_row_positions.len() {
-            visual_row_positions[target_row]
-        } else {
-            visual_row_positions.last().copied().unwrap_or((0, 0))
-        }
-    }
-
-    /// Calculate buffer byte position from screen coordinates
-    ///
-    /// When `compose_width` is set and narrower than the content area, the
-    /// content is centered with left padding.  View-line mappings are built
-    /// relative to that compose render area, so the same offset must be
-    /// applied here when converting screen coordinates.
-    ///
-    /// Returns None if the position cannot be determined (e.g., click in gutter for click handler)
-    pub(crate) fn screen_to_buffer_position(
-        col: u16,
-        row: u16,
-        content_rect: ratatui::layout::Rect,
-        gutter_width: u16,
-        cached_mappings: &Option<Vec<crate::app::types::ViewLineMapping>>,
-        fallback_position: usize,
-        allow_gutter_click: bool,
-        compose_width: Option<u16>,
-    ) -> Option<usize> {
-        // Adjust content_rect for compose layout centering
-        let content_rect = Self::adjust_content_rect_for_compose(content_rect, compose_width);
-
-        // Calculate relative position in content area
-        let content_col = col.saturating_sub(content_rect.x);
-        let content_row = row.saturating_sub(content_rect.y);
-
-        tracing::trace!(
-            col,
-            row,
-            ?content_rect,
-            gutter_width,
-            content_col,
-            content_row,
-            num_mappings = cached_mappings.as_ref().map(|m| m.len()),
-            "screen_to_buffer_position"
-        );
-
-        // Handle gutter clicks
-        let text_col = if content_col < gutter_width {
-            if !allow_gutter_click {
-                return None; // Click handler skips gutter clicks
-            }
-            0 // Drag handler uses position 0 of the line
-        } else {
-            content_col.saturating_sub(gutter_width) as usize
-        };
-
-        // Use cached view line mappings for accurate position lookup
-        let visual_row = content_row as usize;
-
-        // Helper to get position from a line mapping at a given visual column
-        let position_from_mapping =
-            |line_mapping: &crate::app::types::ViewLineMapping, col: usize| -> usize {
-                if col < line_mapping.visual_to_char.len() {
-                    // Use O(1) lookup: visual column -> char index -> source byte
-                    if let Some(byte_pos) = line_mapping.source_byte_at_visual_col(col) {
-                        return byte_pos;
-                    }
-                    // Column maps to virtual/injected content - find nearest real position
-                    for c in (0..col).rev() {
-                        if let Some(byte_pos) = line_mapping.source_byte_at_visual_col(c) {
-                            return byte_pos;
-                        }
-                    }
-                    line_mapping.line_end_byte
-                } else {
-                    // Click is past end of visible content
-                    // For empty lines (only a newline), return the line start position
-                    // to keep cursor on this line rather than jumping to the next line
-                    if line_mapping.visual_to_char.len() <= 1 {
-                        // Empty or newline-only line - return first source byte if available
-                        if let Some(Some(first_byte)) = line_mapping.char_source_bytes.first() {
-                            return *first_byte;
-                        }
-                    }
-                    line_mapping.line_end_byte
-                }
-            };
-
-        let position = cached_mappings
-            .as_ref()
-            .and_then(|mappings| {
-                if let Some(line_mapping) = mappings.get(visual_row) {
-                    // Click is on a visible line
-                    Some(position_from_mapping(line_mapping, text_col))
-                } else if !mappings.is_empty() {
-                    // Click is below last visible line - use the last line at the clicked column
-                    let last_mapping = mappings.last().unwrap();
-                    Some(position_from_mapping(last_mapping, text_col))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(fallback_position);
-
-        Some(position)
-    }
-
-    pub(super) fn adjust_content_rect_for_compose(
-        content_rect: ratatui::layout::Rect,
-        compose_width: Option<u16>,
-    ) -> ratatui::layout::Rect {
-        if let Some(cw) = compose_width {
-            let clamped = cw.min(content_rect.width).max(1);
-            if clamped < content_rect.width {
-                let pad_total = content_rect.width - clamped;
-                let left_pad = pad_total / 2;
-                ratatui::layout::Rect::new(
-                    content_rect.x + left_pad,
-                    content_rect.y,
-                    clamped,
-                    content_rect.height,
-                )
-            } else {
-                content_rect
-            }
-        } else {
-            content_rect
-        }
-    }
-
-    /// Check whether a gutter click at `target_position` should toggle a fold.
-    /// Returns `Some(target_position)` (the byte to fold at) or `None`.
-    fn fold_toggle_byte_from_position(
-        state: &crate::state::EditorState,
-        collapsed_header_bytes: &std::collections::BTreeMap<usize, Option<String>>,
-        target_position: usize,
-        content_col: u16,
-        gutter_width: u16,
-    ) -> Option<usize> {
-        if content_col >= gutter_width {
-            return None;
-        }
-
-        use crate::view::folding::indent_folding;
-        let line_start = indent_folding::find_line_start_byte(&state.buffer, target_position);
-
-        // Already collapsed → allow toggling (unfold)
-        if collapsed_header_bytes.contains_key(&line_start) {
-            return Some(target_position);
-        }
-
-        // Check LSP folding ranges first (line-based comparison unavoidable)
-        if !state.folding_ranges.is_empty() {
-            let line = state.buffer.get_line_number(target_position);
-            let has_lsp_fold = state.folding_ranges.iter().any(|range| {
-                let start_line = range.start_line as usize;
-                let end_line = range.end_line as usize;
-                start_line == line && end_line > start_line
-            });
-            if has_lsp_fold {
-                return Some(target_position);
-            }
-        }
-
-        // Fallback: indent-based foldable detection on bytes when LSP ranges are empty
-        if state.folding_ranges.is_empty() {
-            let tab_size = state.buffer_settings.tab_size;
-            let max_scan = crate::config::INDENT_FOLD_INDICATOR_MAX_SCAN;
-            let max_bytes = max_scan * state.buffer.estimated_line_length();
-            if indent_folding::indent_fold_end_byte(&state.buffer, line_start, tab_size, max_bytes)
-                .is_some()
-            {
-                return Some(target_position);
-            }
-        }
-
-        None
-    }
-
-    pub(super) fn fold_toggle_line_at_screen_position(
-        &self,
-        col: u16,
-        row: u16,
-    ) -> Option<(BufferId, usize)> {
-        for (split_id, buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
-            &self.cached_layout.split_areas
-        {
-            if col < content_rect.x
-                || col >= content_rect.x + content_rect.width
-                || row < content_rect.y
-                || row >= content_rect.y + content_rect.height
-            {
-                continue;
-            }
-
-            if self.is_terminal_buffer(*buffer_id) || self.is_composite_buffer(*buffer_id) {
-                continue;
-            }
-
-            let (gutter_width, collapsed_header_bytes) = {
-                let state = self.buffers.get(buffer_id)?;
-                let headers = self
-                    .split_view_states
-                    .get(split_id)
-                    .map(|vs| {
-                        vs.folds
-                            .collapsed_header_bytes(&state.buffer, &state.marker_list)
-                    })
-                    .unwrap_or_default();
-                (state.margins.left_total_width() as u16, headers)
-            };
-
-            let cached_mappings = self.cached_layout.view_line_mappings.get(split_id).cloned();
-            let fallback = self
-                .split_view_states
-                .get(split_id)
-                .map(|vs| vs.viewport.top_byte)
-                .unwrap_or(0);
-            let compose_width = self
-                .split_view_states
-                .get(split_id)
-                .and_then(|vs| vs.compose_width);
-
-            let target_position = Self::screen_to_buffer_position(
-                col,
-                row,
-                *content_rect,
-                gutter_width,
-                &cached_mappings,
-                fallback,
-                true,
-                compose_width,
-            )?;
-
-            let adjusted_rect = Self::adjust_content_rect_for_compose(*content_rect, compose_width);
-            let content_col = col.saturating_sub(adjusted_rect.x);
-            let state = self.buffers.get(buffer_id)?;
-            if let Some(byte_pos) = Self::fold_toggle_byte_from_position(
-                state,
-                &collapsed_header_bytes,
-                target_position,
-                content_col,
-                gutter_width,
-            ) {
-                return Some((*buffer_id, byte_pos));
-            }
-        }
-
-        None
-    }
-
-    /// Handle click in editor content area
-    pub(super) fn handle_editor_click(
-        &mut self,
-        col: u16,
-        row: u16,
-        split_id: crate::model::event::LeafId,
-        buffer_id: BufferId,
-        content_rect: ratatui::layout::Rect,
-        modifiers: crossterm::event::KeyModifiers,
-    ) -> AnyhowResult<()> {
-        use crate::model::event::{CursorId, Event};
-        use crossterm::event::KeyModifiers;
-        // Build modifiers string for plugins
-        let modifiers_str = if modifiers.contains(KeyModifiers::SHIFT) {
-            "shift".to_string()
-        } else {
-            String::new()
-        };
-
-        // Dispatch MouseClick hook to plugins
-        // Plugins can handle clicks on their virtual buffers
-        if self.plugin_manager.has_hook_handlers("mouse_click") {
-            self.plugin_manager.run_hook(
-                "mouse_click",
-                HookArgs::MouseClick {
-                    column: col,
-                    row,
-                    button: "left".to_string(),
-                    modifiers: modifiers_str,
-                    content_x: content_rect.x,
-                    content_y: content_rect.y,
-                },
-            );
-        }
-
-        // Focus this split (handles terminal mode exit, tab state, etc.)
-        self.focus_split(split_id, buffer_id);
-
-        // Handle composite buffer clicks specially
-        if self.is_composite_buffer(buffer_id) {
-            return self.handle_composite_click(col, row, split_id, buffer_id, content_rect);
-        }
-
-        // Ensure key context is Normal for non-terminal buffers
-        // This handles the edge case where split/buffer don't change but we clicked from FileExplorer
-        if !self.is_terminal_buffer(buffer_id) {
-            self.key_context = crate::input::keybindings::KeyContext::Normal;
-        }
-
-        // Get cached view line mappings for this split (before mutable borrow of buffers)
-        let cached_mappings = self
-            .cached_layout
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
-
-        // Get fallback from SplitViewState viewport
-        let fallback = self
-            .split_view_states
-            .get(&split_id)
-            .map(|vs| vs.viewport.top_byte)
-            .unwrap_or(0);
-
-        // Get compose width for this split (adjusts content rect for centered layout)
-        let compose_width = self
-            .split_view_states
-            .get(&split_id)
-            .and_then(|vs| vs.compose_width);
-
-        // Calculate clicked position in buffer
-        let (toggle_fold_byte, onclick_action, target_position, cursor_snapshot) =
-            if let Some(state) = self.buffers.get(&buffer_id) {
-                let gutter_width = state.margins.left_total_width() as u16;
-
-                let Some(target_position) = Self::screen_to_buffer_position(
-                    col,
-                    row,
-                    content_rect,
-                    gutter_width,
-                    &cached_mappings,
-                    fallback,
-                    true, // Allow gutter clicks - position cursor at start of line
-                    compose_width,
-                ) else {
-                    return Ok(());
-                };
-
-                // Toggle fold on gutter click if this line is foldable/collapsed
-                let adjusted_rect =
-                    Self::adjust_content_rect_for_compose(content_rect, compose_width);
-                let content_col = col.saturating_sub(adjusted_rect.x);
-                let collapsed_header_bytes = self
-                    .split_view_states
-                    .get(&split_id)
-                    .map(|vs| {
-                        vs.folds
-                            .collapsed_header_bytes(&state.buffer, &state.marker_list)
-                    })
-                    .unwrap_or_default();
-                let toggle_fold_byte = Self::fold_toggle_byte_from_position(
-                    state,
-                    &collapsed_header_bytes,
-                    target_position,
-                    content_col,
-                    gutter_width,
-                );
-
-                let cursor_snapshot = self
-                    .split_view_states
-                    .get(&split_id)
-                    .map(|vs| {
-                        let cursor = vs.cursors.primary();
-                        (
-                            vs.cursors.primary_id(),
-                            cursor.position,
-                            cursor.anchor,
-                            cursor.sticky_column,
-                            cursor.deselect_on_move,
-                        )
-                    })
-                    .unwrap_or((CursorId(0), 0, None, 0, true));
-
-                // Check for onClick text property at this position
-                // This enables clickable UI elements in virtual buffers
-                let onclick_action = state
-                    .text_properties
-                    .get_at(target_position)
-                    .iter()
-                    .find_map(|prop| {
-                        prop.get("onClick")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-
-                (
-                    toggle_fold_byte,
-                    onclick_action,
-                    target_position,
-                    cursor_snapshot,
-                )
-            } else {
-                return Ok(());
-            };
-
-        if toggle_fold_byte.is_some() {
-            self.toggle_fold_at_byte(buffer_id, target_position);
-            return Ok(());
-        }
-
-        let (primary_cursor_id, old_position, old_anchor, old_sticky_column, deselect_on_move) =
-            cursor_snapshot;
-
-        if let Some(action_name) = onclick_action {
-            // Execute the action associated with this clickable element
-            tracing::debug!(
-                "onClick triggered at position {}: action={}",
-                target_position,
-                action_name
-            );
-            let empty_args = std::collections::HashMap::new();
-            if let Some(action) = Action::from_str(&action_name, &empty_args) {
-                return self.handle_action(action);
-            }
-            return Ok(());
-        }
-
-        // Move cursor to clicked position (respect shift for selection)
-        // Both modifiers supported since some terminals intercept shift+click.
-        let extend_selection =
-            modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::CONTROL);
-        let new_anchor = if extend_selection {
-            Some(old_anchor.unwrap_or(old_position))
-        } else if deselect_on_move {
-            None
-        } else {
-            old_anchor
-        };
-
-        let new_sticky_column = self
-            .buffers
-            .get(&buffer_id)
-            .and_then(|state| state.buffer.offset_to_position(target_position))
-            .map(|pos| pos.column)
-            .unwrap_or(0);
-
-        let event = Event::MoveCursor {
-            cursor_id: primary_cursor_id,
-            old_position,
-            new_position: target_position,
-            old_anchor,
-            new_anchor,
-            old_sticky_column,
-            new_sticky_column,
-        };
-
-        self.active_event_log_mut().append(event.clone());
-        self.apply_event_to_active_buffer(&event);
-        self.track_cursor_movement(&event);
-
-        // Start text selection drag for potential mouse drag
-        self.mouse_state.dragging_text_selection = true;
-        self.mouse_state.drag_selection_split = Some(split_id);
-        self.mouse_state.drag_selection_anchor = Some(new_anchor.unwrap_or(target_position));
-
-        Ok(())
-    }
-
-    /// Handle click in file explorer
-    pub(super) fn handle_file_explorer_click(
-        &mut self,
-        col: u16,
-        row: u16,
-        explorer_area: ratatui::layout::Rect,
-    ) -> AnyhowResult<()> {
-        // Check if click is on the title bar (first row)
-        if row == explorer_area.y {
-            // Check if click is on close button (× at right side of title bar)
-            // Close button is at position: explorer_area.x + explorer_area.width - 3 to -1
-            let close_button_x = explorer_area.x + explorer_area.width.saturating_sub(3);
-            if col >= close_button_x && col < explorer_area.x + explorer_area.width {
-                self.toggle_file_explorer();
-                return Ok(());
-            }
-        }
-
-        // Focus file explorer
-        self.key_context = crate::input::keybindings::KeyContext::FileExplorer;
-
-        // Calculate which item was clicked (accounting for border and title)
-        // The file explorer has a 1-line border at top and bottom
-        let relative_row = row.saturating_sub(explorer_area.y + 1); // +1 for top border
-
-        if let Some(ref mut explorer) = self.file_explorer {
-            let display_nodes = explorer.get_display_nodes();
-            let scroll_offset = explorer.get_scroll_offset();
-            let clicked_index = (relative_row as usize) + scroll_offset;
-
-            if clicked_index < display_nodes.len() {
-                let (node_id, _indent) = display_nodes[clicked_index];
-
-                // Select this node
-                explorer.set_selected(Some(node_id));
-
-                // Check if it's a file or directory
-                let node = explorer.tree().get_node(node_id);
-                if let Some(node) = node {
-                    if node.is_dir() {
-                        // Toggle expand/collapse using the existing method
-                        self.file_explorer_toggle_expand();
-                    } else if node.is_file() {
-                        // Open the file but keep focus on file explorer (single click)
-                        // Double-click or Enter will focus the editor
-                        let path = node.entry.path.clone();
-                        let name = node.entry.name.clone();
-                        match self.open_file(&path) {
-                            Ok(_) => {
-                                self.set_status_message(
-                                    rust_i18n::t!("explorer.opened_file", name = &name).to_string(),
-                                );
-                            }
-                            Err(e) => {
-                                // Check if this is a large file encoding confirmation error
-                                if let Some(confirmation) = e.downcast_ref::<
-                                    crate::model::buffer::LargeFileEncodingConfirmation,
-                                >() {
-                                    self.start_large_file_encoding_confirmation(confirmation);
-                                } else {
-                                    self.set_status_message(
-                                        rust_i18n::t!("file.error_opening", error = e.to_string())
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Start the line ending selection prompt
-    fn start_set_line_ending_prompt(&mut self) {
-        use crate::model::buffer::LineEnding;
-
-        let current_line_ending = self.active_state().buffer.line_ending();
-
-        let options = [
-            (LineEnding::LF, "LF", "Unix/Linux/Mac"),
-            (LineEnding::CRLF, "CRLF", "Windows"),
-            (LineEnding::CR, "CR", "Classic Mac"),
-        ];
-
-        let current_index = options
-            .iter()
-            .position(|(le, _, _)| *le == current_line_ending)
-            .unwrap_or(0);
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = options
-            .iter()
-            .map(|(le, name, desc)| {
-                let is_current = *le == current_line_ending;
-                crate::input::commands::Suggestion {
-                    text: format!("{} ({})", name, desc),
-                    description: if is_current {
-                        Some("current".to_string())
-                    } else {
-                        None
-                    },
-                    value: Some(name.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Line ending: ".to_string(),
-            PromptType::SetLineEnding,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                let (_, name, desc) = options[current_index];
-                prompt.input = format!("{} ({})", name, desc);
-                prompt.cursor_pos = prompt.input.len();
-            }
-        }
-    }
-
-    /// Start the encoding selection prompt
-    fn start_set_encoding_prompt(&mut self) {
-        use crate::model::buffer::Encoding;
-
-        let current_encoding = self.active_state().buffer.encoding();
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = Encoding::all()
-            .iter()
-            .map(|enc| {
-                let is_current = *enc == current_encoding;
-                crate::input::commands::Suggestion {
-                    text: format!("{} ({})", enc.display_name(), enc.description()),
-                    description: if is_current {
-                        Some("current".to_string())
-                    } else {
-                        None
-                    },
-                    value: Some(enc.display_name().to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        let current_index = Encoding::all()
-            .iter()
-            .position(|enc| *enc == current_encoding)
-            .unwrap_or(0);
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Encoding: ".to_string(),
-            PromptType::SetEncoding,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                let enc = Encoding::all()[current_index];
-                prompt.input = format!("{} ({})", enc.display_name(), enc.description());
-                prompt.cursor_pos = prompt.input.len();
-                // Select all text so typing immediately replaces it
-                prompt.selection_anchor = Some(0);
-            }
-        }
-    }
-
-    /// Start the reload with encoding prompt
-    ///
-    /// Prompts user to select an encoding, then reloads the current file with that encoding.
-    /// Requires the buffer to have no unsaved modifications.
-    fn start_reload_with_encoding_prompt(&mut self) {
-        use crate::model::buffer::Encoding;
-
-        // Check if buffer has a file path
-        let has_file = self
-            .buffers
-            .get(&self.active_buffer())
-            .and_then(|s| s.buffer.file_path())
-            .is_some();
-
-        if !has_file {
-            self.set_status_message("Cannot reload: buffer has no file".to_string());
-            return;
-        }
-
-        // Check for unsaved modifications
-        let is_modified = self
-            .buffers
-            .get(&self.active_buffer())
-            .map(|s| s.buffer.is_modified())
-            .unwrap_or(false);
-
-        if is_modified {
-            self.set_status_message(
-                "Cannot reload: buffer has unsaved modifications (save first)".to_string(),
-            );
-            return;
-        }
-
-        let current_encoding = self.active_state().buffer.encoding();
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = Encoding::all()
-            .iter()
-            .map(|enc| {
-                let is_current = *enc == current_encoding;
-                crate::input::commands::Suggestion {
-                    text: format!("{} ({})", enc.display_name(), enc.description()),
-                    description: if is_current {
-                        Some("current".to_string())
-                    } else {
-                        None
-                    },
-                    value: Some(enc.display_name().to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        let current_index = Encoding::all()
-            .iter()
-            .position(|enc| *enc == current_encoding)
-            .unwrap_or(0);
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Reload with encoding: ".to_string(),
-            PromptType::ReloadWithEncoding,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                let enc = Encoding::all()[current_index];
-                prompt.input = format!("{} ({})", enc.display_name(), enc.description());
-                prompt.cursor_pos = prompt.input.len();
-            }
-        }
-    }
-
-    /// Start the language selection prompt
-    fn start_set_language_prompt(&mut self) {
-        let current_language = self.active_state().language.clone();
-
-        // Build suggestions from all available syntect syntaxes + Plain Text option
-        let mut suggestions: Vec<crate::input::commands::Suggestion> = vec![
-            // Plain Text option (no syntax highlighting)
-            crate::input::commands::Suggestion {
-                text: "Plain Text".to_string(),
-                description: if current_language == "text" || current_language == "Plain Text" {
-                    Some("current".to_string())
-                } else {
-                    None
-                },
-                value: Some("Plain Text".to_string()),
-                disabled: false,
-                keybinding: None,
-                source: None,
-            },
-        ];
-
-        // Add all available syntaxes from the grammar registry (100+ languages)
-        let mut syntax_names: Vec<&str> = self.grammar_registry.available_syntaxes();
-        // Sort alphabetically for easier navigation
-        syntax_names.sort_unstable_by_key(|a| a.to_lowercase());
-
-        let mut current_index_found = None;
-        for syntax_name in syntax_names {
-            // Skip "Plain Text" as we already added it at the top
-            if syntax_name == "Plain Text" {
-                continue;
-            }
-            // Resolve the syntect display name to the canonical config language
-            // ID so we can compare against state.language (which is always a
-            // config key, e.g. "rust" not "Rust").
-            let is_current = self
-                .resolve_language_id(syntax_name)
-                .is_some_and(|id| id == current_language);
-            if is_current {
-                current_index_found = Some(suggestions.len());
-            }
-            suggestions.push(crate::input::commands::Suggestion {
-                text: syntax_name.to_string(),
-                description: if is_current {
-                    Some("current".to_string())
-                } else {
-                    None
-                },
-                value: Some(syntax_name.to_string()),
-                disabled: false,
-                keybinding: None,
-                source: None,
-            });
-        }
-
-        // Find current language index
-        let current_index = current_index_found.unwrap_or(0);
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Language: ".to_string(),
-            PromptType::SetLanguage,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                // Don't set input - keep it empty so typing filters the list
-                // The selected suggestion shows the current language
-            }
-        }
-    }
-
-    /// Start the theme selection prompt with available themes
-    fn start_select_theme_prompt(&mut self) {
-        let available_themes = self.theme_registry.list();
-        let current_theme_name = &self.theme.name;
-
-        // Find the index of the current theme
-        let current_index = available_themes
-            .iter()
-            .position(|info| info.name == *current_theme_name)
-            .unwrap_or(0);
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = available_themes
-            .iter()
-            .map(|info| {
-                let is_current = info.name == *current_theme_name;
-                let description = match (is_current, info.pack.is_empty()) {
-                    (true, true) => Some("(current)".to_string()),
-                    (true, false) => Some(format!("{} (current)", info.pack)),
-                    (false, true) => None,
-                    (false, false) => Some(info.pack.clone()),
-                };
-                crate::input::commands::Suggestion {
-                    text: info.name.clone(),
-                    description,
-                    value: Some(info.name.clone()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Select theme: ".to_string(),
-            PromptType::SelectTheme {
-                original_theme: current_theme_name.clone(),
-            },
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                // Also set input to match selected theme
-                prompt.input = current_theme_name.to_string();
-                prompt.cursor_pos = prompt.input.len();
-            }
-        }
-    }
-
-    /// Apply a theme by name and persist it to config
-    pub(super) fn apply_theme(&mut self, theme_name: &str) {
-        if !theme_name.is_empty() {
-            if let Some(theme) = self.theme_registry.get_cloned(theme_name) {
-                self.theme = theme;
-
-                // Set terminal cursor color to match theme
-                self.theme.set_terminal_cursor_color();
-
-                // Update the config in memory using the normalized registry key,
-                // not the JSON name field, so that the config value can be looked
-                // up in the registry on restart (fixes #1001).
-                let normalized = crate::view::theme::normalize_theme_name(theme_name);
-                self.config.theme = normalized.into();
-
-                // Persist to config file
-                self.save_theme_to_config();
-
-                self.set_status_message(
-                    t!("view.theme_changed", theme = self.theme.name.clone()).to_string(),
-                );
-            } else {
-                self.set_status_message(format!("Theme '{}' not found", theme_name));
-            }
-        }
-    }
-
-    /// Preview a theme by name (without persisting to config)
-    /// Used for live preview when navigating theme selection
-    pub(super) fn preview_theme(&mut self, theme_name: &str) {
-        if !theme_name.is_empty() && theme_name != self.theme.name {
-            if let Some(theme) = self.theme_registry.get_cloned(theme_name) {
-                self.theme = theme;
-                self.theme.set_terminal_cursor_color();
-            }
-        }
-    }
-
-    /// Save the current theme setting to the user's config file
-    fn save_theme_to_config(&mut self) {
-        // Create the directory if it doesn't exist
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.config_dir) {
-            tracing::warn!("Failed to create config directory: {}", e);
-            return;
-        }
-
-        // Save the theme using explicit changes to avoid the issue where
-        // changing to the default theme doesn't persist (because save_to_layer
-        // computes delta vs defaults and sees no difference).
-        let resolver = ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
-        let config_path = resolver.user_config_path();
-        tracing::info!(
-            "Saving theme '{}' to user config at {}",
-            self.config.theme.0,
-            config_path.display()
-        );
-
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(
-            "/theme".to_string(),
-            serde_json::Value::String(self.config.theme.0.clone()),
-        );
-
-        match resolver.save_changes_to_layer(
-            &changes,
-            &std::collections::HashSet::new(),
-            ConfigLayer::User,
-        ) {
-            Ok(()) => {
-                tracing::info!("Theme saved successfully to {}", config_path.display());
-            }
-            Err(e) => {
-                tracing::warn!("Failed to save theme to config: {}", e);
-            }
-        }
-    }
-
-    /// Start the keybinding map selection prompt with available maps
-    fn start_select_keybinding_map_prompt(&mut self) {
-        // Built-in keybinding maps
-        let builtin_maps = vec!["default", "emacs", "vscode", "macos"];
-
-        // Collect user-defined keybinding maps from config
-        let user_maps: Vec<&str> = self
-            .config
-            .keybinding_maps
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
-
-        // Combine built-in and user maps
-        let mut all_maps: Vec<&str> = builtin_maps;
-        for map in &user_maps {
-            if !all_maps.contains(map) {
-                all_maps.push(map);
-            }
-        }
-
-        let current_map = &self.config.active_keybinding_map;
-
-        // Find the index of the current keybinding map
-        let current_index = all_maps
-            .iter()
-            .position(|name| *name == current_map)
-            .unwrap_or(0);
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = all_maps
-            .iter()
-            .map(|map_name| {
-                let is_current = *map_name == current_map;
-                crate::input::commands::Suggestion {
-                    text: map_name.to_string(),
-                    description: if is_current {
-                        Some("(current)".to_string())
-                    } else {
-                        None
-                    },
-                    value: Some(map_name.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Select keybinding map: ".to_string(),
-            PromptType::SelectKeybindingMap,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                // Also set input to match selected map
-                prompt.input = current_map.to_string();
-                prompt.cursor_pos = prompt.input.len();
-            }
-        }
-    }
-
-    /// Apply a keybinding map by name and persist it to config
-    pub(super) fn apply_keybinding_map(&mut self, map_name: &str) {
-        if map_name.is_empty() {
-            return;
-        }
-
-        // Check if the map exists (either built-in or user-defined)
-        let is_builtin = matches!(map_name, "default" | "emacs" | "vscode" | "macos");
-        let is_user_defined = self.config.keybinding_maps.contains_key(map_name);
-
-        if is_builtin || is_user_defined {
-            // Update the active keybinding map in config
-            self.config.active_keybinding_map = map_name.to_string().into();
-
-            // Reload the keybinding resolver with the new map
-            self.keybindings = crate::input::keybindings::KeybindingResolver::new(&self.config);
-
-            // Persist to config file
-            self.save_keybinding_map_to_config();
-
-            self.set_status_message(t!("view.keybindings_switched", map = map_name).to_string());
-        } else {
-            self.set_status_message(t!("view.keybindings_unknown", map = map_name).to_string());
-        }
-    }
-
-    /// Save the current keybinding map setting to the user's config file
-    fn save_keybinding_map_to_config(&mut self) {
-        // Create the directory if it doesn't exist
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.config_dir) {
-            tracing::warn!("Failed to create config directory: {}", e);
-            return;
-        }
-
-        // Save the config using the resolver
-        let resolver = ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
-        if let Err(e) = resolver.save_to_layer(&self.config, ConfigLayer::User) {
-            tracing::warn!("Failed to save keybinding map to config: {}", e);
-        }
-    }
-
-    /// Start the cursor style selection prompt
-    fn start_select_cursor_style_prompt(&mut self) {
-        use crate::config::CursorStyle;
-
-        let current_style = self.config.editor.cursor_style;
-
-        // Build suggestions from available cursor styles
-        let suggestions: Vec<crate::input::commands::Suggestion> = CursorStyle::OPTIONS
-            .iter()
-            .zip(CursorStyle::DESCRIPTIONS.iter())
-            .map(|(style_name, description)| {
-                let is_current = *style_name == current_style.as_str();
-                crate::input::commands::Suggestion {
-                    text: description.to_string(),
-                    description: if is_current {
-                        Some("(current)".to_string())
-                    } else {
-                        None
-                    },
-                    value: Some(style_name.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        // Find the index of the current cursor style
-        let current_index = CursorStyle::OPTIONS
-            .iter()
-            .position(|s| *s == current_style.as_str())
-            .unwrap_or(0);
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Select cursor style: ".to_string(),
-            PromptType::SelectCursorStyle,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                prompt.input = CursorStyle::DESCRIPTIONS[current_index].to_string();
-                prompt.cursor_pos = prompt.input.len();
-            }
-        }
-    }
-
-    /// Apply a cursor style and persist it to config
-    pub(super) fn apply_cursor_style(&mut self, style_name: &str) {
-        use crate::config::CursorStyle;
-
-        if let Some(style) = CursorStyle::parse(style_name) {
-            // Update the config in memory
-            self.config.editor.cursor_style = style;
-
-            // Apply the cursor style to the terminal
-            if self.session_mode {
-                // In session mode, queue the escape sequence to be sent to the client
-                self.queue_escape_sequences(style.to_escape_sequence());
-            } else {
-                // In normal mode, write directly to stdout
-                use std::io::stdout;
-                // Best-effort cursor style change to stdout.
-                #[allow(clippy::let_underscore_must_use)]
-                let _ = crossterm::execute!(stdout(), style.to_crossterm_style());
-            }
-
-            // Persist to config file
-            self.save_cursor_style_to_config();
-
-            // Find the description for the status message
-            let description = CursorStyle::OPTIONS
-                .iter()
-                .zip(CursorStyle::DESCRIPTIONS.iter())
-                .find(|(name, _)| **name == style_name)
-                .map(|(_, desc)| *desc)
-                .unwrap_or(style_name);
-
-            self.set_status_message(
-                t!("view.cursor_style_changed", style = description).to_string(),
-            );
-        }
-    }
-
-    /// Start the remove ruler prompt with current rulers as suggestions
-    fn start_remove_ruler_prompt(&mut self) {
-        let active_split = self.split_manager.active_split();
-        let rulers = self
-            .split_view_states
-            .get(&active_split)
-            .map(|vs| vs.rulers.clone())
-            .unwrap_or_default();
-
-        if rulers.is_empty() {
-            self.set_status_message(t!("rulers.none_configured").to_string());
-            return;
-        }
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = rulers
-            .iter()
-            .map(|&col| crate::input::commands::Suggestion {
-                text: format!("Column {}", col),
-                description: None,
-                value: Some(col.to_string()),
-                disabled: false,
-                keybinding: None,
-                source: None,
-            })
-            .collect();
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            t!("rulers.remove_prompt").to_string(),
-            PromptType::RemoveRuler,
-            suggestions,
-        ));
-    }
-
-    /// Save the current cursor style setting to the user's config file
-    fn save_cursor_style_to_config(&mut self) {
-        // Create the directory if it doesn't exist
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.config_dir) {
-            tracing::warn!("Failed to create config directory: {}", e);
-            return;
-        }
-
-        // Save the config using the resolver
-        let resolver = ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
-        if let Err(e) = resolver.save_to_layer(&self.config, ConfigLayer::User) {
-            tracing::warn!("Failed to save cursor style to config: {}", e);
-        }
-    }
-
-    /// Start the locale selection prompt with available locales
-    fn start_select_locale_prompt(&mut self) {
-        let available_locales = crate::i18n::available_locales();
-        let current_locale = crate::i18n::current_locale();
-
-        // Find the index of the current locale
-        let current_index = available_locales
-            .iter()
-            .position(|name| *name == current_locale)
-            .unwrap_or(0);
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = available_locales
-            .iter()
-            .map(|locale_name| {
-                let is_current = *locale_name == current_locale;
-                let description = if let Some((english_name, native_name)) =
-                    crate::i18n::locale_display_name(locale_name)
-                {
-                    if english_name == native_name {
-                        // Same name (e.g., English/English)
-                        if is_current {
-                            format!("{} (current)", english_name)
-                        } else {
-                            english_name.to_string()
-                        }
-                    } else {
-                        // Different names (e.g., German/Deutsch)
-                        if is_current {
-                            format!("{} / {} (current)", english_name, native_name)
-                        } else {
-                            format!("{} / {}", english_name, native_name)
-                        }
-                    }
-                } else {
-                    // Unknown locale
-                    if is_current {
-                        "(current)".to_string()
-                    } else {
-                        String::new()
-                    }
-                };
-                crate::input::commands::Suggestion {
-                    text: locale_name.to_string(),
-                    description: if description.is_empty() {
-                        None
-                    } else {
-                        Some(description)
-                    },
-                    value: Some(locale_name.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            t!("locale.select_prompt").to_string(),
-            PromptType::SelectLocale,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-                // Start with empty input to show all options initially
-                prompt.input = String::new();
-                prompt.cursor_pos = 0;
-            }
-        }
-    }
-
-    /// Apply a locale and persist it to config
-    pub(super) fn apply_locale(&mut self, locale_name: &str) {
-        if !locale_name.is_empty() {
-            // Update the locale at runtime
-            crate::i18n::set_locale(locale_name);
-
-            // Update the config in memory
-            self.config.locale = crate::config::LocaleName(Some(locale_name.to_string()));
-
-            // Regenerate menus with the new locale
-            self.menus = crate::config::MenuConfig::translated();
-
-            // Refresh command palette commands with new locale
-            if let Ok(mut registry) = self.command_registry.write() {
-                registry.refresh_builtin_commands();
-            }
-
-            // Persist to config file
-            self.save_locale_to_config();
-
-            self.set_status_message(t!("locale.changed", locale_name = locale_name).to_string());
-        }
-    }
-
-    /// Save the current locale setting to the user's config file
-    fn save_locale_to_config(&mut self) {
-        // Create the directory if it doesn't exist
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.config_dir) {
-            tracing::warn!("Failed to create config directory: {}", e);
-            return;
-        }
-
-        // Save the config using the resolver
-        let resolver = ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
-        if let Err(e) = resolver.save_to_layer(&self.config, ConfigLayer::User) {
-            tracing::warn!("Failed to save locale to config: {}", e);
-        }
-    }
-
-    /// Switch to the previously active tab in the current split
-    fn switch_to_previous_tab(&mut self) {
-        let active_split = self.split_manager.active_split();
-        let previous_buffer = self
-            .split_view_states
-            .get(&active_split)
-            .and_then(|vs| vs.previous_buffer());
-
-        if let Some(prev_id) = previous_buffer {
-            // Verify the buffer is still open in this split
-            let is_valid = self
-                .split_view_states
-                .get(&active_split)
-                .is_some_and(|vs| vs.open_buffers.contains(&prev_id));
-
-            if is_valid && prev_id != self.active_buffer() {
-                // Save current position before switching
-                self.position_history.commit_pending_movement();
-
-                let cursors = self.active_cursors();
-                let position = cursors.primary().position;
-                let anchor = cursors.primary().anchor;
-                self.position_history
-                    .record_movement(self.active_buffer(), position, anchor);
-                self.position_history.commit_pending_movement();
-
-                self.set_active_buffer(prev_id);
-            } else if !is_valid {
-                self.set_status_message(t!("status.previous_tab_closed").to_string());
-            }
-        } else {
-            self.set_status_message(t!("status.no_previous_tab").to_string());
-        }
-    }
-
-    /// Start the switch-to-tab-by-name prompt with suggestions from open buffers
-    fn start_switch_to_tab_prompt(&mut self) {
-        let active_split = self.split_manager.active_split();
-        let open_buffers = if let Some(view_state) = self.split_view_states.get(&active_split) {
-            view_state.open_buffers.clone()
-        } else {
-            return;
-        };
-
-        if open_buffers.is_empty() {
-            self.set_status_message(t!("status.no_tabs_in_split").to_string());
-            return;
-        }
-
-        // Find the current buffer's index
-        let current_index = open_buffers
-            .iter()
-            .position(|&id| id == self.active_buffer())
-            .unwrap_or(0);
-
-        let suggestions: Vec<crate::input::commands::Suggestion> = open_buffers
-            .iter()
-            .map(|&buffer_id| {
-                let display_name = self
-                    .buffer_metadata
-                    .get(&buffer_id)
-                    .map(|m| m.display_name.clone())
-                    .unwrap_or_else(|| format!("Buffer {:?}", buffer_id));
-
-                let is_current = buffer_id == self.active_buffer();
-                let is_modified = self
-                    .buffers
-                    .get(&buffer_id)
-                    .is_some_and(|b| b.buffer.is_modified());
-
-                let description = match (is_current, is_modified) {
-                    (true, true) => Some("(current, modified)".to_string()),
-                    (true, false) => Some("(current)".to_string()),
-                    (false, true) => Some("(modified)".to_string()),
-                    (false, false) => None,
-                };
-
-                crate::input::commands::Suggestion {
-                    text: display_name,
-                    description,
-                    value: Some(buffer_id.0.to_string()),
-                    disabled: false,
-                    keybinding: None,
-                    source: None,
-                }
-            })
-            .collect();
-
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
-            "Switch to tab: ".to_string(),
-            PromptType::SwitchToTab,
-            suggestions,
-        ));
-
-        if let Some(prompt) = self.prompt.as_mut() {
-            if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
-            }
-        }
-    }
-
-    /// Switch to a tab by its BufferId
-    pub(crate) fn switch_to_tab(&mut self, buffer_id: BufferId) {
-        // Verify the buffer exists and is open in the current split
-        let active_split = self.split_manager.active_split();
-        let is_valid = self
-            .split_view_states
-            .get(&active_split)
-            .is_some_and(|vs| vs.open_buffers.contains(&buffer_id));
-
-        if !is_valid {
-            self.set_status_message(t!("status.tab_not_found").to_string());
-            return;
-        }
-
-        if buffer_id != self.active_buffer() {
-            // Save current position before switching
-            self.position_history.commit_pending_movement();
-
-            let cursors = self.active_cursors();
-            let position = cursors.primary().position;
-            let anchor = cursors.primary().anchor;
-            self.position_history
-                .record_movement(self.active_buffer(), position, anchor);
-            self.position_history.commit_pending_movement();
-
-            self.set_active_buffer(buffer_id);
-        }
-    }
-
-    /// Handle character insertion in prompt mode.
-    fn handle_insert_char_prompt(&mut self, c: char) -> AnyhowResult<()> {
-        // Check if this is the query-replace confirmation prompt
-        if let Some(ref prompt) = self.prompt {
-            if prompt.prompt_type == PromptType::QueryReplaceConfirm {
-                return self.handle_interactive_replace_key(c);
-            }
-        }
-
-        // Reset history navigation when user starts typing
-        // This allows them to press Up to get back to history items
-        // Reset history navigation when typing in a prompt
-        if let Some(ref prompt) = self.prompt {
-            if let Some(key) = Self::prompt_type_to_history_key(&prompt.prompt_type) {
-                if let Some(history) = self.prompt_histories.get_mut(&key) {
-                    history.reset_navigation();
-                }
-            }
-        }
-
-        if let Some(prompt) = self.prompt_mut() {
-            // Use insert_str to properly handle selection deletion
-            let s = c.to_string();
-            prompt.insert_str(&s);
-        }
-        self.update_prompt_suggestions();
-        Ok(())
-    }
-
-    /// Handle character insertion in normal editor mode.
-    fn handle_insert_char_editor(&mut self, c: char) -> AnyhowResult<()> {
-        // Check if editing is disabled (show_cursors = false)
-        if self.is_editing_disabled() {
-            self.set_status_message(t!("buffer.editing_disabled").to_string());
-            return Ok(());
-        }
-
-        // Cancel any pending LSP requests since the text is changing
-        self.cancel_pending_lsp_requests();
-
-        if let Some(events) = self.action_to_events(Action::InsertChar(c)) {
-            if events.len() > 1 {
-                // Multi-cursor: use optimized bulk edit (O(n) instead of O(n²))
-                let description = format!("Insert '{}'", c);
-                if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, description.clone())
-                {
-                    self.active_event_log_mut().append(bulk_edit);
-                }
-            } else {
-                // Single cursor - apply normally
-                for event in events {
-                    self.active_event_log_mut().append(event.clone());
-                    self.apply_event_to_active_buffer(&event);
-                }
-            }
-        }
-
-        // Auto-trigger signature help on '(' and ','
-        if c == '(' || c == ',' {
-            self.request_signature_help();
-        }
-
-        // Auto-trigger completion on trigger characters
-        self.maybe_trigger_completion(c);
-
-        Ok(())
-    }
-
-    /// Apply an action by converting it to events.
-    ///
-    /// This is the catch-all handler for actions that can be converted to buffer events
-    /// (cursor movements, text edits, etc.). It handles batching for multi-cursor,
-    /// position history tracking, and editing permission checks.
-    fn apply_action_as_events(&mut self, action: Action) -> AnyhowResult<()> {
-        // Check if active buffer is a composite buffer - handle scroll/movement specially
-        let buffer_id = self.active_buffer();
-        if self.is_composite_buffer(buffer_id) {
-            if let Some(_handled) = self.handle_composite_action(buffer_id, &action) {
-                return Ok(());
-            }
-        }
-
-        // Get description before moving action
-        let action_description = format!("{:?}", action);
-
-        // Check if this is an editing action and editing is disabled
-        let is_editing_action = matches!(
-            action,
-            Action::InsertNewline
-                | Action::InsertTab
-                | Action::DeleteForward
-                | Action::DeleteWordBackward
-                | Action::DeleteWordForward
-                | Action::DeleteLine
-                | Action::DuplicateLine
-                | Action::MoveLineUp
-                | Action::MoveLineDown
-                | Action::DedentSelection
-                | Action::ToggleComment
-        );
-
-        if is_editing_action && self.is_editing_disabled() {
-            self.set_status_message(t!("buffer.editing_disabled").to_string());
-            return Ok(());
-        }
-
-        if let Some(events) = self.action_to_events(action) {
-            if events.len() > 1 {
-                // Check if this batch contains buffer modifications
-                let has_buffer_mods = events
-                    .iter()
-                    .any(|e| matches!(e, Event::Insert { .. } | Event::Delete { .. }));
-
-                if has_buffer_mods {
-                    // Multi-cursor buffer edit: use optimized bulk edit (O(n) instead of O(n²))
-                    if let Some(bulk_edit) =
-                        self.apply_events_as_bulk_edit(events.clone(), action_description)
-                    {
-                        self.active_event_log_mut().append(bulk_edit);
-                    }
-                } else {
-                    // Multi-cursor non-buffer operation: use Batch for atomic undo
-                    let batch = Event::Batch {
-                        events: events.clone(),
-                        description: action_description,
-                    };
-                    self.active_event_log_mut().append(batch.clone());
-                    self.apply_event_to_active_buffer(&batch);
-                }
-
-                // Track position history for all events
-                for event in &events {
-                    self.track_cursor_movement(event);
-                }
-            } else {
-                // Single cursor - apply normally
-                for event in events {
-                    self.active_event_log_mut().append(event.clone());
-                    self.apply_event_to_active_buffer(&event);
-                    self.track_cursor_movement(&event);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Track cursor movement in position history if applicable.
-    pub(super) fn track_cursor_movement(&mut self, event: &Event) {
-        if self.in_navigation {
-            return;
-        }
-
-        if let Event::MoveCursor {
-            new_position,
-            new_anchor,
-            ..
-        } = event
-        {
-            self.position_history
-                .record_movement(self.active_buffer(), *new_position, *new_anchor);
-        }
     }
 }

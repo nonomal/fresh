@@ -10,12 +10,12 @@ const editor = getEditor();
 const NAMESPACE = "git-explorer";
 
 const COLORS = {
-  added: [80, 250, 123] as [number, number, number],
-  modified: [255, 184, 108] as [number, number, number],
-  deleted: [255, 85, 85] as [number, number, number],
-  renamed: [139, 233, 253] as [number, number, number],
-  untracked: [241, 250, 140] as [number, number, number],
-  conflicted: [255, 121, 198] as [number, number, number],
+  added:      "ui.file_status_added_fg",
+  modified:   "ui.file_status_modified_fg",
+  deleted:    "ui.file_status_deleted_fg",
+  renamed:    "ui.file_status_renamed_fg",
+  untracked:  "ui.file_status_untracked_fg",
+  conflicted: "ui.file_status_conflicted_fg",
 };
 
 const PRIORITY = {
@@ -58,7 +58,7 @@ function parseStatusOutput(output: string, repoRoot: string) {
     .split(separator)
     .map((entry) => entry.replace(/\r$/, ""))
     .filter((entry) => entry.length > 0);
-  const byPath = new Map<string, { path: string; symbol: string; color: [number, number, number]; priority: number }>();
+  const byPath = new Map<string, { path: string; symbol: string; color: string; priority: number }>();
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
@@ -117,9 +117,14 @@ async function refreshGitExplorerDecorations() {
       return;
     }
 
+    // -z gives NUL-terminated, raw (unquoted) paths. Without it git
+    // wraps any path containing spaces or special chars in double
+    // quotes (e.g. `?? "name copy.txt"`), which the parser would then
+    // key the decoration against — meaning the actual on-disk path
+    // never matches and the badge never appears next to the file.
     const statusResult = await editor.spawnProcess(
       "git",
-      ["status", "--porcelain"],
+      ["status", "--porcelain", "-z"],
       repoRoot
     );
     if (statusResult.exit_code !== 0) {
@@ -141,23 +146,28 @@ async function refreshGitExplorerDecorations() {
   }
 }
 
-function onGitExplorerAfterFileOpen() {
-  refreshGitExplorerDecorations();
-}
-registerHandler("onGitExplorerAfterFileOpen", onGitExplorerAfterFileOpen);
 
-function onGitExplorerAfterFileSave() {
-  refreshGitExplorerDecorations();
-}
-registerHandler("onGitExplorerAfterFileSave", onGitExplorerAfterFileSave);
 
-function onGitExplorerEditorInitialized() {
-  refreshGitExplorerDecorations();
-}
-registerHandler("onGitExplorerEditorInitialized", onGitExplorerEditorInitialized);
 
-editor.on("after_file_open", "onGitExplorerAfterFileOpen");
-editor.on("after_file_save", "onGitExplorerAfterFileSave");
-editor.on("editor_initialized", "onGitExplorerEditorInitialized");
+
+
+
+
+
+editor.on("after_file_open", () => {
+  refreshGitExplorerDecorations();
+});
+editor.on("after_file_save", () => {
+  refreshGitExplorerDecorations();
+});
+editor.on("after_file_explorer_change", () => {
+  refreshGitExplorerDecorations();
+});
+editor.on("editor_initialized", () => {
+  refreshGitExplorerDecorations();
+});
+editor.on("focus_gained", () => {
+  refreshGitExplorerDecorations();
+});
 
 refreshGitExplorerDecorations();

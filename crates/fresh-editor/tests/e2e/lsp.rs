@@ -126,8 +126,8 @@ fn test_lsp_completion_replaces_word() -> anyhow::Result<()> {
 
     harness.render()?;
 
-    // Confirm selection with Enter
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    // Confirm selection with Tab
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Buffer should now contain the full word, not "test_ftest_function"
@@ -240,7 +240,7 @@ fn test_lsp_completion_popup() -> anyhow::Result<()> {
     harness.render()?;
 
     // Select second item and confirm
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify the completion was inserted
@@ -259,7 +259,11 @@ fn test_lsp_diagnostics_status_bar() -> anyhow::Result<()> {
     use fresh::model::event::{Event, OverlayFace};
     use fresh::view::overlay::OverlayNamespace;
 
-    let mut harness = EditorTestHarness::new(80, 24)?;
+    // 120×24 instead of 80×24: with the {{remote}} indicator on the
+    // default status bar, the trailing Messages element is
+    // ellipsis-truncated at 80 cols. The widening keeps the
+    // assertions below readable.
+    let mut harness = EditorTestHarness::new(120, 24)?;
 
     // Type some text
     harness.type_text("let x = 5;\nlet y = 10;")?;
@@ -403,7 +407,7 @@ fn test_lsp_completion_navigation() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection (should insert item3)
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify item3 was inserted
@@ -519,7 +523,7 @@ fn test_lsp_completion_after_dot() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection (should insert "len" after the dot)
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify "args." is preserved and "len" is appended
@@ -575,7 +579,7 @@ fn test_lsp_completion_after_dot_with_partial() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection (should replace "le" with "length")
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify "args." is preserved and "le" is replaced with "length"
@@ -670,7 +674,7 @@ fn test_lsp_completion_filtering() -> anyhow::Result<()> {
     }
 
     // Confirm first selection (test_function)
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify completion replaced "test_" with "test_function"
@@ -784,10 +788,10 @@ fn test_lsp_waiting_indicator() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    \n}\n")?;
 
@@ -796,8 +800,10 @@ fn test_lsp_waiting_indicator() -> anyhow::Result<()> {
     config.editor.enable_semantic_tokens_full = true;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -805,7 +811,11 @@ fn test_lsp_waiting_indicator() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -853,9 +863,9 @@ fn test_lsp_waiting_indicator() -> anyhow::Result<()> {
 fn test_semantic_tokens_version_gating() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
-    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(150)?;
-
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(temp_dir.path(), 150)?;
     let test_file = temp_dir.path().join("semantic.rs");
     std::fs::write(&test_file, "fn main() {}\n")?;
 
@@ -863,8 +873,8 @@ fn test_semantic_tokens_version_gating() -> anyhow::Result<()> {
     config.editor.enable_semantic_tokens_full = true;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::semantic_tokens_delay_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::semantic_tokens_delay_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -874,7 +884,11 @@ fn test_semantic_tokens_version_gating() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -951,17 +965,17 @@ fn test_semantic_tokens_range_preserves_overlays_on_edit() -> anyhow::Result<()>
     use crate::common::fake_lsp::FakeLspServer;
     use std::collections::HashSet;
 
-    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(200)?;
-
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(temp_dir.path(), 200)?;
     let test_file = temp_dir.path().join("semantic_range.rs");
     std::fs::write(&test_file, "fn main() { let value = 1; }\n")?;
 
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::semantic_tokens_delay_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::semantic_tokens_delay_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -971,7 +985,11 @@ fn test_semantic_tokens_range_preserves_overlays_on_edit() -> anyhow::Result<()>
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -1046,17 +1064,17 @@ fn test_semantic_tokens_persist_on_enter_key() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
     use std::collections::HashSet;
 
-    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(200)?;
-
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(temp_dir.path(), 200)?;
     let test_file = temp_dir.path().join("semantic_enter.rs");
     std::fs::write(&test_file, "fn main() { let value = 1; }\n")?;
 
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::semantic_tokens_delay_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::semantic_tokens_delay_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -1066,7 +1084,11 @@ fn test_semantic_tokens_persist_on_enter_key() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -1141,9 +1163,9 @@ fn test_semantic_tokens_overlays_shift_on_edit() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
     use std::collections::HashMap;
 
-    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(200)?;
-
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_delay(temp_dir.path(), 200)?;
     let test_file = temp_dir.path().join("semantic_shift.rs");
     std::fs::write(&test_file, "fn main() { let value = 1; }\n")?;
 
@@ -1151,8 +1173,8 @@ fn test_semantic_tokens_overlays_shift_on_edit() -> anyhow::Result<()> {
     config.editor.enable_semantic_tokens_full = false;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::semantic_tokens_delay_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::semantic_tokens_delay_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -1162,7 +1184,11 @@ fn test_semantic_tokens_overlays_shift_on_edit() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -1245,9 +1271,9 @@ fn test_semantic_tokens_overlays_shift_on_edit() -> anyhow::Result<()> {
 fn test_semantic_tokens_range_only_viewport_highlighting() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
-    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_range_only()?;
-
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_semantic_tokens_range_only(temp_dir.path())?;
     let test_file = temp_dir.path().join("semantic_range_only.rs");
     std::fs::write(&test_file, "fn main() { let value = 1; }\n")?;
 
@@ -1255,8 +1281,8 @@ fn test_semantic_tokens_range_only_viewport_highlighting() -> anyhow::Result<()>
     config.editor.enable_semantic_tokens_full = false;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::semantic_tokens_range_only_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::semantic_tokens_range_only_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -1266,7 +1292,11 @@ fn test_semantic_tokens_range_only_viewport_highlighting() -> anyhow::Result<()>
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -1411,10 +1441,10 @@ fn test_lsp_completion_canceled_on_cursor_move() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    test_\n}\n")?;
 
@@ -1422,8 +1452,10 @@ fn test_lsp_completion_canceled_on_cursor_move() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -1431,7 +1463,11 @@ fn test_lsp_completion_canceled_on_cursor_move() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -1478,10 +1514,10 @@ fn test_lsp_cursor_animation() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    test_\n}\n")?;
 
@@ -1489,8 +1525,10 @@ fn test_lsp_cursor_animation() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -1498,7 +1536,11 @@ fn test_lsp_cursor_animation() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -1546,10 +1588,10 @@ fn test_lsp_completion_canceled_on_text_edit() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    test_\n}\n")?;
 
@@ -1559,8 +1601,10 @@ fn test_lsp_completion_canceled_on_text_edit() -> anyhow::Result<()> {
     config.editor.quick_suggestions = false;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -1568,7 +1612,11 @@ fn test_lsp_completion_canceled_on_text_edit() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -1678,9 +1726,13 @@ edition = "2021"
         let _ = harness.editor_mut().process_async_messages();
         harness.render()?;
 
-        // Check if LSP is ready by looking at the screen output (status bar)
+        // Check if LSP is ready by looking at the screen output (status bar).
+        // The running-state indicator is "LSP (on)" — it previously showed
+        // "[rust: ready]" inline, but the status bar was simplified to a
+        // three-state badge (on/off/error) with per-server detail moved to
+        // the clickable status popup.
         let screen = harness.screen_to_string();
-        if screen.contains("LSP") && screen.contains("ready") {
+        if screen.contains("LSP (on)") {
             lsp_ready = true;
             println!("LSP initialized and ready");
             break;
@@ -2028,7 +2080,7 @@ fn test_lsp_typing_performance_with_many_diagnostics() -> anyhow::Result<()> {
 fn test_handle_rename_response_with_document_changes() -> anyhow::Result<()> {
     use lsp_types::{
         DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range,
-        TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+        TextDocumentEdit, TextEdit, WorkspaceEdit,
     };
 
     let mut harness = EditorTestHarness::new(80, 30)?;
@@ -2043,11 +2095,7 @@ fn test_handle_rename_response_with_document_changes() -> anyhow::Result<()> {
     harness.render()?;
 
     // Create a WorkspaceEdit with documentChanges (like rust-analyzer sends)
-    let uri = url::Url::from_file_path(&test_file)
-        .unwrap()
-        .as_str()
-        .parse::<Uri>()
-        .unwrap();
+    let uri = fresh_core::file_uri::path_to_lsp_uri(&test_file).unwrap();
     let text_edit_1 = TextEdit {
         range: Range {
             start: Position {
@@ -2132,10 +2180,11 @@ fn test_lsp_diagnostics_non_blocking() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Create a completely blocking fake LSP server that never responds
-    let _fake_server = FakeLspServer::spawn_blocking()?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_blocking(temp_dir.path())?;
 
     // Create temporary directory and test file
-    let temp_dir = tempfile::tempdir()?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    // original code\n}\n")?;
 
@@ -2143,8 +2192,8 @@ fn test_lsp_diagnostics_non_blocking() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::blocking_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::blocking_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -2154,7 +2203,11 @@ fn test_lsp_diagnostics_non_blocking() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config and working directory
@@ -2301,7 +2354,7 @@ fn test_rust_analyzer_rename_real_scenario() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: "rust-analyzer".to_string(),
             args: vec![
                 "--log-file".to_string(),
@@ -2313,7 +2366,11 @@ fn test_rust_analyzer_rename_real_scenario() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // CRITICAL: Set working directory to the temp project so rust-analyzer
@@ -2478,7 +2535,7 @@ fn test_rust_analyzer_rename_real_scenario() -> anyhow::Result<()> {
 fn test_lsp_rename_consecutive_same_position() -> anyhow::Result<()> {
     use lsp_types::{
         DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range,
-        TextDocumentEdit, TextEdit, Uri, WorkspaceEdit,
+        TextDocumentEdit, TextEdit, WorkspaceEdit,
     };
 
     let mut harness = EditorTestHarness::new(80, 30)?;
@@ -2498,11 +2555,7 @@ fn test_lsp_rename_consecutive_same_position() -> anyhow::Result<()> {
     assert!(initial_content.contains("fn calculate(value: i32)"));
 
     // FIRST RENAME: value -> amount
-    let uri = url::Url::from_file_path(&test_file)
-        .unwrap()
-        .as_str()
-        .parse::<Uri>()
-        .unwrap();
+    let uri = fresh_core::file_uri::path_to_lsp_uri(&test_file).unwrap();
 
     let first_rename_edit = WorkspaceEdit {
         changes: None,
@@ -2688,18 +2741,20 @@ edition = "2021"
             break;
         }
 
-        // Also print status periodically
+        // Also print the rendered status bar periodically
         if i % 50 == 0 && i > 0 {
-            let lsp_status = harness.editor().get_lsp_status();
-            eprintln!("  [{}ms] LSP status: {}", i * 100, lsp_status);
+            eprintln!(
+                "  [{}ms] status bar: {}",
+                i * 100,
+                harness.get_status_bar().trim_end()
+            );
         }
     }
 
     if !lsp_ready {
-        let lsp_status = harness.editor().get_lsp_status();
         eprintln!(
-            "⚠ Warning: LSP may not have initialized fully. Status: {}",
-            lsp_status
+            "⚠ Warning: LSP may not have initialized fully. Status bar: {}",
+            harness.get_status_bar().trim_end()
         );
         eprintln!("Continuing test anyway...");
     }
@@ -2901,10 +2956,11 @@ fn test_lsp_progress_status_display() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Create a fake LSP server that sends progress notifications
-    let _fake_server = FakeLspServer::spawn_with_progress()?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_progress(temp_dir.path())?;
 
     // Create temporary directory and test file
-    let temp_dir = tempfile::tempdir()?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    println!(\"Hello\");\n}\n")?;
 
@@ -2912,8 +2968,8 @@ fn test_lsp_progress_status_display() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::progress_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::progress_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -2923,7 +2979,11 @@ fn test_lsp_progress_status_display() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config and working directory
@@ -3063,10 +3123,11 @@ fn test_lsp_crash_detection_and_restart() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Create a fake LSP server that crashes after initialization
-    let _fake_server = FakeLspServer::spawn_crashing()?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_crashing(temp_dir.path())?;
 
     // Create temporary directory and test file
-    let temp_dir = tempfile::tempdir()?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    let x = 5;\n}\n")?;
 
@@ -3074,8 +3135,8 @@ fn test_lsp_crash_detection_and_restart() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::crashing_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::crashing_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -3085,7 +3146,11 @@ fn test_lsp_crash_detection_and_restart() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config and working directory
@@ -3264,10 +3329,7 @@ fn test_pull_diagnostics_message_handling() -> anyhow::Result<()> {
     harness.render()?;
 
     // Get the URI for the file
-    let uri = url::Url::from_file_path(&test_file)
-        .ok()
-        .and_then(|u| u.as_str().parse::<lsp_types::Uri>().ok())
-        .expect("Should create URI");
+    let uri = fresh_core::file_uri::path_to_lsp_uri(&test_file).expect("Should create URI");
 
     // Simulate receiving pulled diagnostics
     // Create a test diagnostic
@@ -3333,10 +3395,7 @@ fn test_pull_diagnostics_unchanged_response() -> anyhow::Result<()> {
     harness.render()?;
 
     // Get the URI
-    let uri = url::Url::from_file_path(&test_file)
-        .ok()
-        .and_then(|u| u.as_str().parse::<lsp_types::Uri>().ok())
-        .expect("Should create URI");
+    let uri = fresh_core::file_uri::path_to_lsp_uri(&test_file).expect("Should create URI");
 
     // Send an unchanged response (simulating server returning same diagnostics)
     if let Some(bridge) = harness.editor().async_bridge() {
@@ -3365,15 +3424,18 @@ fn test_pull_diagnostics_unchanged_response() -> anyhow::Result<()> {
 fn test_pull_diagnostics_auto_trigger_after_open() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
+    // Create a temp directory and test file
+    let temp_dir = tempfile::TempDir::new()?;
+
     // Create fake LSP server with pull diagnostics support
-    let _server = FakeLspServer::spawn_with_pull_diagnostics()?;
+    let _server = FakeLspServer::spawn_with_pull_diagnostics(temp_dir.path())?;
 
     // Create config that uses the pull diagnostics fake server
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::pull_diagnostics_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::pull_diagnostics_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -3383,11 +3445,12 @@ fn test_pull_diagnostics_auto_trigger_after_open() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
-
-    // Create a temp directory and test file
-    let temp_dir = tempfile::TempDir::new()?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "hello world")?;
 
@@ -3445,15 +3508,18 @@ fn test_pull_diagnostics_auto_trigger_after_open() -> anyhow::Result<()> {
 fn test_pull_diagnostics_result_id_tracking() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
+    // Create a temp directory and test file
+    let temp_dir = tempfile::TempDir::new()?;
+
     // Create fake LSP server with pull diagnostics support
-    let _server = FakeLspServer::spawn_with_pull_diagnostics()?;
+    let _server = FakeLspServer::spawn_with_pull_diagnostics(temp_dir.path())?;
 
     // Create config that uses the pull diagnostics fake server
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::pull_diagnostics_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::pull_diagnostics_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -3463,11 +3529,12 @@ fn test_pull_diagnostics_result_id_tracking() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
-
-    // Create a temp directory and test file
-    let temp_dir = tempfile::TempDir::new()?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "hello world")?;
 
@@ -3691,6 +3758,64 @@ fn test_inlay_hints_position_tracking() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression test: deleting a text range that contains an inlay hint's
+/// anchor must remove the hint from screen immediately. Without the fix
+/// the hint lingered because the underlying marker just snapped to the
+/// deletion start, leaving stale virtual text visible until the next LSP
+/// refresh (which itself wasn't happening — see the debounced re-request
+/// wired in alongside this fix).
+#[test]
+fn test_inlay_hint_cleared_when_range_deleted() -> anyhow::Result<()> {
+    use fresh::view::virtual_text::VirtualTextPosition;
+    use ratatui::style::{Color, Style};
+
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    // Seed buffer content.
+    harness.type_text("let x = 5;")?;
+    harness.render()?;
+
+    // Inject an inlay hint at byte 5 (between "let x" and " = 5;").
+    let state = harness.editor_mut().active_state_mut();
+    let buf_len = state.buffer.len();
+    if buf_len > 0 {
+        state.marker_list.adjust_for_insert(0, buf_len);
+    }
+    let hint_style = Style::default().fg(Color::Rgb(128, 128, 128));
+    state.virtual_texts.add(
+        &mut state.marker_list,
+        5,
+        ": i32".to_string(),
+        hint_style,
+        VirtualTextPosition::AfterChar,
+        0,
+    );
+    harness.render()?;
+
+    let screen_before = harness.screen_to_string();
+    assert!(
+        screen_before.contains(": i32"),
+        "hint should be visible before deletion, screen:\n{}",
+        screen_before
+    );
+
+    // Select the entire buffer content and delete it. Every hint anchor
+    // byte is inside the selection, so every hint must be removed.
+    harness.send_key(KeyCode::Home, KeyModifiers::CONTROL)?;
+    harness.send_key(KeyCode::End, KeyModifiers::CONTROL | KeyModifiers::SHIFT)?;
+    harness.send_key(KeyCode::Delete, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    let screen_after = harness.screen_to_string();
+    assert!(
+        !screen_after.contains(": i32"),
+        "inlay hint should vanish once its anchor range is deleted, screen:\n{}",
+        screen_after
+    );
+
+    Ok(())
+}
+
 /// Test that stopped LSP server does not auto-restart when typing
 ///
 /// This test verifies that when a user explicitly stops an LSP server via the "stop lsp"
@@ -3703,10 +3828,11 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Create a fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
 
     // Create temporary directory and test file
-    let temp_dir = tempfile::tempdir()?;
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    let x = 5;\n}\n")?;
 
@@ -3714,8 +3840,10 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true, // Auto-start so it starts when we open the file
@@ -3723,7 +3851,11 @@ fn test_stopped_lsp_does_not_auto_restart_on_edit() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config and working directory
@@ -4028,10 +4160,10 @@ fn test_hover_popup_persists_within_symbol_and_popup() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Spawn fake LSP server (has hover support)
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn example_function() {}\n")?;
 
@@ -4039,8 +4171,10 @@ fn test_hover_popup_persists_within_symbol_and_popup() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -4048,7 +4182,11 @@ fn test_hover_popup_persists_within_symbol_and_popup() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -4104,6 +4242,195 @@ fn test_hover_popup_persists_within_symbol_and_popup() -> anyhow::Result<()> {
     assert!(
         !harness.editor().active_state().popups.is_visible(),
         "Hover popup should be dismissed when mouse leaves editor area"
+    );
+
+    Ok(())
+}
+
+/// Regression test for issue #692.
+///
+/// When the user moves the mouse outside the hover popup, then back inside
+/// it, and then clicks inside the popup, the popup must stay visible (clicks
+/// inside a hover popup start a text selection — they are not a "dismiss"
+/// gesture). Previously the popup was torn down by the click in this
+/// sequence even though clicking without moving outside first kept it open.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_hover_popup_persists_through_click_after_outside_move() -> anyhow::Result<()> {
+    use crate::common::fake_lsp::FakeLspServer;
+
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn example_function() {}\n")?;
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Trigger the hover popup over the function name.
+    harness.mouse_move(10, 2)?;
+    harness.render()?;
+    harness.editor_mut().force_check_mouse_hover();
+    harness.wait_until(|h| h.editor().active_state().popups.is_visible())?;
+
+    // The popup is anchored below the hover point. The persistence test
+    // demonstrates (12, 5) is over the popup body when the source line is
+    // at row 2 in this layout.
+    let popup_col: u16 = 12;
+    let popup_row: u16 = 5;
+
+    // 1. Move into the popup body — popup should stay visible.
+    harness.mouse_move(popup_col, popup_row)?;
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should stay visible while mouse is over it"
+    );
+
+    // 2. Move "around" outside the popup but still in the editor. Each of
+    //    these positions previously dismissed the popup independently
+    //    (different byte-position, gutter cell, empty line-end), so this is
+    //    where the hover would disappear before the user gets to click.
+    harness.mouse_move(2, 2)?; // gutter / line-number area
+    harness.mouse_move(2, 4)?; // empty editor row
+    harness.mouse_move(40, 4)?; // empty cell past line end on another row
+    harness.mouse_move(10, 2)?; // back over the hovered symbol
+
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should stay visible while the mouse moves through gutter, \
+         empty rows, and past-end-of-line space within the editor"
+    );
+
+    // 3. Move into the popup again and click — popup must NOT be dismissed.
+    harness.mouse_move(popup_col, popup_row)?;
+    harness.mouse_click(popup_col, popup_row)?;
+
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Hover popup should stay visible after clicking inside it, even when the \
+         mouse first moved outside the popup (issue #692)"
+    );
+
+    Ok(())
+}
+
+/// Regression test: a fresh hover response must not stack on top of an
+/// existing hover popup. Earlier the `update_lsp_hover_state` path
+/// dismissed the prior popup whenever the mouse left the symbol; once the
+/// fix for #692 stopped that eager dismissal, every new LSP hover response
+/// pushed a new popup onto the stack while the previous one was still
+/// there, producing a pile of hovers stacked on the screen.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_hover_popup_does_not_accumulate_across_hovers() -> anyhow::Result<()> {
+    use crate::common::fake_lsp::FakeLspServer;
+
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
+    let test_file = temp_dir.path().join("test.rs");
+    // Two well-separated identifiers on the same line so we can hover
+    // each in turn and trigger two distinct LSP responses.
+    std::fs::write(&test_file, "fn alpha_function() {} fn beta_function() {}\n")?;
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // First hover — over `alpha_function`.
+    harness.mouse_move(10, 2)?;
+    harness.render()?;
+    harness.editor_mut().force_check_mouse_hover();
+    harness.wait_until(|h| h.editor().active_state().popups.is_visible())?;
+    let popups_after_first = harness.editor().active_state().popups.all().len();
+    assert_eq!(
+        popups_after_first, 1,
+        "Exactly one hover popup expected after first hover"
+    );
+
+    // Second hover — move to `beta_function` (a different word). Wait for
+    // the debounce, force the request, and wait for the response.
+    harness.mouse_move(35, 2)?;
+    harness.sleep(std::time::Duration::from_millis(600));
+    harness.editor_mut().force_check_mouse_hover();
+    // Settle: render until the editor has processed at least one further
+    // hover response. We can't filter by popup count alone (that would be
+    // exactly the regression we're testing), so just give the response a
+    // chance to land.
+    for _ in 0..20 {
+        harness.render()?;
+        let _ = harness.editor_mut().process_async_messages();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let popups_after_second = harness.editor().active_state().popups.all().len();
+    assert_eq!(
+        popups_after_second, 1,
+        "A second LSP hover response must REPLACE the existing hover popup, \
+         not accumulate on top of it (regression). Stack length: {}",
+        popups_after_second
     );
 
     Ok(())
@@ -4420,7 +4747,7 @@ fn test_popup_home_key_selects_first_item() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify item_0 was inserted (first item)
@@ -4473,7 +4800,7 @@ fn test_popup_end_key_selects_last_item() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify item_19 was inserted (last item)
@@ -5330,18 +5657,14 @@ fn test_completion_type_to_filter_preserves_selection() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test accept_suggestion_on_enter: "off" makes Enter insert newline instead of accepting
+/// Test that Enter in completion popup dismisses popup and inserts newline
 #[test]
-fn test_completion_accept_on_enter_off() -> anyhow::Result<()> {
-    use fresh::config::AcceptSuggestionOnEnter;
+fn test_completion_enter_dismisses_and_inserts_newline() -> anyhow::Result<()> {
     use fresh::model::event::{
         Event, PopupContentData, PopupData, PopupKindHint, PopupListItemData, PopupPositionData,
     };
 
-    // Configure accept_suggestion_on_enter to "off"
-    let mut config = fresh::config::Config::default();
-    config.editor.accept_suggestion_on_enter = AcceptSuggestionOnEnter::Off;
-    let mut harness = EditorTestHarness::with_config(80, 24, config)?;
+    let mut harness = EditorTestHarness::new(80, 24)?;
 
     // Type initial text
     harness.type_text("test")?;
@@ -5395,7 +5718,7 @@ fn test_completion_accept_on_enter_off() -> anyhow::Result<()> {
     // Verify popup is closed
     assert!(
         !harness.editor().active_state().popups.is_visible(),
-        "Popup should be closed after Enter with accept_on_enter=off"
+        "Popup should be closed after Enter"
     );
 
     // Verify buffer contains original text + newline, NOT the completion
@@ -5414,18 +5737,14 @@ fn test_completion_accept_on_enter_off() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test accept_suggestion_on_enter: "on" (default) makes Enter accept completion
+/// Test that Tab in completion popup accepts the selected completion
 #[test]
-fn test_completion_accept_on_enter_on() -> anyhow::Result<()> {
-    use fresh::config::AcceptSuggestionOnEnter;
+fn test_completion_tab_accepts() -> anyhow::Result<()> {
     use fresh::model::event::{
         Event, PopupContentData, PopupData, PopupKindHint, PopupListItemData, PopupPositionData,
     };
 
-    // Ensure accept_suggestion_on_enter is "on" (default)
-    let mut config = fresh::config::Config::default();
-    config.editor.accept_suggestion_on_enter = AcceptSuggestionOnEnter::On;
-    let mut harness = EditorTestHarness::with_config(80, 24, config)?;
+    let mut harness = EditorTestHarness::new(80, 24)?;
 
     // Type initial text
     harness.type_text("test")?;
@@ -5472,14 +5791,14 @@ fn test_completion_accept_on_enter_on() -> anyhow::Result<()> {
         "Popup should be visible"
     );
 
-    // Press Enter - should accept completion
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    // Press Tab - should accept completion
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify popup is closed
     assert!(
         !harness.editor().active_state().popups.is_visible(),
-        "Popup should be closed after Enter"
+        "Popup should be closed after Tab"
     );
 
     // Verify buffer contains the completion
@@ -5533,7 +5852,7 @@ fn test_completion_snippet_cursor_position() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify the snippet was expanded correctly
@@ -5587,7 +5906,7 @@ fn test_completion_snippet_with_default() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify the snippet was expanded with default text
@@ -5644,7 +5963,7 @@ fn test_completion_plain_text_no_snippet() -> anyhow::Result<()> {
     harness.render()?;
 
     // Confirm selection
-    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
     harness.render()?;
 
     // Verify plain text was inserted
@@ -5670,10 +5989,10 @@ fn test_hover_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
 
     // Spawn fake LSP server script (but we don't want it to actually be used)
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn example_function() {\n    let x = 42;\n}\n")?;
 
@@ -5681,8 +6000,10 @@ fn test_hover_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: false, // This is the key setting - LSP should NOT auto-start
@@ -5690,7 +6011,11 @@ fn test_hover_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
     // Enable mouse hover in config
     config.editor.mouse_hover_enabled = true;
@@ -5757,10 +6082,10 @@ fn test_typing_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
     use crossterm::event::KeyCode;
 
     // Spawn fake LSP server script (but we don't want it to actually be used)
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n}\n")?;
 
@@ -5768,8 +6093,10 @@ fn test_typing_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: false, // This is the key setting - LSP should NOT auto-start
@@ -5777,7 +6104,11 @@ fn test_typing_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -5828,21 +6159,23 @@ fn test_typing_does_not_autostart_lsp_when_disabled() -> anyhow::Result<()> {
 #[cfg_attr(target_os = "windows", ignore)] // Uses Bash-based fake LSP server
 fn test_completion_triggered_on_trigger_character() -> anyhow::Result<()> {
     // Spawn fake LSP server with logging
-    let _fake_server = FakeLspServer::spawn_with_logging()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+
     let log_file = temp_dir.path().join("completion_trigger_test_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    foo\n}\n")?;
 
-    // Configure editor with quick_suggestions disabled to isolate trigger char behavior
+    // Configure editor with auto_show enabled but quick_suggestions disabled
+    // to isolate trigger char behavior
     let mut config = fresh::config::Config::default();
+    config.editor.completion_popup_auto_show = true;
     config.editor.quick_suggestions = false; // Only trigger chars should work
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::logging_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
@@ -5852,7 +6185,11 @@ fn test_completion_triggered_on_trigger_character() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -5910,21 +6247,22 @@ fn test_completion_triggered_on_trigger_character() -> anyhow::Result<()> {
 #[cfg_attr(target_os = "windows", ignore)] // Uses Bash-based fake LSP server
 fn test_completion_triggered_on_word_char_with_quick_suggestions() -> anyhow::Result<()> {
     // Spawn fake LSP server with logging
-    let _fake_server = FakeLspServer::spawn_with_logging()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+
     let log_file = temp_dir.path().join("quick_suggestions_test_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    \n}\n")?;
 
-    // Configure editor with quick_suggestions ENABLED
+    // Configure editor with auto_show and quick_suggestions ENABLED
     let mut config = fresh::config::Config::default();
+    config.editor.completion_popup_auto_show = true;
     config.editor.quick_suggestions = true;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::logging_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
@@ -5934,7 +6272,11 @@ fn test_completion_triggered_on_word_char_with_quick_suggestions() -> anyhow::Re
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -5991,10 +6333,10 @@ fn test_completion_triggered_on_word_char_with_quick_suggestions() -> anyhow::Re
 #[cfg_attr(target_os = "windows", ignore)] // Uses Bash-based fake LSP server
 fn test_completion_not_triggered_on_word_char_without_quick_suggestions() -> anyhow::Result<()> {
     // Spawn fake LSP server with logging
-    let _fake_server = FakeLspServer::spawn_with_logging()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+
     let log_file = temp_dir.path().join("no_quick_suggestions_test_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    \n}\n")?;
@@ -6004,8 +6346,8 @@ fn test_completion_not_triggered_on_word_char_without_quick_suggestions() -> any
     config.editor.quick_suggestions = false;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::logging_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
@@ -6015,7 +6357,11 @@ fn test_completion_not_triggered_on_word_char_without_quick_suggestions() -> any
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -6074,10 +6420,10 @@ fn test_completion_not_triggered_on_word_char_without_quick_suggestions() -> any
 #[cfg_attr(target_os = "windows", ignore)] // Uses Bash-based fake LSP server
 fn test_completion_not_triggered_on_non_word_char() -> anyhow::Result<()> {
     // Spawn fake LSP server with logging
-    let _fake_server = FakeLspServer::spawn_with_logging()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+
     let log_file = temp_dir.path().join("non_word_char_test_log.txt");
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, "fn main() {\n    foo\n}\n")?;
@@ -6087,8 +6433,8 @@ fn test_completion_not_triggered_on_non_word_char() -> anyhow::Result<()> {
     config.editor.quick_suggestions = true;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::logging_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
@@ -6098,7 +6444,11 @@ fn test_completion_not_triggered_on_non_word_char() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     // Create harness with config
@@ -6149,6 +6499,290 @@ fn test_completion_not_triggered_on_non_word_char() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test that Ctrl+Space toggles the completion popup off when it's already open
+#[test]
+fn test_completion_ctrl_space_toggles_popup_off() -> anyhow::Result<()> {
+    use fresh::model::event::{
+        Event, PopupContentData, PopupData, PopupKindHint, PopupListItemData, PopupPositionData,
+    };
+
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    // Type some text
+    harness.type_text("test")?;
+    harness.render()?;
+
+    // Show completion popup
+    harness.apply_event(Event::ShowPopup {
+        popup: PopupData {
+            kind: PopupKindHint::Completion,
+            title: None,
+            description: None,
+            transient: false,
+            content: PopupContentData::List {
+                items: vec![PopupListItemData {
+                    text: "test_function".to_string(),
+                    detail: None,
+                    icon: Some("λ".to_string()),
+                    data: Some("test_function".to_string()),
+                }],
+                selected: 0,
+            },
+            position: PopupPositionData::BelowCursor,
+            width: 50,
+            max_height: 15,
+            bordered: true,
+        },
+    })?;
+    harness.render()?;
+
+    // Verify popup is visible
+    assert!(
+        harness.editor().active_state().popups.is_visible(),
+        "Popup should be visible after showing"
+    );
+
+    // Press Ctrl+Space - should dismiss the popup (toggle off)
+    harness.send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)?;
+    harness.render()?;
+
+    // Verify popup is closed
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "Popup should be closed after Ctrl+Space toggle"
+    );
+
+    // Verify buffer still has original text (no completion accepted)
+    let buffer = harness.get_buffer_content().unwrap();
+    assert!(
+        !buffer.contains("test_function"),
+        "Buffer should NOT contain completion text after Ctrl+Space dismiss, got: {:?}",
+        buffer
+    );
+
+    Ok(())
+}
+
+/// Test that completion popup does NOT auto-show when completion_popup_auto_show is false (default)
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Bash-based fake LSP server
+fn test_completion_no_auto_show_by_default() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+
+    let log_file = temp_dir.path().join("no_auto_show_test_log.txt");
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn main() {\n    \n}\n")?;
+
+    // Default config: completion_popup_auto_show = false
+    let mut config = fresh::config::Config::default();
+    assert!(
+        !config.editor.completion_popup_auto_show,
+        "completion_popup_auto_show should default to false"
+    );
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: vec![log_file.to_string_lossy().to_string()],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for LSP to initialize
+    harness.wait_until(|_| {
+        let log_content = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log_content.contains("textDocument/didOpen")
+    })?;
+
+    std::fs::write(&log_file, "")?;
+
+    // Move to the empty line
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::End, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Type word characters — should NOT trigger completion since auto_show is false
+    harness.type_text("print")?;
+    harness.render()?;
+
+    // Also try a trigger character
+    harness.send_key(KeyCode::Char('.'), KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Give time for any async trigger
+    for _ in 0..10 {
+        harness.process_async_and_render()?;
+        harness.sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Verify NO completion was triggered
+    let log_content = std::fs::read_to_string(&log_file)?;
+    assert!(
+        !log_content.contains("textDocument/completion"),
+        "Expected NO completion request when completion_popup_auto_show=false. \
+         But completion was triggered. Log: {}",
+        log_content
+    );
+
+    Ok(())
+}
+
+/// Test that completion popup auto-shows when completion_popup_auto_show is true
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Bash-based fake LSP server
+fn test_completion_auto_show_when_enabled() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn_with_logging(temp_dir.path())?;
+
+    let log_file = temp_dir.path().join("auto_show_enabled_test_log.txt");
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn main() {\n    \n}\n")?;
+
+    // Enable auto-show + quick suggestions
+    let mut config = fresh::config::Config::default();
+    config.editor.completion_popup_auto_show = true;
+    config.editor.quick_suggestions = true;
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::logging_script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: vec![log_file.to_string_lossy().to_string()],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for LSP to initialize
+    harness.wait_until(|_| {
+        let log_content = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log_content.contains("textDocument/didOpen")
+    })?;
+
+    std::fs::write(&log_file, "")?;
+
+    // Move to the empty line
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::End, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Type a word character
+    harness.send_key(KeyCode::Char('p'), KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Wait for completion request (should be triggered)
+    harness.wait_until(|_| {
+        let log_content = std::fs::read_to_string(&log_file).unwrap_or_default();
+        log_content.contains("textDocument/completion")
+    })?;
+
+    let log_content = std::fs::read_to_string(&log_file)?;
+    assert!(
+        log_content.contains("textDocument/completion"),
+        "Expected completion to be triggered when completion_popup_auto_show=true. Log: {}",
+        log_content
+    );
+
+    Ok(())
+}
+
+/// Test that the accept key hint "(Tab)" is shown in the completion popup rendering
+#[test]
+fn test_completion_popup_shows_accept_key_hint() -> anyhow::Result<()> {
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    // Type some text
+    harness.type_text("tes")?;
+    harness.render()?;
+
+    // Trigger completion via Ctrl+Space to get the accept hint set
+    // First set up buffer words so the popup has items
+    // We need to type a word that will have completions, then trigger
+    harness.send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)?;
+    harness.render()?;
+
+    // The buffer-word completion may or may not find items for "tes".
+    // Let's use a more reliable approach: type a full word, then type a prefix.
+    // Clear and start over with known buffer content.
+    // Create a new harness with pre-existing text for buffer word completions.
+    let mut harness = EditorTestHarness::new(80, 24)?;
+
+    // Type a word, then newline, then a prefix of that word
+    harness.type_text("test_function")?;
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.type_text("test")?;
+    harness.render()?;
+
+    // Trigger completion via Ctrl+Space
+    harness.send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)?;
+    harness.render()?;
+
+    // Check that the popup is visible and contains the hint
+    let popup_visible = harness.editor().active_state().popups.is_visible();
+    assert!(popup_visible, "Completion popup should be visible");
+
+    // The popup should have accept_key_hint set
+    let has_hint = harness
+        .editor()
+        .active_state()
+        .popups
+        .top()
+        .and_then(|p| p.accept_key_hint.as_ref())
+        .is_some();
+    assert!(has_hint, "Completion popup should have accept_key_hint set");
+
+    // Now check the rendered output for "(Tab)" text
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("(Tab)"),
+        "Rendered screen should contain '(Tab)' hint. Screen:\n{}",
+        screen
+    );
+
+    Ok(())
+}
+
 /// Test that hover popup stays stable when mouse moves (no range from LSP)
 ///
 /// When the LSP server doesn't return a symbol range in the hover response (like pyrefly),
@@ -6165,11 +6799,12 @@ fn test_hover_popup_follows_mouse_when_lsp_returns_no_range() -> anyhow::Result<
     use std::time::Duration;
 
     // Spawn fake LSP server that does NOT return range in hover response
-    let _fake_server = FakeLspServer::spawn_without_range()?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_without_range(temp_dir.path())?;
 
     // Create temp dir and test file with multiple lines of code
     // This allows testing both horizontal and vertical mouse movement
-    let temp_dir = tempfile::tempdir()?;
     let test_file = temp_dir.path().join("test.rs");
     // Multiple lines with content so we can move mouse both horizontally and vertically
     let file_content = "fn example_function_name() {}\n\
@@ -6184,8 +6819,8 @@ fn test_hover_popup_follows_mouse_when_lsp_returns_no_range() -> anyhow::Result<
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::no_range_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::no_range_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -6195,7 +6830,11 @@ fn test_hover_popup_follows_mouse_when_lsp_returns_no_range() -> anyhow::Result<
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -6218,8 +6857,14 @@ fn test_hover_popup_follows_mouse_when_lsp_returns_no_range() -> anyhow::Result<
         None
     }
 
-    // Move mouse over the first symbol and get initial popup position
-    let initial_col = 10u16;
+    // Move mouse over the first symbol and get initial popup position.
+    // Anchor to the rendered gutter width so all test positions stay within the
+    // identifier "example_function_name" regardless of gutter size. The word
+    // starts at `gutter_width + 3` (after "fn "), and the test below samples
+    // mouse positions at offsets -2, +2, +5 from initial — so pick an offset
+    // that keeps every sample inside the identifier.
+    let gutter_width = harness.editor().active_state().margins.left_total_width() as u16;
+    let initial_col = gutter_width + 6;
     let initial_row = 2u16;
     harness.mouse_move(initial_col, initial_row)?;
     harness.render()?;
@@ -6398,10 +7043,10 @@ fn test_hover_does_not_trigger_past_end_of_line() -> anyhow::Result<()> {
     use std::time::Duration;
 
     // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file with a short line
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     // Short line - "fn foo() {}" is about 11 chars, so column 50 is way past end
     let file_content = "fn foo() {}\n";
@@ -6411,8 +7056,10 @@ fn test_hover_does_not_trigger_past_end_of_line() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -6420,7 +7067,11 @@ fn test_hover_does_not_trigger_past_end_of_line() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -6495,15 +7146,15 @@ fn test_hover_does_not_trigger_on_empty_line() -> anyhow::Result<()> {
     use crate::common::fake_lsp::FakeLspServer;
     use std::time::Duration;
 
-    // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
     // Create temp dir and test file matching user's scenario:
     // Line 1: import statement
     // Line 2: empty
     // Line 3: symbol (hover target)
     // Line 4: empty (this is where hover should NOT trigger)
     let temp_dir = tempfile::tempdir()?;
+
+    // Spawn fake LSP server
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
     let test_file = temp_dir.path().join("test.rs");
     let file_content = "use std;\n\nfn foo() {}\n\n";
     std::fs::write(&test_file, file_content)?;
@@ -6512,8 +7163,10 @@ fn test_hover_does_not_trigger_on_empty_line() -> anyhow::Result<()> {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -6521,7 +7174,11 @@ fn test_hover_does_not_trigger_on_empty_line() -> anyhow::Result<()> {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -6602,10 +7259,10 @@ fn test_hover_no_duplicate_popup_when_moving_within_symbol() -> anyhow::Result<(
     use std::time::Duration;
 
     // Spawn fake LSP server
-    let _fake_server = FakeLspServer::spawn()?;
-
-    // Create temp dir and test file
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
     let test_file = temp_dir.path().join("test.rs");
     // "array_equal" is a long symbol - we'll hover on different columns within it
     let file_content = "fn array_equal() {}\n";
@@ -6615,8 +7272,10 @@ fn test_hover_no_duplicate_popup_when_moving_within_symbol() -> anyhow::Result<(
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::script_path().to_string_lossy().to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
             args: vec![],
             enabled: true,
             auto_start: true,
@@ -6624,7 +7283,11 @@ fn test_hover_no_duplicate_popup_when_moving_within_symbol() -> anyhow::Result<(
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -7377,7 +8040,7 @@ log("STOPPED")
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "c".to_string(),
-        fresh::types::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::types::LspServerConfig {
             command: "python3".to_string(),
             args: vec![script_path.to_string_lossy().to_string()],
             enabled: true,
@@ -7386,7 +8049,11 @@ log("STOPPED")
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -7693,7 +8360,7 @@ log("STOPPED")
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "c".to_string(),
-        fresh::types::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::types::LspServerConfig {
             command: "python3".to_string(),
             args: vec![script_path.to_string_lossy().to_string()],
             enabled: true,
@@ -7702,7 +8369,11 @@ log("STOPPED")
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -7994,7 +8665,7 @@ log("STOPPED")
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "c".to_string(),
-        fresh::types::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::types::LspServerConfig {
             command: "python3".to_string(),
             args: vec![script_path.to_string_lossy().to_string()],
             enabled: true,
@@ -8003,7 +8674,11 @@ log("STOPPED")
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -8068,6 +8743,1174 @@ log("STOPPED")
          This reproduces the bug where E:N shows in the status bar but the ● gutter marker \
          is missing on trailing error lines.\nFull screen:\n{}",
         intx_row, intx_content, diag_row, diag_content, screen
+    );
+
+    Ok(())
+}
+
+/// Test that commenting a line does not displace inlay hints on subsequent lines.
+///
+/// Reproduces issue #1263: "Comments displace inlay hints"
+/// When commenting a line (Ctrl+/), inlay hints on subsequent lines should
+/// remain at their correct column positions. The bug causes them to be
+/// shifted right by the length of the comment prefix (e.g., 3 chars for "// ").
+#[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_inlay_hints_requested_for_every_open_buffer() -> anyhow::Result<()> {
+    // Regression: when the LSP started with multiple buffers already open,
+    // earlier in-flight inlay-hint responses were silently dropped because
+    // the editor only tracked a single pending request id. Only the
+    // last-issued buffer's response was accepted — the others stayed blank
+    // until the user edited them. This test opens two files, waits for
+    // the server to reply to both, and asserts the hint text appears on
+    // each file's tab.
+    use crate::common::harness::HarnessOptions;
+
+    let temp_dir = tempfile::tempdir()?;
+
+    // Fake LSP that tags each didOpen'd URI with a unique hint derived
+    // from the file's basename. It does not parse the buffer — it just
+    // echoes back a hint for every textDocument/inlayHint request so we
+    // can tell which file received a hint on screen.
+    let script = r#"#!/bin/bash
+
+read_message() {
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: $length\r\n\r\n%s" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    case "$method" in
+        "initialize")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":{"capabilities":{"textDocumentSync":1,"inlayHintProvider":true}}}'
+            ;;
+        "initialized")
+            ;;
+        "textDocument/inlayHint")
+            # Extract the request URI, derive a distinct label from the
+            # filename basename (without extension). Return ONE hint at
+            # line 0, col 0 so the editor renders it at the start of the
+            # first line of whichever buffer asked.
+            uri=$(echo "$msg" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+            basename=${uri##*/}
+            label="[${basename%.*}]"
+            hints='[{"position":{"line":0,"character":0},"label":"'"$label"'","kind":1}]'
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":'"$hints"'}'
+            ;;
+        "shutdown")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
+            break
+            ;;
+    esac
+done
+"#;
+
+    let script_path = temp_dir.path().join("fake_lsp_multi.sh");
+    std::fs::write(&script_path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+
+    // Two distinct C files — we expect hints for BOTH buffers.
+    let file_alpha = temp_dir.path().join("alpha.c");
+    let file_beta = temp_dir.path().join("beta.c");
+    std::fs::write(&file_alpha, "int x = 1;\n")?;
+    std::fs::write(&file_beta, "int y = 2;\n")?;
+
+    let mut config = fresh::config::Config::default();
+    config.editor.enable_inlay_hints = true;
+    config.lsp.insert(
+        "c".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: script_path.to_string_lossy().to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::create(
+        120,
+        30,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
+    )?;
+
+    // Open both files (both tabs live concurrently). The hint for the
+    // non-active buffer would be dropped before the fix.
+    harness.open_file(&file_alpha)?;
+    harness.open_file(&file_beta)?;
+    harness.render()?;
+
+    // Wait for the hint of the CURRENTLY visible (beta) buffer.
+    harness.wait_for_screen_contains("[beta]")?;
+
+    // Now switch to alpha — its hint must also be populated. Before the
+    // fix, alpha's response was discarded as "stale" so this would never
+    // appear.
+    harness.open_file(&file_alpha)?;
+    harness.render()?;
+    harness.wait_for_screen_contains("[alpha]")?;
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_inlay_hints_stay_at_end_of_line_after_delete_below() -> anyhow::Result<()> {
+    // Regression: when deleting a line (Ctrl+Shift+K), inlay hints on
+    // lines ABOVE the deleted line were observed jumping from the END
+    // of their lines (where the LSP placed them) to the START of their
+    // lines. This test reproduces the scenario with a fake LSP that
+    // returns one end-of-line hint per non-empty line, keyed off the
+    // buffer content it tracks via didOpen/didChange.
+    use crate::common::harness::HarnessOptions;
+
+    let temp_dir = tempfile::tempdir()?;
+
+    // Fake LSP: on every inlayHint request, return hints at the end of
+    // lines 0..=6, with labels that identify the line number. We don't
+    // parse the buffer — we just emit hints at high character columns
+    // so they land at end-of-line after position clamping. If the
+    // client later clears line 4 we won't "know" (we still emit 7
+    // hints), but the editor will simply drop the hint whose line
+    // index exceeds the current buffer's line count, which is fine:
+    // we're testing what happens to the hints that SHOULD still be
+    // present (lines 0,1,2,3,5,6 relative to the original content).
+    let script = r#"#!/bin/bash
+
+read_message() {
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: $length\r\n\r\n%s" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    case "$method" in
+        "initialize")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":{"capabilities":{"textDocumentSync":1,"inlayHintProvider":true}}}'
+            ;;
+        "initialized")
+            ;;
+        "textDocument/inlayHint")
+            # One hint per line 0..6 (skipping line 4), positioned at
+            # character=200 which is the exact length of every line
+            # (each source line is padded to 200 chars). This matches
+            # how real servers like rust-analyzer place end-of-line
+            # hints: at the column *just before* the newline.
+            hints='[{"position":{"line":0,"character":200},"label":"<EOL-L0>","kind":1},{"position":{"line":1,"character":200},"label":"<EOL-L1>","kind":1},{"position":{"line":2,"character":200},"label":"<EOL-L2>","kind":1},{"position":{"line":3,"character":200},"label":"<EOL-L3>","kind":1},{"position":{"line":5,"character":200},"label":"<EOL-L5>","kind":1},{"position":{"line":6,"character":200},"label":"<EOL-L6>","kind":1}]'
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":'"$hints"'}'
+            ;;
+        "shutdown")
+            send_message '{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}'
+            break
+            ;;
+    esac
+done
+"#;
+
+    let script_path = temp_dir.path().join("fake_lsp_eol_hints.sh");
+    std::fs::write(&script_path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+
+    // Each line has a distinctive word so the hint label identifies
+    // it on screen, padded out with junk so every line is hundreds of
+    // characters long (the user reported the bug on source code lines
+    // of typical length; short lines would mask it by happening to
+    // fit alongside a misrendered hint).
+    let test_file = temp_dir.path().join("test.c");
+    let mut content = String::new();
+    for word in &[
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+    ] {
+        content.push_str(word);
+        content.push(' ');
+        // pad to ~200 characters with a repeating filler
+        let pad = "x".repeat(200usize.saturating_sub(word.len() + 1));
+        content.push_str(&pad);
+        content.push('\n');
+    }
+    std::fs::write(&test_file, &content)?;
+
+    let mut config = fresh::config::Config::default();
+    config.editor.enable_inlay_hints = true;
+    config.lsp.insert(
+        "c".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: script_path.to_string_lossy().to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    // Narrow terminal forces long lines to wrap across multiple view
+    // rows — the user-reported bug only manifests in that case. Each
+    // source line is ~200 chars and the viewport is 100 wide, so every
+    // line wraps.
+    let mut harness = EditorTestHarness::create(
+        100,
+        40,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // `check_hint_position` asserts that the hint for `word`/`label`
+    // renders AFTER the word on screen, regardless of wrapping:
+    //   * if both land on the same terminal row, word must come before
+    //     label;
+    //   * if they land on different rows, the word's row must precede
+    //     the label's row (the line wraps, label sits on a later row
+    //     near the end).
+    // With the bug we're hunting, the label would render at the START
+    // of the first wrapped row of the source line — i.e. before the
+    // word on the same row — which both checks reject.
+    let check_hint_position = |screen: &str, word: &str, label: &str, tag: &str| {
+        let rows: Vec<&str> = screen.lines().collect();
+        let word_row = rows
+            .iter()
+            .position(|l| l.contains(word))
+            .unwrap_or_else(|| panic!("[{tag}] word {word:?} not on screen:\n{screen}"));
+        let label_row = rows
+            .iter()
+            .position(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("[{tag}] label {label:?} not on screen:\n{screen}"));
+        if word_row == label_row {
+            let row = rows[word_row];
+            let w = row.find(word).unwrap();
+            let l = row.find(label).unwrap();
+            assert!(
+                w < l,
+                "[{tag}] same row: word {word:?} at col {w} must precede hint {label:?} at col {l}. Row: {row:?}"
+            );
+        } else {
+            assert!(
+                word_row < label_row,
+                "[{tag}] word {word:?} on row {word_row} must come before hint {label:?} on row {label_row}.\nScreen:\n{screen}"
+            );
+        }
+    };
+
+    // The fake LSP skips line 4 (echo), so we don't expect <EOL-L4>.
+    // Wait until the first and last of our expected hint labels land.
+    harness.wait_for_screen_contains("<EOL-L0>")?;
+    harness.wait_for_screen_contains("<EOL-L6>")?;
+
+    let screen_before = harness.screen_to_string();
+    eprintln!("=== Before delete ===\n{}", screen_before);
+
+    // Sanity: before the delete, hint 0 follows "alpha".
+    check_hint_position(&screen_before, "alpha", "<EOL-L0>", "before-delete");
+
+    // The user-reported bug is about hints on lines ABOVE the delete.
+    // Move cursor down onto a line FAR below the hints we'll check —
+    // "foxtrot" (6th source line). With wrapping, every source line
+    // takes 4 view rows, so 5*4 = 20 Down presses should land us on
+    // foxtrot. We use Goto Line via the palette instead to be robust
+    // to exact wrap math.
+    harness.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)?;
+    harness.wait_for_screen_contains(">command")?;
+    // Remove the ">" prefix so we can type a line number (Quick Open
+    // uses `:N` for line jump after backspacing the command prefix).
+    harness.send_key(KeyCode::Backspace, KeyModifiers::NONE)?;
+    harness.type_text(":6")?;
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Invoke "Delete Line" via the command palette so we don't depend
+    // on any particular keybinding.
+    harness.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)?;
+    harness.wait_for_screen_contains(">command")?;
+    harness.type_text("Delete Line")?;
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    harness.wait_until(|h| {
+        h.get_buffer_content()
+            .map(|c| !c.contains("foxtrot"))
+            .unwrap_or(false)
+    })?;
+
+    let screen_after_delete = harness.screen_to_string();
+
+    // The user-reported bug: an inlay hint that was positioned right
+    // at the end of its line (e.g. a closing-brace function-name hint
+    // in Rust) flips from `} <hint-name>` to `<hint-name> }` after a
+    // nearby line is deleted. Each affected hint is anchored to the
+    // trailing \n of its source line — i.e. rendered BeforeChar on
+    // the \n byte — and its byte offset should either stay put (for
+    // lines above the delete) or shift by exactly the deleted byte
+    // count (for lines below).
+    //
+    // Check each surviving end-of-line hint STILL renders after its
+    // line's distinguishing word.
+    for (word, label) in [
+        ("alpha", "<EOL-L0>"),
+        ("bravo", "<EOL-L1>"),
+        ("charlie", "<EOL-L2>"),
+        ("delta", "<EOL-L3>"),
+        ("golf", "<EOL-L6>"),
+    ] {
+        check_hint_position(
+            &screen_after_delete,
+            word,
+            label,
+            &format!("post-delete-{word}"),
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_comment_does_not_displace_inlay_hints() -> anyhow::Result<()> {
+    use crate::common::harness::HarnessOptions;
+
+    let temp_dir = tempfile::tempdir()?;
+
+    // Create a fake LSP that returns inlay hints for function call arguments.
+    // It parses the buffer to find lines matching "= add(" and returns
+    // parameter hints (a: and b:) at the argument positions.
+    let script = r#"#!/bin/bash
+
+read_message() {
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    echo -en "Content-Length: $length\r\n\r\n$message"
+}
+
+BUFFER_FILE=$(mktemp)
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    case "$method" in
+        "initialize")
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"textDocumentSync":1,"inlayHintProvider":true}}}'
+            ;;
+        "initialized")
+            ;;
+        "textDocument/didOpen")
+            text=$(echo "$msg" | sed 's/.*"text":"//;s/".*//' | sed 's/\\n/\n/g')
+            echo "$text" > "$BUFFER_FILE"
+            ;;
+        "textDocument/didChange")
+            text=$(echo "$msg" | grep -o '"text":"[^"]*"' | tail -1 | sed 's/"text":"//;s/"$//' | sed 's/\\n/\n/g')
+            if [ -n "$text" ]; then
+                echo "$text" > "$BUFFER_FILE"
+            fi
+            ;;
+        "textDocument/inlayHint")
+            # Return parameter hints only for call sites (lines with "= add(")
+            hints="["
+            first=true
+            line_num=0
+            while IFS= read -r line; do
+                # Only match call sites, not the function definition
+                case "$line" in
+                    *"= add("*)
+                        # Find column after "add("
+                        prefix="${line%%add(*}"
+                        col=$(( ${#prefix} + 4 ))
+                        # Find second arg position (after ", ")
+                        after_add="${line#*add(}"
+                        before_comma="${after_add%%,*}"
+                        col2=$(( col + ${#before_comma} + 2 ))
+
+                        if [ "$first" = true ]; then
+                            first=false
+                        else
+                            hints="$hints,"
+                        fi
+                        hints="$hints{\"position\":{\"line\":$line_num,\"character\":$col},\"label\":\"a:\",\"kind\":2}"
+                        hints="$hints,{\"position\":{\"line\":$line_num,\"character\":$col2},\"label\":\"b:\",\"kind\":2}"
+                        ;;
+                esac
+                line_num=$((line_num + 1))
+            done < "$BUFFER_FILE"
+            hints="$hints]"
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":'"$hints"'}'
+            ;;
+        "shutdown")
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+            rm -f "$BUFFER_FILE"
+            break
+            ;;
+    esac
+done
+"#;
+
+    let script_path = temp_dir.path().join("fake_lsp_inlay.sh");
+    std::fs::write(&script_path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+
+    // Create a C source file: line 1 is the definition, lines 2-3 are call sites
+    let test_file = temp_dir.path().join("test.c");
+    std::fs::write(
+        &test_file,
+        "int add(int a, int b) { return a + b; }\nint x = add(1, 2);\nint y = add(3, 4);\n",
+    )?;
+
+    // Configure LSP with our fake server
+    let mut config = fresh::config::Config::default();
+    config.editor.enable_inlay_hints = true;
+    config.lsp.insert(
+        "c".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: script_path.to_string_lossy().to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::create(
+        100,
+        30,
+        HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
+    )?;
+
+    // Open the test file and wait for inlay hints to appear
+    harness.open_file(&test_file)?;
+    harness.render()?;
+    harness.wait_for_screen_contains("a:")?;
+
+    let screen_before = harness.screen_to_string();
+    eprintln!("Before commenting:\n{}", screen_before);
+
+    // Use find_text_on_screen to locate the "a:" hint on the "int y" line.
+    // We'll look for "a: 3" which uniquely identifies the hint on line 3.
+    let hint_pos_before = harness
+        .find_text_on_screen("a: 3")
+        .expect("Should find 'a: 3' hint on screen before commenting");
+    eprintln!(
+        "Before commenting: 'a: 3' at col={}, row={}",
+        hint_pos_before.0, hint_pos_before.1
+    );
+
+    // Move cursor to line 1 (the function definition)
+    harness.send_key(KeyCode::Home, KeyModifiers::CONTROL)?;
+    harness.render()?;
+
+    // Toggle comment on line 1 with Ctrl+/
+    harness.send_key(KeyCode::Char('/'), KeyModifiers::CONTROL)?;
+    harness.render()?;
+
+    // Verify line 1 is now commented
+    let content = harness.get_buffer_content().unwrap();
+    assert!(
+        content.starts_with("// "),
+        "Line 1 should be commented. Buffer: {:?}",
+        content
+    );
+
+    // The old inlay hints are still displayed via marker tracking
+    // (markers auto-adjust their byte positions when text is inserted).
+    // The bug is that hints on subsequent lines render at displaced columns.
+    let screen_after = harness.screen_to_string();
+    eprintln!("After commenting:\n{}", screen_after);
+
+    // The "int y" line (line 3) should still render the hints correctly:
+    //   "int y = add(a: 3, b: 4);"
+    // With the bug (issue #1263), the hints are displaced by 3 chars:
+    //   "int y = aa: dd(b: 3, 4);"  ← hints shifted left into wrong positions
+    //
+    // Check: the hint "a:" should still appear right after "add(" on the int y line,
+    // NOT embedded in the middle of "add".
+    // We verify by checking that "add(a:" is present (correct rendering).
+    let line3_correct = screen_after.contains("add(a: 3");
+    let line3_broken = screen_after.contains("aa: dd(");
+
+    assert!(
+        line3_correct && !line3_broken,
+        "Inlay hints on subsequent lines should NOT be displaced after commenting line 1.\n\
+         Expected 'add(a: 3' on screen (hints at correct column).\n\
+         Got broken rendering with 'aa: dd(' (hints displaced by 3 chars).\n\
+         This reproduces issue #1263: Comments displace inlay hints.\n\
+         Screen before:\n{}\nScreen after:\n{}",
+        screen_before,
+        screen_after
+    );
+
+    Ok(())
+}
+
+/// Test that LSP workspace root uses root_markers detection from the file path,
+/// not the editor's working directory, when started via the manual restart command.
+///
+/// Reproduces issue #1360: when opening ~/.config/wezterm/wezterm.lua from $HOME,
+/// the LSP workspace root was set to $HOME because manual_restart didn't pass the
+/// file path for root_markers-based detection.
+///
+/// Uses auto_start: false and triggers LSP via the command palette (Start/Restart
+/// LSP) to exercise the manual_restart path specifically.
+#[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_lsp_workspace_root_uses_file_dir_not_cwd() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+
+    // Set up directory structure: working_dir is a "home" directory,
+    // file is in a nested subdirectory (like ~/.config/wezterm/wezterm.lua)
+    let home_dir = temp_dir.path().join("fakehome");
+    let config_dir = home_dir.join("dotconfig").join("wezterm");
+    std::fs::create_dir_all(&config_dir)?;
+
+    let test_file = config_dir.join("test.lua");
+    std::fs::write(&test_file, "local wezterm = require 'wezterm'\nreturn {}\n")?;
+
+    // Create a fake LSP server that logs the rootUri from the initialize request
+    let log_file = temp_dir.path().join("lsp_init_log.txt");
+    let script_path = temp_dir.path().join("fake_lua_lsp.sh");
+    let script = format!(
+        r##"#!/bin/bash
+LOG_FILE="{log_file}"
+> "$LOG_FILE"
+
+read_message() {{
+    local content_length=0
+    while IFS=: read -r key value; do
+        key=$(echo "$key" | tr -d '\r\n')
+        value=$(echo "$value" | tr -d '\r\n ')
+        if [ "$key" = "Content-Length" ]; then
+            content_length=$value
+        fi
+        if [ -z "$key" ]; then
+            break
+        fi
+    done
+    if [ $content_length -gt 0 ]; then
+        dd bs=1 count=$content_length 2>/dev/null
+    fi
+}}
+
+send_message() {{
+    local message="$1"
+    local length=${{#message}}
+    printf "Content-Length: $length\r\n\r\n%s" "$message"
+}}
+
+while true; do
+    msg=$(read_message)
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    case "$method" in
+        "initialize")
+            # Extract rootUri from the initialize params and log it
+            root_uri=$(echo "$msg" | grep -o '"rootUri":"[^"]*"' | cut -d'"' -f4)
+            echo "ROOT_URI=$root_uri" >> "$LOG_FILE"
+            send_message '{{"jsonrpc":"2.0","id":'"$msg_id"',"result":{{"capabilities":{{"textDocumentSync":{{"openClose":true,"change":2}},"completionProvider":{{"resolveProvider":false}}}}}}}}'
+            ;;
+        "initialized")
+            ;;
+        "textDocument/didOpen")
+            ;;
+        "shutdown")
+            send_message '{{"jsonrpc":"2.0","id":'"$msg_id"',"result":null}}'
+            ;;
+        "exit")
+            exit 0
+            ;;
+    esac
+done
+"##,
+        log_file = log_file.display()
+    );
+    std::fs::write(&script_path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Configure LSP for lua with root_markers that won't be found in the test dirs
+    // Configure LSP for lua with auto_start: false to force the manual restart path
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "lua".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: script_path.to_string_lossy().to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: false, // KEY: must be manually started to exercise manual_restart
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: vec![".luarc.json".to_string()], // Not present in test dirs
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    // Create harness with working_dir set to "home" (simulating running from $HOME)
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, config, home_dir.clone())?;
+
+    // Open the lua file — LSP will NOT start because auto_start is false
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Verify LSP is NOT running yet
+    assert!(
+        !harness
+            .editor()
+            .running_lsp_servers()
+            .contains(&"lua".to_string()),
+        "LSP should not be running before manual start"
+    );
+
+    // Use command palette to trigger "Start/Restart LSP" (exercises manual_restart path)
+    harness.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)?;
+    harness.wait_for_prompt()?;
+    harness.type_text("Start")?;
+    harness.render()?;
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Wait for the fake LSP to receive the initialize request and log the rootUri
+    harness.wait_until(|_| {
+        std::fs::read_to_string(&log_file)
+            .unwrap_or_default()
+            .contains("ROOT_URI=")
+    })?;
+
+    let log = std::fs::read_to_string(&log_file)?;
+    let root_uri_line = log
+        .lines()
+        .find(|l| l.starts_with("ROOT_URI="))
+        .expect("ROOT_URI not found in log");
+    let root_uri = &root_uri_line["ROOT_URI=".len()..];
+
+    // The root URI should be the file's parent directory (config_dir),
+    // NOT the working directory (home_dir)
+    let expected_suffix = "fakehome/dotconfig/wezterm";
+    assert!(
+        root_uri.contains(expected_suffix),
+        "rootUri should be the file's parent directory, not the working directory.\n\
+         Expected rootUri to contain: {expected_suffix}\n\
+         Got rootUri: {root_uri}\n\
+         This would fail if the editor uses cwd ({}) instead of the file's directory.",
+        home_dir.display()
+    );
+    assert!(
+        !root_uri.ends_with("/fakehome"),
+        "rootUri must NOT be the working directory (home dir).\n\
+         Got rootUri: {root_uri}"
+    );
+
+    Ok(())
+}
+
+/// Test that "restart lsp" command shows a prompt with correct suggestions
+/// when multiple servers are configured.
+///
+/// With a single server, restart happens immediately (no prompt).
+/// With multiple servers, a prompt should appear listing:
+/// 1. An "all enabled" option for the current language
+/// 2. Individual server entries for each configured server
+#[test]
+#[cfg_attr(windows, ignore = "Uses bash script for fake LSP server")]
+fn test_restart_lsp_prompt_shows_suggestions() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn main() {}\n")?;
+
+    let script = FakeLspServer::script_path(temp_dir.path())
+        .to_string_lossy()
+        .to_string();
+
+    // Configure two servers so the prompt appears
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![
+            fresh::services::lsp::LspServerConfig {
+                command: script.clone(),
+                args: vec![],
+                enabled: true,
+                auto_start: true,
+                process_limits: fresh::services::process_limits::ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                root_markers: Default::default(),
+                name: Some("server-a".to_string()),
+                only_features: None,
+                except_features: None,
+            },
+            fresh::services::lsp::LspServerConfig {
+                command: script,
+                args: vec![],
+                enabled: true,
+                auto_start: true,
+                process_limits: fresh::services::process_limits::ProcessLimits::default(),
+                initialization_options: None,
+                env: Default::default(),
+                language_id_overrides: Default::default(),
+                root_markers: Default::default(),
+                name: Some("server-b".to_string()),
+                only_features: None,
+                except_features: None,
+            },
+        ]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for LSP to start
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .running_lsp_servers()
+                .contains(&"rust".to_string())
+        })
+        .expect("LSP server should start");
+
+    // Trigger the restart LSP action directly (as if the user selected it from command palette)
+    harness.editor_mut().handle_lsp_restart();
+    harness.render()?;
+
+    // A prompt should now be visible (multiple servers configured)
+    assert!(
+        harness.editor().is_prompting(),
+        "Restart LSP should show a prompt when multiple servers are configured"
+    );
+
+    // Check the screen contains the expected suggestions
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("rust (all enabled)"),
+        "Prompt should show 'rust (all enabled)' option. Screen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("rust/server-a"),
+        "Prompt should show 'rust/server-a' option. Screen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("rust/server-b"),
+        "Prompt should show 'rust/server-b' option. Screen:\n{}",
+        screen
+    );
+
+    // Dismiss the prompt
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    Ok(())
+}
+
+/// Test that "restart lsp" via prompt actually restarts the server
+///
+/// Stop the LSP, then use the restart prompt to bring it back.
+#[test]
+#[cfg_attr(windows, ignore = "Uses bash script for fake LSP server")]
+fn test_restart_lsp_prompt_restarts_stopped_server() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn main() {}\n")?;
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for LSP to start
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .running_lsp_servers()
+                .contains(&"rust".to_string())
+        })
+        .expect("LSP server should start");
+
+    // Stop the LSP server
+    let stopped = harness.editor_mut().shutdown_lsp_server("rust");
+    assert!(stopped, "shutdown_lsp_server should return true");
+
+    harness
+        .wait_until(|h| {
+            !h.editor()
+                .running_lsp_servers()
+                .contains(&"rust".to_string())
+        })
+        .expect("LSP server should stop");
+
+    // Now trigger restart LSP — with a single server, this restarts immediately
+    harness.editor_mut().handle_lsp_restart();
+    harness.render()?;
+
+    // Wait for LSP to come back
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .running_lsp_servers()
+                .contains(&"rust".to_string())
+        })
+        .expect("LSP server should restart after prompt confirmation");
+
+    Ok(())
+}
+
+/// Test that "stop lsp" via prompt sends didClose before removing handles
+///
+/// This is a regression test: previously, `disable_lsp_for_buffer` was called AFTER
+/// `shutdown_server` removed the handles, causing a spurious "no handle for language" warning.
+/// The fix sends didClose BEFORE shutting down the server.
+#[test]
+#[cfg_attr(windows, ignore = "Uses bash script for fake LSP server")]
+fn test_stop_lsp_via_prompt_no_warning() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn main() {}\n")?;
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        80,
+        24,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for LSP to start
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .running_lsp_servers()
+                .contains(&"rust".to_string())
+        })
+        .expect("LSP server should start");
+
+    // Trigger the stop LSP action (opens a prompt)
+    harness.editor_mut().handle_lsp_stop();
+    harness.render()?;
+
+    assert!(
+        harness.editor().is_prompting(),
+        "Stop LSP should show a prompt"
+    );
+
+    // Confirm with Enter (the single server should be pre-selected)
+    harness.send_key(KeyCode::Enter, KeyModifiers::NONE)?;
+    harness.render()?;
+
+    // Wait for LSP to stop
+    harness
+        .wait_until(|h| {
+            !h.editor()
+                .running_lsp_servers()
+                .contains(&"rust".to_string())
+        })
+        .expect("LSP server should stop after prompt confirmation");
+
+    // The key assertion: the editor is still functional (no panic from the warning path)
+    // and the prompt closed successfully
+    assert!(
+        !harness.editor().is_prompting(),
+        "Prompt should be closed after stop"
+    );
+
+    Ok(())
+}
+
+/// Bug from interactive walkthrough (Critical #3): when an LSP
+/// server fails to spawn (e.g. binary missing inside the
+/// container), the per-language log file at
+/// `{log_dir}/lsp/{language}-{PID}.log` was never created, so
+/// the LSP popup's "View Log" item went down the `disabled()`
+/// branch and clicking it did nothing. Users had no path to
+/// the actual spawn error.
+///
+/// Fix: in `LspManager::force_spawn`'s `Err` branch, write a
+/// stub log with the failure reason so View Log opens
+/// something readable.
+///
+/// Regression guard: configure an LSP server pointing at a
+/// non-existent binary, open a file that triggers auto-spawn,
+/// wait for the stub log to materialize, assert it contains
+/// the failure marker.
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "spawn-failure stub uses unix-style path; the underlying
+              behavior is platform-agnostic but the test setup is unix-only"
+)]
+#[test]
+fn lsp_spawn_failure_writes_stub_log_for_view_log_popup() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, "fn main() {}\n")?;
+
+    // Configure LSP for `rust` with a command that definitely
+    // does not exist on PATH or anywhere on disk. The spawn
+    // attempt must fail synchronously inside `LspHandle::spawn`,
+    // which routes through the `Err(e)` branch we patched.
+    let bogus = temp_dir
+        .path()
+        .join("definitely-not-an-lsp-server-fresh-test")
+        .to_string_lossy()
+        .to_string();
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: bogus.clone(),
+            args: vec![],
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        100,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    // Snapshot any pre-existing log to detect the stub overwrite.
+    let log_path = fresh::services::log_dirs::lsp_log_path("rust");
+    let _ = std::fs::remove_file(&log_path);
+
+    // Open the file: triggers auto-spawn → spawn fails →
+    // stub log is written.
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // The spawn failure path runs synchronously inside the
+    // open_file → try_spawn flow, but we tick a few times in
+    // case the runtime defers the write. The stub is a single
+    // `fs::write` call right after the `tracing::error!`, so
+    // it should land within the first tick.
+    harness
+        .wait_until(|_| log_path.exists())
+        .expect("LSP spawn-failure stub log should be written when spawn fails");
+
+    let contents = std::fs::read_to_string(&log_path)?;
+    assert!(
+        contents.contains("failed to spawn"),
+        "stub log should explain the spawn failure; got:\n{contents}"
+    );
+    assert!(
+        contents.contains("Configured command:"),
+        "stub log should include the configured command for diagnosis; got:\n{contents}"
+    );
+    assert!(
+        contents.contains(&bogus),
+        "stub log should mention the actual configured binary path so the user can spot \
+         typos / missing installs. got:\n{contents}"
     );
 
     Ok(())

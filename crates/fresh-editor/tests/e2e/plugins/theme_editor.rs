@@ -41,11 +41,31 @@ fn open_theme_editor(harness: &mut EditorTestHarness) {
         .unwrap();
     harness.render().unwrap();
 
-    // Wait for theme editor to fully load
+    // Wait for theme editor to fully load.
+    //
+    // We must wait for the PANEL CONTENT to be populated, not just for the
+    // `*Theme Editor*` tab label to appear. The tab bar updates as soon as
+    // the buffer group is created, which happens BEFORE the plugin runs
+    // `setPanelContent` to populate the tree/picker/footer panels. On slower
+    // platforms (e.g. Windows) there's a visible race window in which the
+    // tab is in place but every panel is still blank — previously this
+    // helper used `screen.contains("Editor")` which matches the `*Theme
+    // Editor*` tab label, so the wait returned during that blank window
+    // and every subsequent `contains("Theme Editor:")` / `contains("#...")`
+    // assertion in the callers raced against a half-rendered UI.
+    //
+    // Instead, wait for per-panel content the plugin writes via
+    // setPanelContent:
+    //   - `Theme Editor: ` — the first line of the tree (left) panel,
+    //     e.g. "Theme Editor: dark".
+    //   - `Select a color field` (when nothing is selected yet) or `Hex:`
+    //     (after a color has been picked) — both only appear after the
+    //     picker (right) panel has been populated.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("Theme Editor:") || screen.contains("Editor")
+            screen.contains("Theme Editor: ")
+                && (screen.contains("Select a color field") || screen.contains("Hex:"))
         })
         .unwrap();
 }
@@ -100,6 +120,279 @@ fn test_theme_editor_command_registered() {
     // The theme editor command should be registered and visible in the palette
     harness.assert_screen_contains("Edit Theme");
     harness.assert_screen_contains("theme_editor");
+}
+
+/// Test that the tab bar remains present when opening and closing the theme editor.
+/// Verifies buffer group integration: the theme editor appears as a single tab entry,
+/// panel splits don't show per-split tab bars, and closing the group restores the
+/// previous state.
+#[test]
+fn test_theme_editor_tab_bar_persists() {
+    init_tracing_from_env();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, Default::default(), project_root)
+            .unwrap();
+
+    // === Initial state: tab bar present with [No Name] ===
+    harness.render().unwrap();
+    let initial_screen = harness.screen_to_string();
+    assert!(
+        initial_screen.contains("[No Name]"),
+        "Initial tab bar should show [No Name]. Screen:\n{}",
+        initial_screen
+    );
+
+    // === Open theme editor: tab bar still present, shows the new tab ===
+    open_theme_editor(&mut harness);
+
+    let after_open_screen = harness.screen_to_string();
+    assert!(
+        after_open_screen.contains("[No Name]"),
+        "Tab bar should still show [No Name] after opening theme editor. Screen:\n{}",
+        after_open_screen
+    );
+    assert!(
+        after_open_screen.contains("*Theme Editor*"),
+        "Theme editor should appear as a new tab entry. Screen:\n{}",
+        after_open_screen
+    );
+    assert!(
+        after_open_screen.contains("Theme Editor:"),
+        "Theme editor panel content should be visible. Screen:\n{}",
+        after_open_screen
+    );
+
+    // === Close theme editor: tab bar still present ===
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Close Theme Editor").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness
+        .wait_until(|h| !h.screen_to_string().contains("Theme Editor:"))
+        .unwrap();
+
+    let after_close_screen = harness.screen_to_string();
+    assert!(
+        after_close_screen.contains("[No Name]"),
+        "Tab bar should still show [No Name] after closing theme editor. Screen:\n{}",
+        after_close_screen
+    );
+    assert!(
+        !after_close_screen.contains("*Theme Editor*"),
+        "Theme editor tab should be gone after close. Screen:\n{}",
+        after_close_screen
+    );
+}
+
+/// Invoking the "Close Buffer" command from the command palette while a
+/// group panel is the active/focused target should close the entire group,
+/// not just the one panel. Individual panels are internal details that the
+/// user should not be able to close piecemeal via the generic Close Buffer
+/// command — they close together with the group.
+#[test]
+fn test_close_buffer_while_in_group_closes_whole_group() {
+    init_tracing_from_env();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, Default::default(), project_root)
+            .unwrap();
+
+    harness.render().unwrap();
+
+    // Open theme editor — the group tab becomes active.
+    open_theme_editor(&mut harness);
+
+    let after_open_screen = harness.screen_to_string();
+    assert!(
+        after_open_screen.contains("*Theme Editor*"),
+        "Theme editor should be open. Screen:\n{}",
+        after_open_screen
+    );
+    assert!(
+        after_open_screen.contains("Theme Editor:"),
+        "Theme editor panel content should be visible. Screen:\n{}",
+        after_open_screen
+    );
+
+    // Run the generic "Close Buffer" command (not the theme-editor-specific
+    // "Theme: Close Editor"). With the theme editor active, this should
+    // close the whole group — NOT just close the currently-focused panel
+    // buffer while leaving the rest of the group's layout visible.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Close Buffer").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // After close, the group tab, the group's panel content, and the group
+    // panels themselves should all be gone.
+    harness
+        .wait_until(|h| !h.screen_to_string().contains("*Theme Editor*"))
+        .unwrap();
+
+    let after_close_screen = harness.screen_to_string();
+    assert!(
+        !after_close_screen.contains("*Theme Editor*"),
+        "Theme editor group tab should be gone after Close Buffer. Screen:\n{}",
+        after_close_screen
+    );
+    assert!(
+        !after_close_screen.contains("Theme Editor:"),
+        "Theme editor panel content should be gone after Close Buffer. Screen:\n{}",
+        after_close_screen
+    );
+    assert!(
+        after_close_screen.contains("[No Name]"),
+        "Original [No Name] buffer tab should still be visible. Screen:\n{}",
+        after_close_screen
+    );
+}
+
+/// Next/Previous Buffer should cycle across both regular buffer tabs and
+/// group tabs (i.e., top-level tabs in the tab bar). Opening a file +
+/// opening the theme editor should give two tabs, and next_buffer should
+/// toggle between them regardless of whether the group is currently active.
+#[test]
+fn test_next_buffer_cycles_across_groups_and_buffers() {
+    init_tracing_from_env();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    let test_file = project_root.join("cycle_test.txt");
+    fs::write(&test_file, "UniqueContentMarker\n").unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, Default::default(), project_root)
+            .unwrap();
+
+    // Open the source file.
+    harness.open_file(&test_file).unwrap();
+    harness.render().unwrap();
+
+    // File is active; screen should show the file's content.
+    let after_file_screen = harness.screen_to_string();
+    assert!(
+        after_file_screen.contains("UniqueContentMarker"),
+        "Source file should be visible. Screen:\n{}",
+        after_file_screen
+    );
+
+    // Open theme editor — this becomes the active tab; the file tab stays
+    // in the tab bar.
+    open_theme_editor(&mut harness);
+
+    let after_theme_screen = harness.screen_to_string();
+    assert!(
+        after_theme_screen.contains("cycle_test.txt"),
+        "File tab should still be listed. Screen:\n{}",
+        after_theme_screen
+    );
+    assert!(
+        after_theme_screen.contains("*Theme Editor*"),
+        "Theme editor tab should be listed. Screen:\n{}",
+        after_theme_screen
+    );
+    assert!(
+        after_theme_screen.contains("Theme Editor:"),
+        "Theme editor content should be visible. Screen:\n{}",
+        after_theme_screen
+    );
+
+    // Run "Next Buffer" from the command palette. This should cycle from
+    // the group tab back to the file tab.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Next Buffer").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("UniqueContentMarker"))
+        .unwrap();
+
+    let back_to_file_screen = harness.screen_to_string();
+    assert!(
+        back_to_file_screen.contains("UniqueContentMarker"),
+        "Next Buffer should switch back to the source file. Screen:\n{}",
+        back_to_file_screen
+    );
+    // The theme editor tab should still be present in the tab bar (the
+    // group wasn't closed, just inactive).
+    assert!(
+        back_to_file_screen.contains("*Theme Editor*"),
+        "Theme editor tab should still be visible after switching away. Screen:\n{}",
+        back_to_file_screen
+    );
+    // And the theme editor content should NOT be on screen any more.
+    assert!(
+        !back_to_file_screen.contains("Theme Editor:"),
+        "Theme editor panel content should not be visible after switching away. Screen:\n{}",
+        back_to_file_screen
+    );
+
+    // Run "Next Buffer" again — should now switch back to the theme editor.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Next Buffer").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Theme Editor:"))
+        .unwrap();
+
+    let back_to_theme_screen = harness.screen_to_string();
+    assert!(
+        back_to_theme_screen.contains("Theme Editor:"),
+        "Next Buffer should cycle back to the theme editor. Screen:\n{}",
+        back_to_theme_screen
+    );
 }
 
 /// Test that the theme editor opens successfully without crashing
@@ -877,15 +1170,28 @@ fn test_comments_appear_before_fields() {
 
     // In the two-panel layout, field descriptions appear in the right-side picker panel
     // when a field is selected. The Editor section starts expanded by default, so just
-    // press Down to navigate from the section header to the first field (bg).
+    // press Down to navigate from the section header to the first field.
+    //
+    // The plugin sorts fields alphabetically within a section, so *which* field is
+    // first depends on whichever editor color sorts first by key — this must not be
+    // hard-coded to any specific name (see #779: adding `after_eof_bg` bumped the
+    // alphabetically-first field, breaking the old matcher). Instead, verify that
+    // *some* editor field is selected and shown in the picker.
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    // Wait for the picker panel to show the field path (plugin may need extra render cycles)
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.bg") || screen.contains("editor.fg")
+            // The tree panel shows the selection marker `▸` in front of a field row.
+            // The picker panel shows the path of the currently-selected field as
+            // `editor.<field_name> - <display_name>`. Matching either is enough;
+            // on narrow terminals the picker header can be truncated, so accept
+            // the tree-panel marker as an equivalent signal.
+            screen.contains("\u{25B8} ")
+                || screen
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("editor."))
         })
         .unwrap();
 }
@@ -1977,17 +2283,14 @@ fn test_builtin_theme_requires_save_as() {
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
         .unwrap();
-    harness.process_async_and_render().unwrap();
 
-    // Should show Save As prompt or message about requiring Save As
-    let screen = harness.screen_to_string();
-    let requires_save_as = screen.contains("Save theme as") || screen.contains("save as");
-
-    assert!(
-        requires_save_as,
-        "Builtin theme should require Save As. Screen:\n{}",
-        screen
-    );
+    // Wait for Save As prompt to appear (async plugin handler)
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("Save theme as") || screen.contains("save as")
+        })
+        .unwrap();
 }
 
 /// Test that color swatches are displayed next to color values
@@ -2293,11 +2596,19 @@ fn test_theme_editor_select_nostalgia_from_dropdown() {
     harness.render().unwrap();
     eprintln!("[TEST] Enter pressed, waiting for Theme Editor to load...");
 
-    // Wait for theme editor to fully load
+    // Wait for theme editor to fully load.
+    //
+    // Must wait for per-panel content (populated by setPanelContent) rather
+    // than just the `*Theme Editor*` tab label — see `open_theme_editor` for
+    // the full rationale. The tab label appears as soon as the buffer group
+    // is created, which is BEFORE the plugin populates the tree/picker
+    // panels, and on Windows CI that race window is wide enough that the
+    // subsequent assertions below consistently observed blank panels.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("Theme Editor") && !screen.contains("Loading theme editor")
+            screen.contains("Theme Editor: ")
+                && (screen.contains("Select a color field") || screen.contains("Hex:"))
         })
         .unwrap();
     eprintln!("[TEST] Theme Editor loaded");
@@ -2501,11 +2812,16 @@ fn test_inspect_theme_at_cursor_opens_theme_editor() {
     harness.render().unwrap();
 
     // Wait for the theme editor to open and auto-navigate to the editor field
-    // (the resolved key will be editor.fg or editor.bg, so "Editor" section expands)
+    // (the resolved key will be editor.fg or editor.bg, so "Editor" section expands).
+    // On macOS the long temp-dir path can push "editor.fg"/"editor.bg" off the right
+    // panel header, so also match the selected-field indicator (▸) next to the field name.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2558,7 +2874,10 @@ fn test_inspect_theme_at_cursor_multiple_rounds() {
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2589,7 +2908,10 @@ fn test_inspect_theme_at_cursor_multiple_rounds() {
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2618,7 +2940,10 @@ fn test_inspect_theme_at_cursor_multiple_rounds() {
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -2995,6 +3320,7 @@ fn test_issue_1180_save_theme_creates_themes_directory() {
 #[test]
 fn test_inspect_after_saving_custom_theme() {
     init_tracing_from_env();
+    fresh::services::signal_handler::install_signal_handlers();
 
     let context_temp = tempfile::TempDir::new().unwrap();
     let dir_context = DirectoryContext::for_testing(context_temp.path());
@@ -3022,6 +3348,7 @@ fn test_inspect_after_saving_custom_theme() {
 
     harness.open_file(&test_file).unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] file opened, starting step 1");
 
     // === Step 1: Open theme editor, select builtin, edit a color, save as custom ===
 
@@ -3036,10 +3363,12 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for 'Select theme to edit'");
     harness
         .wait_until(|h| h.screen_to_string().contains("Select theme to edit"))
         .unwrap();
 
+    tracing::warn!("[test] typing 'light' and pressing Enter");
     harness.type_text("light").unwrap();
     harness.render().unwrap();
     harness
@@ -3047,6 +3376,7 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for Theme Editor tab");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
@@ -3055,6 +3385,7 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
 
     // Expand Editor section and navigate to the first color field (bg)
+    tracing::warn!("[test] expanding Editor section");
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
@@ -3067,9 +3398,11 @@ fn test_inspect_after_saving_custom_theme() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] waiting for '#' (color edit field)");
     harness
         .wait_until(|h| h.screen_to_string().contains("#"))
         .unwrap();
+    tracing::warn!("[test] typing color #FF0000");
     harness
         .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
         .unwrap();
@@ -3080,15 +3413,18 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for Theme Editor after color edit");
     harness
         .wait_until(|h| h.screen_to_string().contains("Theme Editor"))
         .unwrap();
 
     // Save as "light_custom" (with underscore to test normalization)
+    tracing::warn!("[test] pressing Ctrl+S to save");
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
         .unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] waiting for 'Save theme as' dialog");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
@@ -3096,6 +3432,7 @@ fn test_inspect_after_saving_custom_theme() {
         })
         .unwrap();
     harness.render().unwrap();
+    tracing::warn!("[test] typing 'light_custom' and pressing Enter");
     harness.type_text("light_custom").unwrap();
     harness.render().unwrap();
     harness
@@ -3103,6 +3440,7 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for saved/applied confirmation");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
@@ -3111,14 +3449,17 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
 
     // === Step 2: Close theme editor via Escape ===
+    tracing::warn!("[test] step 2: closing theme editor via Escape");
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
+    tracing::warn!("[test] waiting for 'Hello world' (main editor)");
     harness
         .wait_until(|h| h.screen_to_string().contains("Hello world"))
         .unwrap();
 
     // === Step 3: Inspect Theme at Cursor — should work with the custom theme ===
+    tracing::warn!("[test] step 3: opening Inspect Theme at Cursor");
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
@@ -3130,11 +3471,19 @@ fn test_inspect_after_saving_custom_theme() {
         .unwrap();
     harness.render().unwrap();
 
-    // Wait for theme editor to reopen and auto-navigate to editor fields
+    // Wait for theme editor to reopen and auto-navigate to editor fields.
+    // The full qualified name (editor.fg / editor.bg) appears in the right panel
+    // header, but on macOS the long temp-dir path in the left header can push it
+    // off-screen.  Fall back to checking for the selected-field indicator (▸)
+    // next to the short field name in the tree panel.
+    tracing::warn!("[test] waiting for editor.fg/editor.bg fields");
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            screen.contains("editor.fg") || screen.contains("editor.bg")
+            screen.contains("editor.fg")
+                || screen.contains("editor.bg")
+                || screen.contains("\u{25B8} fg")
+                || screen.contains("\u{25B8} bg")
         })
         .unwrap();
 
@@ -3227,10 +3576,43 @@ fn test_palette_swatch_click_targets_correct_column() {
         lines[palette_row_y as usize]
     );
 
-    // Record the fg color of the 1st swatch (col 0) and 5th swatch (col 4)
-    // Col 0 swatch at screen x=41, Col 4 swatch at screen x=41+3*4=53
-    let swatch_col_0_x: u16 = 41;
-    let swatch_col_4_x: u16 = 41 + 3 * 4;
+    // Locate the first palette swatch (`██`) on the palette row at runtime,
+    // then compute sibling swatch columns. The buffer-group theme editor
+    // renders the palette inside the right panel (picker), so the absolute
+    // screen column of col 0 depends on the tree/picker split ratio and is
+    // not fixed. Each swatch is 2 chars of `██` followed by 1 char of
+    // separator, so col N is col 0 + 3*N. Previously the test hardcoded
+    // x=41 which happened to be the `fg` row's swatch column in the LEFT
+    // (tree) panel — clicking there would move the tree selection instead
+    // of applying a palette color.
+    let swatch_col_0_x: u16 = {
+        // The left panel also contains `██` (field swatches). We must find
+        // the palette swatches in the RIGHT panel — i.e. the first `██`
+        // that appears AFTER the vertical divider `│` in the palette row.
+        let row_cells: Vec<String> = (0..120)
+            .map(|x| {
+                harness
+                    .get_cell(x, palette_row_y)
+                    .unwrap_or_else(|| " ".to_string())
+            })
+            .collect();
+        let divider_col = row_cells
+            .iter()
+            .position(|s| s == "│")
+            .expect("palette row should contain a `│` divider") as u16;
+        // Scan after the divider for two adjacent `█` cells.
+        let mut found = None;
+        let mut x = divider_col + 1;
+        while x + 1 < 120 {
+            if row_cells[x as usize] == "█" && row_cells[(x + 1) as usize] == "█" {
+                found = Some(x);
+                break;
+            }
+            x += 1;
+        }
+        found.expect("palette row should contain `██` after the divider")
+    };
+    let swatch_col_4_x: u16 = swatch_col_0_x + 3 * 4;
 
     let color_at_col0 = harness
         .get_cell_style(swatch_col_0_x, palette_row_y)
@@ -3434,4 +3816,446 @@ fn test_theme_editor_page_up_page_down() {
     );
 
     harness.assert_no_plugin_errors();
+}
+
+/// Test that named color swatches in the theme editor use the native ANSI
+/// color (e.g. Color::Yellow) rather than an RGB approximation.
+///
+/// BUG: When a theme field uses a named color like "Yellow", the swatch (██)
+/// in the theme editor was rendered as Color::Rgb(255, 255, 0) instead of
+/// Color::Yellow. This is wrong because the actual theme renders Color::Yellow
+/// as ANSI color 3 (via crossterm), which terminals display as a different
+/// shade than RGB(255, 255, 0). The swatch should use the native ANSI color
+/// so it matches what the user actually sees.
+#[test]
+fn test_named_color_swatch_uses_native_ansi_color() {
+    init_tracing_from_env();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    // Create a theme with a named color "Yellow" for tab_active_fg.
+    // The swatch should render as Color::Yellow (native ANSI),
+    // not Color::Rgb(255, 255, 0).
+    let themes_dir = project_root.join("themes");
+    fs::create_dir(&themes_dir).unwrap();
+    let test_theme = r#"{
+        "name": "dark",
+        "editor": {
+            "bg": [30, 30, 30],
+            "fg": [212, 212, 212]
+        },
+        "ui": {
+            "tab_active_fg": "Yellow",
+            "tab_active_bg": [0, 0, 200]
+        },
+        "search": {},
+        "diagnostic": {},
+        "syntax": {}
+    }"#;
+    fs::write(themes_dir.join("dark.json"), test_theme).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, Default::default(), project_root)
+            .unwrap();
+    harness.render().unwrap();
+
+    // Open theme editor
+    open_theme_editor(&mut harness);
+
+    // Wait for the theme editor to fully display
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Theme Editor"))
+        .unwrap();
+
+    // The "ui" section is collapsed by default. Navigate down until the
+    // selection indicator (▸) lands on the UI Elements section header.
+    //
+    // Use true semantic waiting: after each Down press, wait until the
+    // *selected line's content* (the line containing ▸) actually changes.
+    // Waiting on "screen changed" is unreliable because unrelated async
+    // work (timers, async redraws, etc.) can flip a cell between the
+    // key-press and the real selection update, making the previous wait
+    // return early and letting the test race ahead of the plugin thread —
+    // which was the source of this test's intermittent timeouts.
+    let selection_indicator = '\u{25B8}'; // ▸
+    let selected_line = |h: &EditorTestHarness| -> Option<String> {
+        h.screen_to_string()
+            .lines()
+            .find(|l| l.contains(selection_indicator))
+            .map(|s| s.to_string())
+    };
+    let line_is_collapsed_ui_section = |l: &str| l.contains("> UI") || l.contains("> ui");
+    let line_is_expanded_ui_section = |l: &str| l.contains("▼ UI") || l.contains("▼ ui");
+
+    loop {
+        if selected_line(&harness)
+            .as_deref()
+            .map(line_is_collapsed_ui_section)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        let before = selected_line(&harness);
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        // Wait until ▸ is visible AND on a different line. Without the
+        // is_some() guard, a transient scroll-lag frame (where ▸ is
+        // off-viewport) would satisfy `None != Some(old)`, letting the
+        // loop capture `before = None` on the next iteration and then
+        // block forever on `None != None`.
+        harness
+            .wait_until(|h| {
+                let cur = selected_line(h);
+                cur.is_some() && cur != before
+            })
+            .unwrap();
+    }
+
+    // Expand the UI section and wait semantically for the selected line
+    // to flip from collapsed (▸> UI) to expanded (▸▼ UI).
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            selected_line(h)
+                .as_deref()
+                .map(line_is_expanded_ui_section)
+                .unwrap_or(false)
+        })
+        .unwrap();
+
+    // Navigate down to tab_active_fg within the expanded UI section.
+    // Same semantic-wait pattern: wait for the selected line's content to
+    // change after each Down press, not just for any screen cell to flip.
+    loop {
+        if selected_line(&harness)
+            .as_deref()
+            .map(|l| l.contains("tab_active_fg"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        let before = selected_line(&harness);
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        harness
+            .wait_until(|h| {
+                let cur = selected_line(h);
+                cur.is_some() && cur != before
+            })
+            .unwrap();
+    }
+
+    // Move selection away so the tab_active_fg row renders without the
+    // selection highlight (which adds a bg overlay that breaks the
+    // fg==bg swatch detection).
+    let before = selected_line(&harness);
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| {
+            let cur = selected_line(h);
+            cur.is_some() && cur != before
+        })
+        .unwrap();
+
+    // Wait for the tab_active_fg swatch to render with the correct native
+    // ANSI Yellow color. On slow CI the plugin may not have finished
+    // painting the inline overlay yet.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            let lines: Vec<&str> = screen.lines().collect();
+            let Some(row) = lines
+                .iter()
+                .position(|l| l.contains("tab_active_fg") && l.contains("██"))
+            else {
+                return false;
+            };
+            find_swatch_color(h, row as u16) == Some(Color::Yellow)
+        })
+        .unwrap();
+}
+
+/// Regression test: switching the active theme via "Select Theme" while a
+/// theme-editor plugin buffer is open must refresh the overlay colors the
+/// plugin painted with.
+///
+/// The bug was that the plugin resolved its UI palette client-side — it
+/// read `editor.getThemeData()` in JS, dug out the RGB tuple for
+/// `syntax.keyword`, and handed the RGB array to `setVirtualBufferContent`.
+/// That made the overlay an `OverlayFace::Style` with baked RGB, so the
+/// core's render-time theme-key resolver (`split_rendering.rs` →
+/// `ThemedStyle` branch) was bypassed and a theme switch left the buffer
+/// painted in the old theme's colors.
+///
+/// The fix is to pass theme-key strings (e.g. `"syntax.keyword"`) straight
+/// through to the core. `OverlayFace::from_options` then stores the key
+/// in `ThemedStyle { fg_theme: Some("syntax.keyword"), .. }` and the next
+/// render resolves it against `ctx.theme` — which is the new theme after
+/// `apply_theme`.
+#[test]
+fn test_theme_editor_colors_update_on_theme_change() {
+    init_tracing_from_env();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    let mut config = fresh::config::Config::default();
+    config.theme = "dark".into();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(140, 40, config, project_root).unwrap();
+
+    harness.render().unwrap();
+
+    // Open the theme editor with "dark" selected.
+    open_theme_editor(&mut harness);
+
+    // The "Theme Editor:" header row carries a hardcoded `colors.header`
+    // fg of [100, 180, 255] (blue) AND the buffer's default editor.bg.
+    // Record both the text-cell and an empty cell on the same row.
+    let header_pos = harness
+        .find_text_on_screen("Theme Editor:")
+        .expect("'Theme Editor:' header should be visible in the theme editor buffer");
+    let dark_header_fg = harness
+        .get_cell_style(header_pos.0, header_pos.1)
+        .expect("header cell should have a style")
+        .fg;
+
+    // Sample a cell well to the right on the same row where there's no text
+    // (so we get the buffer's default bg, not an overlay).
+    let empty_col = header_pos.0.saturating_add(60);
+    let dark_row_empty_bg = harness
+        .get_cell_style(empty_col, header_pos.1)
+        .expect("cell should have a style")
+        .bg;
+    assert_eq!(
+        dark_row_empty_bg,
+        Some(Color::Rgb(30, 30, 30)),
+        "With dark theme, theme editor buffer empty cells should have bg [30,30,30], got {:?}. \
+         Screen:\n{}",
+        dark_row_empty_bg,
+        harness.screen_to_string(),
+    );
+
+    // --- Switch to the light theme via the command palette ---
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Select Theme").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_screen_contains("Select theme").unwrap();
+
+    for _ in 0..20 {
+        harness
+            .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.type_text("light").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+    harness.render().unwrap();
+
+    // After the switch, both the buffer background AND the hardcoded header
+    // fg should reflect the new theme. In particular, the plugin's cached
+    // overlay-styles (baked RGB) should be refreshed so they don't stay as
+    // the dark theme's values against the new light bg.
+    let header_pos = harness
+        .find_text_on_screen("Theme Editor:")
+        .expect("'Theme Editor:' header should still be visible after theme switch");
+    let empty_col = header_pos.0.saturating_add(60);
+    let light_row_empty_bg = harness
+        .get_cell_style(empty_col, header_pos.1)
+        .expect("cell should have a style")
+        .bg;
+    assert_eq!(
+        light_row_empty_bg,
+        Some(Color::Rgb(255, 255, 255)),
+        "After switching to light theme, theme editor buffer empty cells should have \
+         bg [255,255,255], got {:?}. Screen:\n{}",
+        light_row_empty_bg,
+        harness.screen_to_string(),
+    );
+
+    let light_header_fg = harness
+        .get_cell_style(header_pos.0, header_pos.1)
+        .expect("header cell should have a style")
+        .fg;
+
+    // BUG REPRODUCTION: the plugin-provided header highlight fg is baked at
+    // `setVirtualBufferContent` time and does not refresh when the theme
+    // changes. We assert that the fg DOES change — this is the behaviour
+    // the user expects, and it currently fails because the plugin's
+    // hardcoded RGB highlights never get re-applied.
+    assert_ne!(
+        light_header_fg,
+        dark_header_fg,
+        "After switching themes, the theme editor's header-text fg should be refreshed \
+         (expected it to differ from the dark-theme value {:?}). The plugin-provided \
+         overlay colors appear to be baked at creation time and never refreshed on \
+         theme change. Screen:\n{}",
+        dark_header_fg,
+        harness.screen_to_string(),
+    );
+}
+
+/// Find the fg color of the swatch (██) on a given screen row.
+/// Scans the left panel area (columns 0-37) for cells where fg == bg,
+/// which indicates a color swatch.
+fn find_swatch_color(harness: &EditorTestHarness, row: u16) -> Option<Color> {
+    for col in 0..38 {
+        if let Some(cell_text) = harness.get_cell(col, row) {
+            if cell_text == "█" {
+                if let Some(style) = harness.get_cell_style(col, row) {
+                    // Swatch cells have fg == bg (same color)
+                    if style.fg.is_some() && style.fg == style.bg {
+                        return style.fg;
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Regression test: pasting (or any path that runs
+/// `apply_events_as_bulk_edit`) inside the Theme Editor must not
+/// panic. Reported in the field as
+/// `called Option::unwrap() on a None value` at
+/// `app/event_apply.rs:228`.
+///
+/// Reproduces by opening the Theme Editor (which puts the active
+/// buffer inside a buffer-group panel whose `BufferId` lives in the
+/// inner panel's `keyed_states`, NOT in the outer split's
+/// `keyed_states`) and then triggering a multi-event paste. The
+/// bulk-edit path captures `split_id` from the outer split but
+/// `active_buf` from `effective_active_pair`, so the outer split's
+/// `keyed_states.get(&active_buf)` is `None` and unwraps to a panic.
+#[test]
+fn test_paste_in_theme_editor_does_not_panic() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, Default::default(), project_root)
+            .unwrap();
+    harness.render().unwrap();
+
+    open_theme_editor(&mut harness);
+
+    // Use the internal-only clipboard so this test doesn't fight the
+    // host system clipboard in parallel CI runs.
+    harness
+        .editor_mut()
+        .set_clipboard_for_test("zzz\nzzz".to_string());
+
+    // Multi-line clipboard content forces the bulk-edit path even
+    // with a single cursor + no selection if the implementation ever
+    // changes; for the current implementation, force the bulk path
+    // explicitly by adding a second cursor first via Ctrl+D
+    // (add-cursor-next-match) — but that requires a match, so just
+    // hand-craft the events through paste_text.
+    //
+    // The simpler reproducer: select the current line then paste,
+    // which produces (Delete, Insert) — 2 events → bulk path.
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    harness.send_key(KeyCode::End, KeyModifiers::SHIFT).unwrap();
+    harness.render().unwrap();
+
+    // This must not panic.
+    harness.editor_mut().paste_for_test();
+    harness.render().unwrap();
+}
+
+/// Regression test: opening the Theme Editor for the `terminal` built-in
+/// theme must populate the tree panel with field rows. The terminal theme
+/// uses non-color schema fields (`selection_modifier`,
+/// `semantic_highlight_modifier`) which are arrays of strings — the
+/// plugin used to treat any array as an RGB tuple and crash inside
+/// `formatColorValue → rgbToHex → toHex` when it hit a modifier value,
+/// which aborted `buildTreeLines` and left the tree panel completely
+/// blank.
+#[test]
+fn test_theme_editor_terminal_builtin_renders_field_rows() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "theme_editor");
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(140, 40, Default::default(), project_root)
+            .unwrap();
+    harness.render().unwrap();
+
+    // Open Edit Theme via command palette and pick the `terminal` built-in.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Edit Theme").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Select theme to edit"))
+        .unwrap();
+    harness.type_text("terminal").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+
+    // Wait for the editor's header so we know the buffer was opened.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Theme Editor: terminal"))
+        .unwrap();
+
+    // The tree panel should list the `editor` section header and at least
+    // one field row. If `buildTreeLines` aborted the tree will be blank
+    // (only the divider column survives), so the section name and field
+    // keys never appear.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("Theme Editor: terminal")
+                && screen.contains("editor")
+                && (screen.contains(" bg ") || screen.contains(" fg "))
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "Theme editor tree panel never populated for terminal theme. \
+                 Likely the plugin's `formatColorValue` crashed on a non-color \
+                 field (e.g. `selection_modifier: [\"reversed\"]`). \
+                 Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
 }

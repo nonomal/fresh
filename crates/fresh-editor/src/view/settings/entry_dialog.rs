@@ -3,7 +3,9 @@
 //! Provides a modal dialog for editing complex map entries using the same
 //! SettingItem/SettingControl infrastructure as the main settings UI.
 
-use super::items::{build_item_from_value, control_to_value, SettingControl, SettingItem};
+use super::items::{
+    build_item_from_value, control_to_value, ItemBoxStyle, SettingControl, SettingItem,
+};
 use super::schema::{SettingSchema, SettingType};
 use crate::view::controls::{FocusState, TextInputState};
 use serde_json::Value;
@@ -48,6 +50,9 @@ pub struct EntryDialogState {
     pub first_editable_index: usize,
     /// Whether deletion is disabled (for auto-managed entries like plugins)
     pub no_delete: bool,
+    /// When true, the dialog wraps a single non-Object value (e.g., an ObjectArray).
+    /// `to_value()` returns the raw control value instead of wrapping in an Object.
+    pub is_single_value: bool,
 }
 
 impl EntryDialogState {
@@ -77,13 +82,17 @@ impl EntryDialogState {
             layer_source: crate::config_io::ConfigLayer::System,
             read_only: !is_new, // Key is editable only for new entries
             is_auto_managed: false,
+            nullable: false,
+            is_null: false,
             section: None,
             is_section_start: false,
-            layout_width: 0,
+            style: ItemBoxStyle::default(),
+            dual_list_sibling: None,
         };
         items.push(key_item);
 
         // Add schema-driven items from object properties
+        let is_single_value = !matches!(&schema.setting_type, SettingType::Object { .. });
         if let SettingType::Object { properties } = &schema.setting_type {
             for prop in properties {
                 let field_name = prop.path.trim_start_matches('/');
@@ -91,10 +100,18 @@ impl EntryDialogState {
                 let item = build_item_from_value(prop, field_value);
                 items.push(item);
             }
+        } else {
+            // For non-object types (e.g., ObjectArray, Map), build a single item
+            // from the entire value so the dialog can render it
+            let item = build_item_from_value(schema, Some(value));
+            items.push(item);
         }
 
-        // Sort items: read-only first, then editable
+        // Sort items: read-only first, then editable (stable sort preserves x-order)
         items.sort_by_key(|item| !item.read_only);
+
+        // Compute is_section_start for section headers in entry dialogs
+        Self::compute_section_starts(&mut items);
 
         // Find the first editable item index
         let first_editable_index = items
@@ -116,7 +133,7 @@ impl EntryDialogState {
             format!("Edit {}", schema.name)
         };
 
-        Self {
+        let mut result = Self {
             entry_key: key,
             map_path: map_path.to_string(),
             title,
@@ -135,7 +152,12 @@ impl EntryDialogState {
             original_value: value.clone(),
             first_editable_index,
             no_delete,
-        }
+            is_single_value,
+        };
+        // Pre-focus the first item in any ObjectArray controls so pressing
+        // Enter opens the item editor instead of "Add new".
+        result.init_object_array_focus();
+        result
     }
 
     /// Create a dialog for an array item (no key field)
@@ -162,6 +184,9 @@ impl EntryDialogState {
 
         // Sort items: read-only first, then editable
         items.sort_by_key(|item| !item.read_only);
+
+        // Compute is_section_start for section headers
+        Self::compute_section_starts(&mut items);
 
         // Find the first editable item index
         let first_editable_index = items
@@ -202,6 +227,22 @@ impl EntryDialogState {
             original_value: value.clone(),
             first_editable_index,
             no_delete: false, // Arrays typically allow deletion
+            is_single_value: false,
+        }
+    }
+
+    /// Compute is_section_start flags for section headers.
+    /// Marks the first item in each new section so the renderer can draw headers.
+    fn compute_section_starts(items: &mut [SettingItem]) {
+        let mut last_section: Option<&str> = None;
+        for item in items.iter_mut() {
+            let current = item.section.as_deref();
+            if current.is_some() && current != last_section {
+                item.is_section_start = true;
+            }
+            if current.is_some() {
+                last_section = current;
+            }
         }
     }
 
@@ -218,6 +259,30 @@ impl EntryDialogState {
         self.entry_key.clone()
     }
 
+    /// Full JSON pointer path to the entry this dialog edits.
+    ///
+    /// For an existing map entry under `/universal_lsp` with key `quicklsp`,
+    /// this returns `/universal_lsp/quicklsp`. For array items, `entry_key`
+    /// is the stringified index. For brand-new map entries whose key has
+    /// not been chosen yet, this falls back to `map_path` (the parent
+    /// container) — callers are expected to avoid writing at that path.
+    ///
+    /// Nested dialogs and any pending-change paths derived from this dialog
+    /// must be rooted here — not at `map_path` — otherwise the entry key
+    /// segment is dropped and changes land under `""` in the saved config.
+    pub fn entry_path(&self) -> String {
+        // Use the live key field so new entries pick up whatever the user
+        // has typed before opening a nested dialog. For existing entries
+        // the key field is read-only and equals `entry_key`, so this is
+        // consistent with the on-disk path.
+        let key = self.get_key();
+        if key.is_empty() {
+            self.map_path.clone()
+        } else {
+            format!("{}/{}", self.map_path, key)
+        }
+    }
+
     /// Get button count (3 for existing entries with Delete, 2 for new/no_delete entries)
     pub fn button_count(&self) -> usize {
         if self.is_new || self.no_delete {
@@ -229,6 +294,16 @@ impl EntryDialogState {
 
     /// Convert dialog state back to JSON value (excludes the __key__ item)
     pub fn to_value(&self) -> Value {
+        // For single-value dialogs (non-Object schemas like ObjectArray),
+        // return the control's value directly instead of wrapping in an Object.
+        if self.is_single_value {
+            for item in &self.items {
+                if item.path != "__key__" {
+                    return control_to_value(&item.control);
+                }
+            }
+        }
+
         let mut obj = serde_json::Map::new();
 
         for item in &self.items {
@@ -263,81 +338,42 @@ impl EntryDialogState {
         }
     }
 
-    /// Move focus to next item or button
+    /// Move focus to next editable item, navigating within composite controls first.
+    ///
+    /// For composite controls (Map, ObjectArray, TextList), Down first navigates
+    /// through their internal entries and [+] Add new row before moving to the
+    /// next dialog item. When at the last editable item, wraps to buttons.
+    /// When on the last button, wraps back to the first editable item.
     pub fn focus_next(&mut self) {
         if self.editing_text {
-            return; // Don't change focus while editing
+            return;
         }
 
         if self.focus_on_buttons {
             if self.focused_button + 1 < self.button_count() {
-                // Move to next button
                 self.focused_button += 1;
             } else {
-                // Wrap to first editable item (skip read-only items)
+                // Wrap to first editable item
                 if self.first_editable_index < self.items.len() {
                     self.focus_on_buttons = false;
                     self.selected_item = self.first_editable_index;
+                    self.sub_focus = None;
+                    self.init_composite_focus(true);
                 }
-                // If all items are read-only, stay on buttons (don't wrap)
             }
         } else {
-            // Check if current item is an ObjectArray that can navigate internally
-            let array_nav_result = self.items.get(self.selected_item).and_then(|item| {
-                if let SettingControl::ObjectArray(state) = &item.control {
-                    // Navigation order: entries -> add-new -> exit
-                    match state.focused_index {
-                        Some(idx) if idx + 1 < state.bindings.len() => {
-                            // On entry, can go to next entry
-                            Some(true)
-                        }
-                        Some(_) => {
-                            // On last entry, can go to add-new
-                            Some(true)
-                        }
-                        None => {
-                            // On add-new, exit to next dialog item
-                            Some(false)
-                        }
-                    }
+            // Try navigating within a composite control first
+            let handled = self.try_composite_focus_next();
+            if !handled {
+                // Composite is at its exit boundary (or not a composite) — advance to next item
+                if self.selected_item + 1 < self.items.len() {
+                    self.selected_item += 1;
+                    self.sub_focus = None;
+                    self.init_composite_focus(true);
                 } else {
-                    None
-                }
-            });
-
-            match array_nav_result {
-                Some(true) => {
-                    // Navigate within the ObjectArray
-                    if let Some(item) = self.items.get_mut(self.selected_item) {
-                        if let SettingControl::ObjectArray(state) = &mut item.control {
-                            state.focus_next();
-                        }
-                    }
-                }
-                Some(false) => {
-                    // Exit ObjectArray, go to next item
-                    if self.selected_item + 1 < self.items.len() {
-                        self.selected_item += 1;
-                        self.sub_focus = None;
-                        // Initialize next item's ObjectArray if it has entries
-                        self.init_object_array_focus();
-                    } else {
-                        self.focus_on_buttons = true;
-                        self.focused_button = 0;
-                    }
-                }
-                None => {
-                    // Not an ObjectArray, normal navigation
-                    // All items after first_editable_index are editable (sorted)
-                    if self.selected_item + 1 < self.items.len() {
-                        self.selected_item += 1;
-                        self.sub_focus = None;
-                        // Initialize next item's ObjectArray if it has entries
-                        self.init_object_array_focus();
-                    } else {
-                        self.focus_on_buttons = true;
-                        self.focused_button = 0;
-                    }
+                    // Past last item, go to buttons
+                    self.focus_on_buttons = true;
+                    self.focused_button = 0;
                 }
             }
         }
@@ -346,86 +382,41 @@ impl EntryDialogState {
         self.ensure_selected_visible(self.viewport_height);
     }
 
-    /// Move focus to previous item or button
+    /// Move focus to previous editable item, navigating within composite controls first.
+    ///
+    /// For composite controls, Up first navigates backwards through their internal
+    /// entries before moving to the previous dialog item. When at the first editable
+    /// item, wraps to buttons. When on the first button, wraps back to the last item.
     pub fn focus_prev(&mut self) {
         if self.editing_text {
-            return; // Don't change focus while editing
+            return;
         }
 
         if self.focus_on_buttons {
             if self.focused_button > 0 {
                 self.focused_button -= 1;
             } else {
-                // Move back to last editable item
+                // Wrap to last editable item
                 if self.first_editable_index < self.items.len() {
                     self.focus_on_buttons = false;
                     self.selected_item = self.items.len().saturating_sub(1);
+                    self.sub_focus = None;
+                    self.init_composite_focus(false);
                 }
-                // If all items are read-only, stay on buttons (don't wrap)
             }
         } else {
-            // Check if current item is an ObjectArray that can navigate internally
-            let array_nav_result = self.items.get(self.selected_item).and_then(|item| {
-                if let SettingControl::ObjectArray(state) = &item.control {
-                    // Navigation order (reverse): exit <- entries <- add-new
-                    match state.focused_index {
-                        None => {
-                            // On add-new, can go back to last entry (if any)
-                            if !state.bindings.is_empty() {
-                                Some(true)
-                            } else {
-                                Some(false) // No entries, exit
-                            }
-                        }
-                        Some(0) => {
-                            // On first entry, exit to previous dialog item
-                            Some(false)
-                        }
-                        Some(_) => {
-                            // On entry, can go to previous entry
-                            Some(true)
-                        }
-                    }
+            // Try navigating within a composite control first
+            let handled = self.try_composite_focus_prev();
+            if !handled {
+                // Composite is at its entry boundary (or not a composite) — go to previous item
+                if self.selected_item > self.first_editable_index {
+                    self.selected_item -= 1;
+                    self.sub_focus = None;
+                    self.init_composite_focus(false);
                 } else {
-                    None
-                }
-            });
-
-            match array_nav_result {
-                Some(true) => {
-                    // Navigate within the ObjectArray
-                    if let Some(item) = self.items.get_mut(self.selected_item) {
-                        if let SettingControl::ObjectArray(state) = &mut item.control {
-                            state.focus_prev();
-                        }
-                    }
-                }
-                Some(false) => {
-                    // Exit ObjectArray, go to previous editable item (not into read-only)
-                    if self.selected_item > self.first_editable_index {
-                        self.selected_item -= 1;
-                        self.sub_focus = None;
-                        // Initialize previous item's ObjectArray to add-new (end)
-                        self.init_object_array_focus_end();
-                    } else {
-                        // At first editable item, go to buttons
-                        self.focus_on_buttons = true;
-                        self.focused_button = self.button_count().saturating_sub(1);
-                    }
-                }
-                None => {
-                    // Not an ObjectArray, normal navigation
-                    // Don't go below first_editable_index (read-only items)
-                    if self.selected_item > self.first_editable_index {
-                        self.selected_item -= 1;
-                        self.sub_focus = None;
-                        // Initialize previous item's ObjectArray to add-new (end)
-                        self.init_object_array_focus_end();
-                    } else {
-                        // At first editable item, go to buttons
-                        self.focus_on_buttons = true;
-                        self.focused_button = self.button_count().saturating_sub(1);
-                    }
+                    // Before first editable item, go to buttons
+                    self.focus_on_buttons = true;
+                    self.focused_button = self.button_count().saturating_sub(1);
                 }
             }
         }
@@ -434,65 +425,216 @@ impl EntryDialogState {
         self.ensure_selected_visible(self.viewport_height);
     }
 
-    /// Initialize ObjectArray focus to first entry (when arriving from above)
-    fn init_object_array_focus(&mut self) {
-        if let Some(item) = self.items.get_mut(self.selected_item) {
-            if let SettingControl::ObjectArray(state) = &mut item.control {
-                // Start at first entry if there are any, otherwise stay on add-new
-                if !state.bindings.is_empty() {
-                    state.focused_index = Some(0);
+    /// Try to navigate forward within the current composite control.
+    /// Returns true if the navigation was handled internally, false if at the exit boundary.
+    fn try_composite_focus_next(&mut self) -> bool {
+        let item = match self.items.get(self.selected_item) {
+            Some(item) => item,
+            None => return false,
+        };
+        match &item.control {
+            SettingControl::Map(state) => {
+                // Map returns bool: true = handled internally, false = at boundary
+                let at_boundary = state.focused_entry.is_none(); // On add-new → exit
+                if at_boundary {
+                    return false;
                 }
+                if let Some(item) = self.items.get_mut(self.selected_item) {
+                    if let SettingControl::Map(state) = &mut item.control {
+                        return state.focus_next();
+                    }
+                }
+                false
             }
+            SettingControl::ObjectArray(state) => {
+                // ObjectArray: None = on add-new → exit
+                if state.focused_index.is_none() {
+                    return false;
+                }
+                if let Some(item) = self.items.get_mut(self.selected_item) {
+                    if let SettingControl::ObjectArray(state) = &mut item.control {
+                        state.focus_next();
+                        return true;
+                    }
+                }
+                false
+            }
+            SettingControl::TextList(state) => {
+                // TextList: None = on add-new → exit
+                if state.focused_item.is_none() {
+                    return false;
+                }
+                if let Some(item) = self.items.get_mut(self.selected_item) {
+                    if let SettingControl::TextList(state) = &mut item.control {
+                        state.focus_next();
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 
-    /// Initialize ObjectArray focus to add-new (when arriving from below)
-    fn init_object_array_focus_end(&mut self) {
+    /// Try to navigate backward within the current composite control.
+    /// Returns true if the navigation was handled internally, false if at the entry boundary.
+    fn try_composite_focus_prev(&mut self) -> bool {
+        let item = match self.items.get(self.selected_item) {
+            Some(item) => item,
+            None => return false,
+        };
+        match &item.control {
+            SettingControl::Map(state) => {
+                // Map: Some(0) = at first entry → exit
+                let at_boundary = matches!(state.focused_entry, Some(0))
+                    || (state.focused_entry.is_none() && state.entries.is_empty());
+                if at_boundary {
+                    return false;
+                }
+                if let Some(item) = self.items.get_mut(self.selected_item) {
+                    if let SettingControl::Map(state) = &mut item.control {
+                        return state.focus_prev();
+                    }
+                }
+                false
+            }
+            SettingControl::ObjectArray(state) => {
+                // ObjectArray: Some(0) = at first entry → exit
+                if matches!(state.focused_index, Some(0))
+                    || (state.focused_index.is_none() && state.bindings.is_empty())
+                {
+                    return false;
+                }
+                if let Some(item) = self.items.get_mut(self.selected_item) {
+                    if let SettingControl::ObjectArray(state) = &mut item.control {
+                        state.focus_prev();
+                        return true;
+                    }
+                }
+                false
+            }
+            SettingControl::TextList(state) => {
+                // TextList: Some(0) = at first item → exit
+                if matches!(state.focused_item, Some(0))
+                    || (state.focused_item.is_none() && state.items.is_empty())
+                {
+                    return false;
+                }
+                if let Some(item) = self.items.get_mut(self.selected_item) {
+                    if let SettingControl::TextList(state) = &mut item.control {
+                        state.focus_prev();
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Initialize a composite control's focus when entering it.
+    /// `from_above`: true = entering from the item above (start at first entry),
+    ///               false = entering from below (start at add-new / last entry).
+    fn init_composite_focus(&mut self, from_above: bool) {
         if let Some(item) = self.items.get_mut(self.selected_item) {
-            if let SettingControl::ObjectArray(state) = &mut item.control {
-                // Start at add-new row (None)
-                state.focused_index = None;
+            match &mut item.control {
+                SettingControl::Map(state) => {
+                    state.init_focus(from_above);
+                }
+                SettingControl::ObjectArray(state) => {
+                    if from_above {
+                        state.focused_index = if state.bindings.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                    } else {
+                        // Coming from below: start at add-new
+                        state.focused_index = None;
+                    }
+                }
+                SettingControl::TextList(state) => {
+                    if from_above {
+                        state.focused_item = if state.items.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                    } else {
+                        // Coming from below: start at add-new
+                        state.focused_item = None;
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    /// Move to next sub-item within current control (for TextList, Map)
-    pub fn sub_focus_next(&mut self) {
-        if let Some(item) = self.items.get(self.selected_item) {
-            let max_sub = match &item.control {
-                SettingControl::TextList(state) => state.items.len(), // +1 for add-new
-                SettingControl::Map(state) => state.entries.len(),    // +1 for add-new
-                _ => 0,
-            };
+    /// Toggle focus between items region and buttons region.
+    /// Used by Tab key to provide region-level navigation.
+    pub fn toggle_focus_region(&mut self) {
+        self.toggle_focus_region_direction(true);
+    }
 
-            if max_sub > 0 {
-                let current = self.sub_focus.unwrap_or(0);
-                if current < max_sub {
-                    self.sub_focus = Some(current + 1);
+    /// Toggle between items and buttons regions.
+    /// When in buttons region, Tab cycles through buttons before returning to items.
+    /// `forward` controls direction: true = Tab, false = Shift+Tab.
+    pub fn toggle_focus_region_direction(&mut self, forward: bool) {
+        if self.editing_text {
+            return;
+        }
+
+        if self.focus_on_buttons {
+            if forward {
+                // Tab forward through buttons, then back to items
+                if self.focused_button + 1 < self.button_count() {
+                    self.focused_button += 1;
                 } else {
-                    // Move to next item
-                    self.sub_focus = None;
-                    self.focus_next();
+                    // Past last button — return to items
+                    if self.first_editable_index < self.items.len() {
+                        self.focus_on_buttons = false;
+                        if self.selected_item < self.first_editable_index {
+                            self.selected_item = self.first_editable_index;
+                        }
+                    } else {
+                        // All items read-only, wrap to first button
+                        self.focused_button = 0;
+                    }
                 }
             } else {
-                self.focus_next();
+                // Shift+Tab backward through buttons, then back to items
+                if self.focused_button > 0 {
+                    self.focused_button -= 1;
+                } else {
+                    // Before first button — return to items
+                    if self.first_editable_index < self.items.len() {
+                        self.focus_on_buttons = false;
+                        if self.selected_item < self.first_editable_index {
+                            self.selected_item = self.first_editable_index;
+                        }
+                    } else {
+                        // All items read-only, wrap to last button
+                        self.focused_button = self.button_count().saturating_sub(1);
+                    }
+                }
             }
         } else {
-            self.focus_next();
+            // Move to buttons
+            self.focus_on_buttons = true;
+            self.focused_button = if forward {
+                0
+            } else {
+                self.button_count().saturating_sub(1)
+            };
         }
+
+        self.update_focus_states();
+        self.ensure_selected_visible(self.viewport_height);
     }
 
-    /// Move to previous sub-item within current control
-    pub fn sub_focus_prev(&mut self) {
-        if let Some(sub) = self.sub_focus {
-            if sub > 0 {
-                self.sub_focus = Some(sub - 1);
-            } else {
-                self.sub_focus = None;
-            }
-        } else {
-            self.focus_prev();
-        }
+    /// Initialize composite control focus for the selected item (when dialog opens)
+    fn init_object_array_focus(&mut self) {
+        self.init_composite_focus(true);
     }
 
     /// Update focus states for all items
@@ -510,6 +652,7 @@ impl EntryDialogState {
                 SettingControl::Dropdown(s) => s.focus = state,
                 SettingControl::Text(s) => s.focus = state,
                 SettingControl::TextList(s) => s.focus = state,
+                SettingControl::DualList(s) => s.focus = state,
                 SettingControl::Map(s) => s.focus = state,
                 SettingControl::ObjectArray(s) => s.focus = state,
                 SettingControl::Json(s) => s.focus = state,
@@ -518,12 +661,22 @@ impl EntryDialogState {
         }
     }
 
-    /// Calculate total content height for all items (including separator)
+    /// Height of a section header (label + blank line)
+    const SECTION_HEADER_HEIGHT: usize = 2;
+
+    /// Calculate total content height for all items (including separator and section headers)
     pub fn total_content_height(&self) -> usize {
         let items_height: usize = self
             .items
             .iter()
-            .map(|item| item.control.control_height() as usize)
+            .map(|item| {
+                let section_h = if item.is_section_start {
+                    Self::SECTION_HEADER_HEIGHT
+                } else {
+                    0
+                };
+                item.control.control_height() as usize + section_h
+            })
             .sum();
         // Add 1 for separator if we have both read-only and editable items
         let separator_height =
@@ -535,13 +688,20 @@ impl EntryDialogState {
         items_height + separator_height
     }
 
-    /// Calculate the Y offset of the selected item (including separator)
+    /// Calculate the Y offset of the selected item (including separator and section headers)
     pub fn selected_item_offset(&self) -> usize {
         let items_offset: usize = self
             .items
             .iter()
             .take(self.selected_item)
-            .map(|item| item.control.control_height() as usize)
+            .map(|item| {
+                let section_h = if item.is_section_start {
+                    Self::SECTION_HEADER_HEIGHT
+                } else {
+                    0
+                };
+                item.control.control_height() as usize + section_h
+            })
             .sum();
         // Add 1 for separator if selected item is after it
         let separator_offset = if self.first_editable_index > 0
@@ -552,7 +712,19 @@ impl EntryDialogState {
         } else {
             0
         };
-        items_offset + separator_offset
+        // Add section header height if the selected item itself starts a section
+        let own_section_h = self
+            .items
+            .get(self.selected_item)
+            .map(|item| {
+                if item.is_section_start {
+                    Self::SECTION_HEADER_HEIGHT
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        items_offset + separator_offset + own_section_h
     }
 
     /// Calculate the height of the selected item
@@ -657,8 +829,8 @@ impl EntryDialogState {
             }
             match &mut item.control {
                 SettingControl::Text(state) => {
-                    // TextInputState uses focus state, cursor is already at end from with_value
                     state.cursor = state.value.len();
+                    state.editing = true;
                     self.editing_text = true;
                 }
                 SettingControl::TextList(state) => {
@@ -682,8 +854,10 @@ impl EntryDialogState {
     /// Stop text editing mode
     pub fn stop_editing(&mut self) {
         if let Some(item) = self.current_item_mut() {
-            if let SettingControl::Number(state) = &mut item.control {
-                state.cancel_editing();
+            match &mut item.control {
+                SettingControl::Number(state) => state.cancel_editing(),
+                SettingControl::Text(state) => state.editing = false,
+                _ => {}
             }
         }
         self.editing_text = false;
@@ -1130,6 +1304,10 @@ mod tests {
                         default: Some(serde_json::json!(true)),
                         read_only: false,
                         section: None,
+                        order: None,
+                        nullable: false,
+                        enum_from: None,
+                        dual_list_sibling: None,
                     },
                     SettingSchema {
                         path: "/command".to_string(),
@@ -1139,12 +1317,20 @@ mod tests {
                         default: Some(serde_json::json!("")),
                         read_only: false,
                         section: None,
+                        order: None,
+                        nullable: false,
+                        enum_from: None,
+                        dual_list_sibling: None,
                     },
                 ],
             },
             default: None,
             read_only: false,
             section: None,
+            order: None,
+            nullable: false,
+            enum_from: None,
+            dual_list_sibling: None,
         }
     }
 
@@ -1251,6 +1437,58 @@ mod tests {
 
         dialog.focus_prev();
         assert!(dialog.focus_on_buttons); // Wraps to buttons, not to read-only Key
+    }
+
+    #[test]
+    fn entry_path_joins_map_path_and_entry_key() {
+        let schema = create_test_schema();
+
+        // Existing entry: full path is map_path + "/" + entry_key
+        let existing = EntryDialogState::from_schema(
+            "rust".to_string(),
+            &serde_json::json!({}),
+            &schema,
+            "/lsp",
+            false,
+            false,
+        );
+        assert_eq!(existing.entry_path(), "/lsp/rust");
+
+        // New entry with no key typed yet falls back to the parent map path.
+        // Nested dialogs keyed off this are outside the scope of this test.
+        let new_entry = EntryDialogState::from_schema(
+            String::new(),
+            &serde_json::json!({}),
+            &schema,
+            "/lsp",
+            true,
+            false,
+        );
+        assert_eq!(new_entry.entry_path(), "/lsp");
+    }
+
+    #[test]
+    fn entry_path_tracks_live_key_edits_for_new_entries() {
+        let schema = create_test_schema();
+        let mut dialog = EntryDialogState::from_schema(
+            String::new(),
+            &serde_json::json!({}),
+            &schema,
+            "/universal_lsp",
+            true,
+            false,
+        );
+
+        // User types a key into the editable key field.
+        for item in dialog.items.iter_mut() {
+            if item.path == "__key__" {
+                if let SettingControl::Text(state) = &mut item.control {
+                    state.value = "myserver".to_string();
+                }
+            }
+        }
+
+        assert_eq!(dialog.entry_path(), "/universal_lsp/myserver");
     }
 
     #[test]

@@ -2,6 +2,13 @@ use crate::model::marker::{MarkerId, MarkerList};
 use ratatui::style::{Color, Style};
 use std::collections::BTreeMap;
 
+/// Minimum number of digits reserved in the line-number column.
+///
+/// The gutter grows with the buffer's line count, but never shrinks below this
+/// minimum — otherwise a 1-line buffer would render with a single-character
+/// number column that feels cramped next to the indicator and separator.
+pub const MIN_LINE_NUMBER_DIGITS: usize = 2;
+
 /// Position of a margin in the editor
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarginPosition {
@@ -152,7 +159,7 @@ impl MarginConfig {
     pub fn left_default() -> Self {
         Self {
             position: MarginPosition::Left,
-            width: 4, // Minimum 4 digits for line numbers
+            width: MIN_LINE_NUMBER_DIGITS,
             enabled: true,
             show_separator: true,
             separator: " │ ".to_string(), // Separator with spaces: " │ " (space before for indicators, space after for readability)
@@ -473,6 +480,32 @@ impl MarginManager {
         by_line
     }
 
+    /// Get the byte position of a line indicator's marker.
+    ///
+    /// Returns the current byte offset for the given marker ID, or None if the
+    /// marker doesn't exist. Useful for testing that marker positions survive
+    /// undo/redo correctly.
+    pub fn get_indicator_position(&self, marker_id: MarkerId) -> Option<usize> {
+        self.indicator_markers.get_position(marker_id)
+    }
+
+    /// Query indicator markers in a byte range.
+    /// Returns (MarkerId, start, end) tuples for markers in the range.
+    pub fn query_indicator_range(&self, start: usize, end: usize) -> Vec<(MarkerId, usize, usize)> {
+        self.indicator_markers.query_range(start, end)
+    }
+
+    /// Move a line indicator's marker to a new byte position.
+    ///
+    /// This is a no-op if the marker doesn't exist in the indicator markers.
+    /// Used to restore displaced markers after undo.
+    pub fn set_indicator_position(&mut self, marker_id: MarkerId, new_position: usize) {
+        // Only move if this marker is actually tracked by margins
+        if self.line_indicators.contains_key(&marker_id.0) {
+            self.indicator_markers.set_position(marker_id, new_position);
+        }
+    }
+
     /// Add an annotation to a margin
     pub fn add_annotation(&mut self, annotation: MarginAnnotation) {
         let annotations = match annotation.position {
@@ -587,7 +620,7 @@ impl MarginManager {
             } else {
                 ((buffer_total_lines as f64).log10().floor() as usize) + 1
             };
-            self.left_config.width = digits.max(4);
+            self.left_config.width = digits.max(MIN_LINE_NUMBER_DIGITS);
         }
     }
 
@@ -615,7 +648,7 @@ impl MarginManager {
         } else {
             self.left_config.enabled = true;
             if self.left_config.width == 0 {
-                self.left_config.width = 4;
+                self.left_config.width = MIN_LINE_NUMBER_DIGITS;
             }
         }
     }
@@ -731,9 +764,18 @@ mod tests {
     fn test_margin_manager_update_width() {
         let mut manager = MarginManager::new();
 
-        // Small buffer
+        // Single-line buffer — clamped to the minimum
+        manager.update_width_for_buffer(1, true);
+        assert_eq!(manager.left_config.width, MIN_LINE_NUMBER_DIGITS);
+
+        // Two-digit buffer
         manager.update_width_for_buffer(99, true);
-        assert_eq!(manager.left_config.width, 4); // Minimum 4
+        assert_eq!(manager.left_config.width, 2);
+
+        // Three-digit buffer — now tracks the actual digit count rather than
+        // padding to a fixed minimum of 4 (see issue #1204).
+        manager.update_width_for_buffer(500, true);
+        assert_eq!(manager.left_config.width, 3);
 
         // Medium buffer (4 digits)
         manager.update_width_for_buffer(1000, true);
@@ -746,6 +788,26 @@ mod tests {
         // Very large buffer (7 digits)
         manager.update_width_for_buffer(1000000, true);
         assert_eq!(manager.left_config.width, 7);
+    }
+
+    #[test]
+    fn test_margin_manager_total_width_adapts_to_buffer() {
+        // Regression test for issue #1204: the rendered gutter width should
+        // scale with the actual line count instead of being pinned to a fixed
+        // minimum of 4 digits.
+        let mut manager = MarginManager::new();
+
+        // Small buffer — 2-digit minimum, gutter = 1 (indicator) + 2 + 3 (" │ ")
+        manager.update_width_for_buffer(10, true);
+        assert_eq!(manager.left_total_width(), 6);
+
+        // 3-digit line count — gutter grows to 7
+        manager.update_width_for_buffer(250, true);
+        assert_eq!(manager.left_total_width(), 7);
+
+        // 4-digit line count — gutter grows to 8
+        manager.update_width_for_buffer(5000, true);
+        assert_eq!(manager.left_total_width(), 8);
     }
 
     #[test]

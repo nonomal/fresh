@@ -9,7 +9,9 @@
 //! compatible with git's ignore rules.
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Status of a file/directory with respect to ignore patterns
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,10 @@ pub struct IgnorePatterns {
     /// Key: directory path, Value: gitignore rules for that directory
     gitignores: Vec<(PathBuf, Gitignore)>,
 
+    /// Mtime of each loaded .gitignore at load time. Used to detect
+    /// external edits and deletions during the file-tree poll.
+    gitignore_mtimes: HashMap<PathBuf, SystemTime>,
+
     /// Custom glob patterns to ignore
     custom_patterns: Vec<String>,
 
@@ -49,6 +55,7 @@ impl IgnorePatterns {
     pub fn new() -> Self {
         Self {
             gitignores: Vec::new(),
+            gitignore_mtimes: HashMap::new(),
             custom_patterns: Vec::new(),
             show_hidden: false,
             show_gitignored: false,
@@ -56,32 +63,56 @@ impl IgnorePatterns {
         }
     }
 
-    /// Load .gitignore file from a directory
+    /// Install a gitignore for `dir` from already-read bytes.
     ///
-    /// This should be called when expanding a directory to load its .gitignore
-    pub fn load_gitignore(&mut self, dir: &Path) -> std::io::Result<()> {
-        let gitignore_path = dir.join(".gitignore");
-
-        if !gitignore_path.exists() {
-            return Ok(()); // No .gitignore, nothing to load
-        }
-
+    /// I/O lives in the caller (the editor's filesystem authority), keeping
+    /// this module pure so it works uniformly over local and remote trees.
+    /// Pass `mtime` so the poll can later detect external changes.
+    pub fn load_gitignore_from_bytes(
+        &mut self,
+        dir: &Path,
+        contents: &[u8],
+        mtime: Option<SystemTime>,
+    ) {
         let mut builder = GitignoreBuilder::new(dir);
-        builder.add(&gitignore_path);
+        let source = dir.join(".gitignore");
+        for line in contents.split(|&b| b == b'\n') {
+            let line = std::str::from_utf8(line).unwrap_or("");
+            if let Err(e) = builder.add_line(Some(source.clone()), line) {
+                tracing::warn!("Malformed .gitignore line in {:?}: {}", source, e);
+            }
+        }
 
         match builder.build() {
             Ok(gitignore) => {
-                // Remove any existing gitignore for this directory
                 self.gitignores.retain(|(path, _)| path != dir);
-                // Add new gitignore
                 self.gitignores.push((dir.to_path_buf(), gitignore));
-                Ok(())
+                if let Some(mtime) = mtime {
+                    self.gitignore_mtimes.insert(dir.to_path_buf(), mtime);
+                } else {
+                    self.gitignore_mtimes.remove(dir);
+                }
             }
             Err(e) => {
-                tracing::warn!("Failed to load .gitignore from {:?}: {}", gitignore_path, e);
-                Ok(()) // Don't fail if .gitignore is malformed
+                tracing::warn!("Failed to build .gitignore for {:?}: {}", dir, e);
             }
         }
+    }
+
+    /// Drop any loaded gitignore for `dir`.
+    pub fn remove_gitignore(&mut self, dir: &Path) {
+        self.gitignores.retain(|(d, _)| d != dir);
+        self.gitignore_mtimes.remove(dir);
+    }
+
+    /// Dirs for which a gitignore is currently loaded.
+    pub fn loaded_gitignore_dirs(&self) -> Vec<PathBuf> {
+        self.gitignores.iter().map(|(d, _)| d.clone()).collect()
+    }
+
+    /// Mtime recorded when the gitignore for `dir` was last loaded.
+    pub fn stored_gitignore_mtime(&self, dir: &Path) -> Option<SystemTime> {
+        self.gitignore_mtimes.get(dir).copied()
     }
 
     /// Add a custom glob pattern to ignore
@@ -100,29 +131,29 @@ impl IgnorePatterns {
 
     /// Check if a path should be ignored
     ///
-    /// Returns true if the file should be hidden from the tree
+    /// Each filter (hidden / custom / gitignored) is evaluated independently:
+    /// a file is hidden from the tree if *any* enabled filter matches it. This
+    /// way a file that is both hidden and gitignored still disappears when
+    /// gitignored files are hidden, even if hidden files are shown.
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        let status = self.get_status(path, is_dir);
-
-        match status {
-            IgnoreStatus::Visible => false,
-            IgnoreStatus::GitIgnored => !self.show_gitignored,
-            IgnoreStatus::Hidden => !self.show_hidden,
-            IgnoreStatus::CustomIgnored => !self.show_custom_ignored,
+        if !self.show_hidden && is_hidden_name(path) {
+            return true;
         }
+        if !self.show_custom_ignored && self.matches_custom_pattern(path) {
+            return true;
+        }
+        if !self.show_gitignored && self.matches_gitignore(path, is_dir) {
+            return true;
+        }
+        false
     }
 
     /// Get the ignore status of a path
     ///
     /// This is useful for rendering (e.g., gray out ignored files)
     pub fn get_status(&self, path: &Path, is_dir: bool) -> IgnoreStatus {
-        // Check if hidden (starts with .)
-        if let Some(name) = path.file_name() {
-            if let Some(name_str) = name.to_str() {
-                if name_str.starts_with('.') && name_str != ".." && name_str != "." {
-                    return IgnoreStatus::Hidden;
-                }
-            }
+        if is_hidden_name(path) {
+            return IgnoreStatus::Hidden;
         }
 
         // Check custom patterns
@@ -222,6 +253,7 @@ impl IgnorePatterns {
     /// Clear all gitignore rules
     pub fn clear_gitignores(&mut self) {
         self.gitignores.clear();
+        self.gitignore_mtimes.clear();
     }
 
     /// Clear all custom patterns
@@ -241,12 +273,16 @@ impl Default for IgnorePatterns {
     }
 }
 
+fn is_hidden_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with('.') && n != "." && n != "..")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::io::Write;
-    use tempfile::TempDir;
 
     #[test]
     fn test_hidden_file_detection() {
@@ -297,22 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn test_gitignore_loading() -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let gitignore_path = temp_dir.path().join(".gitignore");
-
-        let mut file = fs::File::create(&gitignore_path)?;
-        writeln!(file, "*.log")?;
-        writeln!(file, "build/")?;
-        writeln!(file, "# Comment")?;
-        writeln!(file, "!important.log")?;
-
+    fn test_gitignore_loading() {
         let mut patterns = IgnorePatterns::new();
-        patterns.load_gitignore(temp_dir.path())?;
-
+        patterns.load_gitignore_from_bytes(
+            Path::new("/foo"),
+            b"*.log\nbuild/\n# Comment\n!important.log\n",
+            None,
+        );
         assert_eq!(patterns.gitignore_count(), 1);
-
-        Ok(())
     }
 
     #[test]
@@ -344,25 +372,55 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_gitignores() -> std::io::Result<()> {
-        let temp_root = TempDir::new()?;
-        let sub_dir = temp_root.path().join("subdir");
-        fs::create_dir(&sub_dir)?;
+    fn test_hidden_gitignored_respects_gitignore_filter() {
+        // Regression test for #1388: a file that is both hidden (starts with '.')
+        // and matched by .gitignore must stay hidden when `show_gitignored` is
+        // false, even if `show_hidden` is true. Hidden ≠ gitignored, and the
+        // user's choice to hide gitignored files should take precedence.
+        let root = Path::new("/repo");
+        let mut patterns = IgnorePatterns::new();
+        patterns.load_gitignore_from_bytes(root, b".DS_Store\n", None);
+        patterns.set_show_hidden(true);
+        patterns.set_show_gitignored(false);
 
-        // Root .gitignore
-        let mut root_gitignore = fs::File::create(temp_root.path().join(".gitignore"))?;
-        writeln!(root_gitignore, "*.tmp")?;
+        let ds_store = root.join(".DS_Store");
+        assert!(
+            patterns.is_ignored(&ds_store, false),
+            ".DS_Store is gitignored; should be hidden despite show_hidden=true"
+        );
 
-        // Subdir .gitignore
-        let mut sub_gitignore = fs::File::create(sub_dir.join(".gitignore"))?;
-        writeln!(sub_gitignore, "*.bak")?;
+        // A hidden file NOT in .gitignore should still be shown.
+        let gitignore_file = root.join(".gitignore");
+        assert!(
+            !patterns.is_ignored(&gitignore_file, false),
+            ".gitignore is hidden but not gitignored; should be visible \
+             when show_hidden=true"
+        );
+
+        // With show_hidden=false, the hidden filter hides .DS_Store on its own
+        // regardless of the gitignore filter state.
+        patterns.set_show_hidden(false);
+        patterns.set_show_gitignored(true);
+        assert!(
+            patterns.is_ignored(&ds_store, false),
+            "show_hidden=false still hides .DS_Store (hidden filter)"
+        );
+
+        // Both filters disabled → fully visible.
+        patterns.set_show_hidden(true);
+        patterns.set_show_gitignored(true);
+        assert!(!patterns.is_ignored(&ds_store, false));
+    }
+
+    #[test]
+    fn test_multiple_gitignores() {
+        let root = Path::new("/repo");
+        let sub = root.join("subdir");
 
         let mut patterns = IgnorePatterns::new();
-        patterns.load_gitignore(temp_root.path())?;
-        patterns.load_gitignore(&sub_dir)?;
+        patterns.load_gitignore_from_bytes(root, b"*.tmp\n", None);
+        patterns.load_gitignore_from_bytes(&sub, b"*.bak\n", None);
 
         assert_eq!(patterns.gitignore_count(), 2);
-
-        Ok(())
     }
 }

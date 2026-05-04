@@ -1,6 +1,8 @@
-use crate::common::harness::{layout, EditorTestHarness};
+use crate::common::harness::{layout, EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
+use fresh::config_io::DirectoryContext;
+use tempfile::TempDir;
 
 /// Test that the tab bar is visible by default
 #[test]
@@ -38,7 +40,12 @@ fn test_menu_bar_visible_by_default() {
 /// Test that toggling tab bar via command palette hides and shows it
 #[test]
 fn test_toggle_tab_bar_via_command_palette() {
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    // 120×24 instead of 80×24: with `{remote}` on the
+    // default status bar, the trailing Messages element
+    // gets ellipsis-truncated at 80. The widening keeps
+    // 'Status bar shown' / 'Menu bar hidden' / etc.
+    // readable for the assertions below.
+    let mut harness = EditorTestHarness::new(120, 24).unwrap();
     harness.render().unwrap();
 
     // Verify tab bar is visible initially (shows "[No Name]" for new buffer)
@@ -84,7 +91,12 @@ fn test_toggle_tab_bar_via_command_palette() {
 /// Test that toggling menu bar via command palette hides and shows it
 #[test]
 fn test_toggle_menu_bar_via_command_palette() {
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    // 120×24 instead of 80×24: with `{remote}` on the
+    // default status bar, the trailing Messages element
+    // gets ellipsis-truncated at 80. The widening keeps
+    // 'Status bar shown' / 'Menu bar hidden' / etc.
+    // readable for the assertions below.
+    let mut harness = EditorTestHarness::new(120, 24).unwrap();
     harness.render().unwrap();
 
     // Verify menu bar is visible initially
@@ -281,7 +293,12 @@ fn test_status_bar_visible_by_default() {
 /// Test that toggling status bar via command palette hides and shows it
 #[test]
 fn test_toggle_status_bar_via_command_palette() {
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    // 120×24 instead of 80×24: with `{remote}` on the
+    // default status bar, the trailing Messages element
+    // gets ellipsis-truncated at 80. The widening keeps
+    // 'Status bar shown' / 'Menu bar hidden' / etc.
+    // readable for the assertions below.
+    let mut harness = EditorTestHarness::new(120, 24).unwrap();
     harness.render().unwrap();
 
     // Status bar should be visible initially
@@ -372,5 +389,241 @@ fn test_all_bars_hidden() {
         !status_bar_row.contains("Ln"),
         "Status bar should be hidden. Got: {}",
         status_bar_row
+    );
+}
+
+/// Test that the prompt line is visible by default
+#[test]
+fn test_prompt_line_visible_by_default() {
+    let harness = EditorTestHarness::new(80, 24).unwrap();
+    assert!(
+        harness.editor().prompt_line_visible(),
+        "Prompt line should be visible by default"
+    );
+}
+
+/// Test that toggling the prompt line off at runtime hides it.
+/// (The config-load path with show_prompt_line=false is covered by
+/// `test_settings_show_prompt_line_applies_immediately`; the harness
+/// always forces show_prompt_line=true so layout-sensitive tests stay
+/// stable, hence this test exercises the runtime toggle instead.)
+#[test]
+fn test_toggle_prompt_line_off_hides_it() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    assert!(harness.editor().prompt_line_visible());
+    harness.editor_mut().toggle_prompt_line();
+    assert!(
+        !harness.editor().prompt_line_visible(),
+        "Prompt line should be hidden after toggling it off"
+    );
+}
+
+/// Test that changing show_prompt_line via the Settings UI takes effect immediately
+#[test]
+fn test_settings_show_prompt_line_applies_immediately() {
+    let mut harness = EditorTestHarness::new(100, 40).unwrap();
+    harness.render().unwrap();
+
+    // Prompt line should be visible initially
+    assert!(harness.editor().prompt_line_visible());
+
+    // Open settings
+    harness.open_settings().unwrap();
+
+    // Search for "show_prompt_line"
+    harness
+        .send_key(KeyCode::Char('/'), KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("show_prompt").unwrap();
+    harness.render().unwrap();
+
+    // Jump to result and toggle it off
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Save with Ctrl+S
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Settings should be closed
+    assert!(
+        !harness.editor().is_settings_open(),
+        "Settings should be closed after Ctrl+S"
+    );
+
+    // Prompt line should now be hidden (applied immediately, not requiring restart)
+    assert!(
+        !harness.editor().prompt_line_visible(),
+        "Prompt line should be hidden after toggling show_prompt_line off via Settings UI"
+    );
+}
+
+/// Test that toggling prompt line via command palette hides and shows it
+#[test]
+fn test_toggle_prompt_line_via_command_palette() {
+    // 120×24 instead of 80×24: with `{remote}` on the
+    // default status bar, the trailing Messages element
+    // gets ellipsis-truncated at 80. The widening keeps
+    // 'Status bar shown' / 'Menu bar hidden' / etc.
+    // readable for the assertions below.
+    let mut harness = EditorTestHarness::new(120, 24).unwrap();
+    harness.render().unwrap();
+
+    // Prompt line should be visible initially
+    assert!(harness.editor().prompt_line_visible());
+
+    // Open command palette
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Type "toggle prompt line" to find the command
+    harness.type_text("Toggle Prompt Line").unwrap();
+    harness.render().unwrap();
+
+    // Press Enter to execute
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Prompt line should now be hidden
+    harness.assert_screen_contains("Prompt line hidden");
+    assert!(!harness.editor().prompt_line_visible());
+
+    // Toggle back - open command palette again
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness.type_text("Toggle Prompt Line").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Prompt line should be visible again
+    harness.assert_screen_contains("Prompt line shown");
+    assert!(harness.editor().prompt_line_visible());
+}
+
+/// Regression test for issue #1156: toggling the menu bar via the View menu /
+/// command palette should persist to the global user config so the change is
+/// truly global (every workspace picks it up on next launch), not a per-
+/// workspace override.
+#[test]
+fn test_toggle_menu_bar_persists_to_global_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    // Session 1: open the editor and toggle the menu bar off via the runtime
+    // action (same code path used by the View menu and the "Toggle Menu Bar"
+    // command-palette entry).
+    {
+        let mut harness = EditorTestHarness::create(
+            80,
+            24,
+            HarnessOptions::new()
+                .with_config(Config::default())
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+        harness.render().unwrap();
+
+        // Sanity: the global default is "show menu bar" = true.
+        assert!(harness.editor().config().editor.show_menu_bar);
+
+        harness.editor_mut().toggle_menu_bar();
+
+        // After toggling, the runtime config must reflect the new value.
+        assert!(
+            !harness.editor().config().editor.show_menu_bar,
+            "toggle_menu_bar should update show_menu_bar in the global config"
+        );
+    }
+
+    // Session 2: a different working directory using the same user config
+    // dir. Loading the config layers from disk must reflect the persisted
+    // change — otherwise the toggle was per-workspace, not global.
+    let other_project = temp_dir.path().join("other_project");
+    std::fs::create_dir(&other_project).unwrap();
+    let loaded = Config::load_with_layers(&dir_context, &other_project);
+    assert!(
+        !loaded.editor.show_menu_bar,
+        "Toggle should persist to user config so unrelated workspaces inherit it"
+    );
+}
+
+/// Regression test for issue #1156: a stale `menu_bar_hidden` workspace
+/// override from an older Fresh release must not silently win over the
+/// current global `editor.show_menu_bar` setting. The setting is global,
+/// so the override is treated as legacy and ignored on restore.
+#[test]
+fn test_workspace_override_does_not_shadow_global_show_menu_bar() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    // Session 1: hide the menu bar (toggle persists to global user config)
+    // and save the workspace. Older builds also wrote a per-workspace
+    // `menu_bar_hidden=true` override here.
+    {
+        let mut harness = EditorTestHarness::create(
+            80,
+            24,
+            HarnessOptions::new()
+                .with_config(Config::default())
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+        harness.render().unwrap();
+        harness.editor_mut().toggle_menu_bar();
+        harness.shutdown(true).unwrap();
+    }
+
+    // Session 2: the user re-enables the menu bar globally before reopening
+    // (e.g. via the Settings UI on a different machine, or by editing the
+    // config file). Now reopen the same workspace — the global setting
+    // must win.
+    let mut harness = EditorTestHarness::create(
+        80,
+        24,
+        HarnessOptions::new()
+            .with_config({
+                let mut c = Config::default();
+                c.editor.show_menu_bar = true;
+                c
+            })
+            .with_working_dir(project_dir.clone())
+            .with_shared_dir_context(dir_context.clone())
+            .without_empty_plugins_dir(),
+    )
+    .unwrap();
+    harness.editor_mut().try_restore_workspace().unwrap();
+    harness.render().unwrap();
+
+    let menu_bar_row = harness.get_screen_row(0);
+    assert!(
+        menu_bar_row.contains("File"),
+        "Global show_menu_bar=true must take precedence over a stale \
+         workspace override. Got row 0: {:?}",
+        menu_bar_row
     );
 }

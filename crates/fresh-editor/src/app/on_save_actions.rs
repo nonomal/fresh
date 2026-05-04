@@ -11,6 +11,7 @@ use std::time::Duration;
 use super::Editor;
 use crate::config::{FormatterConfig, OnSaveAction};
 use crate::model::event::Event;
+use crate::services::process_hidden::HideWindow;
 use rust_i18n::t;
 
 /// Result of running a formatter or on-save action
@@ -136,7 +137,11 @@ impl Editor {
 
         let formatter = match formatter {
             Some(f) => f,
-            None => return Err(format!("No formatter configured for {}", language)),
+            None => {
+                // No external formatter — try LSP formatting
+                self.request_formatting();
+                return Ok(());
+            }
         };
 
         match self.run_formatter(&formatter, &path) {
@@ -185,7 +190,8 @@ impl Editor {
         cmd.args(["-c", &full_command])
             .current_dir(&project_root)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .hide_window();
 
         if formatter.stdin {
             cmd.stdin(Stdio::piped());
@@ -204,72 +210,123 @@ impl Editor {
             }
         };
 
-        // Write buffer content to stdin if configured
-        if formatter.stdin {
+        // Stream buffer content to stdin on a background thread so that
+        // we can drain stdout/stderr concurrently. Without this, any
+        // formatter whose output exceeds the kernel's pipe buffer
+        // (~64KB on Linux) blocks writing stdout, which in turn blocks
+        // waiting for `wait_with_output` and produces the "Format Buffer
+        // hangs" symptom (issue #1573).
+        let stdin_writer = if formatter.stdin {
             let content = self.active_state().buffer.to_string().unwrap_or_default();
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Err(e) = stdin.write_all(content.as_bytes()) {
+            child.stdin.take().map(|mut stdin| {
+                std::thread::spawn(move || -> std::io::Result<()> {
+                    stdin.write_all(content.as_bytes())?;
+                    stdin.flush()?;
+                    // Dropping `stdin` here closes the pipe so the child
+                    // sees EOF and exits once it has consumed the input.
+                    Ok(())
+                })
+            })
+        } else {
+            None
+        };
+
+        // Enforce the timeout on an auxiliary thread that kills the child
+        // by PID if it has not finished within `timeout_ms`.
+        // `wait_with_output` blocks until the child closes its
+        // stdout/stderr, so without a watchdog a truly stuck process
+        // would never time out.
+        let timeout = Duration::from_millis(formatter.timeout_ms);
+        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_pid = child.id();
+        let watchdog = {
+            let timed_out = std::sync::Arc::clone(&timed_out);
+            let child_finished = std::sync::Arc::clone(&child_finished);
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                while start.elapsed() < timeout {
+                    if child_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                #[cfg(unix)]
+                {
+                    // SAFETY: libc::kill is async-signal-safe and we only
+                    // signal a child we spawned.
+                    unsafe {
+                        libc::kill(child_pid as i32, libc::SIGKILL);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child_pid;
+                }
+            })
+        };
+
+        // Wait for the child and collect output. `wait_with_output`
+        // internally reads stdout and stderr on separate threads, so
+        // large outputs cannot deadlock the way they did with the old
+        // `try_wait`-polling implementation.
+        let output_result = child.wait_with_output();
+        child_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Join the stdin writer (it has either finished or will finish
+        // once the child closes its end of the pipe, which happens on
+        // exit or SIGKILL).
+        if let Some(handle) = stdin_writer {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                // If the child exited before we finished writing, a
+                // `BrokenPipe` is expected and not a hard error; we
+                // still want the output the formatter produced.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Ok(Err(e)) => {
                     return ActionResult::Error(format!("Failed to write to stdin: {}", e));
+                }
+                Err(_) => {
+                    return ActionResult::Error("stdin writer thread panicked".to_string());
                 }
             }
         }
+        if let Err(e) = watchdog.join() {
+            tracing::warn!("formatter watchdog thread panicked: {e:?}");
+        }
 
-        // Wait for the process with timeout
-        let timeout = Duration::from_millis(formatter.timeout_ms);
-        let start = std::time::Instant::now();
+        if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+            return ActionResult::Error(format!(
+                "Formatter '{}' timed out after {}ms",
+                formatter.command, formatter.timeout_ms
+            ));
+        }
 
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let output = match child.wait_with_output() {
-                        Ok(o) => o,
-                        Err(e) => {
-                            return ActionResult::Error(format!("Failed to get output: {}", e))
-                        }
-                    };
+        let output = match output_result {
+            Ok(o) => o,
+            Err(e) => return ActionResult::Error(format!("Failed to get output: {}", e)),
+        };
 
-                    if status.success() {
-                        return match String::from_utf8(output.stdout) {
-                            Ok(s) => ActionResult::Success(s),
-                            Err(e) => {
-                                ActionResult::Error(format!("Invalid UTF-8 in output: {}", e))
-                            }
-                        };
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let error_output = if !stderr.is_empty() {
-                            stderr.trim().to_string()
-                        } else if !stdout.is_empty() {
-                            stdout.trim().to_string()
-                        } else {
-                            format!("exit code {:?}", status.code())
-                        };
-                        return ActionResult::Error(format!(
-                            "Formatter '{}' failed: {}",
-                            formatter.command, error_output
-                        ));
-                    }
-                }
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        // Best-effort kill of timed-out process.
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = child.kill();
-                        return ActionResult::Error(format!(
-                            "Formatter '{}' timed out after {}ms",
-                            formatter.command, formatter.timeout_ms
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    return ActionResult::Error(format!(
-                        "Failed to wait for '{}': {}",
-                        formatter.command, e
-                    ));
-                }
+        if output.status.success() {
+            match String::from_utf8(output.stdout) {
+                Ok(s) => ActionResult::Success(s),
+                Err(e) => ActionResult::Error(format!("Invalid UTF-8 in output: {}", e)),
             }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let error_output = if !stderr.is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("exit code {:?}", output.status.code())
+            };
+            ActionResult::Error(format!(
+                "Formatter '{}' failed: {}",
+                formatter.command, error_output
+            ))
         }
     }
 
@@ -318,7 +375,8 @@ impl Editor {
         cmd.args(["-c", &full_command])
             .current_dir(&working_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .hide_window();
 
         if action.stdin {
             cmd.stdin(Stdio::piped());
@@ -532,6 +590,7 @@ fn command_exists(command: &str) -> bool {
             .arg(command)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .hide_window()
             .status()
             .map(|s| s.success())
             .unwrap_or(false)

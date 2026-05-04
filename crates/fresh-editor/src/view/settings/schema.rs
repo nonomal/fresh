@@ -73,6 +73,17 @@ pub struct SettingSchema {
     pub read_only: bool,
     /// Section/group within the category (from x-section)
     pub section: Option<String>,
+    /// Sort order override (from x-order). Lower values sort first.
+    /// When set, overrides alphabetical sorting.
+    pub order: Option<i32>,
+    /// Whether this setting accepts null (i.e., can be "unset" to inherit).
+    /// Derived from JSON Schema `"type": ["<type>", "null"]`.
+    pub nullable: bool,
+    /// Dynamic enum source path: derive dropdown options from the keys of
+    /// another config property at runtime (e.g., "/languages").
+    pub enum_from: Option<String>,
+    /// Path to the sibling dual-list setting (for cross-exclusion)
+    pub dual_list_sibling: Option<String>,
 }
 
 /// Type of a setting, determines which control to render
@@ -114,6 +125,11 @@ pub enum SettingType {
         /// Whether to disallow adding new entries (entries are auto-managed)
         no_add: bool,
     },
+    /// Dual-list: ordered subset of a fixed set of options with sibling cross-exclusion
+    DualList {
+        options: Vec<EnumOption>,
+        sibling_path: Option<String>,
+    },
     /// Complex type we can't edit directly
     Complex,
 }
@@ -136,6 +152,9 @@ pub struct SettingCategory {
     pub path: String,
     /// Description of this category
     pub description: Option<String>,
+    /// Whether this category is nullable (e.g., `Option<LanguageConfig>`)
+    /// and can be cleared as a whole.
+    pub nullable: bool,
     /// Settings in this category
     pub settings: Vec<SettingSchema>,
     /// Subcategories
@@ -180,6 +199,23 @@ struct RawSchema {
     /// Section/group within the category for organizing related settings
     #[serde(rename = "x-section")]
     section: Option<String>,
+    /// Sort order override for field ordering in entry dialogs
+    #[serde(rename = "x-order")]
+    order: Option<i32>,
+    /// anyOf combinator (used by schemars for Option<T> where T is a struct)
+    #[serde(rename = "anyOf")]
+    any_of: Option<Vec<RawSchema>>,
+    /// Dynamic enum: derive dropdown options from the keys of another config
+    /// property at runtime (e.g., `"x-enum-from": "/languages"` populates
+    /// the dropdown with keys from the `languages` HashMap).
+    #[serde(rename = "x-enum-from")]
+    enum_from: Option<String>,
+    /// Dual-list options defined on the item schema (array of {value, name})
+    #[serde(rename = "x-dual-list-options", default)]
+    dual_list_options: Vec<DualListOptionEntry>,
+    /// Path to the sibling dual-list setting (for cross-exclusion)
+    #[serde(rename = "x-dual-list-sibling")]
+    dual_list_sibling: Option<String>,
 }
 
 /// An entry in the x-enum-values array
@@ -192,6 +228,15 @@ struct EnumValueEntry {
     name: Option<String>,
     /// The actual value (must match the referenced type)
     value: serde_json::Value,
+}
+
+/// An option entry in x-dual-list-options
+#[derive(Debug, Deserialize)]
+struct DualListOptionEntry {
+    /// The actual value (e.g., "{filename}")
+    value: String,
+    /// Human-friendly display name
+    name: Option<String>,
 }
 
 /// additionalProperties can be a boolean or a schema object
@@ -216,6 +261,14 @@ impl SchemaType {
         match self {
             Self::Single(s) => Some(s.as_str()),
             Self::Multiple(v) => v.first().map(|s| s.as_str()),
+        }
+    }
+
+    /// Check if this type includes "null" (i.e., the field is nullable/optional)
+    fn contains_null(&self) -> bool {
+        match self {
+            Self::Single(s) => s == "null",
+            Self::Multiple(v) => v.iter().any(|s| s == "null"),
         }
     }
 }
@@ -246,6 +299,16 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
         // Resolve references
         let resolved = resolve_ref(&prop, &defs);
 
+        // Detect if this property is nullable (Option<T> generates anyOf with null variant)
+        let is_nullable = prop.any_of.as_ref().is_some_and(|variants| {
+            variants.iter().any(|v| {
+                v.schema_type
+                    .as_ref()
+                    .map(|t| t.primary() == Some("null"))
+                    .unwrap_or(false)
+            })
+        });
+
         // Check if this property should be a standalone category (for Map types)
         if prop.standalone_category {
             // Create a category with the Map setting as its only content
@@ -254,16 +317,27 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
                 name: display_name,
                 path: path.clone(),
                 description: prop.description.clone().or(resolved.description.clone()),
+                nullable: is_nullable,
                 settings: vec![setting],
                 subcategories: Vec::new(),
             });
         } else if let Some(ref inner_props) = resolved.properties {
-            // This is a category with nested settings
+            // This is a category with nested settings.
             let settings = parse_properties(inner_props, &path, &defs, &enum_values_map);
+            // Prefer the field-level doc comment (more specific to how the
+            // category is used) over the struct-level one (often generic
+            // boilerplate like "Editor configuration"). When both exist they
+            // tend to read as near-duplicates side by side, so we don't
+            // concatenate them.
+            let description = prop
+                .description
+                .clone()
+                .or_else(|| resolved.description.clone());
             categories.push(SettingCategory {
                 name: display_name,
                 path: path.clone(),
-                description: resolved.description.clone(),
+                description,
+                nullable: is_nullable,
                 settings,
                 subcategories: Vec::new(),
             });
@@ -284,6 +358,7 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
                 name: "General".to_string(),
                 path: String::new(),
                 description: Some("General settings".to_string()),
+                nullable: false,
                 settings: top_level_settings,
                 subcategories: Vec::new(),
             },
@@ -333,11 +408,18 @@ fn parse_properties(
     for (name, prop) in properties {
         let path = format!("{}/{}", parent_path, name);
         let setting = parse_setting(name, &path, prop, defs, enum_values_map);
+
         settings.push(setting);
     }
 
-    // Sort settings alphabetically by name
-    settings.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sort settings: by x-order (if set) first, then alphabetically by name.
+    // Settings with x-order come before those without.
+    settings.sort_by(|a, b| match (a.order, b.order) {
+        (Some(a_ord), Some(b_ord)) => a_ord.cmp(&b_ord).then_with(|| a.name.cmp(&b.name)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
+    });
 
     settings
 }
@@ -365,6 +447,24 @@ fn parse_setting(
     // Get section from schema or resolved ref
     let section = schema.section.clone().or_else(|| resolved.section.clone());
 
+    // Get order from schema or resolved ref
+    let order = schema.order.or(resolved.order);
+
+    // Detect nullability from type array containing "null" or anyOf containing a null variant
+    let nullable = resolved
+        .schema_type
+        .as_ref()
+        .map(|t| t.contains_null())
+        .unwrap_or(false)
+        || schema.any_of.as_ref().is_some_and(|variants| {
+            variants.iter().any(|v| {
+                v.schema_type
+                    .as_ref()
+                    .map(|t| t.primary() == Some("null"))
+                    .unwrap_or(false)
+            })
+        });
+
     SettingSchema {
         path: path.to_string(),
         name: i18n_name(path, name),
@@ -373,6 +473,16 @@ fn parse_setting(
         default: schema.default.clone(),
         read_only,
         section,
+        order,
+        nullable,
+        enum_from: schema
+            .enum_from
+            .clone()
+            .or_else(|| resolved.enum_from.clone()),
+        dual_list_sibling: schema
+            .dual_list_sibling
+            .clone()
+            .or_else(|| resolved.dual_list_sibling.clone()),
     }
 }
 
@@ -442,6 +552,24 @@ fn determine_type(
             // Check if it's an array of strings, integers, or objects
             if let Some(ref items) = resolved.items {
                 let item_resolved = resolve_ref(items, defs);
+                // Check for dual-list options on the item schema
+                if !item_resolved.dual_list_options.is_empty() {
+                    let options = item_resolved
+                        .dual_list_options
+                        .iter()
+                        .map(|entry| EnumOption {
+                            name: entry.name.clone().unwrap_or_else(|| entry.value.clone()),
+                            value: entry.value.clone(),
+                        })
+                        .collect();
+                    return SettingType::DualList {
+                        options,
+                        sibling_path: schema
+                            .dual_list_sibling
+                            .clone()
+                            .or_else(|| resolved.dual_list_sibling.clone()),
+                    };
+                }
                 let item_type = item_resolved.schema_type.as_ref().and_then(|t| t.primary());
                 if item_type == Some("string") {
                     return SettingType::StringArray;
@@ -477,8 +605,14 @@ fn determine_type(
                         let value_schema =
                             parse_setting("value", "", inner_resolved, defs, enum_values_map);
 
-                        // Get display_field from x-display-field in the referenced schema
-                        let display_field = inner_resolved.display_field.clone();
+                        // Get display_field from x-display-field in the referenced schema.
+                        // If the value schema is an array, also check the array items for display_field.
+                        let display_field = inner_resolved.display_field.clone().or_else(|| {
+                            inner_resolved.items.as_ref().and_then(|items| {
+                                let items_resolved = resolve_ref(items, defs);
+                                items_resolved.display_field.clone()
+                            })
+                        });
 
                         // Get no_add from the parent schema (resolved)
                         let no_add = resolved.no_add;
@@ -510,13 +644,30 @@ fn determine_type(
     }
 }
 
-/// Resolve a $ref to its definition
+/// Resolve a $ref to its definition.
+///
+/// Also resolves through `anyOf` patterns generated by schemars for `Option<T>`:
+///   `anyOf: [{ "$ref": "#/$defs/Foo" }, { "type": "null" }]`
+/// In this case, the non-null `$ref` variant is resolved.
 fn resolve_ref<'a>(schema: &'a RawSchema, defs: &'a HashMap<String, RawSchema>) -> &'a RawSchema {
+    // Direct $ref
     if let Some(ref ref_path) = schema.ref_path {
-        // Parse ref path like "#/$defs/EditorConfig"
         if let Some(def_name) = ref_path.strip_prefix("#/$defs/") {
             if let Some(def) = defs.get(def_name) {
                 return def;
+            }
+        }
+    }
+    // anyOf: find the non-null variant and resolve it
+    if let Some(ref variants) = schema.any_of {
+        for variant in variants {
+            let is_null = variant
+                .schema_type
+                .as_ref()
+                .map(|t| t.primary() == Some("null"))
+                .unwrap_or(false);
+            if !is_null {
+                return resolve_ref(variant, defs);
             }
         }
     }
@@ -655,10 +806,161 @@ mod tests {
     }
 
     #[test]
+    fn test_any_of_nullable_object() {
+        // Tests that anyOf: [{$ref: "..."}, {type: "null"}] resolves to an Object type
+        // and is marked as nullable. This is the pattern schemars generates for Option<T>.
+        let schema_json = r##"
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "fallback": {
+      "description": "Fallback language config",
+      "anyOf": [
+        { "$ref": "#/$defs/LanguageConfig" },
+        { "type": "null" }
+      ],
+      "default": null
+    }
+  },
+  "$defs": {
+    "LanguageConfig": {
+      "description": "Language-specific configuration",
+      "type": "object",
+      "properties": {
+        "grammar": {
+          "description": "Grammar name",
+          "type": "string",
+          "default": ""
+        },
+        "comment_prefix": {
+          "description": "Comment prefix",
+          "type": ["string", "null"],
+          "default": null
+        },
+        "auto_indent": {
+          "description": "Enable auto-indent",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  }
+}
+"##;
+        let categories = parse_schema(schema_json).unwrap();
+
+        // anyOf with $ref should resolve through to LanguageConfig's properties,
+        // creating a category (like "Editor") with individual sub-field controls
+        let fallback_cat = categories
+            .iter()
+            .find(|c| c.path == "/fallback")
+            .expect("fallback should be a category");
+        assert_eq!(fallback_cat.settings.len(), 3);
+
+        // Verify sub-fields are properly typed
+        let grammar = fallback_cat
+            .settings
+            .iter()
+            .find(|s| s.name == "Grammar")
+            .unwrap();
+        assert!(matches!(grammar.setting_type, SettingType::String));
+
+        let auto_indent = fallback_cat
+            .settings
+            .iter()
+            .find(|s| s.name == "Auto Indent")
+            .unwrap();
+        assert!(matches!(auto_indent.setting_type, SettingType::Boolean));
+    }
+
+    #[test]
     fn test_humanize_name() {
         assert_eq!(humanize_name("tab_size"), "Tab Size");
         assert_eq!(humanize_name("line_numbers"), "Line Numbers");
         assert_eq!(humanize_name("check_for_updates"), "Check For Updates");
         assert_eq!(humanize_name("lsp"), "Lsp");
+    }
+
+    #[test]
+    fn test_enum_from_parsed_from_schema() {
+        let schema_json = r##"{
+            "type": "object",
+            "properties": {
+                "default_language": {
+                    "type": ["string", "null"],
+                    "x-enum-from": "/languages"
+                },
+                "theme": {
+                    "type": "string"
+                }
+            }
+        }"##;
+
+        let categories = parse_schema(schema_json).unwrap();
+        let general = &categories[0];
+        let default_lang = general
+            .settings
+            .iter()
+            .find(|s| s.name == "Default Language")
+            .expect("should have Default Language setting");
+
+        assert_eq!(
+            default_lang.enum_from.as_deref(),
+            Some("/languages"),
+            "enum_from should be parsed from x-enum-from"
+        );
+        assert!(default_lang.nullable, "should be nullable");
+
+        // theme should not have enum_from
+        let theme = general
+            .settings
+            .iter()
+            .find(|s| s.name == "Theme")
+            .expect("should have Theme setting");
+        assert!(theme.enum_from.is_none());
+    }
+
+    #[test]
+    fn test_dual_list_parsed_from_schema() {
+        let schema_json = r##"{
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "x-dual-list-options": [
+                            {"value": "red", "name": "Red"},
+                            {"value": "green", "name": "Green"},
+                            {"value": "blue", "name": "Blue"}
+                        ]
+                    },
+                    "x-dual-list-sibling": "/other_tags"
+                }
+            }
+        }"##;
+        let categories = parse_schema(schema_json).unwrap();
+        let general = &categories[0];
+        let tags = general
+            .settings
+            .iter()
+            .find(|s| s.path == "/tags")
+            .expect("tags setting");
+
+        match &tags.setting_type {
+            SettingType::DualList {
+                options,
+                sibling_path,
+            } => {
+                assert_eq!(options.len(), 3);
+                assert_eq!(options[0].value, "red");
+                assert_eq!(options[0].name, "Red");
+                assert_eq!(sibling_path.as_deref(), Some("/other_tags"));
+            }
+            other => panic!("expected DualList, got {:?}", other),
+        }
+        assert_eq!(tags.dual_list_sibling.as_deref(), Some("/other_tags"));
     }
 }

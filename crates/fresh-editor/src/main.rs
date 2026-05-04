@@ -1,5 +1,10 @@
+// On Windows, a GUI-feature build uses the "windows" subsystem so launching
+// from Explorer / a Start-Menu shortcut does not flash a console window.
+// The TUI build (no `gui` feature) keeps the default "console" subsystem.
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 use anyhow::{Context, Result as AnyhowResult};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use crossterm::event::{
     poll as event_poll, read as event_read, Event as CrosstermEvent, KeyEvent, KeyEventKind,
     MouseEvent,
@@ -10,91 +15,38 @@ use fresh::services::gpm::{gpm_to_crossterm, GpmClient};
 use fresh::services::terminal_modes::{self, KeyboardConfig, TerminalModes};
 use fresh::services::tracing_setup;
 use fresh::{
-    app::Editor,
-    client, config,
-    config_io::DirectoryContext,
-    model::filesystem::{FileSystem, StdFileSystem},
-    server::SocketPaths,
-    services::release_checker,
-    services::remote,
-    services::signal_handler,
-    services::tracing_setup::TracingHandles,
-    workspace,
+    app::Editor, client, config, config_io::DirectoryContext, server::SocketPaths,
+    services::release_checker, services::remote, services::signal_handler,
+    services::tracing_setup::TracingHandles, workspace,
 };
 use ratatui::Terminal;
 use std::{
     io::{self, stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
-/// A terminal text editor with multi-cursor support
+/// English `before_help` banner. Always shown above the auto-generated help so
+/// `--locale` is discoverable even when the editor is otherwise running in a
+/// language the user can't read. Keep this short, plain ASCII, and English —
+/// it is the user's escape hatch when the rest of the help is localized.
+const BEFORE_HELP_EN: &str =
+    "Tip: use --locale <CODE> to change the interface language (e.g. en, es, fr, ja, zh-CN).";
+
+// All user-visible help strings on `Cli` (struct `about` / `long_about`
+// and per-arg `help`) are overridden at runtime by
+// `build_localized_cli_command` so they go through the i18n backend.
+// The doc comments on `Cli` and its fields are intentionally short and
+// only used by the derive — the English `before_help` banner below is
+// the user's escape hatch back to a known language.
+/// fresh
 #[derive(Parser, Debug)]
 #[command(name = "fresh")]
 #[command(version, propagate_version = true)]
-#[command(after_help = concat!(
-    "Commands (use --cmd):\n",
-    "  config show               Print effective configuration\n",
-    "  config paths              Show directories used by Fresh\n",
-    "  init                      Initialize a new plugin/theme/language\n",
-    "\n",
-    "Session commands:\n",
-    "  session list              List active sessions\n",
-    "  session attach [NAME]     Attach to a session (NAME or current dir)\n",
-    "  session new NAME          Start a new named session\n",
-    "  session kill [NAME]       Terminate a session\n",
-    "  session open-file NAME FILES [--wait]   Open files in session (--wait blocks until done)\n",
-    "\n",
-    "File location syntax:\n",
-    "  file.txt:10                  Open at line 10\n",
-    "  file.txt:10:5                Open at line 10, column 5\n",
-    "  file.txt:10-20               Select lines 10 to 20\n",
-    "  file.txt:10:5-20:1           Select from line 10 col 5 to line 20 col 1\n",
-    "  file.txt:10@\"msg\"            Open at line 10 with markdown popup message\n",
-    "  file.txt:10-20@\"msg\"         Select range with markdown popup message\n",
-    "  Tip: use single quotes to avoid shell expansion, e.g. 'file.txt:10@\"msg\"'\n",
-    "\n",
-    "Examples:\n",
-    "  fresh file.txt                               Open a file\n",
-    "  fresh 'file.txt:10-20@\"Check this code\"'     Open with range selected and popup\n",
-    "  fresh -a                                     Attach to session (current dir)\n",
-    "  fresh -a mysession                           Attach to named session\n",
-    "  fresh --cmd session new proj                 Start session named 'proj'\n",
-    "  fresh --cmd session open-file . main.rs     Open file in current dir session\n",
-    "  fresh --cmd session open-file proj a.rs     Open file in 'proj' session\n",
-    "\n",
-    "Guided walkthrough with --wait:\n",
-    "  The --wait flag blocks the CLI process until the user dismisses the popup\n",
-    "  (if @\"message\" was given) or closes the buffer (if no message). This lets\n",
-    "  a script or tool open files sequentially, waiting for the user to finish\n",
-    "  with each one before moving on.\n",
-    "\n",
-    "  Use NAME '.' to target the session for the current working directory.\n",
-    "  A session is started automatically if one isn't already running. When a\n",
-    "  new session is started, the client attaches interactively (--wait is ignored).\n",
-    "\n",
-    "  To show a file with an annotation, combine range selection with @\"msg\":\n",
-    "    fresh --cmd session open-file . 'src/main.rs:10-25@\"msg\"' --wait\n",
-    "\n",
-    "  The message supports markdown. Use real newlines (not \\n literals) in\n",
-    "  the shell string for multi-line messages. For example with $'...':\n",
-    "    fresh --cmd session open-file . \\\n",
-    "      $'src/main.rs:10-25@\"**Title**\\nBody text here\"' --wait\n",
-    "\n",
-    "  To walk through multiple locations, run commands sequentially — each\n",
-    "  one blocks until the user presses Escape (popup) or closes the buffer:\n",
-    "    fresh --cmd session open-file . 'a.rs:1-10@\"Step 1\"' --wait\n",
-    "    fresh --cmd session open-file . 'b.rs:5-20@\"Step 2\"' --wait\n",
-    "    fresh --cmd session open-file . 'c.rs:30@\"Step 3\"'   --wait\n",
-    "\n",
-    "  Use as git's editor:\n",
-    "    git config core.editor 'fresh --cmd session open-file . --wait'\n",
-    "\n",
-    "Documentation: https://getfresh.dev/docs"
-))]
+#[command(before_help = BEFORE_HELP_EN)]
 struct Cli {
     /// Run a command instead of opening files
-    /// Commands: session (list|attach|new|kill|open-file), config (show|paths), init
+    /// Commands: session (list|attach|new|kill|open-file), config (show|paths), grammar (list), init
     #[arg(long, num_args = 1.., value_name = "COMMAND", allow_hyphen_values = true)]
     cmd: Vec<String>,
 
@@ -114,6 +66,14 @@ struct Cli {
     #[arg(long)]
     no_plugins: bool,
 
+    /// Skip `~/.config/fresh/init.ts` for this launch
+    #[arg(long)]
+    no_init: bool,
+
+    /// Safe mode: skip init.ts AND all plugins (recovery from a bad config)
+    #[arg(long)]
+    safe: bool,
+
     /// Path to configuration file
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -126,9 +86,17 @@ struct Cli {
     #[arg(long, value_name = "LOG_FILE")]
     event_log: Option<PathBuf>,
 
-    /// Don't restore previous workspace
-    #[arg(long, alias = "no-session")]
+    /// Don't restore previous workspace (only hot-exit content — unsaved
+    /// modified files and unnamed buffers with content — is still restored
+    /// so in-progress work is not lost)
+    #[arg(long, alias = "no-session", conflicts_with = "restore")]
     no_restore: bool,
+
+    /// Force restore of previous workspace, overriding
+    /// `editor.restore_previous_session = false` in the config.  Cannot be
+    /// combined with `--no-restore`.
+    #[arg(long)]
+    restore: bool,
 
     /// Disable upgrade checking and anonymous telemetry
     #[arg(long)]
@@ -146,6 +114,13 @@ struct Cli {
     /// Session name for server mode (internal, used by spawn_server_detached)
     #[arg(long, hide = true, value_name = "NAME")]
     session_name: Option<String>,
+
+    /// Remote SSH URL for server mode (internal, used by spawn_server_detached
+    /// when the client was launched with `ssh://…` or `user@host:path`).  The
+    /// server parses this, connects, and installs the result as
+    /// `EditorServerConfig.startup_authority`.
+    #[arg(long, hide = true, value_name = "URL")]
+    ssh_url: Option<String>,
 
     // === Deprecated flags from pre-subcommand CLI (hidden, with warnings) ===
     /// [deprecated: use `fresh config show`]
@@ -177,17 +152,27 @@ struct Args {
     files: Vec<String>,
     stdin: bool,
     no_plugins: bool,
+    no_init: bool,
+    safe: bool,
     config: Option<PathBuf>,
     log_file: Option<PathBuf>,
     event_log: Option<PathBuf>,
     no_session: bool,
+    /// Force workspace restore even if `editor.restore_previous_session`
+    /// is disabled in the config.
+    force_restore: bool,
     no_upgrade_check: bool,
     dump_config: bool,
     show_paths: bool,
+    list_grammars: bool,
     locale: Option<String>,
     check_plugin: Option<PathBuf>,
     init: Option<Option<String>>,
     server: bool,
+    /// Forwarded to the detached daemon by `spawn_server_detached`
+    /// when the client saw an `ssh://` / scp-style remote in
+    /// `files`.  Populated only for the daemon side.
+    ssh_url: Option<String>,
     // Session-related fields (set via subcommands or -a shortcut)
     attach: bool,
     list_sessions: bool,
@@ -202,6 +187,17 @@ struct Args {
 
 impl From<Cli> for Args {
     fn from(cli: Cli) -> Self {
+        // Check for grammar list command before the main tuple parsing
+        let list_grammars = if !cli.cmd.is_empty() {
+            let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
+            matches!(
+                cmd_args.as_slice(),
+                ["grammar", "list"] | ["grammars", "list"] | ["grammar", "ls"] | ["grammars"]
+            )
+        } else {
+            false
+        };
+
         // Parse --cmd arguments to determine command
         let (
             list_sessions,
@@ -230,7 +226,7 @@ impl From<Cli> for Args {
                     } else {
                         Some((*name).to_string())
                     };
-                    let wait = files.iter().any(|s| *s == "--wait");
+                    let wait = files.contains(&"--wait");
                     let file_list: Vec<String> = files
                         .iter()
                         .filter(|s| **s != "--wait")
@@ -360,10 +356,14 @@ impl From<Cli> for Args {
                     cli.files,
                     None,
                 ),
+                // Grammar commands (handled via list_grammars flag above)
+                ["grammar", "list"] | ["grammars", "list"] | ["grammar", "ls"] | ["grammars"] => (
+                    false, None, false, None, false, false, None, cli.files, None,
+                ),
                 // Unknown command
                 _ => {
                     eprintln!("Unknown command: {}", cli.cmd.join(" "));
-                    eprintln!("Available commands: session (list|attach|new|kill|info|open-file), config (show|paths), init");
+                    eprintln!("Available commands: session (list|attach|new|kill|info|open-file), config (show|paths), grammar (list), init");
                     std::process::exit(1);
                 }
             }
@@ -395,21 +395,31 @@ impl From<Cli> for Args {
             )
         };
 
+        // Safe mode implies no_plugins and no_init.
+        let safe = cli.safe;
+        let no_plugins = cli.no_plugins || safe;
+        let no_init = cli.no_init || safe;
+
         Args {
             files,
             stdin: cli.stdin,
-            no_plugins: cli.no_plugins,
+            no_plugins,
+            no_init,
+            safe,
             config: cli.config,
             log_file: cli.log_file,
             event_log: cli.event_log,
             no_session: cli.no_restore,
+            force_restore: cli.restore,
             no_upgrade_check: cli.no_upgrade_check,
             dump_config,
             show_paths,
+            list_grammars,
             locale: cli.locale,
             check_plugin: cli.check_plugin,
             init,
             server: cli.server,
+            ssh_url: cli.ssh_url,
             attach,
             list_sessions,
             session_name,
@@ -434,11 +444,21 @@ struct FileLocation {
     message: Option<String>,
 }
 
-/// Parsed remote location from CLI argument in user@host:path format
+/// Parsed remote location from CLI argument.
+///
+/// Accepts two wire forms — both produce the same struct:
+///
+/// - scp-style: `user@host:path[:line[:col]]`
+/// - URL-style: `ssh://[user@]host[:port]/path[:line[:col]]`
+///
+/// `user` is mandatory in the scp-style form and optional in the URL
+/// form (defaults to `$USER` / `$USERNAME`). `port` is only reachable
+/// through the URL form.
 #[derive(Debug, Clone)]
 struct RemoteLocation {
     user: String,
     host: String,
+    port: Option<u16>,
     path: String,
     line: Option<usize>,
     column: Option<usize>,
@@ -469,10 +489,15 @@ struct SetupState {
     /// Stdin streaming state (if --stdin flag or "-" file was used)
     /// Contains temp file path and background thread handle
     stdin_stream: Option<StdinStreamState>,
-    /// Filesystem implementation (local or remote)
-    filesystem: std::sync::Arc<dyn FileSystem + Send + Sync>,
-    /// Process spawner for plugin command execution (local or remote)
-    process_spawner: std::sync::Arc<dyn remote::ProcessSpawner>,
+    /// Single backend slot for "where does the editor act?".
+    ///
+    /// The editor always boots with `Authority::local()`. The SSH
+    /// startup form (`fresh user@host:path`) replaces it with
+    /// `Authority::ssh(...)` here. Devcontainer attach is now a plugin
+    /// concern (it calls `editor.setAuthority({...})` from
+    /// `plugins/devcontainer.ts` after `devcontainer up` returns) so
+    /// startup never blocks on a container.
+    authority: fresh::services::authority::Authority,
     /// Remote session resources - must be kept alive for remote editing
     _remote_session: Option<RemoteSession>,
     /// Key translator for input calibration
@@ -726,20 +751,34 @@ fn handle_first_run_setup(
     file_locations: &[FileLocation],
     show_file_explorer: bool,
     stdin_stream: &mut Option<StdinStreamState>,
-    tracing_handles: &mut Option<TracingHandles>,
     workspace_enabled: bool,
 ) -> AnyhowResult<()> {
     if let Some(log_path) = &args.event_log {
         tracing::trace!("Event logging enabled: {}", log_path.display());
         editor.enable_event_streaming(log_path)?;
     }
+    // The warning-log channel and status-log path used to be wired up
+    // here from `tracing_handles`; that wiring now lives in the main
+    // loop so it survives editor restarts (e.g. devcontainer attach).
 
-    if let Some(handles) = tracing_handles.take() {
-        editor.set_warning_log(handles.warning.receiver, handles.warning.path);
-        editor.set_status_log_path(handles.status.path);
-    }
+    // If the user passed any file argument on the command line and the
+    // `skip_session_restore_when_files_passed` option is on (default), treat
+    // the launch as a focused "open these files" invocation: skip the full
+    // session restore but still recover hot-exit content. `--restore` (force)
+    // is a deliberate user override that wins.
+    let cli_has_file_args = file_locations.iter().any(|loc| !loc.path.is_dir());
+    let cli_overrides_restore = cli_has_file_args
+        && editor
+            .config()
+            .editor
+            .skip_session_restore_when_files_passed
+        && !args.force_restore;
 
-    if workspace_enabled {
+    let restore_full_session = workspace_enabled
+        && !cli_overrides_restore
+        && (args.force_restore || editor.config().editor.restore_previous_session);
+
+    if restore_full_session {
         match editor.try_restore_workspace() {
             Ok(true) => {
                 tracing::info!("Workspace restored successfully");
@@ -749,6 +788,33 @@ fn handle_first_run_setup(
             }
             Err(e) => {
                 tracing::warn!("Failed to restore workspace: {}", e);
+            }
+        }
+    } else {
+        if !workspace_enabled {
+            tracing::info!("Skipping workspace restore: --no-restore was specified");
+        } else if cli_overrides_restore {
+            tracing::info!(
+                "Skipping workspace restore: file arguments passed on the command line (editor.skip_session_restore_when_files_passed)"
+            );
+        } else {
+            tracing::info!(
+                "Skipping workspace restore: editor.restore_previous_session is disabled"
+            );
+        }
+        // Session restore opted out, but hot-exit content (unsaved
+        // modified files + unnamed buffers with content) is still
+        // restored so the user does not lose in-progress work.
+        match editor.try_restore_hot_exit_buffers() {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    "Restored {} hot-exit buffer(s) despite skipping session restore",
+                    n
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed to restore hot-exit buffers: {}", e);
             }
         }
     }
@@ -823,6 +889,37 @@ fn handle_first_run_setup(
 /// prefix properly using std::path APIs.
 ///
 /// If the full path exists as a file, it's used as-is (handles files with colons in name).
+/// Build FileRequest structs from CLI file arguments, resolving paths relative to `working_dir`.
+/// Directories are silently skipped.
+fn build_file_requests(
+    files: &[String],
+    working_dir: &std::path::Path,
+) -> Vec<fresh::server::protocol::FileRequest> {
+    use fresh::server::protocol::FileRequest;
+    let mut requests = Vec::new();
+    for f in files {
+        let loc = parse_file_location(f);
+        let abs_path = if loc.path.is_relative() {
+            working_dir.join(&loc.path)
+        } else {
+            loc.path.clone()
+        };
+        let canonical_path = abs_path.canonicalize().unwrap_or(abs_path);
+        if canonical_path.is_dir() {
+            continue;
+        }
+        requests.push(FileRequest {
+            path: canonical_path.to_string_lossy().to_string(),
+            line: loc.line,
+            column: loc.column,
+            end_line: loc.end_line,
+            end_column: loc.end_column,
+            message: loc.message,
+        });
+    }
+    requests
+}
+
 fn parse_file_location(input: &str) -> FileLocation {
     use std::path::{Component, Path};
 
@@ -988,62 +1085,213 @@ fn parse_line_col(s: &str) -> Option<(usize, Option<usize>)> {
     }
 }
 
-/// Parse a location that may be local (file:line:col) or remote (user@host:path:line:col)
-///
-/// Remote format: user@host:path or user@host:path:line or user@host:path:line:col
-/// The path can be absolute (/path) or relative (path)
-fn parse_location(input: &str) -> ParsedLocation {
-    // Check for SSH-style syntax: user@host:path
-    // Must have @ before the first : to be considered remote
-    // Also skip if it looks like a Windows path (single letter before :)
-    if let Some(at_pos) = input.find('@') {
-        // Everything before @ is the user
-        let user = &input[..at_pos];
+/// Split a remote `path[:line[:col]]` tail.  Only strips the numeric
+/// suffixes — anything non-numeric keeps the full string as the path
+/// (no partial stripping).  Shared between scp-style and `ssh://`
+/// parsing so the two forms agree on what counts as a trailing
+/// line/column.
+fn parse_path_with_line_col(path_and_rest: &str) -> (String, Option<usize>, Option<usize>) {
+    let parts: Vec<&str> = path_and_rest.rsplitn(3, ':').collect();
+    match parts.as_slice() {
+        [maybe_col, maybe_line, rest] => {
+            if let (Ok(line), Ok(col)) = (maybe_line.parse::<usize>(), maybe_col.parse::<usize>()) {
+                (rest.to_string(), Some(line), Some(col))
+            } else {
+                (path_and_rest.to_string(), None, None)
+            }
+        }
+        [maybe_line, rest] => {
+            if let Ok(line) = maybe_line.parse::<usize>() {
+                (rest.to_string(), Some(line), None)
+            } else {
+                (path_and_rest.to_string(), None, None)
+            }
+        }
+        _ => (path_and_rest.to_string(), None, None),
+    }
+}
 
-        // Everything after @ contains host:path[:line[:col]]
+/// Resolve the default SSH user when the `ssh://` URL omits one.
+/// Uses `$USER` on Unix, `$USERNAME` on Windows.  Returns `None` when
+/// neither is set — the caller treats the URL as malformed in that
+/// case.
+fn default_ssh_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("USERNAME").ok())
+        .filter(|u| !u.is_empty())
+}
+
+/// Parse the part of an `ssh://` URL after the `ssh://` prefix.
+/// Returns `None` for any shape we don't recognise (missing `/path`,
+/// empty host, bad port, missing user with no `$USER` fallback).
+fn parse_ssh_url_rest(rest: &str) -> Option<RemoteLocation> {
+    // Authority and path are separated by the first `/`.  Missing
+    // slash means no path, which we reject — consistent with the
+    // scp-style branch that requires a non-empty path component.
+    let (authority, path_and_rest) = rest.split_once('/')?;
+    if path_and_rest.is_empty() {
+        return None;
+    }
+
+    // Optional `user@` prefix on the authority.
+    let (user, host_and_port) = match authority.split_once('@') {
+        Some((u, rest)) if !u.is_empty() && !u.contains(' ') => (u.to_string(), rest),
+        Some(_) => return None, // empty or space-bearing user
+        None => (default_ssh_user()?, authority),
+    };
+
+    // Optional `:port` on the host.
+    let (host, port) = match host_and_port.rsplit_once(':') {
+        Some((h, p)) => {
+            let parsed_port = p.parse::<u16>().ok()?;
+            (h, Some(parsed_port))
+        }
+        None => (host_and_port, None),
+    };
+
+    if host.is_empty() || host.contains(' ') {
+        return None;
+    }
+
+    let (path_tail, line, column) = parse_path_with_line_col(path_and_rest);
+    // URL paths are always absolute (we consumed exactly one `/`
+    // between authority and path).  Re-add it so callers see the
+    // same absolute path they'd get from `ssh://host/etc/hosts`.
+    let path = format!("/{}", path_tail);
+
+    Some(RemoteLocation {
+        user,
+        host: host.to_string(),
+        port,
+        path,
+        line,
+        column,
+    })
+}
+
+/// Render a `RemoteLocation` back into the canonical `ssh://` URL
+/// form (no line/column — that's per-file metadata, not part of the
+/// authority).  Used to forward a client-side remote spec to the
+/// detached daemon via `spawn_server_detached`.
+fn remote_location_to_ssh_url(remote: &RemoteLocation) -> String {
+    // Paths on the remote are absolute by convention; if someone
+    // gave us a relative one (scp-style allows this) preserve it by
+    // dropping any leading `/` duplication.
+    let path = remote.path.trim_start_matches('/');
+    match remote.port {
+        Some(port) => format!("ssh://{}@{}:{}/{}", remote.user, remote.host, port, path),
+        None => format!("ssh://{}@{}/{}", remote.user, remote.host, path),
+    }
+}
+
+/// Scan CLI `files` for remote specs.  Returns `Ok(Some(url))` when
+/// every remote entry agrees on user/host/port (passed as
+/// `--ssh-url` to the detached daemon), `Ok(None)` when no file is
+/// remote, or an error when files straddle hosts.  The check mirrors
+/// `initialize_app` in standalone mode so both entry points reject
+/// the same bad inputs with the same message.
+fn extract_ssh_url_from_files(files: &[String]) -> AnyhowResult<Option<String>> {
+    let parsed: Vec<ParsedLocation> = files
+        .iter()
+        .filter(|f| *f != "-")
+        .map(|f| parse_location(f))
+        .collect();
+
+    let remotes: Vec<&RemoteLocation> = parsed
+        .iter()
+        .filter_map(|loc| match loc {
+            ParsedLocation::Remote(r) => Some(r),
+            ParsedLocation::Local(_) => None,
+        })
+        .collect();
+
+    if remotes.is_empty() {
+        return Ok(None);
+    }
+
+    let first = remotes[0];
+    for r in &remotes[1..] {
+        if r.user != first.user || r.host != first.host || r.port != first.port {
+            anyhow::bail!(
+                "Cannot open files from multiple remote hosts. First: {}@{}, found: {}@{}",
+                first.user,
+                first.host,
+                r.user,
+                r.host
+            );
+        }
+    }
+    if parsed
+        .iter()
+        .any(|loc| matches!(loc, ParsedLocation::Local(_)))
+    {
+        anyhow::bail!(
+            "Cannot mix local and remote files. Use either local paths or remote paths (ssh:// or user@host:path)."
+        );
+    }
+
+    Ok(Some(remote_location_to_ssh_url(first)))
+}
+
+/// Parse a standalone `ssh://…` URL passed via the internal
+/// `--ssh-url` flag.  Accepts only the URL form (not scp-style) and
+/// the URL must carry a path; anything else is a hard error because
+/// this input comes from our own `spawn_server_detached` and a
+/// malformed URL there means we corrupted it on the way over.
+fn parse_ssh_url_arg(url: &str) -> AnyhowResult<RemoteLocation> {
+    let rest = url
+        .strip_prefix("ssh://")
+        .ok_or_else(|| anyhow::anyhow!("--ssh-url expects an ssh:// URL, got {:?}", url))?;
+    parse_ssh_url_rest(rest)
+        .ok_or_else(|| anyhow::anyhow!("--ssh-url is not a valid ssh:// URL: {:?}", url))
+}
+
+/// Parse a location that may be local, scp-style remote, or an
+/// `ssh://` URL.
+///
+/// Accepted forms:
+/// - local: `file`, `file:line`, `file:line:col`
+/// - scp-style remote: `user@host:path[:line[:col]]`
+/// - URL-style remote: `ssh://[user@]host[:port]/path[:line[:col]]`
+///
+/// When `ssh://` omits the user, the current login name (`$USER` /
+/// `$USERNAME`) is used.  The URL form is the only way to pass a
+/// port.  The path must be non-empty in both remote forms.
+fn parse_location(input: &str) -> ParsedLocation {
+    if let Some(rest) = input.strip_prefix("ssh://") {
+        return match parse_ssh_url_rest(rest) {
+            Some(loc) => ParsedLocation::Remote(loc),
+            // Malformed `ssh://` — treat the whole input as a local
+            // filename rather than letting scp-style parsing match
+            // the `ssh://user@host:bad-port/...` slice and produce a
+            // nonsense user like `ssh://user`.
+            None => ParsedLocation::Local(parse_file_location(input)),
+        };
+    }
+
+    // scp-style: user@host:path. Must have @ before the first : to
+    // count as remote (skips Windows drive letters like `C:\...`).
+    if let Some(at_pos) = input.find('@') {
+        let user = &input[..at_pos];
         let after_at = &input[at_pos + 1..];
 
-        // Find the first : which separates host from path
         if let Some(colon_pos) = after_at.find(':') {
             let host = &after_at[..colon_pos];
             let path_and_rest = &after_at[colon_pos + 1..];
 
-            // Validate: user and host must be non-empty and not contain spaces
             if !user.is_empty()
                 && !host.is_empty()
                 && !user.contains(' ')
                 && !host.contains(' ')
                 && !path_and_rest.is_empty()
             {
-                // Now parse path:line:col from path_and_rest
-                // We need to distinguish between path components and line:col suffixes
-                // Strategy: work backwards, try to parse numeric suffixes
-
-                let parts: Vec<&str> = path_and_rest.rsplitn(3, ':').collect();
-
-                let (path, line, column) = match parts.as_slice() {
-                    [maybe_col, maybe_line, rest] => {
-                        if let (Ok(line), Ok(col)) =
-                            (maybe_line.parse::<usize>(), maybe_col.parse::<usize>())
-                        {
-                            (rest.to_string(), Some(line), Some(col))
-                        } else {
-                            (path_and_rest.to_string(), None, None)
-                        }
-                    }
-                    [maybe_line, rest] => {
-                        if let Ok(line) = maybe_line.parse::<usize>() {
-                            (rest.to_string(), Some(line), None)
-                        } else {
-                            (path_and_rest.to_string(), None, None)
-                        }
-                    }
-                    _ => (path_and_rest.to_string(), None, None),
-                };
+                let (path, line, column) = parse_path_with_line_col(path_and_rest);
 
                 return ParsedLocation::Remote(RemoteLocation {
                     user: user.to_string(),
                     host: host.to_string(),
+                    port: None,
                     path,
                     line,
                     column,
@@ -1062,32 +1310,37 @@ struct RemoteSession {
     _connection: remote::SshConnection,
     /// Tokio runtime for async operations
     _runtime: tokio::runtime::Runtime,
+    /// Background reconnect task handle - dropping this aborts the task
+    _reconnect_handle: tokio::task::JoinHandle<()>,
 }
 
-/// Result of creating filesystem - includes optional remote session to keep alive
-struct FilesystemResult {
-    filesystem: std::sync::Arc<dyn FileSystem + Send + Sync>,
-    /// Process spawner for plugin command execution
-    process_spawner: std::sync::Arc<dyn remote::ProcessSpawner>,
-    /// Remote session resources - must be kept alive for remote editing
+/// Bundle of the startup authority plus any resources that must stay
+/// alive for the duration of the session (currently only the SSH
+/// connection handle and its reconnect task).
+struct StartupAuthority {
+    authority: fresh::services::authority::Authority,
     remote_session: Option<RemoteSession>,
 }
 
-/// Create filesystem for local or remote editing
-fn create_filesystem(remote_info: &Option<RemoteLocation>) -> AnyhowResult<FilesystemResult> {
+/// Pick the startup authority. Per principle 6, defaults to
+/// `Authority::local()`; SSH CLI form constructs the remote authority
+/// directly. Devcontainer attach is no longer a core startup concern —
+/// the TS plugin handles it post-boot via `editor.setAuthority(...)`.
+fn create_startup_authority(
+    remote_info: &Option<RemoteLocation>,
+) -> AnyhowResult<StartupAuthority> {
     if let Some(remote) = remote_info {
         connect_remote(remote)
     } else {
-        Ok(FilesystemResult {
-            filesystem: std::sync::Arc::new(StdFileSystem),
-            process_spawner: std::sync::Arc::new(remote::LocalProcessSpawner),
+        Ok(StartupAuthority {
+            authority: fresh::services::authority::Authority::local(),
             remote_session: None,
         })
     }
 }
 
-/// Establish SSH connection to remote host and return RemoteFileSystem
-fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
+/// Establish SSH connection to remote host and return `Authority::ssh`.
+fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<StartupAuthority> {
     // Create a Tokio runtime for the SSH connection
     let rt = tokio::runtime::Runtime::new()
         .context("Failed to create Tokio runtime for remote connection")?;
@@ -1095,9 +1348,17 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
     let connection_params = remote::ConnectionParams {
         user: remote.user.clone(),
         host: remote.host.clone(),
-        port: None, // TODO: support port in remote location parsing
+        port: remote.port,
         identity_file: None,
     };
+
+    match remote.port {
+        Some(port) => eprintln!(
+            "Connecting via SSH to {}@{}:{}...",
+            remote.user, remote.host, port
+        ),
+        None => eprintln!("Connecting via SSH to {}@{}...", remote.user, remote.host),
+    }
 
     // Establish SSH connection (this is async, so we block on it)
     let connection = rt
@@ -1109,6 +1370,7 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
 
     let connection_string = connection.connection_string();
     let channel = connection.channel();
+    let reconnect_params = connection.params().clone();
 
     tracing::info!("Connected to remote host: {}", connection_string);
 
@@ -1116,14 +1378,24 @@ fn connect_remote(remote: &RemoteLocation) -> AnyhowResult<FilesystemResult> {
         channel.clone(),
         connection_string,
     ));
-    let process_spawner = std::sync::Arc::new(remote::RemoteProcessSpawner::new(channel));
+    let process_spawner = std::sync::Arc::new(remote::RemoteProcessSpawner::new(channel.clone()));
 
-    Ok(FilesystemResult {
-        filesystem,
-        process_spawner,
+    // Spawn background reconnect task on the runtime.
+    // We need a runtime context for tokio::spawn inside spawn_reconnect_task.
+    let reconnect_handle = {
+        let _guard = rt.enter();
+        remote::spawn_reconnect_task(channel, reconnect_params)
+    };
+
+    // SSH authority: leave the display label empty so the status bar
+    // falls back to `filesystem.remote_connection_info()`, which knows
+    // how to annotate the disconnect state.
+    Ok(StartupAuthority {
+        authority: fresh::services::authority::Authority::ssh(filesystem, process_spawner),
         remote_session: Some(RemoteSession {
             _connection: connection,
             _runtime: rt,
+            _reconnect_handle: reconnect_handle,
         }),
     })
 }
@@ -1138,7 +1410,11 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
     // Clean up stale log files from dead processes on startup
     fresh::services::log_dirs::cleanup_stale_logs();
 
-    tracing::info!("Editor starting");
+    tracing::info!(
+        "Editor starting (v{} {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("FRESH_GIT_HASH")
+    );
 
     signal_handler::install_signal_handlers();
     tracing::info!("Signal handlers installed");
@@ -1247,13 +1523,17 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         })
         .collect();
 
-    // Create filesystem early - needed for remote directory detection
-    // For remote editing, this establishes the SSH connection
-    let FilesystemResult {
-        filesystem,
-        process_spawner,
+    // Pick the startup authority. Per principle 6, this is `local()`
+    // by default; SSH CLI form swaps in `Authority::ssh(...)` here.
+    // Devcontainer detection is intentionally NOT done here — it moved
+    // into the devcontainer TS plugin so container attach runs
+    // post-boot (see `plugins/devcontainer.ts` and principle 8).
+    tracing::info!("Building startup authority...");
+    let StartupAuthority {
+        authority,
         remote_session,
-    } = create_filesystem(&remote_info)?;
+    } = create_startup_authority(&remote_info)?;
+    tracing::info!("Startup authority ready");
 
     let mut working_dir = None;
     let mut show_file_explorer = false;
@@ -1263,7 +1543,10 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         if let Some(first_loc) = file_locations.first() {
             // Use the filesystem to check if path is a directory
             // This works for both local and remote paths
-            let is_directory = filesystem.is_dir(&first_loc.path).unwrap_or(false);
+            let is_directory = authority
+                .filesystem
+                .is_dir(&first_loc.path)
+                .unwrap_or(false);
             if is_directory {
                 working_dir = Some(first_loc.path.clone());
                 show_file_explorer = true;
@@ -1273,6 +1556,7 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
 
     // Load config using the layered config system
     // For remote editing, use current local dir for config (remote doesn't have our config)
+    tracing::info!("Loading config...");
     let effective_working_dir = if remote_info.is_some() {
         std::env::current_dir().unwrap_or_default()
     } else {
@@ -1301,6 +1585,8 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         config::Config::load_with_layers(&dir_context, &effective_working_dir)
     };
 
+    tracing::info!("Config loaded");
+
     // CLI flag overrides config
     if args.no_upgrade_check {
         config.check_for_updates = false;
@@ -1319,8 +1605,12 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         report_alternate_keys: config.editor.keyboard_report_alternate_keys,
         report_all_keys_as_escape_codes: config.editor.keyboard_report_all_keys_as_escape_codes,
     };
+    tracing::info!("Enabling terminal modes...");
     let terminal_modes = TerminalModes::enable(Some(&keyboard_config))?;
+    tracing::info!("Terminal modes enabled");
 
+    #[cfg(target_os = "linux")]
+    tracing::info!("Connecting to GPM...");
     #[cfg(target_os = "linux")]
     let gpm_client = match GpmClient::connect() {
         Ok(client) => client,
@@ -1334,6 +1624,8 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
 
     if gpm_client.is_some() {
         tracing::info!("Using GPM for mouse capture");
+    } else {
+        tracing::info!("GPM not in use");
     }
 
     // Set cursor style from config
@@ -1343,17 +1635,22 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
     let _ = stdout().execute(config.editor.cursor_style.to_crossterm_style());
     tracing::info!("Set cursor style to {:?}", config.editor.cursor_style);
 
+    tracing::info!("Initializing terminal backend...");
     let backend = ratatui::backend::CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    tracing::info!("Terminal backend ready");
 
     let size = terminal.size()?;
     tracing::info!("Terminal size: {}x{}", size.width, size.height);
 
+    tracing::info!("Loading directory context...");
     let dir_context = DirectoryContext::from_system()?;
+    tracing::info!("Directory context loaded");
     let current_working_dir = working_dir;
 
     // Load key translator for input calibration
+    tracing::info!("Loading key translator...");
     let key_translator = match KeyTranslator::load_from_config_dir(&dir_context.config_dir) {
         Ok(translator) => translator,
         Err(e) => {
@@ -1362,6 +1659,7 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         }
     };
 
+    tracing::info!("Key translator loaded, returning SetupState");
     Ok(SetupState {
         config,
         tracing_handles,
@@ -1375,8 +1673,7 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         key_translator,
         gpm_client,
         terminal_modes,
-        filesystem,
-        process_spawner,
+        authority,
         _remote_session: remote_session,
     })
 }
@@ -1388,6 +1685,7 @@ fn run_editor_iteration(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     key_translator: &KeyTranslator,
     #[cfg(target_os = "linux")] gpm_client: &Option<GpmClient>,
+    terminal_modes: &mut TerminalModes,
 ) -> AnyhowResult<IterationOutcome> {
     #[cfg(target_os = "linux")]
     let loop_result = run_event_loop(
@@ -1396,9 +1694,16 @@ fn run_editor_iteration(
         workspace_enabled,
         key_translator,
         gpm_client,
+        terminal_modes,
     );
     #[cfg(not(target_os = "linux"))]
-    let loop_result = run_event_loop(editor, terminal, workspace_enabled, key_translator);
+    let loop_result = run_event_loop(
+        editor,
+        terminal,
+        workspace_enabled,
+        key_translator,
+        terminal_modes,
+    );
 
     if let Err(e) = editor.end_recovery_session() {
         tracing::warn!("Failed to end recovery session: {}", e);
@@ -1460,6 +1765,52 @@ fn check_plugin_bundle(plugin_path: &std::path::Path) -> AnyhowResult<()> {
     }
 
     Ok(())
+}
+
+/// `fresh --cmd init check` — syntax-check ~/.config/fresh/init.ts via oxc.
+/// Exits 0 if the file is absent or parses cleanly, 1 on any parse error.
+fn init_check_command() -> AnyhowResult<()> {
+    let dir_context = fresh::config_io::DirectoryContext::from_system()
+        .context("failed to resolve config directory")?;
+    let report = fresh::init_script::check(&dir_context.config_dir);
+
+    let path_display = report.path.display();
+    if report.ok {
+        if report.diagnostics.is_empty() {
+            // File may or may not exist — either way, nothing to complain about.
+            println!("init.ts: ok ({path_display})");
+        } else {
+            // Warnings without errors. Still exit 0.
+            for d in &report.diagnostics {
+                eprintln!(
+                    "{path_display}:{}:{}  warning  {}",
+                    d.line, d.column, d.message
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    for d in &report.diagnostics {
+        let tag = match d.severity {
+            fresh::init_script::CheckSeverity::Error => "error",
+            fresh::init_script::CheckSeverity::Warning => "warning",
+        };
+        eprintln!(
+            "{path_display}:{}:{}  {tag}  {}",
+            d.line, d.column, d.message
+        );
+    }
+    let errors = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == fresh::init_script::CheckSeverity::Error)
+        .count();
+    eprintln!(
+        "\n{errors} error{}. init.ts will not be evaluated until fixed.",
+        if errors == 1 { "" } else { "s" }
+    );
+    std::process::exit(1);
 }
 
 /// Initialize a new Fresh package (plugin, theme, or language pack)
@@ -1600,7 +1951,7 @@ fn init_package_command(package_type: Option<String>) -> AnyhowResult<()> {
 }
 
 /// Write a validation script that checks package.json against the official schema
-fn write_validate_script(dir: &PathBuf) -> AnyhowResult<()> {
+fn write_validate_script(dir: &Path) -> AnyhowResult<()> {
     let validate_sh = r#"#!/bin/bash
 # Validate package.json against the official Fresh package schema
 #
@@ -1611,7 +1962,7 @@ curl -sSL https://raw.githubusercontent.com/sinelaw/fresh/main/scripts/validate-
 }
 
 /// Write a validation script for themes (validates both package.json and theme.json)
-fn write_theme_validate_script(dir: &PathBuf) -> AnyhowResult<()> {
+fn write_theme_validate_script(dir: &Path) -> AnyhowResult<()> {
     let validate_sh = r#"#!/bin/bash
 # Validate Fresh theme package
 #
@@ -1644,7 +1995,7 @@ except jsonschema.ValidationError as e:
     write_script_file(dir, "validate.sh", validate_sh)
 }
 
-fn write_script_file(dir: &PathBuf, name: &str, content: &str) -> AnyhowResult<()> {
+fn write_script_file(dir: &Path, name: &str, content: &str) -> AnyhowResult<()> {
     std::fs::write(dir.join(name), content)?;
 
     // Make executable on Unix
@@ -1659,36 +2010,54 @@ fn write_script_file(dir: &PathBuf, name: &str, content: &str) -> AnyhowResult<(
     Ok(())
 }
 
+fn write_package_json(
+    dir: &Path,
+    name: &str,
+    description: &str,
+    author: &str,
+    pkg_type: &str,
+    default_description: &str,
+    fresh_section: &str,
+) -> AnyhowResult<()> {
+    let desc = if description.is_empty() {
+        default_description
+    } else {
+        description
+    };
+    let content = format!(
+        r#"{{
+  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
+  "name": "{name}",
+  "version": "0.1.0",
+  "description": "{desc}",
+  "type": "{pkg_type}",
+  "author": "{author}",
+  "license": "MIT",
+  "fresh": {fresh_section}
+}}
+"#
+    );
+    std::fs::write(dir.join("package.json"), content)?;
+    Ok(())
+}
+
 fn create_plugin_package(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     description: &str,
     author: &str,
 ) -> AnyhowResult<()> {
-    // package.json
-    let package_json = format!(
-        r#"{{
-  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
-  "name": "{}",
-  "version": "0.1.0",
-  "description": "{}",
-  "type": "plugin",
-  "author": "{}",
-  "license": "MIT",
-  "fresh": {{
-    "main": "plugin.ts"
-  }}
-}}
-"#,
+    write_package_json(
+        dir,
         name,
-        if description.is_empty() {
-            "A Fresh plugin".to_string()
-        } else {
-            description.to_string()
-        },
-        author
-    );
-    std::fs::write(dir.join("package.json"), package_json)?;
+        description,
+        author,
+        "plugin",
+        "A Fresh plugin",
+        r#"{
+    "main": "plugin.ts"
+  }"#,
+    )?;
 
     // validate.sh
     write_validate_script(dir)?;
@@ -1768,35 +2137,22 @@ MIT
 }
 
 fn create_theme_package(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     description: &str,
     author: &str,
 ) -> AnyhowResult<()> {
-    // package.json
-    let package_json = format!(
-        r#"{{
-  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
-  "name": "{}",
-  "version": "0.1.0",
-  "description": "{}",
-  "type": "theme",
-  "author": "{}",
-  "license": "MIT",
-  "fresh": {{
-    "theme": "theme.json"
-  }}
-}}
-"#,
+    write_package_json(
+        dir,
         name,
-        if description.is_empty() {
-            "A Fresh theme".to_string()
-        } else {
-            description.to_string()
-        },
-        author
-    );
-    std::fs::write(dir.join("package.json"), package_json)?;
+        description,
+        author,
+        "theme",
+        "A Fresh theme",
+        r#"{
+    "theme": "theme.json"
+  }"#,
+    )?;
 
     // validate.sh - validates both package.json and theme.json
     write_theme_validate_script(dir)?;
@@ -1881,7 +2237,7 @@ MIT
 }
 
 fn create_language_package(
-    dir: &PathBuf,
+    dir: &Path,
     name: &str,
     description: &str,
     author: &str,
@@ -1889,43 +2245,30 @@ fn create_language_package(
     // Create grammars directory
     std::fs::create_dir_all(dir.join("grammars"))?;
 
-    // package.json
-    let package_json = format!(
-        r#"{{
-  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
-  "name": "{}",
-  "version": "0.1.0",
-  "description": "{}",
-  "type": "language",
-  "author": "{}",
-  "license": "MIT",
-  "fresh": {{
-    "grammar": {{
+    write_package_json(
+        dir,
+        name,
+        description,
+        author,
+        "language",
+        "Language support for Fresh",
+        r#"{
+    "grammar": {
       "file": "grammars/syntax.sublime-syntax",
       "extensions": ["ext"]
-    }},
-    "language": {{
+    },
+    "language": {
       "commentPrefix": "//",
       "tabSize": 4,
       "autoIndent": true
-    }},
-    "lsp": {{
+    },
+    "lsp": {
       "command": "language-server",
       "args": ["--stdio"],
       "autoStart": true
-    }}
-  }}
-}}
-"#,
-        name,
-        if description.is_empty() {
-            "Language support for Fresh".to_string()
-        } else {
-            description.to_string()
-        },
-        author
-    );
-    std::fs::write(dir.join("package.json"), package_json)?;
+    }
+  }"#,
+    )?;
 
     // validate.sh
     write_validate_script(dir)?;
@@ -2051,6 +2394,72 @@ MIT
 // === Session persistence commands ===
 
 /// List active sessions
+fn list_grammars_command() -> AnyhowResult<()> {
+    let dir_context = fresh::config_io::DirectoryContext::from_system()?;
+    let config_dir = dir_context.config_dir.clone();
+    let registry = fresh::primitives::grammar::GrammarRegistry::for_editor(config_dir);
+    // The unified catalog already includes tree-sitter-only languages
+    // (e.g. TypeScript) alongside syntect grammars.
+    let grammars = registry.available_grammar_info();
+
+    if grammars.is_empty() {
+        println!("No grammars available.");
+        return Ok(());
+    }
+
+    // Find the longest name and short name for alignment
+    let max_name_len = grammars.iter().map(|g| g.name.len()).max().unwrap_or(0);
+    let max_short_len = grammars
+        .iter()
+        .map(|g| g.short_name.as_ref().map_or(0, |s| s.len()))
+        .max()
+        .unwrap_or(0)
+        .max("SHORT NAME".len());
+
+    println!(
+        "{:<nw$}  {:<sw$}  {:<12}  EXTENSIONS",
+        "GRAMMAR",
+        "SHORT NAME",
+        "SOURCE",
+        nw = max_name_len,
+        sw = max_short_len
+    );
+    println!(
+        "{:<nw$}  {:<sw$}  {:<12}  ----------",
+        "-------",
+        "----------",
+        "------",
+        nw = max_name_len,
+        sw = max_short_len
+    );
+    for grammar in &grammars {
+        let extensions = if grammar.file_extensions.is_empty() {
+            String::new()
+        } else {
+            grammar
+                .file_extensions
+                .iter()
+                .map(|e| format!(".{}", e))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let short = grammar.short_name.as_deref().unwrap_or("");
+        println!(
+            "{:<nw$}  {:<sw$}  {:<12}  {}",
+            grammar.name,
+            short,
+            grammar.source.to_string(),
+            extensions,
+            nw = max_name_len,
+            sw = max_short_len
+        );
+    }
+
+    println!("\n{} grammars available.", grammars.len());
+    println!("Use the grammar name or short name in config: languages -> <language> -> grammar");
+    Ok(())
+}
+
 fn list_sessions_command() -> AnyhowResult<()> {
     let socket_dir = SocketPaths::socket_directory()?;
 
@@ -2110,11 +2519,28 @@ fn list_sessions_command() -> AnyhowResult<()> {
         println!("No active sessions.");
     } else {
         println!("Active sessions:");
-        for (id, display) in sessions {
-            println!("  {} ({})", display, id);
+        for (id, display) in &sessions {
+            if display != id {
+                // Working-directory session: show path and usable name
+                println!("  {}  (name: {})", display, id);
+            } else {
+                // Named session
+                println!("  {}", id);
+            }
         }
         println!();
-        println!("Attach with: fresh session attach [NAME]  or  fresh -a [NAME]");
+        // Show the most convenient attach form for each session type
+        if sessions.len() == 1 {
+            let (id, display) = &sessions[0];
+            if display != id {
+                println!("Attach with: fresh -a  (from that directory)");
+                println!("         or: fresh -a {}", id);
+            } else {
+                println!("Attach with: fresh -a {}", id);
+            }
+        } else {
+            println!("Attach with: fresh -a [NAME]");
+        }
     }
 
     Ok(())
@@ -2207,7 +2633,29 @@ fn run_server_command(args: &Args) -> AnyhowResult<()> {
         args.session_name
     );
 
-    let working_dir = std::env::current_dir()?;
+    // Parse the optional `--ssh-url` the client forwarded via
+    // `spawn_server_detached`.  If present, we connect here — before
+    // building any editor config — so config loading can key off the
+    // remote working directory.
+    let remote_info = match args.ssh_url.as_deref() {
+        Some(url) => Some(parse_ssh_url_arg(url)?),
+        None => None,
+    };
+
+    let StartupAuthority {
+        authority,
+        remote_session,
+    } = create_startup_authority(&remote_info)?;
+
+    // Working directory: local cwd by default; remote path when the
+    // daemon was spawned with an `--ssh-url`.  Config layering is
+    // always keyed off the local cwd (the remote host doesn't have
+    // our config layout), matching the standalone path.
+    let working_dir = match &remote_info {
+        Some(remote) => PathBuf::from(&remote.path),
+        None => std::env::current_dir()?,
+    };
+    let config_dir = std::env::current_dir()?;
     eprintln!("[server] Working directory: {:?}", working_dir);
 
     let dir_context = fresh::config_io::DirectoryContext::from_system()?;
@@ -2217,9 +2665,17 @@ fn run_server_command(args: &Args) -> AnyhowResult<()> {
     let editor_config = if let Some(config_path) = &args.config {
         config::Config::load_from_file(config_path)?
     } else {
-        config::Config::load_with_layers(&dir_context, &working_dir)
+        config::Config::load_with_layers(&dir_context, &config_dir)
     };
     eprintln!("[server] Editor config loaded");
+
+    let session_keepalive: Option<Box<dyn std::any::Any + Send>> =
+        remote_session.map(|rs| Box::new(rs) as Box<dyn std::any::Any + Send>);
+    let startup_authority = if remote_info.is_some() {
+        Some(authority)
+    } else {
+        None
+    };
 
     let config = EditorServerConfig {
         working_dir: working_dir.clone(),
@@ -2228,6 +2684,9 @@ fn run_server_command(args: &Args) -> AnyhowResult<()> {
         editor_config,
         dir_context,
         plugins_enabled: !args.no_plugins,
+        init_enabled: !args.no_init,
+        startup_authority,
+        session_keepalive,
     };
 
     eprintln!("[server] Creating EditorServer...");
@@ -2253,6 +2712,37 @@ fn run_server_command(args: &Args) -> AnyhowResult<()> {
     Ok(())
 }
 
+/// Resolve a session name to socket paths.
+///
+/// When `session_name` is `None`, uses the current working directory.
+/// When it looks like a filesystem path (absolute or `.`-relative), tries to
+/// resolve it as a working-directory session first, falling back to a literal
+/// named session.  This lets users pass paths like `/home/user/project` to
+/// target sessions that were started with `fresh -a` in that directory.
+fn resolve_session(session_name: Option<&str>) -> anyhow::Result<SocketPaths> {
+    let working_dir = std::env::current_dir()?;
+
+    match session_name {
+        None => Ok(SocketPaths::for_working_dir(&working_dir)?),
+        Some(name) => {
+            // If the name looks like a path, try working-dir resolution first.
+            let path = std::path::Path::new(name);
+            if path.is_absolute() || name.contains('/') || name.contains('\\') {
+                // Canonicalize so that e.g. `/home/user/project/` and
+                // `/home/user/project` both match.
+                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                let by_dir = SocketPaths::for_working_dir(&canonical)?;
+                if by_dir.is_server_alive() {
+                    return Ok(by_dir);
+                }
+            }
+
+            // Fall back to literal session name lookup.
+            Ok(SocketPaths::for_session_name(name)?)
+        }
+    }
+}
+
 /// Open files in a running session without attaching
 fn run_open_files_command(
     session_name: Option<&str>,
@@ -2261,7 +2751,7 @@ fn run_open_files_command(
 ) -> AnyhowResult<()> {
     use fresh::server::daemon::is_process_running;
     use fresh::server::protocol::{
-        ClientControl, ClientHello, FileRequest, ServerControl, TermSize, PROTOCOL_VERSION,
+        ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
     };
     use fresh::server::spawn_server_detached;
 
@@ -2270,60 +2760,41 @@ fn run_open_files_command(
         return Ok(());
     }
 
+    // Strip any `ssh://` / `user@host:path` specs off the file list
+    // before they reach `build_file_requests` — those entries become
+    // the daemon's authority, not local path requests.  An existing
+    // server keeps its authority; we don't re-attach through a
+    // remote URL after the fact.
+    let ssh_url = extract_ssh_url_from_files(files)?;
+    let local_files: Vec<String> = if ssh_url.is_some() {
+        files
+            .iter()
+            .filter_map(|f| match parse_location(f) {
+                ParsedLocation::Remote(r) => Some(r.path),
+                ParsedLocation::Local(_) => None,
+            })
+            .collect()
+    } else {
+        files.to_vec()
+    };
+
     let working_dir = std::env::current_dir()?;
+    let file_requests = build_file_requests(&local_files, &working_dir);
 
-    // Build file requests BEFORE starting server, filtering out directories
-    let mut file_requests: Vec<FileRequest> = Vec::new();
-    let mut skipped_dirs = 0;
-
-    for f in files {
-        let loc = parse_file_location(f);
-        // Resolve relative paths to absolute paths based on client's working directory
-        let abs_path = if loc.path.is_relative() {
-            working_dir.join(&loc.path)
-        } else {
-            loc.path.clone()
-        };
-        // Canonicalize to resolve symlinks and normalize
-        let canonical_path = abs_path.canonicalize().unwrap_or(abs_path);
-
-        if canonical_path.is_dir() {
-            skipped_dirs += 1;
-            eprintln!("Skipping directory: {}", canonical_path.display());
-            continue;
-        }
-
-        file_requests.push(FileRequest {
-            path: canonical_path.to_string_lossy().to_string(),
-            line: loc.line,
-            column: loc.column,
-            end_line: loc.end_line,
-            end_column: loc.end_column,
-            message: loc.message,
-        });
-    }
-
-    // Check if we have any files to open BEFORE starting the server
     if file_requests.is_empty() {
-        if skipped_dirs > 0 {
-            eprintln!("No files to open (only directories were specified).");
-        }
+        eprintln!("No files to open (only directories were specified).");
         return Ok(());
     }
 
     // Determine socket paths based on session name or working directory
-    let socket_paths = if let Some(name) = session_name {
-        SocketPaths::for_session_name(name)?
-    } else {
-        SocketPaths::for_working_dir(&working_dir)?
-    };
+    let socket_paths = resolve_session(session_name)?;
 
     // Clean up stale sockets if server is dead
     socket_paths.cleanup_if_stale();
 
     // Start server if not running (like nvr does by default)
     let server_was_started = if !socket_paths.is_server_alive() {
-        let _pid = spawn_server_detached(session_name)?;
+        let _pid = spawn_server_detached(session_name, ssh_url.as_deref())?;
 
         // Wait for server to be ready
         loop {
@@ -2384,11 +2855,22 @@ fn run_open_files_command(
     conn.write_control(&msg)?;
 
     if server_was_started {
-        // We just started the server — drop this fire-and-forget connection
-        // and attach as a normal interactive client so the user can see the
-        // editor. --wait is ignored in this path; the user quits normally.
+        // We just started the server and already sent the OpenFiles command
+        // above.  If we have a controlling terminal, attach interactively so
+        // the user can see the editor.  Otherwise (pipes, scripts, non-tty
+        // contexts) just report success — the server is running headless and
+        // the files have been queued.
         drop(conn);
-        return run_attach(session_name);
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return run_attach(session_name, &[]);
+        } else {
+            eprintln!(
+                "Started new session and opened {} file(s). Attach with: fresh -a{}",
+                file_requests.len(),
+                session_name.map_or(String::new(), |n| format!(" {}", n)),
+            );
+            return Ok(());
+        }
     } else if wait {
         // Existing session — block until the server sends WaitComplete
         loop {
@@ -2414,10 +2896,10 @@ fn run_open_files_command(
 
 /// Attach to an existing session, starting a server if needed
 fn run_attach_command(args: &Args) -> AnyhowResult<()> {
-    run_attach(args.session_name.as_deref())
+    run_attach(args.session_name.as_deref(), &args.files)
 }
 
-fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
+fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> {
     use crossterm::terminal::enable_raw_mode;
     use fresh::server::protocol::{
         ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
@@ -2442,12 +2924,15 @@ fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
 
     let working_dir = std::env::current_dir()?;
 
+    // If the user passed any remote specs, the URL becomes the
+    // daemon's startup authority — and any subsequent `OpenFiles`
+    // carries only the path components (see filtering below).  We
+    // only consume the URL when *starting* a server; attaching to
+    // an existing session ignores it.
+    let ssh_url = extract_ssh_url_from_files(files)?;
+
     // Determine socket paths based on session name or working directory
-    let socket_paths = if let Some(name) = session_name {
-        SocketPaths::for_session_name(name)?
-    } else {
-        SocketPaths::for_working_dir(&working_dir)?
-    };
+    let socket_paths = resolve_session(session_name)?;
 
     // Clean up stale sockets if server is dead
     if socket_paths.cleanup_if_stale() {
@@ -2459,7 +2944,7 @@ fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
         eprintln!("Starting server...");
 
         // Spawn server in background
-        let _pid = spawn_server_detached(session_name)?;
+        let _pid = spawn_server_detached(session_name, ssh_url.as_deref())?;
         true
     } else {
         false
@@ -2537,7 +3022,37 @@ fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
         }
     }
 
+    // Send file open requests if any files were specified on the
+    // command line.  When `ssh_url` was extracted above the file
+    // list carried remote specs; strip them to bare paths so the
+    // daemon opens them through its (SSH) authority.
+    if !files.is_empty() {
+        let local_files: Vec<String> = if ssh_url.is_some() {
+            files
+                .iter()
+                .filter_map(|f| match parse_location(f) {
+                    ParsedLocation::Remote(r) => Some(r.path),
+                    ParsedLocation::Local(_) => None,
+                })
+                .collect()
+        } else {
+            files.to_vec()
+        };
+        let file_requests = build_file_requests(&local_files, &working_dir);
+        if !file_requests.is_empty() {
+            let msg = serde_json::to_string(&ClientControl::OpenFiles {
+                files: file_requests,
+                wait: false,
+            })?;
+            conn.write_control(&msg)?;
+        }
+    }
+
     // Continue to relay loop
+
+    // Save original console mode before anything modifies it
+    #[cfg(windows)]
+    let original_console_mode = fresh_winterm::save_console_mode();
 
     // Enable raw mode - the server sends terminal setup sequences (alternate screen, etc.)
     // but we need raw mode so key presses are forwarded immediately
@@ -2550,6 +3065,11 @@ fn run_attach(session_name: Option<&str>) -> AnyhowResult<()> {
     // The server sends terminal setup sequences (alternate screen, mouse capture, etc.)
     // through us, so we must undo all of them, not just raw mode.
     fresh::services::terminal_modes::emergency_cleanup();
+
+    // Restore original console mode AFTER all cleanup to ensure Quick Edit
+    // mode is properly restored on Windows.
+    #[cfg(windows)]
+    let _ = fresh_winterm::restore_console_mode(original_console_mode);
 
     // Handle result
     match result {
@@ -2599,12 +3119,348 @@ fn print_deprecation_warnings(cli: &Cli) {
     }
 }
 
+fn is_interactive_launch(args: &Args) -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && !args.stdin
+        && !args.attach
+        && !args.server
+        && !args.list_sessions
+        && args.kill.is_none()
+        && args.open_files_in_session.is_none()
+        && args.init.is_none()
+        && !args.list_grammars
+        && !args.dump_config
+        && !args.show_paths
+        && args.check_plugin.is_none()
+}
+
+fn show_paths_command() -> AnyhowResult<()> {
+    let dir_context = fresh::config_io::DirectoryContext::from_system()?;
+    fresh::services::log_dirs::print_all_paths(&dir_context);
+    Ok(())
+}
+
+fn dump_config_command(args: &Args) -> AnyhowResult<()> {
+    let dir_context = fresh::config_io::DirectoryContext::from_system()?;
+    let working_dir = std::env::current_dir().unwrap_or_default();
+    let config = if let Some(config_path) = &args.config {
+        config::Config::load_from_file(config_path)
+            .with_context(|| format!("Failed to load config from {}", config_path.display()))?
+    } else {
+        config::Config::load_with_layers(&dir_context, &working_dir)
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&config).context("Failed to serialize config")?
+    );
+    Ok(())
+}
+
+/// Route non-interactive subcommands. Returns `Some(result)` if a subcommand
+/// was handled so the caller can propagate it; returns `None` for an
+/// interactive editor launch.
+fn run_if_subcommand(args: &Args) -> Option<AnyhowResult<()>> {
+    if args.show_paths {
+        return Some(show_paths_command());
+    }
+    if args.dump_config {
+        return Some(dump_config_command(args));
+    }
+    if args.list_grammars {
+        return Some(list_grammars_command());
+    }
+    #[cfg(feature = "plugins")]
+    if let Some(plugin_path) = &args.check_plugin {
+        return Some(check_plugin_bundle(plugin_path));
+    }
+    if let Some(ref pkg_type) = args.init {
+        if pkg_type.as_deref() == Some("check") {
+            return Some(init_check_command());
+        }
+        return Some(init_package_command(pkg_type.clone()));
+    }
+    if args.list_sessions {
+        return Some(list_sessions_command());
+    }
+    if let Some(ref session) = args.kill {
+        return Some(kill_session_command(session.as_deref(), args));
+    }
+    if args.server {
+        return Some(run_server_command(args));
+    }
+    if let Some((session_name, files, wait)) = &args.open_files_in_session {
+        return Some(run_open_files_command(
+            session_name.as_deref(),
+            files,
+            *wait,
+        ));
+    }
+    if args.attach {
+        return Some(run_attach_command(args));
+    }
+    #[cfg(feature = "gui")]
+    if args.gui {
+        return Some(fresh::gui::run_gui(
+            &args.files,
+            args.no_plugins,
+            args.no_init,
+            args.config.as_ref(),
+            args.locale.as_deref(),
+            args.no_session,
+            args.log_file.as_ref(),
+        ));
+    }
+    None
+}
+
+/// Attempt workspace or hot-exit restore when the editor restarts into a new project.
+fn restore_editor_workspace(editor: &mut Editor, args: &Args) {
+    if args.force_restore || editor.config().editor.restore_previous_session {
+        match editor.try_restore_workspace() {
+            Ok(true) => tracing::info!("Workspace restored successfully"),
+            Ok(false) => tracing::debug!("No previous workspace found"),
+            Err(e) => tracing::warn!("Failed to restore workspace: {}", e),
+        }
+    } else {
+        tracing::info!(
+            "Skipping workspace restore on restart: editor.restore_previous_session is disabled"
+        );
+        // Session restore opted out, but hot-exit content for the newly-switched
+        // project is still restored so in-progress work is not lost.
+        match editor.try_restore_hot_exit_buffers() {
+            Ok(n) if n > 0 => tracing::info!(
+                "Restored {} hot-exit buffer(s) on restart despite skipping session restore",
+                n
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to restore hot-exit buffers on restart: {}", e),
+        }
+    }
+}
+
 fn main() -> AnyhowResult<()> {
-    real_main()
+    match real_main() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // SSH connection errors are expected user-facing failures, not bugs.
+            // Print a clean error message without the stack backtrace.
+            if e.downcast_ref::<remote::SshError>().is_some()
+                || e.chain()
+                    .any(|cause| cause.downcast_ref::<remote::SshError>().is_some())
+            {
+                eprintln!("Error: {:#}", e);
+                std::process::exit(1);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Scan raw CLI arguments for `--locale <X>` / `--locale=X` so we can
+/// initialize i18n *before* clap parses (and potentially exits on
+/// `--help` / `--version`).  Returns the user-supplied locale string,
+/// if any.
+fn pre_clap_locale_override() -> Option<String> {
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--locale" {
+            return iter.next();
+        }
+        if let Some(rest) = arg.strip_prefix("--locale=") {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// Render the localized `after_help` block from translation keys.
+///
+/// Section headers and prose are translated via `i18n::t`; literal
+/// CLI invocations (e.g. `fresh -a mysession`) are kept verbatim
+/// because they are commands the user would actually type.
+fn build_localized_after_help() -> String {
+    use fresh::i18n::t;
+    let mut out = String::new();
+
+    out.push_str(&format!("{}\n", t("cli.section.commands")));
+    out.push_str(&format!(
+        "  config show               {}\n",
+        t("cli.cmd.config_show")
+    ));
+    out.push_str(&format!(
+        "  config paths              {}\n",
+        t("cli.cmd.config_paths")
+    ));
+    out.push_str(&format!(
+        "  grammar list              {}\n",
+        t("cli.cmd.grammar_list")
+    ));
+    out.push_str(&format!(
+        "  init                      {}\n",
+        t("cli.cmd.init")
+    ));
+    out.push('\n');
+
+    out.push_str(&format!("{}\n", t("cli.section.session")));
+    out.push_str(&format!(
+        "  session list              {}\n",
+        t("cli.cmd.session_list")
+    ));
+    out.push_str(&format!(
+        "  session attach [NAME]     {}\n",
+        t("cli.cmd.session_attach")
+    ));
+    out.push_str(&format!(
+        "  session new NAME          {}\n",
+        t("cli.cmd.session_new")
+    ));
+    out.push_str(&format!(
+        "  session kill [NAME]       {}\n",
+        t("cli.cmd.session_kill")
+    ));
+    out.push_str(&format!(
+        "  session open-file NAME FILES [--wait]   {}\n",
+        t("cli.cmd.session_open_file")
+    ));
+    out.push('\n');
+
+    out.push_str(&format!("{}\n", t("cli.section.file_syntax")));
+    out.push_str(&format!(
+        "  file.txt:10                  {}\n",
+        t("cli.file_syntax.line")
+    ));
+    out.push_str(&format!(
+        "  file.txt:10:5                {}\n",
+        t("cli.file_syntax.line_col")
+    ));
+    out.push_str(&format!(
+        "  file.txt:10-20               {}\n",
+        t("cli.file_syntax.range")
+    ));
+    out.push_str(&format!(
+        "  file.txt:10:5-20:1           {}\n",
+        t("cli.file_syntax.range_col")
+    ));
+    out.push_str(&format!(
+        "  file.txt:10@\"msg\"            {}\n",
+        t("cli.file_syntax.line_msg")
+    ));
+    out.push_str(&format!(
+        "  file.txt:10-20@\"msg\"         {}\n",
+        t("cli.file_syntax.range_msg")
+    ));
+    out.push_str(&format!("  {}\n", t("cli.file_syntax.tip")));
+    out.push('\n');
+
+    out.push_str(&format!("{}\n", t("cli.section.examples")));
+    out.push_str(&format!(
+        "  fresh file.txt                               {}\n",
+        t("cli.example.open")
+    ));
+    out.push_str(&format!(
+        "  fresh 'file.txt:10-20@\"Check this code\"'     {}\n",
+        t("cli.example.range_msg")
+    ));
+    out.push_str(&format!(
+        "  fresh -a                                     {}\n",
+        t("cli.example.attach")
+    ));
+    out.push_str(&format!(
+        "  fresh -a mysession                           {}\n",
+        t("cli.example.attach_name")
+    ));
+    out.push_str(&format!(
+        "  fresh --cmd session new proj                 {}\n",
+        t("cli.example.new_session")
+    ));
+    out.push_str(&format!(
+        "  fresh --cmd session open-file . main.rs     {}\n",
+        t("cli.example.open_in_dir")
+    ));
+    out.push_str(&format!(
+        "  fresh --cmd session open-file proj a.rs     {}\n",
+        t("cli.example.open_in_named")
+    ));
+    out.push('\n');
+
+    out.push_str(&format!("{}\n", t("cli.section.guided")));
+    out.push_str(&format!("  {}\n\n", t("cli.guided.wait_intro")));
+    out.push_str(&format!("  {}\n\n", t("cli.guided.session_dot")));
+    out.push_str(&format!("  {}\n", t("cli.guided.annotation")));
+    out.push_str("    fresh --cmd session open-file . 'src/main.rs:10-25@\"msg\"' --wait\n\n");
+    out.push_str(&format!("  {}\n", t("cli.guided.markdown")));
+    out.push_str(
+        "    fresh --cmd session open-file . \\\n      $'src/main.rs:10-25@\"**Title**\\nBody text here\"' --wait\n\n",
+    );
+    out.push_str(&format!("  {}\n", t("cli.guided.walkthrough")));
+    out.push_str("    fresh --cmd session open-file . 'a.rs:1-10@\"Step 1\"' --wait\n");
+    out.push_str("    fresh --cmd session open-file . 'b.rs:5-20@\"Step 2\"' --wait\n");
+    out.push_str("    fresh --cmd session open-file . 'c.rs:30@\"Step 3\"'   --wait\n\n");
+    out.push_str(&format!("  {}\n", t("cli.guided.git_editor")));
+    out.push_str("    git config core.editor 'fresh --cmd session open-file . --wait'\n\n");
+
+    out.push_str(&format!(
+        "{}: https://getfresh.dev/docs",
+        t("cli.documentation")
+    ));
+    out
+}
+
+/// Build the runtime clap `Command` with every help string resolved
+/// through the i18n backend.  The English `before_help` banner with
+/// the `--locale` tip is always shown — even when a user has set a
+/// locale they cannot read — so they can find their way back to
+/// English help.
+fn build_localized_cli_command() -> clap::Command {
+    use fresh::i18n::t;
+
+    let cmd = Cli::command()
+        .about(t("cli.about"))
+        .long_about(t("cli.about"))
+        .before_help(BEFORE_HELP_EN)
+        .after_help(build_localized_after_help())
+        .mut_arg("cmd", |a| a.help(t("cli.arg.cmd")))
+        .mut_arg("files", |a| a.help(t("cli.arg.files")))
+        .mut_arg("attach", |a| a.help(t("cli.arg.attach")))
+        .mut_arg("stdin", |a| a.help(t("cli.arg.stdin")))
+        .mut_arg("no_plugins", |a| a.help(t("cli.arg.no_plugins")))
+        .mut_arg("no_init", |a| a.help(t("cli.arg.no_init")))
+        .mut_arg("safe", |a| a.help(t("cli.arg.safe")))
+        .mut_arg("config", |a| a.help(t("cli.arg.config")))
+        .mut_arg("log_file", |a| a.help(t("cli.arg.log_file")))
+        .mut_arg("event_log", |a| a.help(t("cli.arg.event_log")))
+        .mut_arg("no_restore", |a| a.help(t("cli.arg.no_restore")))
+        .mut_arg("restore", |a| a.help(t("cli.arg.restore")))
+        .mut_arg("no_upgrade_check", |a| {
+            a.help(t("cli.arg.no_upgrade_check"))
+        })
+        .mut_arg("locale", |a| a.help(t("cli.arg.locale")));
+
+    #[cfg(feature = "gui")]
+    let cmd = cmd.mut_arg("gui", |a| a.help(t("cli.arg.gui")));
+
+    cmd
 }
 
 fn real_main() -> AnyhowResult<()> {
-    let cli = Cli::parse();
+    // Enable backtraces for error reporting if not already set.
+    // Errors that crash the editor are bugs — backtraces help diagnose them.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+
+    // Initialize i18n before clap parses, so `--help` (which exits inside
+    // clap before we read the config) is rendered with a localized
+    // supplement when the user has set `--locale` or `LANG`.  This is a
+    // best-effort detection: it uses only the raw `--locale` arg and the
+    // environment.  Once we've loaded the config we re-init with the
+    // resolved locale (CLI > config > env).
+    fresh::i18n::init_with_config(pre_clap_locale_override().as_deref());
+
+    let cli = match Cli::from_arg_matches(&build_localized_cli_command().get_matches()) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
     // Print deprecation warnings for old flags
     print_deprecation_warnings(&cli);
@@ -2612,98 +3468,24 @@ fn real_main() -> AnyhowResult<()> {
     // Convert to legacy Args format for compatibility
     let args: Args = cli.into();
 
-    // Handle --show-paths early (no terminal setup needed)
-    if args.show_paths {
-        let dir_context = fresh::config_io::DirectoryContext::from_system()?;
-        fresh::services::log_dirs::print_all_paths(&dir_context);
-        return Ok(());
+    // Expose `FRESH_INTERACTIVE=1` on the editor's process env when Fresh
+    // is launched as a human-interactive editor (stdin is a TTY, not a
+    // CLI sub-command, not --stdin / --attach / --server). init.ts (and
+    // plugins in general) read this via getEnv to branch on "real"
+    // launches — e.g., skip heavy workflow-setup under $GIT_EDITOR. See
+    // design §5 / §6.2.
+    if is_interactive_launch(&args) {
+        std::env::set_var("FRESH_INTERACTIVE", "1");
     }
 
-    // Handle --dump-config early (no terminal setup needed)
-    if args.dump_config {
-        let dir_context = fresh::config_io::DirectoryContext::from_system()?;
-        let working_dir = std::env::current_dir().unwrap_or_default();
-        let config = if let Some(config_path) = &args.config {
-            match config::Config::load_from_file(config_path) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    eprintln!(
-                        "Error: Failed to load config from {}: {}",
-                        config_path.display(),
-                        e
-                    );
-                    anyhow::bail!(
-                        "Failed to load config from {}: {}",
-                        config_path.display(),
-                        e
-                    );
-                }
-            }
-        } else {
-            config::Config::load_with_layers(&dir_context, &working_dir)
-        };
-
-        // Pretty-print the config as JSON
-        match serde_json::to_string_pretty(&config) {
-            Ok(json) => {
-                println!("{}", json);
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("Error: Failed to serialize config: {}", e);
-                anyhow::bail!("Failed to serialize config: {}", e);
-            }
-        }
+    if let Some(result) = run_if_subcommand(&args) {
+        return result;
     }
 
-    // Handle --check-plugin early (no terminal setup needed)
-    #[cfg(feature = "plugins")]
-    if let Some(plugin_path) = &args.check_plugin {
-        return check_plugin_bundle(plugin_path);
-    }
-
-    // Handle --init early (no terminal setup needed)
-    if let Some(ref pkg_type) = args.init {
-        return init_package_command(pkg_type.clone());
-    }
-
-    // Handle --list-sessions early (no terminal setup needed)
-    if args.list_sessions {
-        return list_sessions_command();
-    }
-
-    // Handle --kill: terminate a session
-    if let Some(ref session) = args.kill {
-        return kill_session_command(session.as_deref(), &args);
-    }
-
-    // Handle --server: run as daemon server
-    if args.server {
-        return run_server_command(&args);
-    }
-
-    // Handle open-file in session: send files to running session without attaching
-    if let Some((session_name, files, wait)) = &args.open_files_in_session {
-        return run_open_files_command(session_name.as_deref(), files, *wait);
-    }
-
-    // Handle --attach: connect to existing session
-    if args.attach {
-        return run_attach_command(&args);
-    }
-
-    // Handle --gui: launch in native window mode (no terminal setup needed)
-    #[cfg(feature = "gui")]
-    if args.gui {
-        return fresh::gui::run_gui(
-            &args.files,
-            args.no_plugins,
-            args.config.as_ref(),
-            args.locale.as_deref(),
-            args.no_session,
-            args.log_file.as_ref(),
-        );
-    }
+    // Save the original console mode BEFORE anything modifies it (raw mode,
+    // enable_vt_input, etc.). Restored at the very end after all cleanup.
+    #[cfg(windows)]
+    let original_console_mode = fresh_winterm::save_console_mode();
 
     let SetupState {
         config,
@@ -2721,8 +3503,7 @@ fn real_main() -> AnyhowResult<()> {
         #[cfg(not(target_os = "linux"))]
         gpm_client,
         mut terminal_modes,
-        filesystem,
-        process_spawner,
+        authority: startup_authority,
         _remote_session,
     } = initialize_app(&args).context("Failed to initialize application")?;
 
@@ -2735,6 +3516,32 @@ fn real_main() -> AnyhowResult<()> {
     // Track whether we should restore workspace on restart (for project switching)
     let mut restore_workspace_on_restart = false;
 
+    // Authority that will drive the next `Editor` constructed in the
+    // loop. Starts from the startup authority (local or SSH); when a
+    // plugin calls `editor.setAuthority(...)` the previous Editor
+    // stashes the new authority in its `pending_authority` slot, which
+    // we consume right before dropping it below.
+    let mut current_authority = startup_authority;
+
+    // Status-message log path is just a clone-able path — capture it
+    // once and re-bind to every restarted editor instance. Without
+    // this, the post-`setAuthority` editor has no path to point the
+    // "click status bar to view log" action at, and the user sees
+    // "status log not available" for every status message after the
+    // restart.
+    let status_log_path: Option<PathBuf> = tracing_handles.as_ref().map(|h| h.status.path.clone());
+
+    // Warning-log channel survives across restarts the same way,
+    // except the `Receiver<()>` is single-consumer and can't be
+    // cloned: lift the whole `(receiver, path)` pair out of the
+    // editor before we drop it, and reinstall it on the next one.
+    // Seeded here from `tracing_handles` (which then no longer carries
+    // the warning slot), and topped up post-iteration via
+    // `editor.take_warning_log()`.
+    let mut warning_log_slot: Option<(std::sync::mpsc::Receiver<()>, PathBuf)> = tracing_handles
+        .take()
+        .map(|h| (h.warning.receiver, h.warning.path));
+
     // Main editor loop - supports restarting with a new working directory
     // Returns (loop_result, last_update_result) tuple
     let (result, last_update_result) = loop {
@@ -2744,10 +3551,15 @@ fn real_main() -> AnyhowResult<()> {
         // Detect terminal color capability
         let color_capability = fresh::view::color_support::ColorCapability::detect();
 
-        // Use the filesystem created during initialization (supports both local and remote)
-        let fs = filesystem.clone();
+        // The editor constructor still takes a filesystem (tests use
+        // it to inject mocks). The authority we want is installed
+        // immediately after construction via `set_boot_authority`, so
+        // that later init — plugin loading, session restore, the
+        // first event-loop tick — sees the real backend.
+        let fs = current_authority.filesystem.clone();
 
-        let mut editor = Editor::with_working_dir(
+        tracing::info!("Creating editor instance...");
+        let mut editor = Editor::with_working_dir_opts(
             config.clone(),
             terminal_width,
             terminal_height,
@@ -2756,43 +3568,62 @@ fn real_main() -> AnyhowResult<()> {
             !args.no_plugins,
             color_capability,
             fs,
+            true, // defer_plugin_load: TUI startup; plugin loads run on the
+                  // plugin thread and arrive via AsyncBridge each tick.
         )
         .context("Failed to create editor instance")?;
+        tracing::info!("Editor instance created");
 
-        // Set the process spawner (LocalProcessSpawner for local, RemoteProcessSpawner for remote)
-        editor.set_process_spawner(process_spawner.clone());
+        // Install the real authority before any plugin / init.ts code
+        // runs, so everything that loads below sees the correct
+        // backend from the first tick.
+        editor.set_boot_authority(current_authority.clone());
+
+        // User init.ts: auto-load from ~/.config/fresh/init.ts through the
+        // same pipeline as "Load Plugin from Buffer". Respects `--no-init`
+        // and `--safe`, and is short-circuited by the crash fuse after
+        // repeated failures. Async to avoid blocking the boot sequence;
+        // the request goes through the same FIFO channel as the startup
+        // plugin loads, so init.ts evaluates after every batch plugin.
+        editor.load_init_script_async(!args.no_init);
+
+        // All plugins (registry + init.ts) have loaded — fire the
+        // plugins_loaded lifecycle hook so init.ts `on("plugins_loaded",
+        // fn)` callbacks can configure plugins via getPluginApi.
+        editor.fire_plugins_loaded_hook();
 
         #[cfg(target_os = "linux")]
         if gpm_client.is_some() {
             editor.set_gpm_active(true);
         }
 
+        // Re-wire the tracing log paths into every editor instance,
+        // not just the first. Status-bar click → open log, warning
+        // indicator click → open log all break otherwise after the
+        // first authority swap restart.
+        if let Some(p) = status_log_path.as_ref() {
+            editor.set_status_log_path(p.clone());
+        }
+        if let Some((rx, p)) = warning_log_slot.take() {
+            editor.set_warning_log(rx, p);
+        }
+
         if first_run {
+            tracing::info!("Running first-run setup...");
             handle_first_run_setup(
                 &mut editor,
                 &args,
                 &file_locations,
                 show_file_explorer,
                 &mut stdin_stream,
-                &mut tracing_handles,
                 workspace_enabled,
             )
             .context("Failed first run setup")?;
+            tracing::info!("First-run setup complete");
         } else {
             if restore_workspace_on_restart {
-                match editor.try_restore_workspace() {
-                    Ok(true) => {
-                        tracing::info!("Workspace restored successfully");
-                    }
-                    Ok(false) => {
-                        tracing::debug!("No previous workspace found");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to restore workspace: {}", e);
-                    }
-                }
+                restore_editor_workspace(&mut editor, &args);
             }
-
             editor.show_file_explorer();
             let path = current_working_dir
                 .as_ref()
@@ -2805,6 +3636,19 @@ fn real_main() -> AnyhowResult<()> {
             tracing::warn!("Failed to start recovery session: {}", e);
         }
 
+        // Drain any CLI file arguments that were queued by
+        // `initialize_app` BEFORE firing the ready hook, so plugins
+        // listening on `ready` see those buffers as already open. Left
+        // to the event loop, ready would fire first and plugins that
+        // branch on "is there a real file open?" (e.g. the dashboard)
+        // would race the file in and open on top of it.
+        editor.process_pending_file_opens();
+
+        // Workspace restored, initial buffers opened, recovery session up —
+        // fire the `ready` lifecycle hook (design M2, §3.3 phase 3) before
+        // handing off to the event loop.
+        editor.fire_ready_hook();
+
         let iteration = run_editor_iteration(
             &mut editor,
             workspace_enabled,
@@ -2812,12 +3656,27 @@ fn real_main() -> AnyhowResult<()> {
             &key_translator,
             #[cfg(target_os = "linux")]
             &gpm_client,
+            &mut terminal_modes,
         )
         .context("Editor iteration failed")?;
 
         let update_result = iteration.update_result;
         let restart_dir = iteration.restart_dir;
         let loop_result = iteration.loop_result;
+
+        // If a plugin called `editor.setAuthority(...)` (or cleared it)
+        // during this iteration, the editor parked the replacement in
+        // `pending_authority` and triggered a restart. Move it into
+        // the loop-local var *before* dropping the editor so the next
+        // iteration builds against the new backend.
+        if let Some(new_authority) = editor.take_pending_authority() {
+            tracing::info!("Authority transition queued; restarting editor");
+            current_authority = new_authority;
+        }
+
+        // Pluck the warning-log channel back out of the soon-to-be-
+        // dropped editor so the next iteration can re-bind it.
+        warning_log_slot = editor.take_warning_log();
 
         drop(editor);
 
@@ -2840,6 +3699,13 @@ fn real_main() -> AnyhowResult<()> {
 
     // Restore terminal state
     terminal_modes.undo();
+
+    // Restore the original console mode AFTER all other cleanup (crossterm's
+    // disable_raw_mode, DisableMouseCapture, etc.) to ensure Quick Edit mode
+    // is properly restored. Without this, text selection with mouse doesn't
+    // work in Windows Terminal after exiting fresh.
+    #[cfg(windows)]
+    let _ = fresh_winterm::restore_console_mode(original_console_mode);
 
     // Check for updates after terminal is restored (using cached result)
     if let Some(update_result) = last_update_result {
@@ -2865,6 +3731,40 @@ fn real_main() -> AnyhowResult<()> {
     result.context("Editor loop returned an error")
 }
 
+/// Handle a pending suspend request from the editor.
+///
+/// Tears down the TUI, raises SIGTSTP so the user drops back to the shell,
+/// and on resume (`fg`) re-enables the modes we just undid and asks for a
+/// full redraw. Windows doesn't have Unix job control, so the action is a
+/// no-op there beyond a status message.
+fn handle_suspend_request(
+    editor: &mut Editor,
+    terminal_modes: &mut TerminalModes,
+) -> AnyhowResult<()> {
+    #[cfg(unix)]
+    {
+        let keyboard_config = KeyboardConfig {
+            disambiguate_escape_codes: editor.config().editor.keyboard_disambiguate_escape_codes,
+            report_event_types: editor.config().editor.keyboard_report_event_types,
+            report_alternate_keys: editor.config().editor.keyboard_report_alternate_keys,
+            report_all_keys_as_escape_codes: editor
+                .config()
+                .editor
+                .keyboard_report_all_keys_as_escape_codes,
+        };
+        terminal_modes::suspend_and_resume(terminal_modes, Some(&keyboard_config))
+            .context("Failed to suspend process")?;
+        editor.request_full_redraw();
+        editor.set_status_message(fresh::i18n::resumed_after_suspend_message());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = terminal_modes;
+        editor.set_status_message(fresh::i18n::suspend_unsupported_message());
+    }
+    Ok(())
+}
+
 /// Main event loop
 #[cfg(target_os = "linux")]
 fn run_event_loop(
@@ -2873,12 +3773,14 @@ fn run_event_loop(
     workspace_enabled: bool,
     key_translator: &KeyTranslator,
     gpm_client: &Option<GpmClient>,
+    terminal_modes: &mut TerminalModes,
 ) -> AnyhowResult<()> {
     run_event_loop_common(
         editor,
         terminal,
         workspace_enabled,
         key_translator,
+        terminal_modes,
         |timeout| poll_with_gpm(gpm_client.as_ref(), timeout),
     )
 }
@@ -2890,11 +3792,27 @@ fn run_event_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     workspace_enabled: bool,
     key_translator: &KeyTranslator,
+    terminal_modes: &mut TerminalModes,
 ) -> AnyhowResult<()> {
-    use fresh::client::win_vt_input::{self, VtInputEvent};
     use fresh::server::input_parser::InputParser;
+    use fresh_winterm::{VtInputEvent, VtInputReader};
 
-    let old_console_mode = win_vt_input::enable_vt_input()?;
+    let old_console_mode = fresh_winterm::enable_vt_input()?;
+    // Use the configured mouse mode: when mouse_hover_enabled is true, use
+    // mode 1003 (all motion) for full hover support; otherwise use mode 1002
+    // (cell motion) which avoids the high event volume that can cause input
+    // corruption on Windows.
+    let mouse_mode = if editor.config().editor.mouse_hover_enabled {
+        fresh_winterm::MouseMode::AllMotion
+    } else {
+        fresh_winterm::MouseMode::CellMotion
+    };
+    fresh_winterm::enable_mouse_tracking(mouse_mode)?;
+
+    // Spawn a dedicated reader thread to drain the console buffer as fast
+    // as possible. This prevents the Windows console from dropping bytes
+    // from VT mouse sequences under high event rates (1003 all-motion).
+    let reader = VtInputReader::spawn();
 
     let mut input_parser = InputParser::new();
     let mut event_buffer: std::collections::VecDeque<CrosstermEvent> =
@@ -2905,49 +3823,54 @@ fn run_event_loop(
         terminal,
         workspace_enabled,
         key_translator,
+        terminal_modes,
         |timeout| -> AnyhowResult<Option<CrosstermEvent>> {
             // Return buffered events first
             if let Some(event) = event_buffer.pop_front() {
                 return Ok(Some(event));
             }
 
-            // Check for timed-out escape sequences
-            let flushed = input_parser.flush_timeout();
-            if !flushed.is_empty() {
-                for event in flushed {
-                    event_buffer.push_back(event);
-                }
-                return Ok(event_buffer.pop_front());
-            }
+            // Drain all available events from the reader thread
+            let mut got_any = false;
+            loop {
+                let event = if !got_any {
+                    reader.poll(timeout)
+                } else {
+                    // Subsequent: non-blocking drain of anything queued
+                    reader.try_recv()
+                };
 
-            // Wait for input with timeout
-            if !win_vt_input::poll_vt_input(timeout)? {
-                return Ok(None);
-            }
-
-            // Read VT input events
-            let vt_events = win_vt_input::read_vt_input()?;
-            for vt_event in vt_events {
-                match vt_event {
-                    VtInputEvent::VtBytes(bytes) => {
-                        // Parse raw VT bytes into crossterm events
+                match event {
+                    Some(VtInputEvent::VtBytes(bytes)) => {
                         let parsed = input_parser.parse(&bytes);
-                        for event in parsed {
-                            event_buffer.push_back(event);
+                        for ev in parsed {
+                            event_buffer.push_back(ev);
                         }
+                        got_any = true;
                     }
-                    VtInputEvent::Resize => {
-                        // Query actual terminal size
+                    Some(VtInputEvent::Resize) => {
                         if let Ok((cols, rows)) = crossterm::terminal::size() {
                             event_buffer.push_back(CrosstermEvent::Resize(cols, rows));
                         }
+                        got_any = true;
                     }
-                    VtInputEvent::FocusGained => {
+                    Some(VtInputEvent::FocusGained) => {
                         event_buffer.push_back(CrosstermEvent::FocusGained);
+                        got_any = true;
                     }
-                    VtInputEvent::FocusLost => {
+                    Some(VtInputEvent::FocusLost) => {
                         event_buffer.push_back(CrosstermEvent::FocusLost);
+                        got_any = true;
                     }
+                    None => break,
+                }
+            }
+
+            if !got_any {
+                // Timed out — flush standalone ESC if any (MS Edit pattern)
+                let flushed = input_parser.parse(b"");
+                for ev in flushed {
+                    event_buffer.push_back(ev);
                 }
             }
 
@@ -2955,10 +3878,9 @@ fn run_event_loop(
         },
     );
 
-    // Restore console mode
-    if let Err(e) = win_vt_input::restore_console_mode(old_console_mode) {
-        tracing::warn!("Failed to restore console mode: {}", e);
-    }
+    // Restore mouse tracking and console mode on exit
+    let _ = fresh_winterm::disable_mouse_tracking();
+    let _ = fresh_winterm::restore_console_mode(old_console_mode);
 
     result
 }
@@ -2970,12 +3892,14 @@ fn run_event_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     workspace_enabled: bool,
     key_translator: &KeyTranslator,
+    terminal_modes: &mut TerminalModes,
 ) -> AnyhowResult<()> {
     run_event_loop_common(
         editor,
         terminal,
         workspace_enabled,
         key_translator,
+        terminal_modes,
         |timeout| {
             if event_poll(timeout)? {
                 Ok(Some(event_read()?))
@@ -2991,6 +3915,7 @@ fn run_event_loop_common<F>(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     workspace_enabled: bool,
     _key_translator: &KeyTranslator,
+    terminal_modes: &mut TerminalModes,
     mut poll_event: F,
 ) -> AnyhowResult<()>
 where
@@ -3044,10 +3969,26 @@ where
             break;
         }
 
+        if editor.take_suspend_request() {
+            handle_suspend_request(editor, terminal_modes)?;
+            needs_render = true;
+            last_render = Instant::now() - FRAME_DURATION;
+            continue;
+        }
+
+        // Active animations force a render every FRAME_DURATION.
+        let animations_active = editor.animations.is_active();
+        if animations_active {
+            needs_render = true;
+        }
+
         if needs_render && last_render.elapsed() >= FRAME_DURATION {
             {
                 let _span = tracing::info_span!("terminal_draw").entered();
+                use crossterm::ExecutableCommand;
+                stdout().execute(crossterm::terminal::BeginSynchronizedUpdate)?;
                 terminal.draw(|frame| editor.render(frame))?;
+                stdout().execute(crossterm::terminal::EndSynchronizedUpdate)?;
             }
             last_render = Instant::now();
             needs_render = false;
@@ -3056,11 +3997,22 @@ where
         let event = if let Some(e) = pending_event.take() {
             Some(e)
         } else {
-            let timeout = if needs_render {
+            let mut timeout = if needs_render {
                 FRAME_DURATION.saturating_sub(last_render.elapsed())
             } else {
                 Duration::from_millis(50)
             };
+            // While animations are running, cap the timeout so the next
+            // iteration fires in time for the next frame — but never past
+            // the earliest animation deadline.
+            if editor.animations.is_active() {
+                let until_next_frame = FRAME_DURATION.saturating_sub(last_render.elapsed());
+                timeout = timeout.min(until_next_frame);
+                if let Some(deadline) = editor.animations.next_deadline() {
+                    let until_deadline = deadline.saturating_duration_since(Instant::now());
+                    timeout = timeout.min(until_deadline);
+                }
+            }
 
             poll_event(timeout)?
         };
@@ -3111,6 +4063,10 @@ where
             CrosstermEvent::Paste(text) => {
                 // External paste from terminal (bracketed paste mode)
                 editor.paste_text(text);
+                needs_render = true;
+            }
+            CrosstermEvent::FocusGained => {
+                editor.focus_gained();
                 needs_render = true;
             }
             _ => {}
@@ -3459,6 +4415,229 @@ mod tests {
             }
             ParsedLocation::Remote(_) => panic!("Expected local, got remote"),
         }
+    }
+
+    // Tests for the URL-style `ssh://` remote form.  The `$USER`
+    // fallback-dependent cases set the env var explicitly so they
+    // don't depend on the test runner's environment.
+
+    #[test]
+    fn test_parse_location_ssh_url_user_and_path() {
+        let loc = parse_location("ssh://alice@host.example/home/alice/main.rs");
+        match loc {
+            ParsedLocation::Remote(rl) => {
+                assert_eq!(rl.user, "alice");
+                assert_eq!(rl.host, "host.example");
+                assert_eq!(rl.port, None);
+                assert_eq!(rl.path, "/home/alice/main.rs");
+                assert_eq!(rl.line, None);
+                assert_eq!(rl.column, None);
+            }
+            ParsedLocation::Local(_) => panic!("Expected remote, got local"),
+        }
+    }
+
+    #[test]
+    fn test_parse_location_ssh_url_with_port() {
+        let loc = parse_location("ssh://bob@server:2222/etc/hosts");
+        match loc {
+            ParsedLocation::Remote(rl) => {
+                assert_eq!(rl.user, "bob");
+                assert_eq!(rl.host, "server");
+                assert_eq!(rl.port, Some(2222));
+                assert_eq!(rl.path, "/etc/hosts");
+            }
+            ParsedLocation::Local(_) => panic!("Expected remote, got local"),
+        }
+    }
+
+    #[test]
+    fn test_parse_location_ssh_url_with_port_and_line_col() {
+        let loc = parse_location("ssh://bob@server:2222/src/lib.rs:42:7");
+        match loc {
+            ParsedLocation::Remote(rl) => {
+                assert_eq!(rl.user, "bob");
+                assert_eq!(rl.host, "server");
+                assert_eq!(rl.port, Some(2222));
+                assert_eq!(rl.path, "/src/lib.rs");
+                assert_eq!(rl.line, Some(42));
+                assert_eq!(rl.column, Some(7));
+            }
+            ParsedLocation::Local(_) => panic!("Expected remote, got local"),
+        }
+    }
+
+    #[test]
+    fn test_parse_location_ssh_url_default_user_from_env() {
+        // Temporarily override $USER so the test doesn't depend on
+        // whatever the runner has set.
+        let prev_user = std::env::var("USER").ok();
+        let prev_username = std::env::var("USERNAME").ok();
+        // SAFETY: single-threaded test; no other thread reads $USER.
+        unsafe {
+            std::env::set_var("USER", "envuser");
+        }
+        let loc = parse_location("ssh://host.example/tmp/file.txt");
+        // Restore before asserting so a panic doesn't poison later tests.
+        unsafe {
+            match prev_user {
+                Some(ref v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+            match prev_username {
+                Some(ref v) => std::env::set_var("USERNAME", v),
+                None => std::env::remove_var("USERNAME"),
+            }
+        }
+        match loc {
+            ParsedLocation::Remote(rl) => {
+                assert_eq!(rl.user, "envuser");
+                assert_eq!(rl.host, "host.example");
+                assert_eq!(rl.port, None);
+                assert_eq!(rl.path, "/tmp/file.txt");
+            }
+            ParsedLocation::Local(_) => panic!("Expected remote, got local"),
+        }
+    }
+
+    #[test]
+    fn test_parse_location_ssh_url_missing_path_is_local() {
+        // `ssh://host` with no `/path` is malformed — fall through to
+        // the local parser, which stores the whole thing as a filename.
+        let loc = parse_location("ssh://host.example");
+        match loc {
+            ParsedLocation::Local(fl) => {
+                assert_eq!(fl.path, PathBuf::from("ssh://host.example"));
+            }
+            ParsedLocation::Remote(_) => panic!("Expected local, got remote"),
+        }
+    }
+
+    #[test]
+    fn test_parse_location_ssh_url_bad_port_is_local() {
+        // Non-numeric port → falls through to local.
+        let loc = parse_location("ssh://alice@host:not-a-port/file");
+        match loc {
+            ParsedLocation::Local(fl) => {
+                assert_eq!(fl.path, PathBuf::from("ssh://alice@host:not-a-port/file"));
+            }
+            ParsedLocation::Remote(_) => panic!("Expected local, got remote"),
+        }
+    }
+
+    #[test]
+    fn test_parse_location_ssh_url_empty_user_is_local() {
+        // `@` with an empty user is malformed — fall through to local.
+        let loc = parse_location("ssh://@host/path");
+        match loc {
+            ParsedLocation::Local(fl) => {
+                assert_eq!(fl.path, PathBuf::from("ssh://@host/path"));
+            }
+            ParsedLocation::Remote(_) => panic!("Expected local, got remote"),
+        }
+    }
+
+    // Tests for the client→daemon plumbing: a remote spec on the
+    // command line becomes a `--ssh-url` forwarded to
+    // `spawn_server_detached`, and the server side parses it back
+    // into the same shape the standalone path uses.
+
+    #[test]
+    fn test_remote_location_to_ssh_url_with_port() {
+        let remote = RemoteLocation {
+            user: "alice".into(),
+            host: "host.example".into(),
+            port: Some(2222),
+            path: "/etc/hosts".into(),
+            line: Some(10),
+            column: None,
+        };
+        // Line/column are per-file, not authority — they must not
+        // appear in the URL we hand to the daemon.
+        assert_eq!(
+            remote_location_to_ssh_url(&remote),
+            "ssh://alice@host.example:2222/etc/hosts"
+        );
+    }
+
+    #[test]
+    fn test_remote_location_to_ssh_url_no_port() {
+        let remote = RemoteLocation {
+            user: "bob".into(),
+            host: "server".into(),
+            port: None,
+            path: "/home/bob".into(),
+            line: None,
+            column: None,
+        };
+        assert_eq!(
+            remote_location_to_ssh_url(&remote),
+            "ssh://bob@server/home/bob"
+        );
+    }
+
+    #[test]
+    fn test_extract_ssh_url_none_for_local_only() {
+        let files = vec!["foo.txt".to_string(), "bar:42".to_string()];
+        assert_eq!(extract_ssh_url_from_files(&files).unwrap(), None);
+    }
+
+    #[test]
+    fn test_extract_ssh_url_from_ssh_urls() {
+        let files = vec![
+            "ssh://alice@host/a".to_string(),
+            "ssh://alice@host/b:10".to_string(),
+        ];
+        assert_eq!(
+            extract_ssh_url_from_files(&files).unwrap(),
+            Some("ssh://alice@host/a".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_ssh_url_from_scp_style() {
+        let files = vec!["alice@host:/etc/hosts".to_string()];
+        assert_eq!(
+            extract_ssh_url_from_files(&files).unwrap(),
+            Some("ssh://alice@host/etc/hosts".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_ssh_url_rejects_mismatched_hosts() {
+        let files = vec![
+            "ssh://alice@host1/a".to_string(),
+            "ssh://alice@host2/b".to_string(),
+        ];
+        assert!(extract_ssh_url_from_files(&files).is_err());
+    }
+
+    #[test]
+    fn test_extract_ssh_url_rejects_mixed_local_and_remote() {
+        let files = vec!["ssh://alice@host/a".to_string(), "local.txt".to_string()];
+        assert!(extract_ssh_url_from_files(&files).is_err());
+    }
+
+    #[test]
+    fn test_parse_ssh_url_arg_accepts_valid_url() {
+        let rl = parse_ssh_url_arg("ssh://alice@host:2222/path").unwrap();
+        assert_eq!(rl.user, "alice");
+        assert_eq!(rl.host, "host");
+        assert_eq!(rl.port, Some(2222));
+        assert_eq!(rl.path, "/path");
+    }
+
+    #[test]
+    fn test_parse_ssh_url_arg_rejects_scp_style() {
+        // The `--ssh-url` flag is URL-form only; scp-style is an
+        // error (we'd never send it over this flag).
+        assert!(parse_ssh_url_arg("alice@host:/path").is_err());
+    }
+
+    #[test]
+    fn test_parse_ssh_url_arg_rejects_malformed() {
+        assert!(parse_ssh_url_arg("ssh://host").is_err()); // no path
+        assert!(parse_ssh_url_arg("ssh://alice@host:bad/path").is_err()); // bad port
     }
 
     // Tests for range selection and message parsing

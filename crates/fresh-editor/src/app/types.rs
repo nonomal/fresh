@@ -1,5 +1,4 @@
 use crate::app::file_open::SortMode;
-use crate::input::keybindings::Action;
 use crate::model::event::{BufferId, ContainerId, LeafId, SplitDirection};
 use crate::services::async_bridge::LspMessageType;
 use ratatui::layout::Rect;
@@ -9,6 +8,69 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BACKGROUND_FILE: &str = "scripts/landscape-wide.txt";
+
+pub const FILE_EXPLORER_CONTEXT_MENU_WIDTH: u16 = 24;
+
+/// Unique identifier for a buffer group
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferGroupId(pub usize);
+
+/// Layout node for a buffer group
+#[derive(Debug, Clone)]
+pub enum GroupLayoutNode {
+    /// A scrollable panel backed by a real buffer
+    Scrollable {
+        /// Panel name (e.g., "tree", "picker")
+        id: String,
+        /// Buffer ID for this panel (set during creation)
+        buffer_id: Option<BufferId>,
+        /// Split leaf ID (set during creation)
+        split_id: Option<LeafId>,
+    },
+    /// A fixed-height panel (header, footer, toolbar)
+    Fixed {
+        /// Panel name
+        id: String,
+        /// Height in rows
+        height: u16,
+        /// Buffer ID (set during creation)
+        buffer_id: Option<BufferId>,
+        /// Split leaf ID (set during creation)
+        split_id: Option<LeafId>,
+    },
+    /// A horizontal or vertical split containing two children
+    Split {
+        direction: SplitDirection,
+        /// Ratio for the first child (0.0 to 1.0)
+        ratio: f32,
+        first: Box<GroupLayoutNode>,
+        second: Box<GroupLayoutNode>,
+    },
+}
+
+/// A buffer group: multiple splits/buffers appearing as one tab.
+///
+/// Each panel is a real buffer with its own viewport, scrollbar,
+/// and cursor. The group presents them as a single logical entity
+/// in the tab bar and buffer list.
+#[derive(Debug)]
+pub struct BufferGroup {
+    /// Unique ID
+    pub id: BufferGroupId,
+    /// Display name (shown in tab bar)
+    pub name: String,
+    /// Mode for keybindings
+    pub mode: String,
+    /// Layout tree
+    pub layout: GroupLayoutNode,
+    /// All buffer IDs in this group (panel name → buffer ID)
+    pub panel_buffers: HashMap<String, BufferId>,
+    /// All split leaf IDs in this group
+    pub panel_splits: HashMap<String, LeafId>,
+    /// The "representative" split that owns the tab entry.
+    /// This is typically the first scrollable panel.
+    pub representative_split: Option<LeafId>,
+}
 
 /// Pre-calculated line information for an event
 /// Calculated BEFORE buffer modification so line numbers are accurate
@@ -49,15 +111,6 @@ impl SearchState {
     pub const MAX_MATCHES: usize = 100_000;
 }
 
-/// A bookmark in the editor (position in a specific buffer)
-#[derive(Debug, Clone)]
-pub(super) struct Bookmark {
-    /// Buffer ID where the bookmark is set
-    pub buffer_id: BufferId,
-    /// Byte offset position in the buffer
-    pub position: usize,
-}
-
 /// State for interactive replace (query-replace)
 #[derive(Debug, Clone)]
 pub(super) struct InteractiveReplaceState {
@@ -84,10 +137,13 @@ pub(super) struct InteractiveReplaceState {
 pub enum BufferKind {
     /// A buffer backed by a file on disk
     File {
-        /// Path to the file
+        /// Host-side path to the file. Filesystem APIs and the
+        /// editor's own buffer state always speak in host paths.
         path: PathBuf,
-        /// LSP URI for the file
-        uri: Option<lsp_types::Uri>,
+        /// LSP-facing URI for the file. Already translated for the
+        /// active authority, so handing this to the LSP server is
+        /// always correct. See [`LspUri`] for the why.
+        uri: Option<LspUri>,
     },
     /// A virtual buffer (not backed by a file)
     /// Used for special buffers like *Diagnostics*, *Grep*, etc.
@@ -128,6 +184,27 @@ pub struct BufferMetadata {
     /// Whether this buffer should be hidden from tabs (used for composite source buffers)
     pub hidden_from_tabs: bool,
 
+    /// Whether this buffer is a synthetic placeholder created when the user
+    /// closed their last buffer with `auto_create_empty_buffer_on_last_buffer_close`
+    /// disabled. The editor's invariants require at least one buffer at all
+    /// times, so we keep this one around but render the split pane as blank
+    /// (no line numbers, no `~` filler) and hide it from tabs to give the
+    /// user a truly empty workspace.
+    pub synthetic_placeholder: bool,
+
+    /// Whether this buffer is opened in "preview" mode (ephemeral).
+    /// A preview buffer is one opened by a single-click in the file explorer
+    /// (or a similar soft-open gesture). Its tab is rendered in italic and
+    /// it is replaced the next time another file is opened the same way.
+    /// The flag is cleared ("promoted") when the user edits the buffer,
+    /// double-clicks the file, or otherwise signals commitment to the file.
+    ///
+    /// Intentionally ephemeral — never serialized into workspace or
+    /// recovery state. Restarting the editor always brings buffers back
+    /// as permanent tabs; preview status belongs to the current session's
+    /// exploration flow only.
+    pub is_preview: bool,
+
     /// Stable recovery ID for unnamed buffers.
     /// For file-backed buffers, recovery ID is computed from the path hash.
     /// For unnamed buffers, this is generated once and reused across auto-saves.
@@ -143,8 +220,14 @@ impl BufferMetadata {
         }
     }
 
-    /// Get the file URI if this is a file-backed buffer
-    pub fn file_uri(&self) -> Option<&lsp_types::Uri> {
+    /// Get the LSP-facing URI if this is a file-backed buffer.
+    ///
+    /// The URI is already translated for the active authority — i.e.
+    /// it carries the in-container path on a devcontainer authority
+    /// and the host path elsewhere. Hand it to the LSP server
+    /// directly; do NOT pass it to filesystem APIs (use
+    /// [`Self::file_path`] for that).
+    pub fn file_uri(&self) -> Option<&LspUri> {
         match &self.kind {
             BufferKind::File { uri, .. } => uri.as_ref(),
             BufferKind::Virtual { .. } => None,
@@ -186,6 +269,8 @@ impl BufferMetadata {
             binary: false,
             lsp_opened_with: HashSet::new(),
             hidden_from_tabs: false,
+            synthetic_placeholder: false,
+            is_preview: false,
             recovery_id: None,
         }
     }
@@ -205,6 +290,8 @@ impl BufferMetadata {
             binary: false,
             lsp_opened_with: HashSet::new(),
             hidden_from_tabs: false,
+            synthetic_placeholder: false,
+            is_preview: false,
             recovery_id: None,
         }
     }
@@ -212,36 +299,93 @@ impl BufferMetadata {
     /// Create metadata for a file-backed buffer
     ///
     /// # Arguments
-    /// * `path` - The canonical absolute path to the file
+    /// * `canonical_path` - The canonical (symlink-resolved) absolute path to the file
+    /// * `display_path` - The user-visible path before canonicalization (for library detection)
     /// * `working_dir` - The canonical working directory for computing relative display name
-    pub fn with_file(path: PathBuf, working_dir: &Path) -> Self {
-        // Compute URI from the absolute path
-        let file_uri = file_path_to_lsp_uri(&path);
+    /// * `path_translation` - Active authority's host↔remote workspace mapping;
+    ///   used to build the LSP-facing `file_uri` so an in-container LSP sees
+    ///   in-container paths. `None` for local/SSH authorities.
+    pub fn with_file(
+        canonical_path: PathBuf,
+        display_path: &Path,
+        working_dir: &Path,
+        path_translation: Option<&crate::services::authority::PathTranslation>,
+    ) -> Self {
+        // Compute URI from the absolute path. When the active authority
+        // has a host↔remote mapping (devcontainer attach), this is
+        // where the host path gets rewritten into the container path
+        // the LSP server actually understands.
+        let file_uri = LspUri::from_host_path(&canonical_path, path_translation);
 
         // Compute display name (project-relative when under working_dir, else absolute path).
         // Use canonicalized forms first to handle macOS /var -> /private/var differences.
-        let display_name = Self::display_name_for_path(&path, working_dir);
+        let display_name = Self::display_name_for_path(&canonical_path, working_dir);
 
-        // Check if this is a library file (in vendor directories or standard libraries)
-        let is_library = Self::is_library_path(&path, working_dir);
-        let (lsp_enabled, lsp_disabled_reason) = if is_library {
-            (false, Some(t!("lsp.disabled.library_file").to_string()))
-        } else {
-            (true, None)
-        };
+        // Check if this is a library file (in vendor directories or standard libraries).
+        // Library files are read-only (to prevent accidental edits) but LSP stays
+        // enabled so that Goto Definition, Hover, Find References, etc. still work
+        // when the user navigates into library source code (issue #1344).
+        //
+        // A file is only considered a library file if BOTH the canonical path and the
+        // user-visible path are in a library directory. This prevents symlinked dotfiles
+        // (e.g., ~/.bash_profile -> /nix/store/...) from being marked read-only when
+        // the user explicitly opened a non-library path (issue #1469).
+        let is_library = Self::is_library_path(&canonical_path, working_dir)
+            && Self::is_library_path(display_path, working_dir);
 
         Self {
             kind: BufferKind::File {
-                path,
+                path: canonical_path,
                 uri: file_uri,
             },
             display_name,
-            lsp_enabled,
-            lsp_disabled_reason,
+            lsp_enabled: true,
+            lsp_disabled_reason: None,
             read_only: is_library,
             binary: false,
             lsp_opened_with: HashSet::new(),
             hidden_from_tabs: false,
+            synthetic_placeholder: false,
+            is_preview: false,
+            recovery_id: None,
+        }
+    }
+
+    /// Create metadata for a buffer fetched from inside a container.
+    ///
+    /// Used by `Editor::open_lsp_uri_target` when a Goto-Definition
+    /// (or similar) URI lands on a path that exists only inside the
+    /// container — typically a stdlib / site-packages entry that
+    /// isn't bind-mounted onto the host. The buffer is read-only
+    /// because there's no host-side writeback path; LSP stays enabled
+    /// so further navigation from the fetched buffer (hover, more
+    /// goto-defs) keeps working.
+    ///
+    /// The supplied `uri` is the wire URI the LSP returned (already
+    /// in container-side coordinates) and is cached verbatim — no
+    /// host→remote translation, because the path *is* the remote
+    /// path. The display name is the file name, since the container
+    /// path has nothing to relativize against the host working dir.
+    pub fn with_container_file(container_path: PathBuf, uri: LspUri) -> Self {
+        let display_name = container_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| container_path.to_string_lossy().to_string());
+        Self {
+            kind: BufferKind::File {
+                path: container_path,
+                uri: Some(uri),
+            },
+            display_name,
+            lsp_enabled: true,
+            lsp_disabled_reason: None,
+            read_only: true,
+            binary: false,
+            lsp_opened_with: HashSet::new(),
+            hidden_from_tabs: false,
+            synthetic_placeholder: false,
+            is_preview: false,
             recovery_id: None,
         }
     }
@@ -377,6 +521,8 @@ impl BufferMetadata {
             binary: false,
             lsp_opened_with: HashSet::new(),
             hidden_from_tabs: false,
+            synthetic_placeholder: false,
+            is_preview: false,
             recovery_id: None,
         }
     }
@@ -394,6 +540,8 @@ impl BufferMetadata {
             binary: false,
             lsp_opened_with: HashSet::new(),
             hidden_from_tabs: true,
+            synthetic_placeholder: false,
+            is_preview: false,
             recovery_id: None,
         }
     }
@@ -403,15 +551,6 @@ impl BufferMetadata {
         self.lsp_enabled = false;
         self.lsp_disabled_reason = Some(reason);
     }
-}
-
-/// State for macro recording
-#[derive(Debug, Clone)]
-pub(super) struct MacroRecordingState {
-    /// The register key for this macro
-    pub key: char,
-    /// Actions recorded so far
-    pub actions: Vec<Action>,
 }
 
 /// LSP progress information
@@ -440,8 +579,8 @@ pub enum HoverTarget {
     SplitSeparator(ContainerId, SplitDirection),
     /// Hovering over a scrollbar thumb (split_id)
     ScrollbarThumb(LeafId),
-    /// Hovering over a scrollbar track (split_id)
-    ScrollbarTrack(LeafId),
+    /// Hovering over a scrollbar track (split_id, relative_row)
+    ScrollbarTrack(LeafId, u16),
     /// Hovering over a menu bar item (menu_index)
     MenuBarItem(usize),
     /// Hovering over a menu dropdown item (menu_index, item_index)
@@ -466,10 +605,10 @@ pub enum HoverTarget {
     FileBrowserShowHiddenCheckbox,
     /// Hovering over the file browser "Detect Encoding" checkbox
     FileBrowserDetectEncodingCheckbox,
-    /// Hovering over a tab name (buffer_id, split_id) - for non-active tabs
-    TabName(BufferId, LeafId),
-    /// Hovering over a tab close button (buffer_id, split_id)
-    TabCloseButton(BufferId, LeafId),
+    /// Hovering over a tab name (target, split_id) - for non-active tabs
+    TabName(crate::view::split::TabTarget, LeafId),
+    /// Hovering over a tab close button (target, split_id)
+    TabCloseButton(crate::view::split::TabTarget, LeafId),
     /// Hovering over a close split button (split_id)
     CloseSplitButton(LeafId),
     /// Hovering over a maximize/unmaximize split button (split_id)
@@ -480,6 +619,8 @@ pub enum HoverTarget {
     FileExplorerStatusIndicator(std::path::PathBuf),
     /// Hovering over the status bar LSP indicator
     StatusBarLspIndicator,
+    /// Hovering over the status bar remote-authority indicator
+    StatusBarRemoteIndicator,
     /// Hovering over the status bar warning badge
     StatusBarWarningBadge,
     /// Hovering over the status bar line ending indicator
@@ -498,6 +639,8 @@ pub enum HoverTarget {
     SearchOptionConfirmEach,
     /// Hovering over a tab context menu item (item_index)
     TabContextMenuItem(usize),
+    /// Hovering over a file explorer context menu item (item_index)
+    FileExplorerContextMenuItem(usize),
 }
 
 /// Tab context menu items
@@ -513,6 +656,10 @@ pub enum TabContextMenuItem {
     CloseToLeft,
     /// Close all tabs
     CloseAll,
+    /// Copy the tab's file path relative to the workspace root
+    CopyRelativePath,
+    /// Copy the tab's absolute file path
+    CopyFullPath,
 }
 
 impl TabContextMenuItem {
@@ -524,6 +671,8 @@ impl TabContextMenuItem {
             Self::CloseToRight,
             Self::CloseToLeft,
             Self::CloseAll,
+            Self::CopyRelativePath,
+            Self::CopyFullPath,
         ]
     }
 
@@ -535,6 +684,8 @@ impl TabContextMenuItem {
             Self::CloseToRight => t!("tab.close_to_right").to_string(),
             Self::CloseToLeft => t!("tab.close_to_left").to_string(),
             Self::CloseAll => t!("tab.close_all").to_string(),
+            Self::CopyRelativePath => t!("tab.copy_relative_path").to_string(),
+            Self::CopyFullPath => t!("tab.copy_full_path").to_string(),
         }
     }
 }
@@ -583,6 +734,161 @@ impl TabContextMenu {
             self.highlighted - 1
         };
     }
+}
+
+/// File explorer context menu items
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileExplorerContextMenuItem {
+    NewFile,
+    NewDirectory,
+    Rename,
+    Cut,
+    Copy,
+    Paste,
+    Duplicate,
+    Delete,
+    CopyFullPath,
+    CopyRelativePath,
+}
+
+impl FileExplorerContextMenuItem {
+    pub fn all() -> &'static [Self] {
+        // Order matters: existing e2e tests address items by their index in
+        // this list (e.g. Delete is index 6 in the single-selection menu).
+        // Append-only changes here keep the older tests stable; the new
+        // entries (Duplicate, CopyFullPath, CopyRelativePath) live after
+        // Delete for that reason.
+        &[
+            Self::NewFile,
+            Self::NewDirectory,
+            Self::Rename,
+            Self::Cut,
+            Self::Copy,
+            Self::Paste,
+            Self::Delete,
+            Self::Duplicate,
+            Self::CopyFullPath,
+            Self::CopyRelativePath,
+        ]
+    }
+
+    pub fn multi_selection() -> &'static [Self] {
+        &[
+            Self::Cut,
+            Self::Copy,
+            Self::Paste,
+            Self::Delete,
+            Self::Duplicate,
+            Self::CopyFullPath,
+            Self::CopyRelativePath,
+        ]
+    }
+
+    pub fn root_single_selection() -> &'static [Self] {
+        // The root menu is intentionally narrow (VS Code parity): only
+        // creation + paste actions. Copy-path on the project root is left
+        // off because the workspace path is already exposed via other
+        // commands and adding it here would surface a "Copy …" entry on
+        // a menu that's supposed to hide destructive/copy-style actions.
+        &[Self::NewFile, Self::NewDirectory, Self::Paste]
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::NewFile => t!("explorer.context.new_file").to_string(),
+            Self::NewDirectory => t!("explorer.context.new_directory").to_string(),
+            Self::Rename => t!("explorer.context.rename").to_string(),
+            Self::Cut => t!("explorer.context.cut").to_string(),
+            Self::Copy => t!("explorer.context.copy").to_string(),
+            Self::Paste => t!("explorer.context.paste").to_string(),
+            Self::Duplicate => t!("explorer.context.duplicate").to_string(),
+            Self::Delete => t!("explorer.context.delete").to_string(),
+            Self::CopyFullPath => t!("explorer.context.copy_full_path").to_string(),
+            Self::CopyRelativePath => t!("explorer.context.copy_relative_path").to_string(),
+        }
+    }
+}
+
+/// State for file explorer context menu (right-click popup in the file explorer)
+#[derive(Debug, Clone)]
+pub struct FileExplorerContextMenu {
+    /// Screen position where the menu should appear (x, y)
+    pub position: (u16, u16),
+    /// Currently highlighted menu item index
+    pub highlighted: usize,
+    /// Whether the menu was opened with multiple items selected
+    pub is_multi_selection: bool,
+    /// Whether the sole selected node is the project root
+    pub is_root_selected: bool,
+}
+
+impl FileExplorerContextMenu {
+    pub fn new(x: u16, y: u16, is_multi_selection: bool, is_root_selected: bool) -> Self {
+        Self {
+            position: (x, y),
+            highlighted: 0,
+            is_multi_selection,
+            is_root_selected,
+        }
+    }
+
+    pub fn items(&self) -> &'static [FileExplorerContextMenuItem] {
+        if self.is_multi_selection {
+            FileExplorerContextMenuItem::multi_selection()
+        } else if self.is_root_selected {
+            FileExplorerContextMenuItem::root_single_selection()
+        } else {
+            FileExplorerContextMenuItem::all()
+        }
+    }
+
+    pub fn height(&self) -> u16 {
+        self.items().len() as u16 + 2
+    }
+
+    pub fn clamped_position(&self, screen_width: u16, screen_height: u16) -> (u16, u16) {
+        let x = if self.position.0 + FILE_EXPLORER_CONTEXT_MENU_WIDTH > screen_width {
+            screen_width.saturating_sub(FILE_EXPLORER_CONTEXT_MENU_WIDTH)
+        } else {
+            self.position.0
+        };
+        let h = self.height();
+        let y = if self.position.1 + h > screen_height {
+            screen_height.saturating_sub(h)
+        } else {
+            self.position.1
+        };
+        (x, y)
+    }
+
+    pub fn next_item(&mut self) {
+        let len = self.items().len();
+        self.highlighted = (self.highlighted + 1) % len;
+    }
+
+    pub fn prev_item(&mut self) {
+        let len = self.items().len();
+        self.highlighted = if self.highlighted == 0 {
+            len - 1
+        } else {
+            self.highlighted - 1
+        };
+    }
+}
+
+/// Lightweight per-cell theme key provenance recorded during rendering.
+/// Stored in `CachedLayout::cell_theme_map` so the theme inspector popup
+/// can look up the exact keys used for any screen position.
+#[derive(Debug, Clone, Default)]
+pub struct CellThemeInfo {
+    /// Foreground theme key (e.g. "syntax.keyword", "editor.fg")
+    pub fg_key: Option<&'static str>,
+    /// Background theme key (e.g. "editor.bg", "diagnostic.warning_bg")
+    pub bg_key: Option<&'static str>,
+    /// Short region label (e.g. "Line Numbers", "Editor Content")
+    pub region: &'static str,
+    /// Dynamic region suffix (e.g. syntax category display name appended to "Syntax: ")
+    pub syntax_category: Option<&'static str>,
 }
 
 /// Information about which theme key(s) style a specific screen position.
@@ -717,8 +1023,10 @@ pub(super) struct MouseState {
     pub drag_start_ratio: Option<f32>,
     /// Whether we're currently dragging the file explorer border
     pub dragging_file_explorer: bool,
-    /// Initial file explorer width percentage when starting to drag
-    pub drag_start_explorer_width: Option<f32>,
+    /// File explorer width at the moment the drag started. Drag
+    /// preserves the active variant: a drag that begins in `Percent`
+    /// stays in `Percent`, and likewise for `Columns`.
+    pub drag_start_explorer_width: Option<crate::config::ExplorerWidth>,
     /// Current hover target (if any)
     pub hover_target: Option<HoverTarget>,
     /// Whether we're currently doing a text selection drag
@@ -727,12 +1035,22 @@ pub(super) struct MouseState {
     pub drag_selection_split: Option<LeafId>,
     /// The buffer byte position where the selection anchor is
     pub drag_selection_anchor: Option<usize>,
+    /// When true, dragging extends selection by whole words (set by double-click)
+    pub drag_selection_by_words: bool,
+    /// The end of the initially double-clicked word (used as anchor when dragging backward)
+    pub drag_selection_word_end: Option<usize>,
     /// Tab drag state (for drag-to-split functionality)
     pub dragging_tab: Option<TabDragState>,
     /// Whether we're currently dragging a popup scrollbar (popup index)
     pub dragging_popup_scrollbar: Option<usize>,
     /// Initial scroll offset when starting to drag popup scrollbar
     pub drag_start_popup_scroll: Option<usize>,
+    /// Whether we're currently dragging the prompt's suggestion-list
+    /// scrollbar (Live Grep floating overlay, issue #1796). The
+    /// rect is held in `cached_layout.suggestions_scrollbar_rect`
+    /// and the math is shared with the buffer-popup scrollbar via
+    /// `view::ui::scrollbar::ScrollbarState::click_to_offset`.
+    pub dragging_prompt_scrollbar: bool,
     /// Whether we're currently selecting text in a popup (popup index)
     pub selecting_in_popup: Option<usize>,
     /// Initial composite scroll_row when starting to drag the scrollbar thumb
@@ -827,9 +1145,23 @@ pub(crate) struct CachedLayout {
     /// Popup areas for mouse hit testing
     /// scrollbar_rect is Some if popup has a scrollbar
     pub popup_areas: Vec<PopupAreaLayout>,
+    /// Editor-level popup areas (e.g. plugin action popups) for mouse hit
+    /// testing. Stored separately from buffer popups because they're owned by
+    /// `Editor.global_popups` rather than the active buffer's state.
+    /// Fields: (popup_index, rect, inner_rect, scroll_offset, num_items)
+    pub global_popup_areas: Vec<(usize, Rect, Rect, usize, usize)>,
     /// Suggestions area for mouse hit testing
     /// (inner_rect, scroll_start_idx, visible_count, total_count)
     pub suggestions_area: Option<(Rect, usize, usize, usize)>,
+    /// Full outer rect of the suggestions popup (including borders).
+    /// Used to absorb clicks on the popup chrome so they don't reach the
+    /// buffer below while the prompt is open.
+    pub suggestions_outer_area: Option<Rect>,
+    /// Hit-test rect for the floating-overlay prompt's scrollbar
+    /// (issue #1796). `None` when no overlay is open or the result
+    /// list fits in the visible window. Click/drag handlers in
+    /// `mouse_input.rs` read this to update `prompt.scroll_offset`.
+    pub suggestions_scrollbar_rect: Option<Rect>,
     /// Tab layouts per split for mouse interaction
     pub tab_layouts: HashMap<LeafId, crate::view::ui::tabs::TabLayout>,
     /// Close split button hit areas
@@ -858,6 +1190,9 @@ pub(crate) struct CachedLayout {
     pub status_bar_language_area: Option<(u16, u16, u16)>,
     /// Status bar message area (row, start_col, end_col) - clickable to show status log
     pub status_bar_message_area: Option<(u16, u16, u16)>,
+    /// Status bar remote-authority indicator area (row, start_col, end_col)
+    /// — clickable to open the remote-authority context menu.
+    pub status_bar_remote_area: Option<(u16, u16, u16)>,
     /// Search options layout for checkbox hit testing
     pub search_options_layout: Option<crate::view::ui::status_bar::SearchOptionsLayout>,
     /// Menu bar layout for hit testing
@@ -865,9 +1200,25 @@ pub(crate) struct CachedLayout {
     /// Last frame dimensions — used by recompute_layout for macro replay
     pub last_frame_width: u16,
     pub last_frame_height: u16,
+    /// Per-cell theme key provenance recorded during rendering.
+    /// Flat vec indexed as `row * width + col` where `width = last_frame_width`.
+    pub cell_theme_map: Vec<CellThemeInfo>,
 }
 
 impl CachedLayout {
+    /// Reset the cell theme map for a new frame
+    pub fn reset_cell_theme_map(&mut self) {
+        let total = self.last_frame_width as usize * self.last_frame_height as usize;
+        self.cell_theme_map.clear();
+        self.cell_theme_map.resize(total, CellThemeInfo::default());
+    }
+
+    /// Look up the theme info for a screen position
+    pub fn cell_theme_at(&self, col: u16, row: u16) -> Option<&CellThemeInfo> {
+        let idx = row as usize * self.last_frame_width as usize + col as usize;
+        self.cell_theme_map.get(idx)
+    }
+
     /// Find which visual row contains the given byte position for a split
     pub fn find_visual_row(&self, split_id: LeafId, byte_pos: usize) -> Option<usize> {
         let mappings = self.view_line_mappings.get(&split_id)?;
@@ -909,15 +1260,56 @@ impl CachedLayout {
         let mappings = self.view_line_mappings.get(&split_id)?;
         let current_row = self.find_visual_row(split_id, current_pos)?;
 
-        let target_row = if direction < 0 {
-            current_row.checked_sub(1)?
-        } else {
-            let next = current_row + 1;
-            if next >= mappings.len() {
-                return None;
-            }
-            next
+        // Walk past purely-virtual rows (e.g. markdown_compose table top/
+        // bottom borders and inter-row separators).  Those rows have no
+        // source mapping at all — their `char_source_bytes` are all `None`
+        // and their `line_end_byte` is inherited from the adjacent content
+        // row.  If MoveDown/MoveUp stopped on them the cursor would land on
+        // a byte that's already at the row above's end, which in turn
+        // causes Down-after-table to teleport back to an earlier position
+        // (regression exposed by markdown_compose's table border feature).
+        //
+        // A row is "navigable" iff at least one of its visual columns maps
+        // to a real source byte.  Skip entirely-virtual rows in the move
+        // direction until we hit a navigable one or run off the edge.
+        let mut target_row = current_row;
+        let navigable = |idx: usize| -> bool {
+            mappings
+                .get(idx)
+                .map(|m| m.char_source_bytes.iter().any(|b| b.is_some()))
+                .unwrap_or(false)
         };
+        loop {
+            target_row = if direction < 0 {
+                target_row.checked_sub(1)?
+            } else {
+                let next = target_row + 1;
+                if next >= mappings.len() {
+                    return None;
+                }
+                next
+            };
+            // Either the next row has real source content, or we've reached
+            // a legitimate non-source row that the rest of the editor
+            // already treats as a cursor stop (trailing empty line at EOF,
+            // implicit blank final line).  In either case stop walking.
+            if navigable(target_row) {
+                break;
+            }
+            let mapping = mappings.get(target_row)?;
+            let is_plugin_virtual =
+                mapping.visual_to_char.is_empty() || mapping.char_source_bytes.is_empty();
+            if !is_plugin_virtual {
+                // The row has columns but none carry a source byte — most
+                // likely a plugin-injected decoration with padding.  Keep
+                // looking.
+                continue;
+            }
+            // Empty mapping (no visual columns) is how EOF-related virtual
+            // rows are represented; those are legitimate cursor stops so we
+            // accept them and fall out of the loop.
+            break;
+        }
 
         let target_mapping = mappings.get(target_row)?;
 
@@ -989,37 +1381,227 @@ impl CachedLayout {
 }
 
 /// Convert a file path to an `lsp_types::Uri`.
-///
-/// Uses `url::Url::from_file_path` for initial encoding, then percent-encodes
-/// characters that the `url` crate (WHATWG) leaves raw but that `lsp_types::Uri`
-/// (strict RFC 3986) rejects — specifically `[`, `]`, `{`, `}`, `|`, `^`, and `` ` ``.
 pub fn file_path_to_lsp_uri(path: &Path) -> Option<lsp_types::Uri> {
-    let url = url::Url::from_file_path(path).ok()?;
-    let url_str = url.as_str();
+    fresh_core::file_uri::path_to_lsp_uri(path)
+}
 
-    // Fast path: if no problematic characters, parse directly
-    if !url_str
-        .bytes()
-        .any(|b| matches!(b, b'[' | b']' | b'{' | b'}' | b'|' | b'^' | b'`'))
-    {
-        return url_str.parse::<lsp_types::Uri>().ok();
+/// LSP-facing URI: a URI as it appears on the wire to or from a
+/// language server. This is a newtype around `lsp_types::Uri`. The
+/// type-system point is to force every URI that crosses the
+/// editor↔LSP boundary through one of the two checked constructors:
+///
+///   * [`LspUri::from_host_path`] — given a host path and the active
+///     authority's host↔remote translation, produces an `LspUri` that
+///     carries the in-container path on container authorities (and
+///     the host path everywhere else).
+///   * [`LspUri::from_wire`] — wraps a raw `lsp_types::Uri` that was
+///     received from the LSP server. The wrapped URI is "remote-side"
+///     under a container authority and must be passed back through
+///     [`LspUri::to_host_path`] before any filesystem-facing code
+///     sees it.
+///
+/// Conversely, the only ways to extract a path are:
+///
+///   * [`LspUri::to_host_path`] — applies remote→host translation
+///     symmetrically with `from_host_path`. This is the host-side
+///     `PathBuf` filesystem APIs accept. Untranslated extraction
+///     (`as_uri().path()`) is intentionally not exposed as a method —
+///     callers that genuinely want the wire-side path string read
+///     `as_str()` and document why a host-path interpretation isn't
+///     wanted.
+///
+/// Storing buffer URIs in [`BufferMetadata`] as `LspUri` (not
+/// `lsp_types::Uri`) keeps the cached form already translated for the
+/// active authority, so the dozens of `metadata.file_uri()` call
+/// sites can't accidentally ship a host URI to a container LSP.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LspUri(lsp_types::Uri);
+
+impl LspUri {
+    /// Build an LSP-facing URI from a host path, applying the
+    /// authority's host→remote translation when one is set. Returns
+    /// `None` for relative paths (matches the pre-newtype helper).
+    pub fn from_host_path(
+        path: &Path,
+        translation: Option<&crate::services::authority::PathTranslation>,
+    ) -> Option<Self> {
+        let mapped = translation
+            .and_then(|t| t.host_to_remote(path))
+            .unwrap_or_else(|| path.to_path_buf());
+        fresh_core::file_uri::path_to_lsp_uri(&mapped).map(Self)
     }
 
-    // Percent-encode characters that url (WHATWG) allows but lsp_types::Uri (RFC 3986) rejects
-    let mut encoded = String::with_capacity(url_str.len() + 16);
-    for byte in url_str.bytes() {
-        match byte {
-            b'[' => encoded.push_str("%5B"),
-            b']' => encoded.push_str("%5D"),
-            b'{' => encoded.push_str("%7B"),
-            b'}' => encoded.push_str("%7D"),
-            b'|' => encoded.push_str("%7C"),
-            b'^' => encoded.push_str("%5E"),
-            b'`' => encoded.push_str("%60"),
-            _ => encoded.push(byte as char),
+    /// Wrap a raw URI received from the LSP wire. The caller must
+    /// subsequently translate via [`Self::to_host_path`] before
+    /// opening the file or comparing with host paths — that's the
+    /// whole point of having the newtype.
+    pub fn from_wire(uri: lsp_types::Uri) -> Self {
+        Self(uri)
+    }
+
+    /// Borrow the underlying raw URI for serialization to the LSP
+    /// wire (e.g. into JSON-RPC params). Only the LSP transport layer
+    /// should call this; editor-level code never sees a bare
+    /// `lsp_types::Uri`.
+    pub fn as_uri(&self) -> &lsp_types::Uri {
+        &self.0
+    }
+
+    /// String form, for log messages and equality comparisons against
+    /// other URI strings (e.g. when matching a buffer against an
+    /// incoming notification's URI). Does not strip the
+    /// host-vs-container ambiguity — comparisons must be between two
+    /// `LspUri`s, not between a wire URI and a host URI.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Decode this URI to a host path, applying the authority's
+    /// remote→host translation when one is set. Returns `None` for
+    /// non-`file://` URIs.
+    pub fn to_host_path(
+        &self,
+        translation: Option<&crate::services::authority::PathTranslation>,
+    ) -> Option<PathBuf> {
+        let raw = fresh_core::file_uri::lsp_uri_to_path(&self.0)?;
+        Some(
+            translation
+                .and_then(|t| t.remote_to_host(&raw))
+                .unwrap_or(raw),
+        )
+    }
+}
+
+/// Build the LSP-facing URI for a host-side `path`, applying the
+/// authority's host→remote translation when one is set.
+///
+/// Thin shim around [`LspUri::from_host_path`] that returns the
+/// inner [`lsp_types::Uri`] for the few callers (root_uri building
+/// inside `LspManager`, code-action workspace folder hand-off) that
+/// have to feed a raw `Uri` into a third-party API. New code should
+/// prefer `LspUri::from_host_path` directly so the host-vs-LSP side
+/// stays type-checked.
+pub fn file_path_to_lsp_uri_with_translation(
+    path: &Path,
+    translation: Option<&crate::services::authority::PathTranslation>,
+) -> Option<lsp_types::Uri> {
+    LspUri::from_host_path(path, translation).map(|u| u.into_inner())
+}
+
+impl LspUri {
+    /// Consume `self` and return the raw `lsp_types::Uri`. Reserved
+    /// for the wire layer (LSP transport, lsp_types interop). Editor
+    /// code uses [`Self::as_uri`] when it just needs to borrow.
+    pub fn into_inner(self) -> lsp_types::Uri {
+        self.0
+    }
+}
+
+// `LspUri` translation algebra works on any platform but the unit-test
+// fixtures use POSIX-shaped paths (the only side that ever exists for a
+// container's interior) and a Linux-style URI without a drive letter.
+// On Windows `lsp_types::Uri::parse(\"file:///workspaces/...\")` returns
+// `None` for lack of a drive letter, which would make these tests fail
+// for reasons unrelated to the algebra they're verifying. Gate to Unix
+// — the cross-platform URI encoding is covered separately by
+// `uri_encoding_tests`.
+#[cfg(all(test, unix))]
+mod lsp_uri_tests {
+    use super::*;
+    use crate::services::authority::PathTranslation;
+
+    fn translation() -> PathTranslation {
+        PathTranslation {
+            host_root: PathBuf::from("/tmp/.tmpA1B2"),
+            remote_root: PathBuf::from("/workspaces/proj"),
         }
     }
-    encoded.parse::<lsp_types::Uri>().ok()
+
+    #[test]
+    fn from_host_path_under_workspace_translates_to_remote_uri() {
+        let host = PathBuf::from("/tmp/.tmpA1B2/src/util.py");
+        let lsp_uri = LspUri::from_host_path(&host, Some(&translation())).expect("absolute path");
+        assert_eq!(lsp_uri.as_str(), "file:///workspaces/proj/src/util.py");
+    }
+
+    #[test]
+    fn from_host_path_outside_workspace_passes_through() {
+        // System headers / library sources sit outside the mounted
+        // workspace; translation returns `None` and the host URI is
+        // shipped to the LSP unchanged. The point of the newtype is
+        // just to make the decision explicit.
+        let host = PathBuf::from("/usr/include/stdio.h");
+        let lsp_uri = LspUri::from_host_path(&host, Some(&translation())).expect("absolute path");
+        assert_eq!(lsp_uri.as_str(), "file:///usr/include/stdio.h");
+    }
+
+    #[test]
+    fn to_host_path_under_remote_root_translates_back() {
+        let wire: lsp_types::Uri = "file:///workspaces/proj/src/util.py".parse().unwrap();
+        let host = LspUri::from_wire(wire)
+            .to_host_path(Some(&translation()))
+            .expect("file:// URI");
+        assert_eq!(host, PathBuf::from("/tmp/.tmpA1B2/src/util.py"));
+    }
+
+    #[test]
+    fn to_host_path_outside_remote_root_passes_through() {
+        let wire: lsp_types::Uri = "file:///usr/include/stdio.h".parse().unwrap();
+        let host = LspUri::from_wire(wire)
+            .to_host_path(Some(&translation()))
+            .expect("file:// URI");
+        assert_eq!(host, PathBuf::from("/usr/include/stdio.h"));
+    }
+
+    #[test]
+    fn round_trip_host_to_wire_to_host_under_workspace() {
+        // The whole point of the symmetry: anything that goes out
+        // through `from_host_path` must come back through
+        // `to_host_path` byte-identical. This is the property the
+        // editor relies on so a buffer's host file_path matches the
+        // path resolved from a server-returned `Location`.
+        let host = PathBuf::from("/tmp/.tmpA1B2/main.py");
+        let lsp_uri = LspUri::from_host_path(&host, Some(&translation())).unwrap();
+        let back = lsp_uri.to_host_path(Some(&translation())).unwrap();
+        assert_eq!(back, host);
+    }
+
+    #[test]
+    fn no_translation_is_identity() {
+        let host = PathBuf::from("/some/host/path/file.rs");
+        let lsp_uri = LspUri::from_host_path(&host, None).unwrap();
+        assert_eq!(lsp_uri.as_str(), "file:///some/host/path/file.rs");
+        let back = lsp_uri.to_host_path(None).unwrap();
+        assert_eq!(back, host);
+    }
+}
+
+/// Self-contained state for the Live Grep floating overlay's preview
+/// pane (issue #1796).
+///
+/// Owned directly by `Editor::overlay_preview_state` rather than
+/// living in `Editor::split_view_states` keyed by a synthetic
+/// `LeafId`. This isolation matters because ~20 sites across the
+/// editor iterate `split_view_states` for cross-cutting work
+/// (workspace save, viewport hooks, settings broadcasts, buffer
+/// close cascades). The preview is a *transient render artefact*,
+/// not a real split — none of those code paths should see it.
+///
+/// The phantom buffer is not in `SplitManager`'s tree either, so
+/// it's invisible to focus rotation (`Alt+]`/`Alt+[`), tab drag
+/// drop zones, hit testing, and `find_leaf_by_role` queries.
+#[derive(Debug)]
+pub struct OverlayPreviewState {
+    /// Buffer currently displayed in the preview pane.
+    pub buffer_id: BufferId,
+    /// View state (cursor, viewport, folds, view mode, …) used by
+    /// the renderer's per-leaf pipeline.
+    pub view_state: crate::view::split::SplitViewState,
+    /// Buffers we loaded only to feed the preview pane. On overlay
+    /// close we close these via the standard `close_buffer` path.
+    /// Buffers the user already had open are *not* in this set —
+    /// dismissing the overlay never disturbs them.
+    pub loaded_buffers: HashSet<BufferId>,
 }
 
 #[cfg(test)]
@@ -1027,7 +1609,6 @@ mod uri_encoding_tests {
     use super::*;
 
     /// Helper to get a platform-appropriate absolute path for testing.
-    /// On Windows, url::Url::from_file_path rejects Unix-style paths.
     fn abs_path(suffix: &str) -> PathBuf {
         std::env::temp_dir().join(suffix)
     }

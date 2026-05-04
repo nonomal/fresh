@@ -40,89 +40,8 @@ fn make_search_opts(
     }
 }
 
-/// Recursively walk `dir` via the `FileSystem` trait, collecting file paths.
-/// Skips hidden entries (dot-prefixed) and common non-source directories.
-fn walk_files_recursive(
-    fs: &dyn crate::model::filesystem::FileSystem,
-    dir: &std::path::Path,
-    out: &mut Vec<std::path::PathBuf>,
-) {
-    let entries = match fs.read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
-        // Skip hidden files/dirs
-        if entry.name.starts_with('.') {
-            continue;
-        }
-        match entry.entry_type {
-            crate::model::filesystem::EntryType::File => {
-                out.push(entry.path);
-            }
-            crate::model::filesystem::EntryType::Directory => {
-                if !IGNORED_DIRS.contains(&entry.name.as_str()) {
-                    walk_files_recursive(fs, &entry.path, out);
-                }
-            }
-            _ => {} // skip symlinks etc. for now
-        }
-    }
-}
-
-/// Streaming variant: recursively walks and sends each file path via callback.
-/// Returns early if `cancel` is set or callback returns false (receiver dropped).
-fn walk_files_streaming(
-    fs: &dyn crate::model::filesystem::FileSystem,
-    dir: &std::path::Path,
-    cancel: &std::sync::atomic::AtomicBool,
-    send: &mut dyn FnMut(std::path::PathBuf) -> bool,
-) {
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let entries = match fs.read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        if entry.name.starts_with('.') {
-            continue;
-        }
-        match entry.entry_type {
-            crate::model::filesystem::EntryType::File => {
-                if !send(entry.path) {
-                    return;
-                }
-            }
-            crate::model::filesystem::EntryType::Directory => {
-                if !IGNORED_DIRS.contains(&entry.name.as_str()) {
-                    walk_files_streaming(fs, &entry.path, cancel, send);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 impl Editor {
     // ==================== Menu Helpers ====================
-
-    /// Find a menu by label, searching built-in menus first then plugin menus.
-    fn find_menu_by_label_mut(&mut self, label: &str) -> Option<&mut crate::config::Menu> {
-        // Check built-in menus first
-        if let Some(menu) = self.menus.menus.iter_mut().find(|m| m.label == label) {
-            return Some(menu);
-        }
-        // Then check plugin menus
-        self.menu_state
-            .plugin_menus
-            .iter_mut()
-            .find(|m| m.label == label)
-    }
 
     // ==================== Overlay Commands ====================
 
@@ -261,6 +180,83 @@ impl Editor {
         }
     }
 
+    /// Handle AddVirtualTextStyled — richer form that accepts theme
+    /// keys for fg/bg and individual style modifiers.  Theme keys are
+    /// resolved at render time so labels follow theme changes live.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_add_virtual_text_styled(
+        &mut self,
+        buffer_id: BufferId,
+        virtual_text_id: String,
+        position: usize,
+        text: String,
+        fg: Option<fresh_core::api::OverlayColorSpec>,
+        bg: Option<fresh_core::api::OverlayColorSpec>,
+        bold: bool,
+        italic: bool,
+        before: bool,
+    ) {
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            use crate::view::virtual_text::VirtualTextPosition;
+            use fresh_core::api::OverlayColorSpec;
+            use ratatui::style::{Color, Modifier, Style};
+
+            let vtext_position = if before {
+                VirtualTextPosition::BeforeChar
+            } else {
+                VirtualTextPosition::AfterChar
+            };
+
+            // Build a fallback style from any concrete RGB values; theme
+            // keys are passed through separately so the renderer can
+            // resolve them on each frame.
+            let mut fallback = Style::default();
+            let mut fg_theme_key: Option<String> = None;
+            let mut bg_theme_key: Option<String> = None;
+            match &fg {
+                Some(OverlayColorSpec::Rgb(r, g, b)) => {
+                    fallback = fallback.fg(Color::Rgb(*r, *g, *b));
+                }
+                Some(OverlayColorSpec::ThemeKey(k)) => {
+                    fg_theme_key = Some(k.clone());
+                }
+                None => {}
+            }
+            match &bg {
+                Some(OverlayColorSpec::Rgb(r, g, b)) => {
+                    fallback = fallback.bg(Color::Rgb(*r, *g, *b));
+                }
+                Some(OverlayColorSpec::ThemeKey(k)) => {
+                    bg_theme_key = Some(k.clone());
+                }
+                None => {}
+            }
+            if bold {
+                fallback = fallback.add_modifier(Modifier::BOLD);
+            }
+            if italic {
+                fallback = fallback.add_modifier(Modifier::ITALIC);
+            }
+
+            // Replace any existing virtual text with this ID.
+            state
+                .virtual_texts
+                .remove_by_id(&mut state.marker_list, &virtual_text_id);
+
+            state.virtual_texts.add_with_id_and_theme_keys(
+                &mut state.marker_list,
+                position,
+                text,
+                fallback,
+                fg_theme_key,
+                bg_theme_key,
+                vtext_position,
+                0, // priority
+                virtual_text_id,
+            );
+        }
+    }
+
     /// Handle RemoveVirtualText command
     pub(super) fn handle_remove_virtual_text(
         &mut self,
@@ -295,39 +291,74 @@ impl Editor {
     }
 
     /// Handle AddVirtualLine command
+    ///
+    /// Theme keys carried by the colour specs are NOT resolved here — they
+    /// are stashed verbatim on the VirtualText so the renderer can resolve
+    /// them against the live theme on every frame and the line follows
+    /// theme changes without the plugin re-emitting it.  Only RGB colour
+    /// specs and short colour names (`"Gray"`, `"DarkGray"`, …) are
+    /// pre-baked into the fallback `Style`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_add_virtual_line(
         &mut self,
         buffer_id: BufferId,
         position: usize,
         text: String,
-        fg_color: (u8, u8, u8),
-        bg_color: Option<(u8, u8, u8)>,
+        fg_color: Option<fresh_core::api::OverlayColorSpec>,
+        bg_color: Option<fresh_core::api::OverlayColorSpec>,
         above: bool,
         namespace: String,
         priority: i32,
     ) {
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            use crate::view::virtual_text::{VirtualTextNamespace, VirtualTextPosition};
-            use ratatui::style::{Color, Style};
+        use crate::view::theme::named_color_from_str;
+        use crate::view::virtual_text::{VirtualTextNamespace, VirtualTextPosition};
+        use fresh_core::api::OverlayColorSpec;
+        use ratatui::style::{Color, Style};
 
+        // Split a colour spec into "fallback colour baked into Style" and
+        // "theme key resolved at render time".  Named colour strings are
+        // recognised eagerly here so they end up in the fallback Style
+        // (mirrors OverlayFace::from_options' policy).
+        fn split(spec: Option<OverlayColorSpec>) -> (Option<Color>, Option<String>) {
+            match spec {
+                Some(OverlayColorSpec::Rgb(r, g, b)) => (Some(Color::Rgb(r, g, b)), None),
+                Some(OverlayColorSpec::ThemeKey(key)) => {
+                    if let Some(color) = named_color_from_str(&key) {
+                        (Some(color), None)
+                    } else {
+                        (None, Some(key))
+                    }
+                }
+                None => (None, None),
+            }
+        }
+
+        let (fg_fallback, fg_theme_key) = split(fg_color);
+        let (bg_fallback, bg_theme_key) = split(bg_color);
+
+        let mut style = Style::default();
+        if let Some(c) = fg_fallback {
+            style = style.fg(c);
+        }
+        if let Some(c) = bg_fallback {
+            style = style.bg(c);
+        }
+
+        if let Some(state) = self.buffers.get_mut(&buffer_id) {
             let placement = if above {
                 VirtualTextPosition::LineAbove
             } else {
                 VirtualTextPosition::LineBelow
             };
-
-            let mut style = Style::default().fg(Color::Rgb(fg_color.0, fg_color.1, fg_color.2));
-            if let Some(bg) = bg_color {
-                style = style.bg(Color::Rgb(bg.0, bg.1, bg.2));
-            }
             let ns = VirtualTextNamespace::from_string(namespace);
 
-            state.virtual_texts.add_line(
+            state.virtual_texts.add_line_with_theme_keys(
                 &mut state.marker_list,
                 position,
                 text,
                 style,
+                fg_theme_key,
+                bg_theme_key,
                 placement,
                 ns,
                 priority,
@@ -399,6 +430,55 @@ impl Editor {
         }
     }
 
+    // ==================== Fold Commands ====================
+
+    /// Handle AddFold command — register a collapsed fold range for the
+    /// given buffer. The fold lives on the buffer-view-state's
+    /// FoldManager, which is keyed per-(split, buffer); we add it to
+    /// every view state that currently shows the buffer (typically
+    /// exactly one).
+    pub(super) fn handle_add_fold(
+        &mut self,
+        buffer_id: BufferId,
+        start: usize,
+        end: usize,
+        placeholder: Option<String>,
+    ) {
+        let Some(state) = self.buffers.get_mut(&buffer_id) else {
+            return;
+        };
+        for vs in self.split_view_states.values_mut() {
+            if vs.keyed_states.contains_key(&buffer_id) {
+                let buf_state = vs.ensure_buffer_state(buffer_id);
+                buf_state
+                    .folds
+                    .add(&mut state.marker_list, start, end, placeholder.clone());
+            }
+        }
+        #[cfg(feature = "plugins")]
+        {
+            self.plugin_render_requested = true;
+        }
+    }
+
+    /// Handle ClearFolds command — drop every collapsed fold range on
+    /// the buffer (across all view states that host it).
+    pub(super) fn handle_clear_folds(&mut self, buffer_id: BufferId) {
+        let Some(state) = self.buffers.get_mut(&buffer_id) else {
+            return;
+        };
+        for vs in self.split_view_states.values_mut() {
+            if vs.keyed_states.contains_key(&buffer_id) {
+                let buf_state = vs.ensure_buffer_state(buffer_id);
+                buf_state.folds.clear(&mut state.marker_list);
+            }
+        }
+        #[cfg(feature = "plugins")]
+        {
+            self.plugin_render_requested = true;
+        }
+    }
+
     // ==================== Soft Break Commands ====================
 
     /// Handle AddSoftBreak command
@@ -456,8 +536,7 @@ impl Editor {
         item: crate::config::MenuItem,
         position: MenuPosition,
     ) {
-        if let Some(menu) = self.find_menu_by_label_mut(&menu_label) {
-            // Insert at the specified position
+        let inserted = self.with_menu_by_label(&menu_label, |menu| {
             let insert_idx = match position {
                 MenuPosition::Top => 0,
                 MenuPosition::Bottom => menu.items.len(),
@@ -481,15 +560,13 @@ impl Editor {
                     .map(|i| i + 1)
                     .unwrap_or(menu.items.len()),
             };
-
             menu.items.insert(insert_idx, item);
-            tracing::info!(
-                "Added menu item to '{}' at position {}",
-                menu_label,
-                insert_idx
-            );
-        } else {
-            tracing::warn!("Menu '{}' not found for adding item", menu_label);
+            insert_idx
+        });
+
+        match inserted {
+            Some(idx) => tracing::info!("Added menu item to '{}' at position {}", menu_label, idx),
+            None => tracing::warn!("Menu '{}' not found for adding item", menu_label),
         }
     }
 
@@ -558,22 +635,24 @@ impl Editor {
 
     /// Handle RemoveMenuItem command
     pub(super) fn handle_remove_menu_item(&mut self, menu_label: String, item_label: String) {
-        if let Some(menu) = self.find_menu_by_label_mut(&menu_label) {
-            // Remove item with matching label
+        let removed = self.with_menu_by_label(&menu_label, |menu| {
             let original_len = menu.items.len();
             menu.items.retain(|item| match item {
                 crate::config::MenuItem::Action { label, .. }
                 | crate::config::MenuItem::Submenu { label, .. } => label != &item_label,
-                _ => true, // Keep separators
+                _ => true,
             });
+            menu.items.len() < original_len
+        });
 
-            if menu.items.len() < original_len {
-                tracing::info!("Removed menu item '{}' from '{}'", item_label, menu_label);
-            } else {
-                tracing::warn!("Menu item '{}' not found in '{}'", item_label, menu_label);
+        match removed {
+            Some(true) => {
+                tracing::info!("Removed menu item '{}' from '{}'", item_label, menu_label)
             }
-        } else {
-            tracing::warn!("Menu '{}' not found for removing item", menu_label);
+            Some(false) => {
+                tracing::warn!("Menu item '{}' not found in '{}'", item_label, menu_label)
+            }
+            None => tracing::warn!("Menu '{}' not found for removing item", menu_label),
         }
     }
 
@@ -618,9 +697,12 @@ impl Editor {
             return;
         }
 
-        // Plugin sends arbitrary SplitId — convert to LeafId at the boundary
+        // Plugin sends arbitrary SplitId — convert to LeafId at the boundary.
+        // Go through set_pane_buffer so tree + SVS stay consistent (the
+        // downstream view_state block tweaks open_buffers/view_transform
+        // further, but the primitive is what keeps the invariant).
         let leaf_id = LeafId(split_id);
-        self.split_manager.set_split_buffer(leaf_id, buffer_id);
+        self.set_pane_buffer(leaf_id, buffer_id);
         tracing::info!("Set split {:?} to buffer {:?}", split_id, buffer_id);
 
         // Switch per-buffer view state — the new buffer's own view_transform
@@ -668,9 +750,26 @@ impl Editor {
     }
 
     /// Handle SetBufferCursor command
+    ///
+    /// Walks both the main split tree (`split_manager.splits_for_buffer`) AND
+    /// the inner leaves of all grouped subtrees stored in `grouped_subtrees`,
+    /// mirroring `handle_scroll_buffer_to_line` — buffer-group panel buffers
+    /// are not represented in `split_manager`'s tree, so the basic lookup
+    /// returns nothing for them.
     pub(super) fn handle_set_buffer_cursor(&mut self, buffer_id: BufferId, position: usize) {
-        // Find all splits that display this buffer and update their view states
-        let splits = self.split_manager.splits_for_buffer(buffer_id);
+        // Find all splits that display this buffer (main tree + grouped subtrees).
+        let mut splits: Vec<crate::app::LeafId> = self.split_manager.splits_for_buffer(buffer_id);
+        for node in self.grouped_subtrees.values() {
+            if let crate::view::split::SplitNode::Grouped { layout, .. } = node {
+                for inner_leaf in layout.leaf_split_ids() {
+                    if let Some(vs) = self.split_view_states.get(&inner_leaf) {
+                        if vs.active_buffer == buffer_id && !splits.contains(&inner_leaf) {
+                            splits.push(inner_leaf);
+                        }
+                    }
+                }
+            }
+        }
         let active_split = self.split_manager.active_split();
 
         tracing::debug!(
@@ -910,8 +1009,7 @@ impl Editor {
 
             // Apply events
             for event in events {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
         }
     }
@@ -949,18 +1047,18 @@ impl Editor {
         let buffer_len = state.buffer.len();
         let clamped_position = final_position.min(buffer_len);
 
-        // Update cursors (now in SplitViewState)
-        let cursors = self.active_cursors_mut();
-        cursors.primary_mut().position = clamped_position;
-        cursors.primary_mut().anchor = None;
+        // Update the cached line number so the status bar shows the correct
+        // position. Without this, the status bar reads a stale value from
+        // state.primary_cursor_line_number which was set before the jump.
+        state.primary_cursor_line_number = crate::model::buffer::LineNumber::Absolute(target_line);
 
-        // Ensure the position is visible in the active split's viewport
-        let active_split = self.split_manager.active_split();
-        let active_buffer = self.active_buffer();
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
-            let state = self.buffers.get_mut(&active_buffer).unwrap();
-            view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
-        }
+        // Funnel through the navigation primitive so the cursor is guaranteed
+        // visible in the viewport (#1689 — without this, jump_to_line_column
+        // could land off-screen if a prior scroll set skip_ensure_visible).
+        self.jump_active_cursor_to(
+            clamped_position,
+            super::navigation::JumpOptions::navigation(),
+        );
     }
 
     /// Handle OpenFileAtLocation command
@@ -970,7 +1068,7 @@ impl Editor {
         line: Option<usize>,
         column: Option<usize>,
     ) -> AnyhowResult<()> {
-        // Open the file
+        // Open the file (may switch to an already-open buffer)
         if let Err(e) = self.open_file(&path) {
             tracing::error!("Failed to open file from plugin: {}", e);
             return Ok(());
@@ -1019,14 +1117,39 @@ impl Editor {
         }
     }
 
-    /// Handle ShowBuffer command
+    /// Handle ShowBuffer command.
+    ///
+    /// If `buffer_id` belongs to a buffer group (i.e., it's one of the group's
+    /// panel buffers), this activates the group's tab and focuses that panel
+    /// instead of clobbering the current split's leaf with the panel buffer —
+    /// which would bypass the group-tab dispatch path and break rendering.
     pub(super) fn handle_show_buffer(&mut self, buffer_id: BufferId) {
-        if self.buffers.contains_key(&buffer_id) {
-            self.set_active_buffer(buffer_id);
-            tracing::info!("Switched to buffer {:?}", buffer_id);
-        } else {
+        if !self.buffers.contains_key(&buffer_id) {
             tracing::warn!("Buffer {:?} not found", buffer_id);
+            return;
         }
+
+        // If this buffer belongs to a group, route through the group's tab.
+        if let Some(&group_id) = self.buffer_to_group.get(&buffer_id) {
+            // Find the panel name for this buffer in the group, then focus it.
+            let panel_name = self.buffer_groups.get(&group_id).and_then(|g| {
+                g.panel_buffers
+                    .iter()
+                    .find_map(|(name, &bid)| (bid == buffer_id).then(|| name.clone()))
+            });
+            if let Some(panel_name) = panel_name {
+                self.focus_panel(group_id.0, panel_name);
+                tracing::info!(
+                    "Switched to group panel buffer {:?} via group {:?}",
+                    buffer_id,
+                    group_id
+                );
+                return;
+            }
+        }
+
+        self.set_active_buffer(buffer_id);
+        tracing::info!("Switched to buffer {:?}", buffer_id);
     }
 
     /// Handle CloseBuffer command
@@ -1044,6 +1167,11 @@ impl Editor {
     // ==================== View/Layout Commands ====================
 
     /// Handle SetLayoutHints command
+    ///
+    /// Targets `buffer_id`'s state in the resolved split, not the split's
+    /// active buffer. Plugins call this asynchronously, so by the time the
+    /// command is drained the focused buffer may have changed; binding to
+    /// `buffer_id` keeps the hint with the buffer the plugin chose.
     pub(super) fn handle_set_layout_hints(
         &mut self,
         buffer_id: BufferId,
@@ -1059,15 +1187,16 @@ impl Editor {
             .or_insert_with(|| {
                 SplitViewState::with_buffer(self.terminal_width, self.terminal_height, buffer_id)
             });
-        view_state.compose_width = hints.compose_width;
-        view_state.compose_column_guides = hints.column_guides;
+        let buf_state = view_state.ensure_buffer_state(buffer_id);
+        buf_state.compose_width = hints.compose_width;
+        buf_state.compose_column_guides = hints.column_guides;
     }
 
     /// Handle SetViewMode command
     pub(super) fn handle_set_view_mode(&mut self, buffer_id: BufferId, mode: &str) {
         use crate::state::ViewMode;
         let view_mode = match mode {
-            "compose" => ViewMode::Compose,
+            "page_view" | "compose" => ViewMode::PageView,
             _ => ViewMode::Source,
         };
         // Set on the specified buffer's per-split view state.
@@ -1312,15 +1441,29 @@ impl Editor {
     }
 
     /// Handle StartPrompt command
-    pub(super) fn handle_start_prompt(&mut self, label: String, prompt_type: String) {
+    pub(super) fn handle_start_prompt(
+        &mut self,
+        label: String,
+        prompt_type: String,
+        floating_overlay: bool,
+    ) {
+        // Refresh the plugin-readable keybinding-label snapshot so
+        // any UI hint the plugin draws ("Alt+P to cycle", etc.)
+        // reflects the user's *current* keymap, not the one from
+        // editor startup. Cheap; runs once per prompt-open.
+        #[cfg(feature = "plugins")]
+        self.refresh_keybinding_labels_snapshot();
+
         // Create a plugin-controlled prompt
         use crate::view::prompt::{Prompt, PromptType};
-        self.prompt = Some(Prompt::new(
+        let mut prompt = Prompt::new(
             label,
             PromptType::Plugin {
                 custom_type: prompt_type.clone(),
             },
-        ));
+        );
+        prompt.overlay = floating_overlay;
+        self.prompt = Some(prompt);
 
         // Fire the prompt_changed hook immediately with empty input
         // This allows plugins to initialize the prompt state
@@ -1340,16 +1483,23 @@ impl Editor {
         label: String,
         prompt_type: String,
         initial_value: String,
+        floating_overlay: bool,
     ) {
+        // Refresh keybinding labels — see `handle_start_prompt`.
+        #[cfg(feature = "plugins")]
+        self.refresh_keybinding_labels_snapshot();
+
         // Create a plugin-controlled prompt with initial text
         use crate::view::prompt::{Prompt, PromptType};
-        self.prompt = Some(Prompt::with_initial_text(
+        let mut prompt = Prompt::with_initial_text(
             label,
             PromptType::Plugin {
                 custom_type: prompt_type.clone(),
             },
             initial_value.clone(),
-        ));
+        );
+        prompt.overlay = floating_overlay;
+        self.prompt = Some(prompt);
 
         // Fire the prompt_changed hook immediately with the initial value
         use crate::services::plugins::hooks::HookArgs;
@@ -1475,6 +1625,7 @@ impl Editor {
         bindings: Vec<(String, String)>,
         read_only: bool,
         allow_text_input: bool,
+        inherit_normal_bindings: bool,
         plugin_name: Option<String>,
     ) {
         use super::parse_key_string;
@@ -1484,10 +1635,15 @@ impl Editor {
         let mode = BufferMode::new(name.clone())
             .with_read_only(read_only)
             .with_allow_text_input(allow_text_input)
+            .with_inherit_normal_bindings(inherit_normal_bindings)
             .with_plugin_name(plugin_name);
 
         // Clear any existing plugin defaults for this mode before re-registering
-        self.keybindings.clear_plugin_defaults_for_mode(&name);
+        {
+            let mut kb = self.keybindings.write().unwrap();
+            kb.clear_plugin_defaults_for_mode(&name);
+            kb.set_mode_inherits_normal_bindings(&name, inherit_normal_bindings);
+        }
 
         let mode_context = KeyContext::Mode(name.clone());
 
@@ -1501,7 +1657,7 @@ impl Editor {
                 if let Some((code, modifiers)) = parse_key_string(key_str) {
                     let action = Action::from_str(command, &std::collections::HashMap::new())
                         .unwrap_or_else(|| Action::PluginAction(command.clone()));
-                    self.keybindings.load_plugin_default(
+                    self.keybindings.write().unwrap().load_plugin_default(
                         mode_context.clone(),
                         code,
                         modifiers,
@@ -1529,7 +1685,7 @@ impl Editor {
                     tracing::debug!("Adding chord binding: {:?} -> {}", sequence, command);
                     let action = Action::from_str(command, &std::collections::HashMap::new())
                         .unwrap_or_else(|| Action::PluginAction(command.clone()));
-                    self.keybindings.load_plugin_chord_default(
+                    self.keybindings.write().unwrap().load_plugin_chord_default(
                         mode_context.clone(),
                         sequence,
                         action,
@@ -1550,10 +1706,11 @@ impl Editor {
                         .keybinding_labels
                         .retain(|k, _| !k.ends_with(&format!("\0{}", name)));
                     // Add current labels from plugin defaults in KeybindingResolver
+                    let keybindings_read = self.keybindings.read().unwrap();
                     if let Some(mode_bindings) =
-                        self.keybindings.get_plugin_defaults().get(&mode_context)
+                        keybindings_read.get_plugin_defaults().get(&mode_context)
                     {
-                        for ((key_code, modifiers), _action) in mode_bindings {
+                        for (key_code, modifiers) in mode_bindings.keys() {
                             let label =
                                 crate::input::keybindings::format_keybinding(key_code, modifiers);
                             if let Some((_key_str, cmd)) = bindings
@@ -1591,7 +1748,7 @@ impl Editor {
         let error = if let Some(lsp) = self.lsp.as_mut() {
             // Respect auto_start setting for plugin requests
             use crate::services::lsp::manager::LspSpawnResult;
-            if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
+            if lsp.try_spawn(&language, None) != LspSpawnResult::Spawned {
                 Some(format!(
                     "LSP server for '{}' is not running (auto_start disabled)",
                     language
@@ -1650,7 +1807,7 @@ impl Editor {
         let lang_config = crate::config::LanguageConfig {
             comment_prefix: config.comment_prefix,
             auto_indent: config.auto_indent.unwrap_or(true),
-            use_tabs: config.use_tabs.unwrap_or(false),
+            use_tabs: config.use_tabs,
             tab_size: config.tab_size,
             show_whitespace_tabs: config.show_whitespace_tabs.unwrap_or(true),
             formatter: config.formatter.map(|f| crate::config::FormatterConfig {
@@ -1661,7 +1818,9 @@ impl Editor {
             }),
             ..Default::default()
         };
-        self.config.languages.insert(language.clone(), lang_config);
+        self.config_mut()
+            .languages
+            .insert(language.clone(), lang_config);
         tracing::info!("Language config registered for '{}'", language);
     }
 
@@ -1697,7 +1856,10 @@ impl Editor {
             lsp.set_language_config(language.clone(), lsp_config.clone());
         }
         // Also update runtime config
-        self.config.lsp.insert(language.clone(), lsp_config);
+        self.config_mut().lsp.insert(
+            language.clone(),
+            crate::types::LspLanguageConfig::Multi(vec![lsp_config]),
+        );
         tracing::info!("LSP server registered for '{}'", language);
     }
 
@@ -1721,7 +1883,52 @@ impl Editor {
     /// RegisterGrammar+ReloadGrammars pairs result in only one rebuild.
     /// The rebuild happens on a background thread; when complete, a
     /// `GrammarRegistryBuilt` message swaps in the new registry.
+    ///
+    /// On the first call, this triggers the deferred full grammar build
+    /// (user grammars + language packs + any plugin grammars accumulated so far).
     pub(super) fn flush_pending_grammars(&mut self) {
+        // On the first call, start the deferred full grammar build.
+        // This includes any plugin grammars that were registered during init,
+        // so we get everything in a single builder.build() pass.
+        if self.needs_full_grammar_build {
+            self.needs_full_grammar_build = false;
+            self.grammar_reload_pending = false;
+
+            // Drain all pending grammars to include in the initial build
+            let additional: Vec<_> = self
+                .pending_grammars
+                .drain(..)
+                .map(|g| crate::primitives::grammar::GrammarSpec {
+                    language: g.language.clone(),
+                    path: std::path::PathBuf::from(g.grammar_path),
+                    extensions: g.extensions.clone(),
+                })
+                .collect();
+
+            // Update config.languages with the extensions so detect_language() works
+            for crate::primitives::grammar::GrammarSpec {
+                language,
+                extensions,
+                ..
+            } in &additional
+            {
+                let lang_config = self
+                    .config_mut()
+                    .languages
+                    .entry(language.clone())
+                    .or_default();
+                for ext in extensions {
+                    if !lang_config.extensions.contains(ext) {
+                        lang_config.extensions.push(ext.clone());
+                    }
+                }
+            }
+
+            let callback_ids: Vec<_> = self.pending_grammar_callbacks.drain(..).collect();
+            self.start_background_grammar_build(additional, callback_ids);
+            return;
+        }
+
         if !self.grammar_reload_pending {
             return;
         }
@@ -1743,27 +1950,78 @@ impl Editor {
             return;
         }
 
+        // Deduplicate: skip grammars whose extensions are all already mapped
+        // in the current registry (meaning the grammar was already loaded by
+        // for_editor or a previous build).
+        let pending_before = self.pending_grammars.len();
+        self.pending_grammars.retain(|g| {
+            // Check if ALL extensions for this grammar are already mapped
+            let all_mapped = !g.extensions.is_empty()
+                && g.extensions
+                    .iter()
+                    .all(|ext| self.grammar_registry.find_by_extension(ext).is_some());
+            if all_mapped {
+                tracing::debug!(
+                    "Skipping already-loaded grammar '{}' (extensions {:?} already mapped)",
+                    g.language,
+                    g.extensions
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if pending_before != self.pending_grammars.len() {
+            tracing::info!(
+                "Deduplicated pending grammars: {} -> {}",
+                pending_before,
+                self.pending_grammars.len()
+            );
+        }
+
+        if self.pending_grammars.is_empty() {
+            tracing::info!(
+                "All pending grammars already loaded, resolving callbacks without rebuild"
+            );
+            // Resolve callbacks immediately — no rebuild needed
+            #[cfg(feature = "plugins")]
+            for cb_id in self.pending_grammar_callbacks.drain(..) {
+                self.plugin_manager
+                    .resolve_callback(cb_id, "null".to_string());
+            }
+            #[cfg(not(feature = "plugins"))]
+            self.pending_grammar_callbacks.clear();
+            return;
+        }
+
         tracing::info!(
             "Flushing {} pending grammars via background rebuild",
             self.pending_grammars.len()
         );
 
         // Collect pending grammars
-        let additional: Vec<_> = self
+        let additional: Vec<crate::primitives::grammar::GrammarSpec> = self
             .pending_grammars
             .drain(..)
-            .map(|g| {
-                (
-                    g.language.clone(),
-                    PathBuf::from(g.grammar_path),
-                    g.extensions.clone(),
-                )
+            .map(|g| crate::primitives::grammar::GrammarSpec {
+                language: g.language.clone(),
+                path: PathBuf::from(g.grammar_path),
+                extensions: g.extensions.clone(),
             })
             .collect();
 
         // Update config.languages with the extensions so detect_language() works
-        for (language, _path, extensions) in &additional {
-            let lang_config = self.config.languages.entry(language.clone()).or_default();
+        for crate::primitives::grammar::GrammarSpec {
+            language,
+            extensions,
+            ..
+        } in &additional
+        {
+            let lang_config = self
+                .config_mut()
+                .languages
+                .entry(language.clone())
+                .or_default();
             for ext in extensions {
                 if !lang_config.extensions.contains(ext) {
                     lang_config.extensions.push(ext.clone());
@@ -1855,8 +2113,18 @@ impl Editor {
 
         // Collect all project files via FileSystem trait (works for both local and remote)
         let cwd = self.working_dir.clone();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
-        walk_files_recursive(&*self.filesystem, &cwd, &mut file_paths);
+        if let Err(e) =
+            self.authority
+                .filesystem
+                .walk_files(&cwd, IGNORED_DIRS, &cancel, &mut |path, _rel| {
+                    file_paths.push(path.to_path_buf());
+                    true
+                })
+        {
+            tracing::warn!("walk_files failed: {}", e);
+        }
 
         // Search each file: open buffers via piece tree, others via fs.search_file
         for file_path in &file_paths {
@@ -1899,7 +2167,7 @@ impl Editor {
                 let mut cursor = crate::model::filesystem::FileSearchCursor::new();
                 let mut file_matches = Vec::new();
                 while !cursor.done && file_matches.len() < remaining {
-                    match self.filesystem.search_file(
+                    match self.authority.filesystem.search_file(
                         file_path,
                         &pattern,
                         &fs_opts_file,
@@ -1939,6 +2207,7 @@ impl Editor {
     /// - Spawns a tokio task that walks the directory tree and fans out file searches
     /// - Each file's matches are sent back immediately via AsyncBridge
     /// - Supports cancellation via AtomicBool when a new search starts
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_grep_project_streaming(
         &mut self,
         pattern: String,
@@ -2003,8 +2272,8 @@ impl Editor {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.streaming_grep_cancellation = Some(cancel.clone());
 
-        let filesystem = self.filesystem.clone();
-        let filesystem_walker = self.filesystem.clone();
+        let filesystem = self.authority.filesystem.clone();
+        let filesystem_walker = self.authority.filesystem.clone();
         let cwd = self.working_dir.clone();
         let query_len = pattern.len();
 
@@ -2036,10 +2305,17 @@ impl Editor {
                 );
                 let mut file_count = 0usize;
 
-                walk_files_streaming(&*filesystem_walker, &cwd, &cancel_walker, &mut |path| {
-                    file_count += 1;
-                    path_tx.blocking_send(path).is_ok()
-                });
+                if let Err(e) = filesystem_walker.walk_files(
+                    &cwd,
+                    IGNORED_DIRS,
+                    &cancel_walker,
+                    &mut |path, _rel| {
+                        file_count += 1;
+                        path_tx.blocking_send(path.to_path_buf()).is_ok()
+                    },
+                ) {
+                    tracing::warn!("GrepStreaming walk_files failed: {}", e);
+                }
 
                 tracing::info!(
                     "GrepStreaming walker: done, sent {} files (search_id={})",
@@ -2267,6 +2543,18 @@ impl Editor {
                     if let Some(meta) = self.buffer_metadata.get_mut(&bid) {
                         meta.hidden_from_tabs = true;
                     }
+                    // `open_file_no_focus` unconditionally attaches the new
+                    // buffer as a tab to the preferred split.  When we're
+                    // running as a side effect of the Search/Replace panel,
+                    // the preferred split may be the panel's split (or any
+                    // normal split), which then carries a phantom tab for
+                    // this "hidden" buffer.  Close-Buffer on the panel would
+                    // then fall through to that tab instead of closing the
+                    // whole split.  Strip the buffer from every split's tab
+                    // list so only the panel split holds the panel buffer.
+                    for view_state in self.split_view_states.values_mut() {
+                        view_state.remove_buffer(bid);
+                    }
                     bid
                 }
                 Err(e) => {
@@ -2292,11 +2580,70 @@ impl Editor {
 
         let replacements = edits.len();
 
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
-            // Apply all edits as a single bulk operation (single undo action)
+        // Owned tuples for helpers that don't take references.
+        let edits_owned: Vec<(usize, usize, String)> = sorted_matches
+            .iter()
+            .map(|&(offset, len)| (offset, len, replacement.clone()))
+            .collect();
+        // Merged edit-lengths list for marker/margin replay on undo/redo.
+        // Mirrors the merging logic in `apply_events_as_bulk_edit`.
+        let edit_lengths: Vec<(usize, usize, usize)> = {
+            let mut lengths: Vec<(usize, usize, usize)> = Vec::new();
+            for (pos, del_len, text) in &edits_owned {
+                if let Some(last) = lengths.last_mut() {
+                    if last.0 == *pos {
+                        last.1 += del_len;
+                        last.2 += text.len();
+                        continue;
+                    }
+                }
+                lengths.push((*pos, *del_len, text.len()));
+            }
+            lengths
+        };
+
+        // Apply edits and capture pre/post snapshots so the replace is undoable
+        // via the standard event log machinery.  Project replace has no
+        // meaningful cursor positions to restore on undo, so we pass empty
+        // cursor lists.
+        let mut saved_path: Option<std::path::PathBuf> = None;
+        let bulk_edit_event = if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            let old_snapshot = state.buffer.snapshot_buffer_state();
+            let displaced_markers = state.capture_displaced_markers_bulk(&edits_owned);
+
+            // Apply all edits as a single bulk operation
             state.buffer.apply_bulk_edits(&edits);
 
-            // Save the buffer via the FileSystem trait
+            // Adjust markers and margins to track the edits, matching the
+            // logic used by interactive multi-cursor edits.
+            for &(pos, del_len, ins_len) in &edit_lengths {
+                if del_len > 0 && ins_len > 0 {
+                    if ins_len > del_len {
+                        state.marker_list.adjust_for_insert(pos, ins_len - del_len);
+                        state.margins.adjust_for_insert(pos, ins_len - del_len);
+                    } else if del_len > ins_len {
+                        state.marker_list.adjust_for_delete(pos, del_len - ins_len);
+                        state.margins.adjust_for_delete(pos, del_len - ins_len);
+                    }
+                } else if del_len > 0 {
+                    state.marker_list.adjust_for_delete(pos, del_len);
+                    state.margins.adjust_for_delete(pos, del_len);
+                } else if ins_len > 0 {
+                    state.marker_list.adjust_for_insert(pos, ins_len);
+                    state.margins.adjust_for_insert(pos, ins_len);
+                }
+            }
+
+            state.highlighter.invalidate_all();
+
+            let new_snapshot = state.buffer.snapshot_buffer_state();
+
+            // Save the buffer via the FileSystem trait.  Capture the path
+            // into the outer `saved_path` so we can refresh the watched
+            // mtime after dropping the &mut self borrow on `state` —
+            // otherwise the auto-revert poller sees the new mtime, treats
+            // it as an external change, and reverts the buffer from disk,
+            // wiping the event log we're about to append (see bug #1).
             if let Some(path) = state.buffer.file_path().map(|p| p.to_path_buf()) {
                 if let Err(e) = state.buffer.save_to_file(&path) {
                     self.plugin_manager.reject_callback(
@@ -2305,6 +2652,67 @@ impl Editor {
                     );
                     return;
                 }
+                saved_path = Some(path);
+            }
+
+            Some(Event::BulkEdit {
+                old_snapshot: Some(old_snapshot),
+                new_snapshot: Some(new_snapshot),
+                old_cursors: Vec::new(),
+                new_cursors: Vec::new(),
+                description: format!(
+                    "Project replace ({} replacement{})",
+                    replacements,
+                    if replacements == 1 { "" } else { "s" }
+                ),
+                edits: edit_lengths,
+                displaced_markers,
+            })
+        } else {
+            None
+        };
+
+        // Refresh the watched mtime for the just-saved file so the
+        // auto-revert poller does NOT treat our own save as an external
+        // change.  Without this, `handle_file_changed` → `revert_buffer_by_id`
+        // would run and reset the event log we're about to append to,
+        // making the replace silently un-undoable (bug #1).
+        if let Some(ref path) = saved_path {
+            self.watch_file(path);
+        }
+
+        // Record the BulkEdit on the buffer's event log so Undo can revert it.
+        if let Some(event) = bulk_edit_event {
+            if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
+                event_log.append(event);
+                // The file on disk is now in the post-replace state, so mark
+                // this position as "saved".  Otherwise `saved_at_index` would
+                // stay at its pre-replace value and undo (which moves
+                // `current_index` backwards) would land on the old saved
+                // position and `update_modified_from_event_log` would clear
+                // the modified flag — leaving the user with a reverted buffer
+                // that looks clean even though disk still has the XYZ
+                // content.  We want the tab to show `a.txt*` after undo.
+                event_log.mark_saved();
+            }
+            self.invalidate_layouts_for_buffer(buffer_id);
+
+            // Notify LSP with full document content (bulk edits collapse
+            // incremental ranges).
+            let full_content_change = self
+                .buffers
+                .get(&buffer_id)
+                .and_then(|s| s.buffer.to_string())
+                .map(|text| {
+                    vec![lsp_types::TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text,
+                    }]
+                })
+                .unwrap_or_default();
+            if !full_content_change.is_empty() {
+                self.send_lsp_changes_for_buffer(buffer_id, full_content_change);
             }
         }
 
@@ -2314,5 +2722,206 @@ impl Editor {
         };
         let json = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
         self.plugin_manager.resolve_callback(callback_id, json);
+    }
+
+    /// Handle StartAnimationArea: translate the plugin description into an
+    /// AnimationKind and start it at the given Rect with the plugin's ID.
+    pub(super) fn handle_start_animation_area(
+        &mut self,
+        id: u64,
+        rect: fresh_core::api::AnimationRect,
+        kind: fresh_core::api::PluginAnimationKind,
+    ) {
+        if !self.config.editor.animations {
+            return;
+        }
+        let area = ratatui::layout::Rect::new(rect.x, rect.y, rect.width, rect.height);
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let animation_kind = translate_plugin_animation_kind(kind);
+        self.animations.start_with_id(
+            crate::view::animation::AnimationId::from_raw(id),
+            area,
+            animation_kind,
+        );
+    }
+
+    /// Handle StartAnimationVirtualBuffer: resolve the virtual buffer's
+    /// current on-screen Rect, then delegate to `handle_start_animation_area`.
+    /// If the rect isn't in the cached split layout yet (common when the
+    /// buffer was just created and no render pass has placed it), the
+    /// request is queued and drained at the top of the next render pass
+    /// once `split_areas` has been recomputed.
+    pub(super) fn handle_start_animation_virtual_buffer(
+        &mut self,
+        id: u64,
+        buffer_id: BufferId,
+        kind: fresh_core::api::PluginAnimationKind,
+    ) {
+        if !self.config.editor.animations {
+            return;
+        }
+        match self.virtual_buffer_screen_rect(buffer_id) {
+            Some(area) => {
+                let animation_kind = translate_plugin_animation_kind(kind);
+                self.animations.start_with_id(
+                    crate::view::animation::AnimationId::from_raw(id),
+                    area,
+                    animation_kind,
+                );
+            }
+            None => {
+                tracing::debug!(
+                    "animate_virtual_buffer: buffer {:?} not yet on screen, deferring",
+                    buffer_id
+                );
+                self.pending_vb_animations.push((id, buffer_id, kind));
+            }
+        }
+    }
+
+    /// Retry deferred virtual-buffer animations now that split_areas has
+    /// been recomputed. Called from render() after layout but before
+    /// animations.apply_all so the first frame of the effect lands in
+    /// the same render pass.
+    pub(crate) fn drain_pending_vb_animations(&mut self) {
+        if self.pending_vb_animations.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_vb_animations);
+        for (id, buffer_id, kind) in pending {
+            match self.virtual_buffer_screen_rect(buffer_id) {
+                Some(area) => {
+                    let animation_kind = translate_plugin_animation_kind(kind);
+                    self.animations.start_with_id(
+                        crate::view::animation::AnimationId::from_raw(id),
+                        area,
+                        animation_kind,
+                    );
+                }
+                None => {
+                    // Still not visible; keep pending for next frame.
+                    self.pending_vb_animations.push((id, buffer_id, kind));
+                }
+            }
+        }
+    }
+
+    /// Look up the on-screen Rect currently occupied by `buffer_id`, if any.
+    /// Reads from the cached split layout captured in the last render pass.
+    pub(crate) fn virtual_buffer_screen_rect(
+        &self,
+        buffer_id: BufferId,
+    ) -> Option<ratatui::layout::Rect> {
+        self.cached_layout
+            .split_areas
+            .iter()
+            .find(|(_, bid, _, _, _, _)| *bid == buffer_id)
+            .map(|(_, _, content_rect, _, _, _)| *content_rect)
+    }
+}
+
+/// Translate the plugin-facing animation description to the internal
+/// `AnimationKind` the runner consumes.
+fn translate_plugin_animation_kind(
+    kind: fresh_core::api::PluginAnimationKind,
+) -> crate::view::animation::AnimationKind {
+    use crate::view::animation::{AnimationKind, Edge};
+    use fresh_core::api::{PluginAnimationEdge, PluginAnimationKind};
+    use std::time::Duration;
+    match kind {
+        PluginAnimationKind::SlideIn {
+            from,
+            duration_ms,
+            delay_ms,
+        } => AnimationKind::SlideIn {
+            from: match from {
+                PluginAnimationEdge::Top => Edge::Top,
+                PluginAnimationEdge::Bottom => Edge::Bottom,
+                PluginAnimationEdge::Left => Edge::Left,
+                PluginAnimationEdge::Right => Edge::Right,
+            },
+            duration: Duration::from_millis(duration_ms as u64),
+            delay: Duration::from_millis(delay_ms as u64),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::Editor;
+    use crate::config::Config;
+    use crate::config_io::DirectoryContext;
+    use fresh_core::api::LayoutHints;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn make_editor() -> (Editor, TempDir) {
+        let config = Config::default();
+        let temp_dir = TempDir::new().unwrap();
+        let dir_context = DirectoryContext::for_testing(temp_dir.path());
+        let fs: Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> =
+            Arc::new(crate::model::filesystem::StdFileSystem);
+        let editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+            fs,
+        )
+        .unwrap();
+        (editor, temp_dir)
+    }
+
+    /// Plugin sends `setLayoutHints(targetBufferId, …)` for buffer X while
+    /// buffer Y is active in the split. The compose_width must land on X
+    /// (the targeted buffer), not on Y. Without the fix, `view_state` derefs
+    /// to the active buffer's `BufferViewState`, so Y receives the width and
+    /// renders centered without anything ever asking for it on Y.
+    #[test]
+    fn handle_set_layout_hints_targets_specified_buffer_not_active() {
+        let (mut editor, _temp) = make_editor();
+
+        let initial_buf = editor.active_buffer();
+        let other_buf = editor.new_buffer();
+        // new_buffer makes `other_buf` active; switch back so initial_buf is active
+        // and `other_buf` is the non-active target the plugin wants to reach.
+        editor.switch_buffer(initial_buf);
+        assert_eq!(editor.active_buffer(), initial_buf);
+
+        // Plugin call: target the non-active buffer.
+        editor.handle_set_layout_hints(
+            other_buf,
+            None,
+            LayoutHints {
+                compose_width: Some(80),
+                column_guides: None,
+            },
+        );
+
+        let active_split = editor.split_manager.active_split();
+        let view_state = editor
+            .split_view_states
+            .get(&active_split)
+            .expect("split view state");
+
+        let other_state = view_state
+            .buffer_state(other_buf)
+            .expect("other buffer keyed in split");
+        assert_eq!(
+            other_state.compose_width,
+            Some(80),
+            "compose_width must land on the targeted buffer",
+        );
+
+        let active_state = view_state
+            .buffer_state(initial_buf)
+            .expect("active buffer keyed in split");
+        assert_eq!(
+            active_state.compose_width, None,
+            "compose_width must NOT land on the (different) active buffer",
+        );
     }
 }

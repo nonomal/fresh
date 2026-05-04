@@ -164,6 +164,57 @@ pub struct VirtualBufferResult {
     pub split_id: Option<u64>,
 }
 
+/// A rectangular region, in cells. Used by the animation plugin API so
+/// callers can target arbitrary screen regions without going through a
+/// virtual buffer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct AnimationRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Edge a slide-in effect enters from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub enum PluginAnimationEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Plugin-facing animation description. Tagged by `kind`. Additional
+/// variants can be added later; plugins must handle the `kind` they send.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[ts(export)]
+pub enum PluginAnimationKind {
+    #[serde(rename_all = "camelCase")]
+    SlideIn {
+        from: PluginAnimationEdge,
+        duration_ms: u32,
+        delay_ms: u32,
+    },
+}
+
+/// Result of creating a buffer group
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct BufferGroupResult {
+    /// The group ID
+    #[ts(type = "number")]
+    pub group_id: u64,
+    /// Panel buffer IDs, keyed by panel name
+    #[ts(type = "Record<string, number>")]
+    pub panels: HashMap<String, u64>,
+}
+
 /// Response from the editor for async plugin operations
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -225,6 +276,23 @@ pub enum PluginResponse {
         request_id: u64,
         split_id: Option<SplitId>,
     },
+}
+
+impl PluginResponse {
+    pub fn request_id(&self) -> u64 {
+        match self {
+            Self::VirtualBufferCreated { request_id, .. }
+            | Self::TerminalCreated { request_id, .. }
+            | Self::LspRequest { request_id, .. }
+            | Self::HighlightsComputed { request_id, .. }
+            | Self::BufferText { request_id, .. }
+            | Self::LineStartPosition { request_id, .. }
+            | Self::LineEndPosition { request_id, .. }
+            | Self::BufferLineCount { request_id, .. }
+            | Self::CompositeBufferCreated { request_id, .. }
+            | Self::SplitByLabel { request_id, .. } => *request_id,
+        }
+    }
 }
 
 /// Messages sent from async plugin tasks to the synchronous main loop
@@ -346,6 +414,23 @@ pub struct BufferInfo {
     pub compose_width: Option<u16>,
     /// The detected language for this buffer (e.g., "rust", "markdown", "text")
     pub language: String,
+    /// Whether this tab was opened in "preview" (ephemeral) mode — true when
+    /// opened via single-click in the file explorer and not yet committed
+    /// (no edit, no double-click, no tab-click, no layout change). Plugins
+    /// that react to buffer lifecycle events should generally treat preview
+    /// buffers as transient; e.g. a diagnostics panel may want to skip
+    /// refreshing itself for a preview tab.
+    #[serde(default)]
+    pub is_preview: bool,
+    /// Split ids that currently hold this buffer (empty when the buffer is
+    /// open but not visible in any split — e.g. background-opened tabs
+    /// that haven't been focused). Lets plugins implement "focus existing
+    /// buffer if visible, else open new" without having to track split
+    /// ids across editor restarts (which reassign them). The list is a
+    /// snapshot at the last `update_plugin_state_snapshot` tick.
+    #[serde(default)]
+    #[ts(type = "number[]")]
+    pub splits: Vec<SplitId>,
 }
 
 fn serialize_path<S: serde::Serializer>(path: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
@@ -370,27 +455,6 @@ where
     seq.end()
 }
 
-/// Serialize optional ranges as [start, end] tuples for JS compatibility
-fn serialize_opt_ranges_as_tuples<S>(
-    ranges: &Option<Vec<Range<usize>>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match ranges {
-        Some(ranges) => {
-            use serde::ser::SerializeSeq;
-            let mut seq = serializer.serialize_seq(Some(ranges.len()))?;
-            for range in ranges {
-                seq.serialize_element(&(range.start, range.end))?;
-            }
-            seq.end()
-        }
-        None => serializer.serialize_none(),
-    }
-}
-
 /// Diff between current buffer content and last saved snapshot
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -399,9 +463,6 @@ pub struct BufferSavedDiff {
     #[serde(serialize_with = "serialize_ranges_as_tuples")]
     #[ts(type = "Array<[number, number]>")]
     pub byte_ranges: Vec<Range<usize>>,
-    #[serde(serialize_with = "serialize_opt_ranges_as_tuples")]
-    #[ts(type = "Array<[number, number]> | null")]
-    pub line_ranges: Option<Vec<Range<usize>>>,
 }
 
 /// Information about the viewport
@@ -419,6 +480,49 @@ pub struct ViewportInfo {
     pub width: u16,
     /// Viewport height
     pub height: u16,
+}
+
+/// Per-split state surfaced to plugins via `editor.listSplits()`.
+///
+/// Plugins that need to operate on every visible buffer (multi-split
+/// flash labels, syncing decorations across panes, ...) can iterate
+/// this list rather than only seeing the active split's `getViewport()`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct SplitSnapshot {
+    /// Stable split identifier; matches the values used by
+    /// `setSplitBuffer`, `focusSplit`, `getSplitByLabel`, etc.
+    pub split_id: usize,
+    /// Buffer currently shown in this split.
+    pub buffer_id: BufferId,
+    /// Viewport (top byte / dimensions) for this split's active buffer.
+    pub viewport: ViewportInfo,
+}
+
+/// Payload delivered to a plugin's `editor.getNextKey()` Promise when
+/// the next keypress arrives in the editor's input dispatch.
+///
+/// `key` uses the same naming as `defineMode` bindings: lowercase
+/// names like `"escape"`, `"enter"`, `"tab"`, `"space"`, `"left"`,
+/// `"f1"`–`"f12"`, or a single character (e.g. `"a"`, `"!"`).
+/// Modifier flags are reported separately so plugins can recognise
+/// chord variants without parsing.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct KeyEventPayload {
+    /// Key name (e.g. `"a"`, `"escape"`, `"f1"`).
+    pub key: String,
+    /// Ctrl held.
+    pub ctrl: bool,
+    /// Alt held.
+    pub alt: bool,
+    /// Shift held (only meaningful for non-character keys; for
+    /// printable characters the case is already encoded in `key`).
+    pub shift: bool,
+    /// Super / Cmd / Meta held.
+    pub meta: bool,
 }
 
 /// Layout hints supplied by plugins (e.g., Compose mode)
@@ -646,6 +750,12 @@ pub struct CreateCompositeBufferOptions {
     /// Diff hunks for alignment (optional)
     #[serde(default)]
     pub hunks: Option<Vec<CompositeHunk>>,
+    /// When set, the first render will scroll to center the Nth hunk (0-indexed).
+    /// This avoids timing issues with imperative scroll commands that depend on
+    /// render-created state (viewport dimensions, view state).
+    #[serde(default, rename = "initialFocusHunk")]
+    #[ts(optional, rename = "initialFocusHunk")]
+    pub initial_focus_hunk: Option<usize>,
 }
 
 /// Wire-format view token kind (serialized for plugin transforms)
@@ -700,7 +810,7 @@ pub struct ViewTokenWire {
     /// The token content
     pub kind: ViewTokenWireKind,
     /// Optional styling for injected content (only used when source_offset is None)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub style: Option<ViewTokenStyle>,
 }
@@ -736,6 +846,10 @@ pub struct EditorStateSnapshot {
     pub all_cursors: Vec<CursorInfo>,
     /// Viewport information for the active buffer
     pub viewport: Option<ViewportInfo>,
+    /// Per-split snapshots: split id, buffer shown, viewport.
+    /// Includes the active split.  Order is unspecified.
+    #[serde(default)]
+    pub splits: Vec<SplitSnapshot>,
     /// Cursor positions per buffer (for buffers other than active)
     pub buffer_cursor_positions: HashMap<BufferId, usize>,
     /// Text properties per buffer (for virtual buffers with properties)
@@ -747,22 +861,66 @@ pub struct EditorStateSnapshot {
     pub clipboard: String,
     /// Editor's working directory (for file operations and spawning processes)
     pub working_dir: PathBuf,
-    /// LSP diagnostics per file URI
-    /// Maps file URI string to Vec of diagnostics for that file
+    /// Status-bar / explorer label for the active authority.
+    ///
+    /// Empty = the local (default) authority with nothing to render.
+    /// Non-empty means a non-local authority is installed (e.g.
+    /// `"Container:abc123def456"` for a devcontainer). Plugins can
+    /// read this via `editor.getAuthorityLabel()` to detect "already
+    /// attached" without having to track state across editor restarts.
+    #[serde(default)]
+    pub authority_label: String,
+    /// LSP diagnostics per file URI.
+    /// Maps file URI string to Vec of diagnostics for that file.
+    ///
+    /// Wrapped in `Arc` so snapshot refresh is a refcount bump rather than
+    /// a deep clone. The editor only mutates its own map through
+    /// `Arc::make_mut`, which CoW-clones while this snapshot still holds
+    /// a reference — a reader can never observe an in-place mutation.
+    ///
+    /// `#[serde(skip)]`: serde out-of-the-box can't serialize `Arc<T>`
+    /// (behind the `rc` cargo feature we don't enable). We never serialize
+    /// the snapshot as a whole — plugin readers pull out these Arcs and
+    /// serialize the *inner* value directly (e.g. `get_all_diagnostics`).
+    #[serde(skip)]
     #[ts(type = "any")]
-    pub diagnostics: HashMap<String, Vec<lsp_types::Diagnostic>>,
-    /// LSP folding ranges per file URI
-    /// Maps file URI string to Vec of folding ranges for that file
+    pub diagnostics: Arc<HashMap<String, Vec<lsp_types::Diagnostic>>>,
+    /// LSP folding ranges per file URI.
+    /// Maps file URI string to Vec of folding ranges for that file.
+    /// Arc-wrapped for the same CoW invariant as `diagnostics`; see that
+    /// field for why this is `#[serde(skip)]`.
+    #[serde(skip)]
     #[ts(type = "any")]
-    pub folding_ranges: HashMap<String, Vec<lsp_types::FoldingRange>>,
-    /// Runtime config as serde_json::Value (merged user config + defaults)
-    /// This is the runtime config, not just the user's config file
+    pub folding_ranges: Arc<HashMap<String, Vec<lsp_types::FoldingRange>>>,
+    /// Runtime config as serde_json::Value (merged user config + defaults).
+    /// This is the runtime config, not just the user's config file.
+    ///
+    /// Wrapped in `Arc` so the snapshot update is a refcount bump. The
+    /// editor reserializes its source `Config` only when the underlying
+    /// `Arc<Config>` pointer has moved (i.e., after a real mutation), and
+    /// swaps the whole `Arc<Value>` atomically — callers never see a
+    /// partially-updated blob. `#[serde(skip)]` for the same reason as
+    /// `diagnostics`.
+    #[serde(skip)]
     #[ts(type = "any")]
-    pub config: serde_json::Value,
-    /// User config as serde_json::Value (only what's in the user's config file)
-    /// Fields not present here are using default values
+    pub config: Arc<serde_json::Value>,
+    /// User config as serde_json::Value (only what's in the user's config file).
+    /// Fields not present here are using default values.
+    /// Arc-wrapped; swapped as a whole when the user's file is reloaded.
+    /// `#[serde(skip)]` for the same reason as `diagnostics`.
+    #[serde(skip)]
     #[ts(type = "any")]
-    pub user_config: serde_json::Value,
+    pub user_config: Arc<serde_json::Value>,
+    /// Available grammars with provenance info, updated when grammar registry changes
+    #[ts(type = "GrammarInfo[]")]
+    pub available_grammars: Vec<GrammarInfoSnapshot>,
+    /// Last-seen grammar registry generation. The state-snapshot updater
+    /// rebuilds `available_grammars` only when this disagrees with the
+    /// registry's current `catalog_gen()`. `#[serde(skip)]` because the
+    /// counter is a host-side detail not exposed to plugins.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub last_grammar_gen: u64,
     /// Global editor mode for modal editing (e.g., "vi-normal", "vi-insert")
     /// When set, this mode's keybindings take precedence over normal key handling
     pub editor_mode: Option<String>,
@@ -805,15 +963,19 @@ impl EditorStateSnapshot {
             primary_cursor: None,
             all_cursors: Vec::new(),
             viewport: None,
+            splits: Vec::new(),
             buffer_cursor_positions: HashMap::new(),
             buffer_text_properties: HashMap::new(),
             selected_text: None,
             clipboard: String::new(),
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            diagnostics: HashMap::new(),
-            folding_ranges: HashMap::new(),
-            config: serde_json::Value::Null,
-            user_config: serde_json::Value::Null,
+            authority_label: String::new(),
+            diagnostics: Arc::new(HashMap::new()),
+            folding_ranges: Arc::new(HashMap::new()),
+            config: Arc::new(serde_json::Value::Null),
+            user_config: Arc::new(serde_json::Value::Null),
+            available_grammars: Vec::new(),
+            last_grammar_gen: 0,
             editor_mode: None,
             plugin_view_states: HashMap::new(),
             plugin_view_states_split: 0,
@@ -827,6 +989,20 @@ impl Default for EditorStateSnapshot {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Grammar info exposed to plugins, mirroring the editor's grammar provenance tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GrammarInfoSnapshot {
+    /// The grammar name as used in config files (case-insensitive matching)
+    pub name: String,
+    /// Where this grammar was loaded from (e.g. "built-in", "plugin (myplugin)")
+    pub source: String,
+    /// File extensions associated with this grammar
+    pub file_extensions: Vec<String>,
+    /// Optional short name alias (e.g., "bash" for "Bourne Again Shell (bash)")
+    pub short_name: Option<String>,
 }
 
 /// Position for inserting menu items or menus
@@ -884,9 +1060,30 @@ pub enum PluginCommand {
     /// Apply a theme by name
     ApplyTheme { theme_name: String },
 
+    /// Override specific theme color keys in-memory for the running session.
+    /// Keys are the same `section.field` strings accepted by
+    /// `Theme::resolve_theme_key` (e.g. `"editor.bg"`, `"ui.status_bar_fg"`).
+    /// Values are `[r, g, b]` triplets. Unknown keys are silently dropped so
+    /// a typo in a fast animation loop doesn't blow up the caller; the
+    /// return channel isn't used — plugins can do a dry-run look-up via
+    /// `getThemeSchema` if they want compile-time safety. Overrides are
+    /// reset the next time the caller (or anyone else) invokes
+    /// `applyTheme`, because that replaces the whole `Theme` from the
+    /// registry.
+    OverrideThemeColors { overrides: HashMap<String, [u8; 3]> },
+
     /// Reload configuration from file
     /// After a plugin saves config changes, it should call this to reload the config
     ReloadConfig,
+
+    /// Write a single setting to the runtime overlay for this session.
+    /// `path` is dot-separated (e.g. "editor.tab_size"). Last write wins.
+    SetSetting {
+        plugin_name: String,
+        path: String,
+        #[ts(type = "unknown")]
+        value: JsonValue,
+    },
 
     /// Register a custom command
     RegisterCommand { command: Command },
@@ -1024,6 +1221,23 @@ pub enum PluginCommand {
         before: bool, // true = before char, false = after char
     },
 
+    /// Add virtual text with full styling — fg/bg can be RGB or theme
+    /// keys (resolved at render time so theme changes apply live).
+    /// This is the richer form of `AddVirtualText` that lets plugins
+    /// produce themed labels (flash jump, type hints with semantic
+    /// colours, …) without hard-coding RGB values.
+    AddVirtualTextStyled {
+        buffer_id: BufferId,
+        virtual_text_id: String,
+        position: usize,
+        text: String,
+        fg: Option<OverlayColorSpec>,
+        bg: Option<OverlayColorSpec>,
+        bold: bool,
+        italic: bool,
+        before: bool,
+    },
+
     /// Remove a virtual text by ID
     RemoveVirtualText {
         buffer_id: BufferId,
@@ -1045,10 +1259,13 @@ pub enum PluginCommand {
         position: usize,
         /// Full line content to display
         text: String,
-        /// Foreground color (RGB)
-        fg_color: (u8, u8, u8),
-        /// Background color (RGB), None = transparent
-        bg_color: Option<(u8, u8, u8)>,
+        /// Foreground color — RGB tuple or theme key string (e.g.
+        /// `"editor.line_number_fg"`).  Resolved at render time so the line
+        /// follows theme changes.
+        fg_color: Option<OverlayColorSpec>,
+        /// Background color — RGB tuple or theme key string.  None =
+        /// transparent (inherits from underlying viewport background).
+        bg_color: Option<OverlayColorSpec>,
         /// true = above the line containing position, false = below
         above: bool,
         /// Namespace for bulk removal (e.g., "git-blame")
@@ -1090,6 +1307,23 @@ pub enum PluginCommand {
         start: usize,
         end: usize,
     },
+
+    /// Add a collapsed fold range. Hides the byte range
+    /// `[start, end)` from rendering — the line containing `start - 1`
+    /// (the fold's "header") stays visible while the lines covered by
+    /// the range are skipped. Used by plugins that want to expose
+    /// outline-style collapse without rebuilding buffer content.
+    AddFold {
+        buffer_id: BufferId,
+        start: usize,
+        end: usize,
+        /// Optional placeholder text to show on the header line
+        /// (currently unused by the renderer; reserved for future use).
+        placeholder: Option<String>,
+    },
+
+    /// Clear every collapsed fold range on the buffer.
+    ClearFolds { buffer_id: BufferId },
 
     /// Add a soft break point for marker-based line wrapping.
     /// The break is stored as a marker that auto-adjusts on buffer edits,
@@ -1205,6 +1439,12 @@ pub enum PluginCommand {
     StartPrompt {
         label: String,
         prompt_type: String, // e.g., "git-grep", "git-find-file"
+        /// When true, the prompt renders as a centred floating
+        /// overlay rather than a bottom-row minibuffer. Used for
+        /// Live Grep (issue #1796). Defaults to false at the wire
+        /// level via `#[serde(default)]`.
+        #[serde(default)]
+        floating_overlay: bool,
     },
 
     /// Start a prompt with pre-filled initial value
@@ -1212,6 +1452,9 @@ pub enum PluginCommand {
         label: String,
         prompt_type: String,
         initial_value: String,
+        /// See `StartPrompt::floating_overlay`.
+        #[serde(default)]
+        floating_overlay: bool,
     },
 
     /// Start an async prompt that returns result via callback
@@ -1222,12 +1465,54 @@ pub enum PluginCommand {
         callback_id: JsCallbackId,
     },
 
+    /// Request the next keypress for the calling plugin.
+    ///
+    /// The editor enqueues `callback_id` and resolves it with a
+    /// `KeyEventPayload` JSON value the next time a key arrives in
+    /// `Editor::handle_key`. Multiple pending requests are FIFO.
+    /// While at least one request is pending, the next key is consumed
+    /// by the resolution and does not propagate to mode bindings or
+    /// other dispatch — this is the primitive that lets a plugin run a
+    /// short input loop (flash labels, vi find-char, replace-char,
+    /// etc.) without binding every printable key in `defineMode`.
+    AwaitNextKey { callback_id: JsCallbackId },
+
+    /// Begin or end "key capture" mode for the calling plugin.
+    ///
+    /// Without this, a plugin running a `getNextKey()` loop has a
+    /// race: keys typed by the user (or pasted, or auto-repeated)
+    /// can arrive between two consecutive `getNextKey()` calls while
+    /// the plugin is still mid-redraw, and would otherwise fall
+    /// through to the editor's normal dispatch (inserting into the
+    /// buffer, etc.).
+    ///
+    /// While capture is active, every key arriving in
+    /// `Editor::handle_key` (after terminal-input dispatch) is
+    /// either resolved against a pending `AwaitNextKey` callback
+    /// (existing behaviour) or, if no callback is pending, *buffered*
+    /// in a FIFO queue.  When the next `AwaitNextKey` is processed,
+    /// the queue is drained first.  This gives plugins lossless,
+    /// in-order delivery of every key the user typed regardless of
+    /// timing.
+    ///
+    /// `EndKeyCapture` clears any unconsumed buffered keys; they do
+    /// NOT replay into the editor's normal dispatch path (that would
+    /// be surprising — the user's intent was for the plugin to
+    /// consume them).
+    SetKeyCaptureActive { active: bool },
+
     /// Update the suggestions list for the current prompt
     /// Uses the editor's Suggestion type
     SetPromptSuggestions { suggestions: Vec<Suggestion> },
 
     /// When enabled, navigating suggestions updates the prompt input text
     SetPromptInputSync { sync: bool },
+
+    /// Set the title shown in a floating-overlay prompt's frame
+    /// header (issue #1796). `None` clears any previously-set title
+    /// and falls back to the prompt-type default. Has no visible
+    /// effect on non-overlay prompts.
+    SetPromptTitle { title: Option<String> },
 
     /// Add a menu item to an existing menu
     /// Add a menu item to an existing menu
@@ -1310,6 +1595,11 @@ pub enum PluginCommand {
         line_wrap: Option<bool>,
         /// Place the new buffer before (left/top of) the existing content (default: false/after)
         before: bool,
+        /// Optional split role tag. When `Some("utility_dock")`, the
+        /// dispatcher routes the buffer to the existing dock leaf if
+        /// one exists; otherwise it seeds a new dock leaf with the
+        /// requested direction/ratio.
+        role: Option<String>,
         /// Optional request ID for async response (if set, editor will send back buffer ID)
         request_id: Option<u64>,
     },
@@ -1324,6 +1614,35 @@ pub enum PluginCommand {
     /// Get text properties at the cursor position in a buffer
     GetTextPropertiesAtCursor { buffer_id: BufferId },
 
+    /// Create a buffer group: multiple panels appearing as one tab.
+    /// Each panel is a real buffer with its own scrollbar and viewport.
+    CreateBufferGroup {
+        /// Display name (shown in tab bar)
+        name: String,
+        /// Mode for keybindings
+        mode: String,
+        /// Layout tree as JSON string (parsed by the handler)
+        layout_json: String,
+        /// Optional request ID for async response
+        request_id: Option<u64>,
+    },
+
+    /// Set the content of a panel within a buffer group.
+    SetPanelContent {
+        /// Group ID
+        group_id: usize,
+        /// Panel name (e.g., "tree", "picker")
+        panel_name: String,
+        /// Content entries
+        entries: Vec<TextPropertyEntry>,
+    },
+
+    /// Close a buffer group (closes all panels and splits)
+    CloseBufferGroup { group_id: usize },
+
+    /// Focus a specific panel within a buffer group
+    FocusPanel { group_id: usize, panel_name: String },
+
     /// Define a buffer mode with keybindings
     DefineMode {
         name: String,
@@ -1331,12 +1650,37 @@ pub enum PluginCommand {
         read_only: bool,
         /// When true, unbound character keys dispatch as `mode_text_input:<char>`.
         allow_text_input: bool,
+        /// When true, keys not bound by this mode fall through to the Normal
+        /// context (motion, selection, copy) instead of being dropped.
+        inherit_normal_bindings: bool,
         /// Name of the plugin that defined this mode (for attribution)
         plugin_name: Option<String>,
     },
 
     /// Switch the current split to display a buffer
     ShowBuffer { buffer_id: BufferId },
+
+    /// Start a frame-buffer animation over a given screen region. The `id`
+    /// is allocated on the plugin side so the JS call can return it
+    /// synchronously; the editor uses it verbatim.
+    StartAnimationArea {
+        id: u64,
+        rect: AnimationRect,
+        kind: PluginAnimationKind,
+    },
+
+    /// Start an animation over the on-screen Rect currently occupied by a
+    /// virtual buffer. If the buffer is not visible, the editor ignores
+    /// the command.
+    StartAnimationVirtualBuffer {
+        id: u64,
+        buffer_id: BufferId,
+        kind: PluginAnimationKind,
+    },
+
+    /// Cancel an animation by the ID returned from `animateArea` /
+    /// `animateVirtualBuffer`. No-op if the ID is unknown or already done.
+    CancelAnimation { id: u64 },
 
     /// Create a virtual buffer in an existing split (replaces current buffer in that split)
     CreateVirtualBufferInExistingSplit {
@@ -1378,6 +1722,8 @@ pub enum PluginCommand {
         sources: Vec<CompositeSourceConfig>,
         /// Diff hunks for line alignment (optional)
         hunks: Option<Vec<CompositeHunk>>,
+        /// When set, first render scrolls to center this hunk (0-indexed)
+        initial_focus_hunk: Option<usize>,
         /// Request ID for async response
         request_id: Option<u64>,
     },
@@ -1390,6 +1736,20 @@ pub enum PluginCommand {
 
     /// Close a composite buffer
     CloseCompositeBuffer { buffer_id: BufferId },
+
+    /// Force-materialize render-dependent state (like `layoutIfNeeded` in UIKit).
+    ///
+    /// Creates `CompositeViewState` for any visible composite buffer that doesn't
+    /// have one, and syncs viewport dimensions from split layout. This ensures
+    /// subsequent commands can read/modify view state that is normally created
+    /// lazily during the render cycle.
+    FlushLayout,
+
+    /// Navigate to the next hunk in a composite buffer
+    CompositeNextHunk { buffer_id: BufferId },
+
+    /// Navigate to the previous hunk in a composite buffer
+    CompositePrevHunk { buffer_id: BufferId },
 
     /// Focus a specific split
     FocusSplit { split_id: SplitId },
@@ -1441,6 +1801,15 @@ pub enum PluginCommand {
         /// Byte offset position for the cursor
         position: usize,
     },
+
+    /// Toggle whether the editor draws a native caret for this buffer.
+    ///
+    /// Buffer-group panel buffers default to `show_cursors = false`, which not
+    /// only hides the caret but also blocks all movement actions in
+    /// `action_to_events`. Plugins that want native cursor motion in a panel
+    /// buffer (e.g. for magit-style row navigation) flip this to `true` after
+    /// `createBufferGroup` returns.
+    SetBufferShowCursors { buffer_id: BufferId, show: bool },
 
     /// Send an arbitrary LSP request and return the raw JSON response
     SendLspRequest {
@@ -1537,6 +1906,18 @@ pub enum PluginCommand {
         /// Buffer ID containing the line
         buffer_id: BufferId,
         /// Line number to center (0-indexed)
+        line: usize,
+    },
+
+    /// Scroll any split/panel that displays `buffer_id` so the given
+    /// line is visible in the viewport. Unlike `ScrollToLineCenter` this
+    /// does not require a split id — it walks all splits (including
+    /// inner panels of a buffer group) and updates every viewport that
+    /// shows this buffer. Line is 0-indexed.
+    ScrollBufferToLine {
+        /// Buffer ID to scroll
+        buffer_id: BufferId,
+        /// Line number to bring into view (0-indexed)
         line: usize,
     },
 
@@ -1703,6 +2084,12 @@ pub enum PluginCommand {
         ratio: Option<f32>,
         /// Whether to focus the new terminal split (default true)
         focus: Option<bool>,
+        /// Whether this terminal survives editor restarts. When false, the
+        /// terminal is excluded from workspace serialization and its backing
+        /// file is kept unique-per-spawn so no scrollback from a prior run
+        /// leaks in. Plugin-created terminals default to `false` since they
+        /// are typically one-off tool UIs (rebuilds, exec shells, etc.).
+        persistent: bool,
         /// Callback ID for async response
         request_id: u64,
     },
@@ -1773,6 +2160,94 @@ pub enum PluginCommand {
         /// Callback ID for async response
         callback_id: JsCallbackId,
     },
+
+    /// Install a new authority.
+    ///
+    /// Authority is opaque to core. The payload is a tagged JSON object
+    /// (filesystem kind + spawner kind + terminal wrapper + display
+    /// label) that `fresh-editor` deserializes into its concrete
+    /// `AuthorityPayload` type. Using `serde_json::Value` here keeps
+    /// fresh-core from growing backend-specific knowledge; see
+    /// `crates/fresh-editor/src/services/authority/mod.rs` for the
+    /// canonical schema.
+    ///
+    /// Fire-and-forget: the transition piggy-backs on the existing
+    /// editor restart flow, so the plugin that sent this command will
+    /// be re-loaded as part of the restart. Any follow-up work the
+    /// plugin wants to do after the switch belongs in its post-restart
+    /// init code, not in a callback here.
+    SetAuthority {
+        #[ts(type = "unknown")]
+        payload: JsonValue,
+    },
+
+    /// Restore the default local authority. Same semantics as
+    /// `SetAuthority` with a local payload — triggers an editor
+    /// restart.
+    ClearAuthority,
+
+    /// Override the Remote Indicator's displayed state for the rest
+    /// of the current editor session (until a restart, or until the
+    /// plugin sends another override / `ClearRemoteIndicatorState`).
+    ///
+    /// The derived state — computed from the active authority's
+    /// connection info — keeps running underneath and is what the
+    /// indicator shows whenever an override is not in effect.
+    /// Plugins use this to surface lifecycle states that have no
+    /// authority-level truth yet (e.g. "Connecting" during
+    /// `devcontainer up`, "FailedAttach" after a non-zero exit).
+    ///
+    /// `state` is a tagged enum keyed by `kind`:
+    ///   - `{ "kind": "local" }`
+    ///   - `{ "kind": "connecting", "label": "..." }`
+    ///   - `{ "kind": "connected", "label": "..." }`
+    ///   - `{ "kind": "failed_attach", "error": "..." }`
+    ///   - `{ "kind": "disconnected", "label": "..." }`
+    ///
+    /// The exact schema lives in
+    /// `crates/fresh-editor/src/view/ui/status_bar.rs`; fresh-core
+    /// takes it opaquely so new variants can land without touching
+    /// core plumbing.
+    SetRemoteIndicatorState {
+        #[ts(type = "unknown")]
+        state: JsonValue,
+    },
+
+    /// Drop any active Remote Indicator override and fall back to
+    /// the authority-derived state. Safe to call without a prior
+    /// `SetRemoteIndicatorState`.
+    ClearRemoteIndicatorState,
+
+    /// Spawn a process on the host, regardless of the currently
+    /// installed authority.
+    ///
+    /// Intended for plugin internals that must run host-side work
+    /// (e.g. `devcontainer up`) before installing an authority that
+    /// would otherwise route the spawn elsewhere. Behaves like
+    /// `SpawnProcess` but always uses `LocalProcessSpawner`.
+    ///
+    /// The TS-side handle exposes `.kill()` on the returned
+    /// `ProcessHandle`, serviced by `KillHostProcess` below — this
+    /// lets callers abort a long-running host spawn (e.g.
+    /// `devcontainer up`) via a user action like "Cancel Startup".
+    SpawnHostProcess {
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        callback_id: JsCallbackId,
+    },
+
+    /// Cancel a host-side process previously started via
+    /// `SpawnHostProcess`. `process_id` is the callback id returned
+    /// by `spawnHostProcess` (the TS handle stores it and forwards
+    /// when the caller invokes `.kill()`).
+    ///
+    /// No-op when the id is unknown — the process may have already
+    /// exited, or the caller may hold a stale handle. SIGKILL on
+    /// Unix per `tokio::process::Child::start_kill`; children of the
+    /// killed process may leak (see Q-C2 in
+    /// `DEVCONTAINER_SPEC_GAP_PLAN.md`).
+    KillHostProcess { process_id: u64 },
 }
 
 impl PluginCommand {
@@ -2168,6 +2643,13 @@ pub struct CreateVirtualBufferInSplitOptions {
     #[serde(default)]
     #[ts(optional)]
     pub entries: Option<Vec<JsTextPropertyEntry>>,
+    /// Split role tag. When set to `"utility_dock"`, the dispatcher
+    /// routes this buffer to the existing dock leaf if one exists,
+    /// instead of creating a new split. See
+    /// `docs/internal/tui-editor-layout-design.md` Section 2.
+    #[serde(default)]
+    #[ts(optional)]
+    pub role: Option<String>,
 }
 
 /// Options for createVirtualBufferInExistingSplit
@@ -2232,6 +2714,15 @@ pub struct CreateTerminalOptions {
     #[serde(default)]
     #[ts(optional)]
     pub focus: Option<bool>,
+    /// Whether this terminal is part of the user's persisted workspace.
+    /// Defaults to `false` for plugin-created terminals — they are typically
+    /// one-off tool UIs (rebuilds, exec shells, build output) and should
+    /// start with empty scrollback on each invocation. Set to `true` only
+    /// when the plugin owns a terminal that the user should see restored
+    /// across editor restarts.
+    #[serde(default)]
+    #[ts(optional)]
+    pub persistent: Option<bool>,
 }
 
 /// Result of getTextPropertiesAtCursor - array of property objects
@@ -2248,45 +2739,43 @@ mod fromjs_impls {
     use super::*;
     use rquickjs::{Ctx, FromJs, Value};
 
-    impl<'js> FromJs<'js> for JsTextPropertyEntry {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "JsTextPropertyEntry",
-                message: Some(e.to_string()),
-            })
-        }
+    // All types that deserialize from a JS value via rquickjs_serde follow
+    // the same 8-line pattern differing only in the type name. This macro
+    // expands that pattern once so adding a new plugin-API type costs one line
+    // here instead of a copy-pasted block.
+    macro_rules! impl_from_js_via_serde {
+        ($($T:ty),+ $(,)?) => {
+            $(
+                impl<'js> FromJs<'js> for $T {
+                    fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
+                        rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
+                            from: "object",
+                            to: stringify!($T),
+                            message: Some(e.to_string()),
+                        })
+                    }
+                }
+            )+
+        };
     }
 
-    impl<'js> FromJs<'js> for CreateVirtualBufferOptions {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "CreateVirtualBufferOptions",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for CreateVirtualBufferInSplitOptions {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "CreateVirtualBufferInSplitOptions",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for CreateVirtualBufferInExistingSplitOptions {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "CreateVirtualBufferInExistingSplitOptions",
-                message: Some(e.to_string()),
-            })
-        }
-    }
+    impl_from_js_via_serde!(
+        JsTextPropertyEntry,
+        CreateVirtualBufferOptions,
+        CreateVirtualBufferInSplitOptions,
+        CreateVirtualBufferInExistingSplitOptions,
+        ActionSpec,
+        ActionPopupAction,
+        ActionPopupOptions,
+        ViewTokenWire,
+        ViewTokenStyle,
+        LayoutHints,
+        CompositeHunk,
+        LanguagePackConfig,
+        LspServerPackConfig,
+        ProcessLimitsPackConfig,
+        CreateTerminalOptions,
+    );
 
     impl<'js> rquickjs::IntoJs<'js> for TextPropertiesAtCursor {
         fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
@@ -2295,71 +2784,10 @@ mod fromjs_impls {
         }
     }
 
-    // === Additional input types for type-safe plugin API ===
-
-    impl<'js> FromJs<'js> for ActionSpec {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "ActionSpec",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for ActionPopupAction {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "ActionPopupAction",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for ActionPopupOptions {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "ActionPopupOptions",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for ViewTokenWire {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "ViewTokenWire",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for ViewTokenStyle {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "ViewTokenStyle",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
-    impl<'js> FromJs<'js> for LayoutHints {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "LayoutHints",
-                message: Some(e.to_string()),
-            })
-        }
-    }
-
     impl<'js> FromJs<'js> for CreateCompositeBufferOptions {
         fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            // Use two-step deserialization for complex nested structures
+            // Two-step deserialization: rquickjs_serde cannot handle the nested
+            // enums in this struct directly, so go via serde_json as an intermediary.
             let json: serde_json::Value =
                 rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
                     from: "object",
@@ -2374,53 +2802,207 @@ mod fromjs_impls {
         }
     }
 
-    impl<'js> FromJs<'js> for CompositeHunk {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "CompositeHunk",
-                message: Some(e.to_string()),
+    // ── Tests for FromJs / IntoJs impls ────────────────────────────────────
+    //
+    // Each impl is a one-liner that delegates to `rquickjs_serde`. A mutant
+    // that replaces the body with `Ok(Default::default())` drops the
+    // decoded payload on the floor. Every test below asserts a
+    // non-defaultable field value, so the mutant cannot pass.
+    //
+    // Note: many of the target structs do not implement `Default`, making
+    // those mutants unviable (they fail to compile) — cargo-mutants still
+    // lists them as candidates. The tests below serve double-duty as
+    // behavioural regression protection for the JS → Rust conversion layer.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use rquickjs::{Context, Runtime};
+
+        /// Run a closure within a fresh QuickJS context so that `FromJs`
+        /// impls can be exercised end-to-end.
+        fn with_js<R>(f: impl for<'js> FnOnce(Ctx<'js>) -> R) -> R {
+            let rt = Runtime::new().expect("create rquickjs runtime");
+            let ctx = Context::full(&rt).expect("create rquickjs context");
+            ctx.with(f)
+        }
+
+        /// Evaluate a JS object literal and decode it as `T` via `FromJs`.
+        fn eval_as<T>(src: &str) -> T
+        where
+            for<'js> T: rquickjs::FromJs<'js>,
+        {
+            with_js(|ctx| {
+                let value: Value = ctx
+                    .eval::<Value, _>(src.as_bytes())
+                    .expect("eval JS source");
+                T::from_js(&ctx, value).expect("from_js decode")
             })
         }
-    }
 
-    impl<'js> FromJs<'js> for LanguagePackConfig {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "LanguagePackConfig",
-                message: Some(e.to_string()),
-            })
+        #[test]
+        fn js_text_property_entry_decodes_text_and_properties() {
+            let got: JsTextPropertyEntry =
+                eval_as("({text: 'hello', properties: {file: '/x.rs'}})");
+            assert_eq!(got.text, "hello");
+            let props = got.properties.expect("properties present");
+            assert_eq!(props.get("file").and_then(|v| v.as_str()), Some("/x.rs"));
         }
-    }
 
-    impl<'js> FromJs<'js> for LspServerPackConfig {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "LspServerPackConfig",
-                message: Some(e.to_string()),
-            })
+        #[test]
+        fn create_virtual_buffer_options_decodes_name() {
+            let got: CreateVirtualBufferOptions = eval_as("({name: 'logs', readOnly: true})");
+            assert_eq!(got.name, "logs");
+            assert_eq!(got.read_only, Some(true));
         }
-    }
 
-    impl<'js> FromJs<'js> for ProcessLimitsPackConfig {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "ProcessLimitsPackConfig",
-                message: Some(e.to_string()),
-            })
+        #[test]
+        fn create_virtual_buffer_in_split_options_decodes_ratio() {
+            let got: CreateVirtualBufferInSplitOptions =
+                eval_as("({name: 'diag', ratio: 0.25, direction: 'horizontal'})");
+            assert_eq!(got.name, "diag");
+            assert!(matches!(got.ratio, Some(r) if (r - 0.25).abs() < 1e-6));
+            assert_eq!(got.direction.as_deref(), Some("horizontal"));
         }
-    }
 
-    impl<'js> FromJs<'js> for CreateTerminalOptions {
-        fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<Self> {
-            rquickjs_serde::from_value(value).map_err(|e| rquickjs::Error::FromJs {
-                from: "object",
-                to: "CreateTerminalOptions",
-                message: Some(e.to_string()),
-            })
+        #[test]
+        fn create_virtual_buffer_in_existing_split_options_decodes_splitid() {
+            let got: CreateVirtualBufferInExistingSplitOptions =
+                eval_as("({name: 'n', splitId: 7})");
+            assert_eq!(got.name, "n");
+            assert_eq!(got.split_id, 7);
+        }
+
+        #[test]
+        fn create_terminal_options_decodes_cwd_and_focus() {
+            let got: CreateTerminalOptions =
+                eval_as("({cwd: '/tmp', direction: 'vertical', focus: false})");
+            assert_eq!(got.cwd.as_deref(), Some("/tmp"));
+            assert_eq!(got.direction.as_deref(), Some("vertical"));
+            assert_eq!(got.focus, Some(false));
+        }
+
+        #[test]
+        fn action_spec_decodes_action_and_count() {
+            let got: ActionSpec = eval_as("({action: 'move_word_right', count: 5})");
+            assert_eq!(got.action, "move_word_right");
+            assert_eq!(got.count, 5);
+        }
+
+        #[test]
+        fn action_popup_action_decodes_id_and_label() {
+            let got: ActionPopupAction = eval_as("({id: 'ok', label: 'OK'})");
+            assert_eq!(got.id, "ok");
+            assert_eq!(got.label, "OK");
+        }
+
+        #[test]
+        fn action_popup_options_decodes_actions_list() {
+            let got: ActionPopupOptions = eval_as(
+                "({id: 'p', title: 't', message: 'm', \
+                   actions: [{id: 'ok', label: 'OK'}]})",
+            );
+            assert_eq!(got.id, "p");
+            assert_eq!(got.title, "t");
+            assert_eq!(got.message, "m");
+            assert_eq!(got.actions.len(), 1);
+            assert_eq!(got.actions[0].id, "ok");
+        }
+
+        #[test]
+        fn view_token_wire_decodes_offset_and_kind() {
+            // Using `Newline` (a unit variant) avoids the tuple-variant
+            // wire-format ambiguity in rquickjs_serde while still exercising
+            // the `FromJs` impl end-to-end.
+            let got: ViewTokenWire = eval_as("({source_offset: 42, kind: 'Newline'})");
+            assert_eq!(got.source_offset, Some(42));
+            assert!(matches!(got.kind, ViewTokenWireKind::Newline));
+        }
+
+        #[test]
+        fn view_token_style_decodes_boolean_flags() {
+            // `fg`/`bg` are `Option<(u8, u8, u8)>` which rquickjs_serde does
+            // not decode from plain JS arrays, so we pin down the boolean
+            // flags — enough to prove the body actually ran.
+            let got: ViewTokenStyle = eval_as("({bold: true, italic: true})");
+            assert!(got.bold);
+            assert!(got.italic);
+            assert!(got.fg.is_none());
+        }
+
+        #[test]
+        fn layout_hints_decodes_compose_width() {
+            let got: LayoutHints = eval_as("({composeWidth: 120})");
+            assert_eq!(got.compose_width, Some(120));
+            assert!(got.column_guides.is_none());
+        }
+
+        #[test]
+        fn create_composite_buffer_options_decodes_name_and_sources() {
+            let got: CreateCompositeBufferOptions = eval_as(
+                "({name: 'diff', mode: 'm', \
+                   layout: {type: 'side-by-side', ratios: [0.5, 0.5], showSeparator: true}, \
+                   sources: [{bufferId: 3, label: 'OLD'}]})",
+            );
+            assert_eq!(got.name, "diff");
+            assert_eq!(got.layout.layout_type, "side-by-side");
+            assert_eq!(got.sources.len(), 1);
+            assert_eq!(got.sources[0].buffer_id, 3);
+            assert_eq!(got.sources[0].label, "OLD");
+        }
+
+        #[test]
+        fn composite_hunk_decodes_all_fields() {
+            let got: CompositeHunk =
+                eval_as("({oldStart: 1, oldCount: 2, newStart: 3, newCount: 4})");
+            assert_eq!(got.old_start, 1);
+            assert_eq!(got.old_count, 2);
+            assert_eq!(got.new_start, 3);
+            assert_eq!(got.new_count, 4);
+        }
+
+        #[test]
+        fn language_pack_config_decodes_comment_prefix_and_tab_size() {
+            let got: LanguagePackConfig =
+                eval_as("({commentPrefix: '//', tabSize: 7, useTabs: true})");
+            assert_eq!(got.comment_prefix.as_deref(), Some("//"));
+            assert_eq!(got.tab_size, Some(7));
+            assert_eq!(got.use_tabs, Some(true));
+        }
+
+        #[test]
+        fn lsp_server_pack_config_decodes_command_and_args() {
+            let got: LspServerPackConfig =
+                eval_as("({command: 'rust-analyzer', args: ['--log'], autoStart: true})");
+            assert_eq!(got.command, "rust-analyzer");
+            assert_eq!(got.args, vec!["--log".to_string()]);
+            assert_eq!(got.auto_start, Some(true));
+        }
+
+        #[test]
+        fn process_limits_pack_config_decodes_percentages() {
+            let got: ProcessLimitsPackConfig =
+                eval_as("({maxMemoryPercent: 75, maxCpuPercent: 50, enabled: true})");
+            assert_eq!(got.max_memory_percent, Some(75));
+            assert_eq!(got.max_cpu_percent, Some(50));
+            assert_eq!(got.enabled, Some(true));
+        }
+
+        /// `TextPropertiesAtCursor::into_js` must serialise the inner vector
+        /// into a JS array whose length matches the payload. A mutant that
+        /// returns a default (`undefined` / empty) value would fail either
+        /// the array check or the length check.
+        #[test]
+        fn text_properties_at_cursor_into_js_preserves_length() {
+            use rquickjs::IntoJs;
+            with_js(|ctx| {
+                let mut entry = std::collections::HashMap::new();
+                entry.insert("k".to_string(), serde_json::json!("v"));
+                let payload = TextPropertiesAtCursor(vec![entry.clone(), entry]);
+
+                let v = payload.into_js(&ctx).expect("into_js");
+                let arr = v.as_array().expect("expected JS array");
+                assert_eq!(arr.len(), 2);
+            });
         }
     }
 }
@@ -2597,7 +3179,11 @@ impl PluginApi {
     /// Start a prompt (minibuffer) with a custom type identifier
     /// The prompt_type is used to filter hooks in plugin code
     pub fn start_prompt(&self, label: String, prompt_type: String) -> Result<(), String> {
-        self.send_command(PluginCommand::StartPrompt { label, prompt_type })
+        self.send_command(PluginCommand::StartPrompt {
+            label,
+            prompt_type,
+            floating_overlay: false,
+        })
     }
 
     /// Set the suggestions for the current prompt
@@ -2609,6 +3195,12 @@ impl PluginApi {
     /// Enable/disable syncing prompt input text when navigating suggestions
     pub fn set_prompt_input_sync(&self, sync: bool) -> Result<(), String> {
         self.send_command(PluginCommand::SetPromptInputSync { sync })
+    }
+
+    /// Set the floating-overlay prompt's title (issue #1796). `None`
+    /// clears the title and falls back to the prompt-type default.
+    pub fn set_prompt_title(&self, title: Option<String>) -> Result<(), String> {
+        self.send_command(PluginCommand::SetPromptTitle { title })
     }
 
     /// Add a menu item to an existing menu
@@ -2720,6 +3312,7 @@ impl PluginApi {
             bindings,
             read_only,
             allow_text_input,
+            inherit_normal_bindings: false,
             plugin_name: None,
         })
     }
@@ -2810,6 +3403,112 @@ impl Clone for PluginApi {
             state_snapshot: Arc::clone(&self.state_snapshot),
         }
     }
+}
+
+// ============================================================================
+// Pluggable Completion Service — TypeScript Plugin API Types
+// ============================================================================
+//
+// These types are the bridge between the Rust `CompletionService` and
+// TypeScript plugins that want to provide completion candidates.  They are
+// serialised to/from JSON via serde and generate TypeScript definitions via
+// ts-rs so that the plugin API stays in sync automatically.
+
+/// A completion candidate produced by a TypeScript plugin provider.
+///
+/// This mirrors `CompletionCandidate` in the Rust `completion::provider`
+/// module but uses serde-friendly primitives for the JS ↔ Rust boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionCandidate {
+    /// Display text shown in the completion popup.
+    pub label: String,
+
+    /// Text to insert when accepted. Falls back to `label` if omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+
+    /// Short detail string shown next to the label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+
+    /// Single-character icon hint (e.g. `"λ"`, `"v"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+
+    /// Provider-assigned relevance score (higher = better).
+    #[serde(default)]
+    pub score: i64,
+
+    /// Whether `insert_text` uses LSP snippet syntax (`$0`, `${1:ph}`, …).
+    #[serde(default)]
+    pub is_snippet: bool,
+
+    /// Opaque data carried through to the `completionAccepted` hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<String>,
+}
+
+/// Context sent to a TypeScript plugin's `provideCompletions` handler.
+///
+/// Plugins receive this as a read-only snapshot so they never need direct
+/// buffer access (which would be unsafe for huge files).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionContext {
+    /// The word prefix typed so far.
+    pub prefix: String,
+
+    /// Byte offset of the cursor.
+    pub cursor_byte: usize,
+
+    /// Byte offset of the word start (for replacement range).
+    pub word_start_byte: usize,
+
+    /// Total buffer size in bytes.
+    pub buffer_len: usize,
+
+    /// Whether the buffer is a lazily-loaded huge file.
+    pub is_large_file: bool,
+
+    /// A text excerpt around the cursor (the contents of the safe scan window).
+    /// Plugins should search only this string, not request the full buffer.
+    pub text_around_cursor: String,
+
+    /// Byte offset within `text_around_cursor` that corresponds to the cursor.
+    pub cursor_offset_in_text: usize,
+
+    /// File language id (e.g. `"rust"`, `"typescript"`), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+}
+
+/// Registration payload sent by a plugin to register a completion provider.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export, rename_all = "camelCase")]
+pub struct TsCompletionProviderRegistration {
+    /// Unique id for this provider (e.g., `"my-snippets"`).
+    pub id: String,
+
+    /// Human-readable name shown in status/debug UI.
+    pub display_name: String,
+
+    /// Priority tier (lower = higher priority). Convention:
+    /// 0 = LSP, 10 = ctags, 20 = buffer words, 30 = dabbrev, 50 = plugin.
+    #[serde(default = "default_plugin_provider_priority")]
+    pub priority: u32,
+
+    /// Optional list of language ids this provider is active for.
+    /// If empty/omitted, the provider is active for all languages.
+    #[serde(default)]
+    pub language_ids: Vec<String>,
+}
+
+fn default_plugin_provider_priority() -> u32 {
+    50
 }
 
 #[cfg(test)]
@@ -2985,6 +3684,8 @@ mod tests {
                 is_composing_in_any_split: false,
                 compose_width: None,
                 language: "text".to_string(),
+                is_preview: false,
+                splits: Vec::new(),
             };
             snapshot.buffers.insert(BufferId(1), buffer_info);
         }
@@ -3029,6 +3730,8 @@ mod tests {
                     is_composing_in_any_split: false,
                     compose_width: None,
                     language: "text".to_string(),
+                    is_preview: false,
+                    splits: Vec::new(),
                 },
             );
             snapshot.buffers.insert(
@@ -3043,6 +3746,8 @@ mod tests {
                     is_composing_in_any_split: false,
                     compose_width: None,
                     language: "text".to_string(),
+                    is_preview: false,
+                    splits: Vec::new(),
                 },
             );
             snapshot.buffers.insert(
@@ -3057,6 +3762,8 @@ mod tests {
                     is_composing_in_any_split: false,
                     compose_width: None,
                     language: "text".to_string(),
+                    is_preview: false,
+                    splits: Vec::new(),
                 },
             );
         }
@@ -3292,5 +3999,445 @@ mod tests {
         let json = serde_json::to_string(&command).unwrap();
         assert!(json.contains("ScrollToLineCenter"));
         assert!(json.contains("50"));
+    }
+
+    /// `JsCallbackId` round-trips through `u64` via `new` / `as_u64` / `From`
+    /// and renders as its underlying integer via `Display`.
+    #[test]
+    fn js_callback_id_conversions_and_display() {
+        for raw in [0u64, 1, 42, u64::MAX] {
+            let id = JsCallbackId::new(raw);
+            assert_eq!(id.as_u64(), raw);
+            assert_eq!(u64::from(id), raw);
+            assert_eq!(JsCallbackId::from(raw), id);
+            assert_eq!(id.to_string(), raw.to_string());
+        }
+    }
+
+    /// Serde `default = ...` helpers fire when the field is omitted and are
+    /// overridden by explicit values. One test per struct pins each helper
+    /// to its documented default.
+    #[test]
+    fn serde_defaults_fire_when_fields_are_omitted() {
+        // default_action_count → 1
+        let spec: ActionSpec = serde_json::from_str(r#"{"action": "move_left"}"#).unwrap();
+        assert_eq!(spec.count, 1);
+        let spec: ActionSpec =
+            serde_json::from_str(r#"{"action": "move_left", "count": 5}"#).unwrap();
+        assert_eq!(spec.count, 5);
+
+        // default_true → showSeparator = true
+        let layout: CompositeLayoutConfig =
+            serde_json::from_str(r#"{"type": "side-by-side"}"#).unwrap();
+        assert!(layout.show_separator);
+        let layout: CompositeLayoutConfig =
+            serde_json::from_str(r#"{"type": "side-by-side", "showSeparator": false}"#).unwrap();
+        assert!(!layout.show_separator);
+
+        // default_plugin_provider_priority → 50
+        let reg: TsCompletionProviderRegistration =
+            serde_json::from_str(r#"{"id": "p", "displayName": "P"}"#).unwrap();
+        assert_eq!(reg.priority, 50);
+        let reg: TsCompletionProviderRegistration =
+            serde_json::from_str(r#"{"id": "p", "displayName": "P", "priority": 3}"#).unwrap();
+        assert_eq!(reg.priority, 3);
+    }
+
+    // ── Behavioural tests added to kill the mutants reported by cargo-mutants ──
+    //
+    // These tests pin down observable behaviour for tiny methods whose bodies
+    // were replaceable with a constant (e.g. `()`, `Ok(())`, `None`, or a
+    // default value) without any existing test noticing.
+
+    /// Helper: build a minimal `Command` with a given name.
+    fn mk_cmd(name: &str) -> Command {
+        Command {
+            name: name.to_string(),
+            description: String::new(),
+            action_name: String::new(),
+            plugin_name: String::new(),
+            custom_contexts: Vec::new(),
+        }
+    }
+
+    /// `CommandRegistry::register` appends new commands and replaces any
+    /// existing entry with the same name; `unregister` removes exactly the
+    /// matching entry and is a no-op for unknown names.
+    ///
+    /// Kills: replace register with `()`; `!= → ==` in register;
+    ///        replace unregister with `()`; `!= → ==` in unregister.
+    #[test]
+    fn command_registry_register_and_unregister_semantics() {
+        let r = CommandRegistry::new();
+
+        r.register(mk_cmd("a"));
+        r.register(mk_cmd("b"));
+        assert_eq!(r.commands.read().unwrap().len(), 2);
+
+        // Re-registering "a" must keep "b" (retain filters by `!=`); the
+        // `== → !=` mutant would drop "b" and leave two copies of "a".
+        r.register(mk_cmd("a"));
+        let names: Vec<String> = r
+            .commands
+            .read()
+            .unwrap()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["b".to_string(), "a".to_string()]);
+
+        // Unregister must remove exactly "a" and preserve "b"; the `== → !=`
+        // mutant would keep "a" and drop "b".
+        r.unregister("a");
+        let names: Vec<String> = r
+            .commands
+            .read()
+            .unwrap()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["b".to_string()]);
+
+        // Unregistering an unknown name is a no-op.
+        r.unregister("nope");
+        assert_eq!(r.commands.read().unwrap().len(), 1);
+    }
+
+    /// `OverlayColorSpec::as_rgb` returns the exact stored tuple for the RGB
+    /// variant and `None` for the theme-key variant; `as_theme_key` is the
+    /// dual. Uses a triple with no zero or one components and a theme key
+    /// that is neither empty nor `"xyzzy"` to kill every constant-return
+    /// mutant reported by cargo-mutants at once.
+    #[test]
+    fn overlay_color_spec_accessors_are_variant_specific() {
+        let rgb = OverlayColorSpec::rgb(12, 34, 56);
+        assert_eq!(rgb.as_rgb(), Some((12, 34, 56)));
+        assert_eq!(rgb.as_theme_key(), None);
+
+        let tk = OverlayColorSpec::theme_key("ui.status_bar_bg");
+        assert_eq!(tk.as_rgb(), None);
+        assert_eq!(tk.as_theme_key(), Some("ui.status_bar_bg"));
+    }
+
+    /// `PluginCommand::debug_variant_name` returns the actual variant name
+    /// derived from the `Debug` impl, not an empty or hard-coded string.
+    #[test]
+    fn plugin_command_debug_variant_name_returns_real_variant() {
+        let c = PluginCommand::SetStatus {
+            message: "hi".into(),
+        };
+        assert_eq!(c.debug_variant_name(), "SetStatus");
+
+        let c2 = PluginCommand::InsertText {
+            buffer_id: BufferId(1),
+            position: 0,
+            text: String::new(),
+        };
+        assert_eq!(c2.debug_variant_name(), "InsertText");
+    }
+
+    // ── PluginApi dispatch / mutation tests ────────────────────────────────
+    //
+    // Each `PluginApi` method is a one-liner that either pushes a
+    // `PluginCommand` onto the channel or mutates a shared registry. The
+    // mutants replace the body with `Ok(())` / `()`, i.e. the side effect
+    // disappears. One assertion per method ties the side effect down.
+
+    fn mk_api() -> (
+        PluginApi,
+        std::sync::mpsc::Receiver<PluginCommand>,
+        Arc<RwLock<HookRegistry>>,
+        Arc<RwLock<CommandRegistry>>,
+        Arc<RwLock<EditorStateSnapshot>>,
+    ) {
+        let hooks = Arc::new(RwLock::new(HookRegistry::new()));
+        let commands = Arc::new(RwLock::new(CommandRegistry::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let snap = Arc::new(RwLock::new(EditorStateSnapshot::new()));
+        let api = PluginApi::new(hooks.clone(), commands.clone(), tx, snap.clone());
+        (api, rx, hooks, commands, snap)
+    }
+
+    /// `unregister_hooks` must actually clear hooks registered under the
+    /// same name; replacing the body with `()` leaves the count at 1.
+    #[test]
+    fn plugin_api_unregister_hooks_clears_registry() {
+        let (api, _rx, hooks, _cmds, _snap) = mk_api();
+        api.register_hook("h", Box::new(|_| true));
+        assert_eq!(hooks.read().unwrap().hook_count("h"), 1);
+        api.unregister_hooks("h");
+        assert_eq!(hooks.read().unwrap().hook_count("h"), 0);
+    }
+
+    /// `register_command` / `unregister_command` must actually write through
+    /// to the shared `CommandRegistry`.
+    #[test]
+    fn plugin_api_register_and_unregister_command_write_through() {
+        let (api, _rx, _hooks, cmds, _snap) = mk_api();
+
+        api.register_command(mk_cmd("x"));
+        assert_eq!(cmds.read().unwrap().commands.read().unwrap().len(), 1);
+
+        api.unregister_command("x");
+        assert_eq!(cmds.read().unwrap().commands.read().unwrap().len(), 0);
+    }
+
+    /// Macro: assert that calling `$call` on a fresh `PluginApi` produces
+    /// exactly one `PluginCommand` matching `$pattern` with the additional
+    /// invariants in `$guard`.
+    macro_rules! assert_dispatches {
+        ($call:expr, $pattern:pat $(if $guard:expr)?) => {{
+            let (api, rx, _h, _c, _s) = mk_api();
+            let _ = $call(&api);
+            match rx.try_recv().expect("no command sent") {
+                $pattern $(if $guard)? => {}
+                other => panic!("unexpected command variant: {:?}", other),
+            }
+        }};
+    }
+
+    /// Every simple `send_command`-based method on `PluginApi` translates
+    /// its arguments into the documented `PluginCommand` variant with the
+    /// expected fields.
+    #[test]
+    fn plugin_api_send_command_methods_dispatch_correctly() {
+        // delete_range
+        assert_dispatches!(
+            |a: &PluginApi| a.delete_range(BufferId(7), 3..9),
+            PluginCommand::DeleteRange { buffer_id, range }
+                if buffer_id == BufferId(7) && range == (3..9)
+        );
+
+        // remove_overlay
+        assert_dispatches!(
+            |a: &PluginApi| a.remove_overlay(BufferId(2), "h-1".into()),
+            PluginCommand::RemoveOverlay { buffer_id, handle }
+                if buffer_id == BufferId(2) && handle.as_str() == "h-1"
+        );
+
+        // clear_namespace
+        assert_dispatches!(
+            |a: &PluginApi| a.clear_namespace(BufferId(3), "diag".into()),
+            PluginCommand::ClearNamespace { buffer_id, namespace }
+                if buffer_id == BufferId(3) && namespace.as_str() == "diag"
+        );
+
+        // clear_overlays_in_range
+        assert_dispatches!(
+            |a: &PluginApi| a.clear_overlays_in_range(BufferId(4), 10, 20),
+            PluginCommand::ClearOverlaysInRange { buffer_id, start, end }
+                if buffer_id == BufferId(4) && start == 10 && end == 20
+        );
+
+        // open_file_at_location
+        assert_dispatches!(
+            |a: &PluginApi| a.open_file_at_location(
+                PathBuf::from("/tmp/x.rs"), Some(4), Some(8)
+            ),
+            PluginCommand::OpenFileAtLocation { path, line, column }
+                if path == PathBuf::from("/tmp/x.rs")
+                    && line == Some(4)
+                    && column == Some(8)
+        );
+
+        // open_file_in_split
+        assert_dispatches!(
+            |a: &PluginApi| a.open_file_in_split(
+                2, PathBuf::from("/tmp/y.rs"), Some(5), None
+            ),
+            PluginCommand::OpenFileInSplit { split_id, path, line, column }
+                if split_id == 2
+                    && path == PathBuf::from("/tmp/y.rs")
+                    && line == Some(5)
+                    && column.is_none()
+        );
+
+        // start_prompt
+        assert_dispatches!(
+            |a: &PluginApi| a.start_prompt("label".into(), "cmd".into()),
+            PluginCommand::StartPrompt { label, prompt_type, floating_overlay }
+                if label == "label" && prompt_type == "cmd" && !floating_overlay
+        );
+
+        // set_prompt_suggestions
+        assert_dispatches!(
+            |a: &PluginApi| a.set_prompt_suggestions(vec![
+                Suggestion::new("one".into()),
+                Suggestion::new("two".into()),
+            ]),
+            PluginCommand::SetPromptSuggestions { suggestions }
+                if suggestions.len() == 2
+                    && suggestions[0].text == "one"
+                    && suggestions[1].text == "two"
+        );
+
+        // set_prompt_input_sync
+        assert_dispatches!(
+            |a: &PluginApi| a.set_prompt_input_sync(true),
+            PluginCommand::SetPromptInputSync { sync } if sync
+        );
+        assert_dispatches!(
+            |a: &PluginApi| a.set_prompt_input_sync(false),
+            PluginCommand::SetPromptInputSync { sync } if !sync
+        );
+
+        // add_menu_item
+        assert_dispatches!(
+            |a: &PluginApi| a.add_menu_item(
+                "File".into(),
+                MenuItem::Label { info: "info".into() },
+                MenuPosition::Bottom,
+            ),
+            PluginCommand::AddMenuItem { menu_label, item, position }
+                if menu_label == "File"
+                    && matches!(item, MenuItem::Label { ref info } if info == "info")
+                    && matches!(position, MenuPosition::Bottom)
+        );
+
+        // add_menu
+        assert_dispatches!(
+            |a: &PluginApi| a.add_menu(
+                Menu {
+                    id: None,
+                    label: "Help".into(),
+                    items: vec![],
+                    when: None,
+                },
+                MenuPosition::After("Edit".into()),
+            ),
+            PluginCommand::AddMenu { menu, position }
+                if menu.label == "Help"
+                    && matches!(position, MenuPosition::After(ref s) if s == "Edit")
+        );
+
+        // remove_menu_item
+        assert_dispatches!(
+            |a: &PluginApi| a.remove_menu_item("File".into(), "Open".into()),
+            PluginCommand::RemoveMenuItem { menu_label, item_label }
+                if menu_label == "File" && item_label == "Open"
+        );
+
+        // remove_menu
+        assert_dispatches!(
+            |a: &PluginApi| a.remove_menu("File".into()),
+            PluginCommand::RemoveMenu { menu_label } if menu_label == "File"
+        );
+
+        // create_virtual_buffer
+        assert_dispatches!(
+            |a: &PluginApi| a.create_virtual_buffer("buf".into(), "mode".into(), true),
+            PluginCommand::CreateVirtualBuffer { name, mode, read_only }
+                if name == "buf" && mode == "mode" && read_only
+        );
+
+        // create_virtual_buffer_with_content
+        assert_dispatches!(
+            |a: &PluginApi| a.create_virtual_buffer_with_content(
+                "n".into(), "m".into(), false, vec![]
+            ),
+            PluginCommand::CreateVirtualBufferWithContent {
+                name, mode, read_only, show_line_numbers, show_cursors,
+                editing_disabled, hidden_from_tabs, request_id, ..
+            }
+                if name == "n" && mode == "m" && !read_only
+                    && show_line_numbers && show_cursors
+                    && !editing_disabled && !hidden_from_tabs
+                    && request_id.is_none()
+        );
+
+        // set_virtual_buffer_content
+        assert_dispatches!(
+            |a: &PluginApi| a.set_virtual_buffer_content(BufferId(9), vec![]),
+            PluginCommand::SetVirtualBufferContent { buffer_id, entries }
+                if buffer_id == BufferId(9) && entries.is_empty()
+        );
+
+        // get_text_properties_at_cursor
+        assert_dispatches!(
+            |a: &PluginApi| a.get_text_properties_at_cursor(BufferId(11)),
+            PluginCommand::GetTextPropertiesAtCursor { buffer_id }
+                if buffer_id == BufferId(11)
+        );
+
+        // define_mode
+        assert_dispatches!(
+            |a: &PluginApi| a.define_mode(
+                "m".into(),
+                vec![("j".into(), "move_down".into())],
+                true,
+                false,
+            ),
+            PluginCommand::DefineMode {
+                name, bindings, read_only, allow_text_input, inherit_normal_bindings, plugin_name
+            }
+                if name == "m"
+                    && bindings.len() == 1
+                    && bindings[0].0 == "j"
+                    && bindings[0].1 == "move_down"
+                    && read_only
+                    && !allow_text_input
+                    && !inherit_normal_bindings
+                    && plugin_name.is_none()
+        );
+
+        // show_buffer
+        assert_dispatches!(
+            |a: &PluginApi| a.show_buffer(BufferId(77)),
+            PluginCommand::ShowBuffer { buffer_id } if buffer_id == BufferId(77)
+        );
+
+        // set_split_scroll
+        assert_dispatches!(
+            |a: &PluginApi| a.set_split_scroll(5, 128),
+            PluginCommand::SetSplitScroll { split_id, top_byte }
+                if split_id == SplitId(5) && top_byte == 128
+        );
+
+        // get_highlights
+        assert_dispatches!(
+            |a: &PluginApi| a.get_highlights(BufferId(1), 0..10, 7),
+            PluginCommand::RequestHighlights { buffer_id, range, request_id }
+                if buffer_id == BufferId(1) && range == (0..10) && request_id == 7
+        );
+    }
+
+    /// `get_active_split_id` reads the snapshot verbatim; a non-{0,1}
+    /// sentinel value kills both the `0` and `1` constant-return mutants.
+    #[test]
+    fn plugin_api_get_active_split_id_reads_snapshot() {
+        let (api, _rx, _h, _c, snap) = mk_api();
+        snap.write().unwrap().active_split_id = 42;
+        assert_eq!(api.get_active_split_id(), 42);
+    }
+
+    /// `state_snapshot_handle` returns a clone of the same `Arc`, not a
+    /// freshly-defaulted snapshot. A distinguishing field value on the
+    /// original state proves that the handle sees it.
+    #[test]
+    fn plugin_api_state_snapshot_handle_shares_underlying_arc() {
+        let (api, _rx, _h, _c, snap) = mk_api();
+        snap.write().unwrap().active_buffer_id = BufferId(42);
+
+        let h = api.state_snapshot_handle();
+        assert_eq!(h.read().unwrap().active_buffer_id, BufferId(42));
+        assert!(Arc::ptr_eq(&h, &snap));
+    }
+
+    /// `KillHostProcess` survives a round-trip through serde: the
+    /// `process_id` field stays identified by name and the variant
+    /// retains its tag shape. If a future contributor renames the
+    /// field or splits it into a tuple, the plugin-runtime TS side
+    /// (which hand-builds the command JSON for the dispatcher) would
+    /// silently break — this test pins the wire format.
+    #[test]
+    fn plugin_command_kill_host_process_serde_round_trip() {
+        let cmd = PluginCommand::KillHostProcess { process_id: 1234 };
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(json["KillHostProcess"]["process_id"], 1234);
+        let decoded: PluginCommand = serde_json::from_value(json).unwrap();
+        match decoded {
+            PluginCommand::KillHostProcess { process_id } => assert_eq!(process_id, 1234),
+            other => panic!("expected KillHostProcess, got {:?}", other),
+        }
     }
 }

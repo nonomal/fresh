@@ -14,6 +14,29 @@ use crate::model::event::BufferId;
 use super::Editor;
 
 impl Editor {
+    /// Push the buffer's full current content to LSP after an out-of-band
+    /// mutation (hot-exit recovery replay / crash-recovery replay). The
+    /// replay paths edit the buffer directly via `buffer.delete` and
+    /// `buffer.insert`, which don't route through the normal event log
+    /// that also emits `didChange`. If LSP's `didOpen` already fired with
+    /// the on-disk content, the server is left on a stale base and every
+    /// position it returns is offset by the net byte delta.
+    pub(crate) fn sync_lsp_after_recovery_replay(&mut self, buffer_id: BufferId) {
+        let Some(text) = self
+            .buffers
+            .get(&buffer_id)
+            .and_then(|state| state.buffer.to_string())
+        else {
+            return;
+        };
+        let full_change = lsp_types::TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text,
+        };
+        self.send_lsp_changes_for_buffer(buffer_id, vec![full_change]);
+    }
+
     /// Start the recovery session (call on editor startup after recovery check)
     pub fn start_recovery_session(&mut self) -> AnyhowResult<()> {
         Ok(self.recovery_service.start_session()?)
@@ -106,14 +129,23 @@ impl Editor {
                     if let Some(path) = original_path {
                         // Open the file path (this creates the buffer)
                         match self.open_file(&path) {
-                            Ok(_) => {
+                            Ok(buffer_id) => {
                                 // Replace buffer content with recovered content
-                                let state = self.active_state_mut();
-                                let total = state.buffer.total_bytes();
-                                state.buffer.delete(0..total);
-                                state.buffer.insert(0, &text);
-                                // Mark as modified since it differs from disk
-                                state.buffer.set_modified(true);
+                                {
+                                    let state = self.active_state_mut();
+                                    let total = state.buffer.total_bytes();
+                                    state.buffer.delete(0..total);
+                                    state.buffer.insert(0, &text);
+                                    // Mark as modified since it differs from disk
+                                    state.buffer.set_modified(true);
+                                }
+                                // Invalidate the event log's saved position so undo
+                                // can't incorrectly clear the modified flag
+                                self.active_event_log_mut().clear_saved_position();
+                                // Recovery replay mutates the buffer directly —
+                                // push the new content to LSP so tokens and
+                                // positions don't drift against an on-disk base.
+                                self.sync_lsp_after_recovery_replay(buffer_id);
                                 recovered_count += 1;
                                 tracing::info!("Recovered buffer: {}", path.display());
                             }
@@ -130,10 +162,16 @@ impl Editor {
                         }
                     } else {
                         // Unsaved buffer - create new buffer with recovered content
-                        self.new_buffer();
-                        let state = self.active_state_mut();
-                        state.buffer.insert(0, &text);
-                        state.buffer.set_modified(true);
+                        let buffer_id = self.new_buffer();
+                        {
+                            let state = self.active_state_mut();
+                            state.buffer.insert(0, &text);
+                            state.buffer.set_modified(true);
+                        }
+                        // Invalidate the event log's saved position so undo
+                        // can't incorrectly clear the modified flag
+                        self.active_event_log_mut().clear_saved_position();
+                        self.sync_lsp_after_recovery_replay(buffer_id);
                         recovered_count += 1;
                         tracing::info!("Recovered unsaved buffer");
                     }
@@ -143,23 +181,29 @@ impl Editor {
                     chunks,
                 }) => {
                     // Chunked recovery for large files - apply chunks directly
-                    if self.open_file(&original_path).is_ok() {
-                        let state = self.active_state_mut();
+                    if let Ok(buffer_id) = self.open_file(&original_path) {
+                        {
+                            let state = self.active_state_mut();
 
-                        // Apply chunks in reverse order to preserve offsets
-                        // Each chunk: delete original_len bytes at offset, then insert content
-                        for chunk in chunks.into_iter().rev() {
-                            let text = String::from_utf8_lossy(&chunk.content).into_owned();
-                            if chunk.original_len > 0 {
-                                state
-                                    .buffer
-                                    .delete(chunk.offset..chunk.offset + chunk.original_len);
+                            // Apply chunks in reverse order to preserve offsets
+                            // Each chunk: delete original_len bytes at offset, then insert content
+                            for chunk in chunks.into_iter().rev() {
+                                let text = String::from_utf8_lossy(&chunk.content).into_owned();
+                                if chunk.original_len > 0 {
+                                    state
+                                        .buffer
+                                        .delete(chunk.offset..chunk.offset + chunk.original_len);
+                                }
+                                state.buffer.insert(chunk.offset, &text);
                             }
-                            state.buffer.insert(chunk.offset, &text);
-                        }
 
-                        // Mark as modified since it differs from disk
-                        state.buffer.set_modified(true);
+                            // Mark as modified since it differs from disk
+                            state.buffer.set_modified(true);
+                        }
+                        // Invalidate the event log's saved position so undo
+                        // can't incorrectly clear the modified flag
+                        self.active_event_log_mut().clear_saved_position();
+                        self.sync_lsp_after_recovery_replay(buffer_id);
                         recovered_count += 1;
                         tracing::info!("Recovered buffer with chunks: {}", original_path.display());
                     }
@@ -200,6 +244,153 @@ impl Editor {
     /// Returns the number of recovery files deleted
     pub fn discard_all_recovery(&mut self) -> AnyhowResult<usize> {
         Ok(self.recovery_service.discard_all_recovery()?)
+    }
+
+    /// Restore only the hot-exit content from the previous clean exit:
+    /// files with unsaved modifications and unnamed buffers that held
+    /// content.  Called when full session restore is opted out (via
+    /// `--no-restore` or `editor.restore_previous_session = false`) so
+    /// the user does not lose in-progress work just because they asked
+    /// to skip restoring the workspace layout.
+    ///
+    /// Unlike [`Editor::recover_all_buffers`], this path uses
+    /// `load_recovery` and leaves the recovery files in place so the
+    /// current session's hot-exit pipeline keeps owning them (the files
+    /// are cleaned up on the next clean shutdown via
+    /// `end_session_preserving`).
+    ///
+    /// Returns the number of buffers restored.
+    pub fn try_restore_hot_exit_buffers(&mut self) -> AnyhowResult<usize> {
+        use crate::services::recovery::RecoveryResult;
+
+        if !self.config.editor.hot_exit {
+            return Ok(0);
+        }
+
+        let entries = self.recovery_service.list_recoverable()?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut restored = 0;
+        for entry in entries {
+            match self.recovery_service.load_recovery(&entry) {
+                Ok(RecoveryResult::Recovered {
+                    original_path,
+                    content,
+                }) => {
+                    let text = String::from_utf8_lossy(&content).into_owned();
+                    if let Some(path) = original_path {
+                        match self.open_file(&path) {
+                            Ok(buffer_id) => {
+                                {
+                                    let state = self.active_state_mut();
+                                    let total = state.buffer.total_bytes();
+                                    state.buffer.delete(0..total);
+                                    state.buffer.insert(0, &text);
+                                    state.buffer.set_modified(true);
+                                    state.buffer.set_recovery_pending(false);
+                                }
+                                self.active_event_log_mut().clear_saved_position();
+                                self.sync_lsp_after_recovery_replay(buffer_id);
+                                restored += 1;
+                                tracing::info!(
+                                    "Hot-exit restore: reopened {} with unsaved changes",
+                                    path.display()
+                                );
+                            }
+                            Err(e) => {
+                                if let Some(confirmation) = e.downcast_ref::<
+                                    crate::model::buffer::LargeFileEncodingConfirmation,
+                                >() {
+                                    self.start_large_file_encoding_confirmation(confirmation);
+                                } else {
+                                    tracing::warn!(
+                                        "Hot-exit restore failed to open {}: {}",
+                                        path.display(),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        // Unnamed buffer with content — create a fresh
+                        // buffer, drop the recovery ID into metadata so
+                        // future hot-exit saves hit the same file.
+                        let buffer_id = self.new_buffer();
+                        {
+                            let state = self.active_state_mut();
+                            state.buffer.insert(0, &text);
+                            state.buffer.set_modified(true);
+                            state.buffer.set_recovery_pending(false);
+                        }
+                        self.active_event_log_mut().clear_saved_position();
+                        if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+                            meta.recovery_id = Some(entry.id.clone());
+                        }
+                        self.sync_lsp_after_recovery_replay(buffer_id);
+                        restored += 1;
+                        tracing::info!(
+                            "Hot-exit restore: reopened unnamed buffer (recovery_id={})",
+                            entry.id
+                        );
+                    }
+                }
+                Ok(RecoveryResult::RecoveredChunks {
+                    original_path,
+                    chunks,
+                }) => match self.open_file(&original_path) {
+                    Ok(buffer_id) => {
+                        {
+                            let state = self.active_state_mut();
+                            for chunk in chunks.into_iter().rev() {
+                                let text = String::from_utf8_lossy(&chunk.content).into_owned();
+                                if chunk.original_len > 0 {
+                                    state
+                                        .buffer
+                                        .delete(chunk.offset..chunk.offset + chunk.original_len);
+                                }
+                                state.buffer.insert(chunk.offset, &text);
+                            }
+                            state.buffer.set_modified(true);
+                            state.buffer.set_recovery_pending(false);
+                        }
+                        self.active_event_log_mut().clear_saved_position();
+                        self.sync_lsp_after_recovery_replay(buffer_id);
+                        restored += 1;
+                        tracing::info!(
+                            "Hot-exit restore: reopened {} with chunked changes",
+                            original_path.display()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Hot-exit restore failed to open {}: {}",
+                            original_path.display(),
+                            e
+                        );
+                    }
+                },
+                Ok(RecoveryResult::OriginalFileModified { id, original_path }) => {
+                    tracing::warn!(
+                        "Hot-exit restore skipped {}: original file {} changed on disk",
+                        id,
+                        original_path.display()
+                    );
+                }
+                Ok(RecoveryResult::Corrupted { id, reason }) => {
+                    tracing::warn!("Hot-exit restore skipped {}: corrupted ({})", id, reason);
+                }
+                Ok(RecoveryResult::NotFound { id }) => {
+                    tracing::warn!("Hot-exit restore: recovery file {} missing", id);
+                }
+                Err(e) => {
+                    tracing::warn!("Hot-exit restore: failed to load {}: {}", entry.id, e);
+                }
+            }
+        }
+
+        Ok(restored)
     }
 
     /// Perform auto-recovery-save for all modified buffers if needed.

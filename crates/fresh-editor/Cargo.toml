@@ -26,18 +26,23 @@ name = "event_debug"
 path = "src/bin/event_debug.rs"
 required-features = ["dev-bins", "runtime"]
 
+[[bin]]
+name = "measure_startup"
+path = "src/bin/measure_startup.rs"
+required-features = ["dev-bins", "runtime"]
+
 [lib]
 name = "fresh"
 path = "src/lib.rs"
 
 [features]
 default = ["plugins", "runtime", "embed-plugins"]
-plugins = ["dep:fresh-plugin-runtime", "dep:fresh-parser-js", "dep:fresh-plugin-api-macros", "dep:ts-rs"]
+plugins = ["dep:fresh-plugin-runtime", "dep:fresh-parser-js", "dep:fresh-plugin-api-macros"]
 # Embed plugins into the binary as a fallback when no disk plugins are found
 embed-plugins = ["plugins", "dep:include_dir", "dep:trash"]
 # Feature for optional development binaries (generate_schema, event_debug)
 # Includes ratatui for theme type definitions needed by schema generation
-dev-bins = ["dep:ratatui"]
+dev-bins = ["dep:ratatui", "dep:vt100"]
 # Runtime feature includes all heavy dependencies needed for the actual editor
 runtime = [
     "dep:crossterm",
@@ -48,10 +53,9 @@ runtime = [
     "dep:tracing-subscriber",
     "dep:fresh-languages",
     "dep:lsp-types",
-    "dep:url",
     "dep:tokio",
     "dep:async-trait",
-    "dep:lru",
+
     "dep:ignore",
     "dep:libc",
     "dep:libloading",
@@ -68,7 +72,7 @@ runtime = [
     "syntect/yaml-load",  # Needed for SyntaxDefinition::load_from_str
     "syntect/default-syntaxes",
     "syntect/default-themes",
-    "dep:plist",  # For loading TextMate grammar files (JSON → plist conversion)
+
     "dep:ureq",
     "dep:alacritty_terminal",
     "dep:portable-pty",
@@ -97,7 +101,7 @@ wasm = [
     "syntect/yaml-load",  # yaml-rust is pure Rust, WASM-compatible
     "syntect/default-syntaxes",
     "syntect/default-themes",
-    "dep:plist",  # plist is pure Rust, WASM-compatible
+
 ]
 
 [dependencies]
@@ -107,12 +111,22 @@ fresh-parser-js = { workspace = true, optional = true }
 fresh-languages = { workspace = true, optional = true, features = ["all-languages"] }
 fresh-plugin-runtime = { workspace = true, optional = true }
 
+# oxc for user init.ts syntax checking (fresh --cmd init check)
+oxc_allocator.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+
 # Always required (for schema generation and runtime)
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
 rust-i18n.workspace = true
 once_cell.workspace = true
+# Cross-platform PATH / binary resolution.  Handles Windows PATHEXT
+# (.CMD/.BAT/.PS1 wrappers that npm -g creates for Node-based LSPs),
+# the Unix executable bit, symlinks, and App Execution Aliases on
+# Windows — all of which our previous hand-rolled probe missed.
+which = "6"
 
 # Runtime dependencies (optional, enabled by "runtime" feature)
 crossterm = { version = "0.29.0", features = ["osc52"], optional = true }
@@ -126,10 +140,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 lsp-types = { workspace = true, optional = true }
-url = { version = "2.5", optional = true }
 tokio = { version = "1.49", features = ["fs", "io-util", "process", "rt", "rt-multi-thread", "sync", "time", "macros"], optional = true }
 async-trait = { version = "0.1", optional = true }
-lru = { version = "0.16", optional = true }
+
 ignore = { version = "0.4", default-features = false, optional = true }
 # regex is always needed for model::buffer search functionality
 regex = { version = "1.12" }
@@ -139,8 +152,6 @@ nix = { version = "0.31", features = ["signal", "pthread", "resource", "poll", "
 
 # Plugin API proc macros for type-safe bindings
 fresh-plugin-api-macros = { workspace = true, optional = true }
-# TypeScript type generation from Rust structs
-ts-rs = { version = "12.0", optional = true }
 
 # anyhow is always needed for model error handling
 anyhow = { workspace = true }
@@ -156,8 +167,7 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 # syntect with default-features=false so we can choose regex engine per build target
 # runtime uses onig (faster), wasm uses fancy-regex (pure Rust, WASM-compatible)
 syntect = { version = "5.3", default-features = false, optional = true }
-# plist for parsing/generating TextMate grammar files
-plist = { version = "1.7", optional = true }
+
 ureq = { version = "3.1.4", default-features = false, features = ["rustls"], optional = true }
 # Unicode handling - always needed for primitives
 unicode-width = { version = "0.2" }
@@ -166,7 +176,6 @@ unicode-segmentation = { version = "1.12" }
 # Encoding support - detection and conversion for various text encodings
 encoding_rs = "0.8"
 chardetng = "0.1"
-charset-normalizer-rs = "1.1"
 
 # Terminal emulation (optional)
 alacritty_terminal = { version = "0.25", optional = true }
@@ -180,6 +189,7 @@ include_dir = { version = "0.7", optional = true }
 tempfile = { version = "3.25", optional = true }
 trash = { version = "5.2.5", optional = true }
 open = { version = "5.3", optional = true }
+vt100 = { version = "0.16", optional = true }
 
 # GUI mode — all windowing/GPU deps are encapsulated in fresh-gui
 fresh-gui = { workspace = true, optional = true }
@@ -194,16 +204,19 @@ tiny_http = "0.12"  # Lightweight HTTP server for testing release checker
 unicode-segmentation = "1.12"  # For grapheme cluster testing
 
 [target.'cfg(windows)'.dependencies]
+fresh-winterm.workspace = true
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Console",
+    "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
     "Win32_Security",
 ] }
 
 [build-dependencies]
 serde_json.workspace = true
+syntect = { version = "5.3", default-features = false, features = ["parsing", "dump-load", "dump-create", "yaml-load", "default-syntaxes", "regex-onig"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -237,6 +250,8 @@ assets = [
     ["../../docs/icons/linux/hicolor/128x128/apps/fresh.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["../../docs/icons/linux/hicolor/256x256/apps/fresh.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["../../docs/icons/linux/hicolor/512x512/apps/fresh.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    # Freedesktop desktop entry
+    ["resources/fresh.desktop", "usr/share/applications/", "644"],
 ]
 # Maintainer scripts to create/remove symlink at /usr/bin/fresh
 maintainer-scripts = "debian/"
@@ -269,6 +284,8 @@ assets = [
     { source = "../../docs/icons/linux/hicolor/128x128/apps/fresh.png", dest = "/usr/share/icons/hicolor/128x128/apps/fresh.png", mode = "644" },
     { source = "../../docs/icons/linux/hicolor/256x256/apps/fresh.png", dest = "/usr/share/icons/hicolor/256x256/apps/fresh.png", mode = "644" },
     { source = "../../docs/icons/linux/hicolor/512x512/apps/fresh.png", dest = "/usr/share/icons/hicolor/512x512/apps/fresh.png", mode = "644" },
+    # Freedesktop desktop entry
+    { source = "resources/fresh.desktop", dest = "/usr/share/applications/fresh.desktop", mode = "644" },
 ]
 # posttrans runs after ALL transaction operations complete - needed because older versions
 # (<=0.1.56) had a preuninstall script that removes /usr/bin/fresh, which deletes our wrapper

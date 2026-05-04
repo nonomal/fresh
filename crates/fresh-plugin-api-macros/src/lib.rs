@@ -668,6 +668,63 @@ type BufferId = number;
 /** Split identifier */
 type SplitId = number;
 
+/**
+ * Payload delivered to handlers registered with `editor.on("mouse_click", ...)`.
+ *
+ * All coordinate fields are in cell (terminal character) units. `buffer_*`
+ * fields are `null` when the click did not land in any buffer panel.
+ */
+interface MouseClickHookArgs {
+  /** Screen column (0-indexed). */
+  column: number;
+  /** Screen row (0-indexed). */
+  row: number;
+  /** Mouse button: "left", "right", "middle". */
+  button: string;
+  /** Modifier keys (e.g. "shift"). */
+  modifiers: string;
+  /** X offset of the content area the click landed in. */
+  content_x: number;
+  /** Y offset of the content area the click landed in. */
+  content_y: number;
+  /** Buffer under the click, or `null` when outside any buffer panel. */
+  buffer_id: number | null;
+  /** 0-indexed buffer row (line number) of the click, accounting for scroll. */
+  buffer_row: number | null;
+  /** 0-indexed byte column inside the buffer row. */
+  buffer_col: number | null;
+}
+
+/**
+ * Registry of typed plugin APIs surfaced through
+ * `editor.exportPluginApi` / `editor.getPluginApi`.
+ *
+ * Plugins that want their surface to be typed for downstream
+ * consumers augment this interface in their own source:
+ *
+ * ```ts
+ * // in my_plugin.ts
+ * export type MyPluginApi = { doThing(): void };
+ * declare global {
+ *   interface FreshPluginRegistry {
+ *     "my-plugin": MyPluginApi;
+ *   }
+ * }
+ * ```
+ *
+ * `editor.getPluginApi("my-plugin")` then returns
+ * `MyPluginApi | null` without any `as`-cast on the consumer side.
+ * Plugins that skip the augmentation still work — the untyped
+ * `getPluginApi<T = unknown>(name: string): T | null` overload
+ * takes over.
+ *
+ * Each plugin's augmentation is emitted to
+ * `<config_dir>/types/plugins.d.ts` at load time (via oxc's
+ * isolated-declarations), so init.ts sees every loaded plugin's
+ * registry entry automatically.
+ */
+interface FreshPluginRegistry {}
+
 "#
 }
 

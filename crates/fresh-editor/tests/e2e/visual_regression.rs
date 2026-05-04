@@ -3,6 +3,7 @@
 // Additional functional tests preserve important assertions from original tests
 
 use crate::common::harness::EditorTestHarness;
+use crate::common::tracing::init_tracing_from_env;
 use crate::common::visual_testing::VisualFlow;
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::model::event::{Event, OverlayFace};
@@ -21,6 +22,7 @@ use std::fs;
 #[test]
 #[cfg_attr(windows, ignore)] // Visual regression tests require consistent terminal rendering
 fn visual_comprehensive_a() {
+    init_tracing_from_env();
     let mut harness = EditorTestHarness::with_temp_project(100, 30).unwrap();
     let project_dir = harness.project_dir().unwrap();
 
@@ -81,16 +83,19 @@ fn long_function() {
         .unwrap();
     harness.render().unwrap();
 
-    // Wait for file explorer to load
-    let _ = harness.wait_until(|h| h.screen_to_string().contains("File explorer ready"));
-    harness.render().unwrap();
-
-    // Expand the src directory in the explorer
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness.render().unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
+    // Wait for file explorer to load and auto-expand to show the current
+    // file (issue #1569): `src/` is expanded automatically, no manual
+    // navigation required. The presence of `main.rs` (the active file)
+    // in the explorer pane is the persistent proof the auto-expand
+    // happened. Originally also matched the transient
+    // "File explorer ready" status message, but at 100×30 — the
+    // canonical visual-regression terminal size — that message is
+    // truncated to "File explor..." when the `{remote}` indicator
+    // is on the bar, leaving the wait blocked forever.
+    let _ = harness.wait_until(|h| {
+        let s = h.screen_to_string();
+        s.contains("main.rs")
+    });
     harness.render().unwrap();
 
     // Focus back on the editor pane (Ctrl+E when in file explorer focuses editor)
@@ -266,7 +271,7 @@ fn helper() {
 /// Test that undo after successful rename restores all occurrences in one step
 #[test]
 fn test_lsp_rename_undo_restores_all() {
-    use lsp_types::{Position, Range, TextEdit, Uri, WorkspaceEdit};
+    use lsp_types::{Position, Range, TextEdit, WorkspaceEdit};
     use std::collections::HashMap;
     use std::io::Write;
 
@@ -293,11 +298,7 @@ fn test_lsp_rename_undo_restores_all() {
     assert_eq!(original_content.matches("value").count(), 3);
 
     // Create file URI from the temp file path
-    let file_uri = url::Url::from_file_path(&test_file)
-        .unwrap()
-        .as_str()
-        .parse::<Uri>()
-        .unwrap();
+    let file_uri = fresh_core::file_uri::path_to_lsp_uri(&test_file).unwrap();
 
     // Simulate LSP WorkspaceEdit response with multiple edits
     #[allow(clippy::mutable_key_type)]

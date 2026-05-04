@@ -15,7 +15,13 @@ use crate::view::popup_mouse::{popup_areas_to_layout_info, PopupHitTester};
 use crate::view::prompt::PromptType;
 use crate::view::ui::tabs::TabHit;
 use anyhow::Result as AnyhowResult;
+use ratatui::layout::Rect;
 use rust_i18n::t;
+
+/// Returns true if (col, row) falls inside `rect`.
+fn in_rect(col: u16, row: u16, rect: Rect) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
 
 impl Editor {
     /// Handle a mouse event.
@@ -29,45 +35,7 @@ impl Editor {
         let col = mouse_event.column;
         let row = mouse_event.row;
 
-        // Detect multi-click (double/triple) for left button down events
-        let (is_double_click, is_triple_click) =
-            if matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let now = self.time_source.now();
-                let is_consecutive = if let (Some(previous_time), Some(previous_pos)) =
-                    (self.previous_click_time, self.previous_click_position)
-                {
-                    let threshold =
-                        std::time::Duration::from_millis(self.config.editor.double_click_time_ms);
-                    let within_time = now.duration_since(previous_time) < threshold;
-                    let same_position = previous_pos == (col, row);
-                    within_time && same_position
-                } else {
-                    false
-                };
-
-                // Update click tracking
-                if is_consecutive {
-                    self.click_count += 1;
-                } else {
-                    self.click_count = 1;
-                }
-                self.previous_click_time = Some(now);
-                self.previous_click_position = Some((col, row));
-
-                let is_triple = self.click_count >= 3;
-                let is_double = self.click_count == 2;
-
-                if is_triple {
-                    // Reset after triple-click so the next click starts fresh
-                    self.click_count = 0;
-                    self.previous_click_time = None;
-                    self.previous_click_position = None;
-                }
-
-                (is_double, is_triple)
-            } else {
-                (false, false)
-            };
+        let (is_double_click, is_triple_click) = self.detect_multi_click(&mouse_event, col, row);
 
         // When keybinding editor is open, capture all mouse events
         if self.keybinding_editor.is_some() {
@@ -118,18 +86,9 @@ impl Editor {
         if self.theme_info_popup.is_some() {
             if let MouseEventKind::Down(MouseButton::Left) = mouse_event.kind {
                 if let Some((popup_rect, button_row_offset)) = self.theme_info_popup_rect() {
-                    let popup_x = popup_rect.x;
-                    let popup_y = popup_rect.y;
-                    let popup_w = popup_rect.width;
-                    let popup_h = popup_rect.height;
-                    let in_popup = col >= popup_x
-                        && col < popup_x + popup_w
-                        && row >= popup_y
-                        && row < popup_y + popup_h;
-
-                    if in_popup {
+                    if in_rect(col, row, popup_rect) {
                         // Check if click is on the button row (last content row before border)
-                        let actual_button_row = popup_y + button_row_offset;
+                        let actual_button_row = popup_rect.y + button_row_offset;
                         if row == actual_button_row {
                             let fg_key = self
                                 .theme_info_popup
@@ -214,9 +173,13 @@ impl Editor {
                 self.mouse_state.dragging_text_selection = false;
                 self.mouse_state.drag_selection_split = None;
                 self.mouse_state.drag_selection_anchor = None;
+                self.mouse_state.drag_selection_by_words = false;
+                self.mouse_state.drag_selection_word_end = None;
                 // Clear popup scrollbar drag state
                 self.mouse_state.dragging_popup_scrollbar = None;
                 self.mouse_state.drag_start_popup_scroll = None;
+                // Clear prompt scrollbar drag state (issue #1796)
+                self.mouse_state.dragging_prompt_scrollbar = false;
                 // Clear popup text selection drag state (selection remains in popup)
                 self.mouse_state.selecting_in_popup = None;
 
@@ -235,12 +198,7 @@ impl Editor {
                         .cached_layout
                         .split_areas
                         .iter()
-                        .find(|(_, _, content_rect, _, _, _)| {
-                            col >= content_rect.x
-                                && col < content_rect.x + content_rect.width
-                                && row >= content_rect.y
-                                && row < content_rect.y + content_rect.height
-                        })
+                        .find(|(_, _, content_rect, _, _, _)| in_rect(col, row, *content_rect))
                         .map(|(_, _, rect, _, _, _)| *rect);
 
                     let (content_x, content_y) = content_rect.map(|r| (r.x, r.y)).unwrap_or((0, 0));
@@ -279,73 +237,12 @@ impl Editor {
                 self.update_lsp_hover_state(col, row);
             }
             MouseEventKind::ScrollUp => {
-                // Shift+ScrollUp => horizontal scroll left
-                if mouse_event
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::SHIFT)
-                {
-                    self.handle_horizontal_scroll(col, row, -3)?;
-                    needs_render = true;
-                } else if self.handle_prompt_scroll(-3) {
-                    // Check if prompt with suggestions is active and should handle scroll
-                    needs_render = true;
-                } else if self.is_file_open_active()
-                    && self.is_mouse_over_file_browser(col, row)
-                    && self.handle_file_open_scroll(-3)
-                {
-                    // Check if file browser is active and mouse is over it
-                    needs_render = true;
-                } else if self.is_mouse_over_any_popup(col, row) {
-                    // Scroll the popup content (works for all popups including completion)
-                    self.scroll_popup(-3);
-                    needs_render = true;
-                } else {
-                    // If in terminal mode, exit to scrollback mode first so scrolling works
-                    if self.terminal_mode && self.is_terminal_buffer(self.active_buffer()) {
-                        self.sync_terminal_to_buffer(self.active_buffer());
-                        self.terminal_mode = false;
-                        self.key_context = crate::input::keybindings::KeyContext::Normal;
-                    }
-                    // Dismiss hover/signature help popups on scroll
-                    self.dismiss_transient_popups();
-                    self.handle_mouse_scroll(col, row, -3)?;
-                    // Sync viewport from SplitViewState to EditorState so rendering sees the scroll
-                    needs_render = true;
-                }
+                self.handle_vertical_scroll(col, row, mouse_event.modifiers, -3)?;
+                needs_render = true;
             }
             MouseEventKind::ScrollDown => {
-                // Shift+ScrollDown => horizontal scroll right
-                if mouse_event
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::SHIFT)
-                {
-                    self.handle_horizontal_scroll(col, row, 3)?;
-                    needs_render = true;
-                } else if self.handle_prompt_scroll(3) {
-                    // Check if prompt with suggestions is active and should handle scroll
-                    needs_render = true;
-                } else if self.is_file_open_active()
-                    && self.is_mouse_over_file_browser(col, row)
-                    && self.handle_file_open_scroll(3)
-                {
-                    needs_render = true;
-                } else if self.is_mouse_over_any_popup(col, row) {
-                    // Scroll the popup content (works for all popups including completion)
-                    self.scroll_popup(3);
-                    needs_render = true;
-                } else {
-                    // If in terminal mode, exit to scrollback mode first so scrolling works
-                    if self.terminal_mode && self.is_terminal_buffer(self.active_buffer()) {
-                        self.sync_terminal_to_buffer(self.active_buffer());
-                        self.terminal_mode = false;
-                        self.key_context = crate::input::keybindings::KeyContext::Normal;
-                    }
-                    // Dismiss hover/signature help popups on scroll
-                    self.dismiss_transient_popups();
-                    self.handle_mouse_scroll(col, row, 3)?;
-                    // Sync viewport from SplitViewState to EditorState so rendering sees the scroll
-                    needs_render = true;
-                }
+                self.handle_vertical_scroll(col, row, mouse_event.modifiers, 3)?;
+                needs_render = true;
             }
             MouseEventKind::ScrollLeft => {
                 // Native horizontal scroll left
@@ -379,6 +276,75 @@ impl Editor {
         Ok(needs_render)
     }
 
+    /// Detect double/triple clicks and update click-tracking state.
+    fn detect_multi_click(
+        &mut self,
+        mouse_event: &crossterm::event::MouseEvent,
+        col: u16,
+        row: u16,
+    ) -> (bool, bool) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if !matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return (false, false);
+        }
+        let now = self.time_source.now();
+        let threshold = std::time::Duration::from_millis(self.config.editor.double_click_time_ms);
+        let is_consecutive = if let (Some(prev_time), Some(prev_pos)) =
+            (self.previous_click_time, self.previous_click_position)
+        {
+            now.duration_since(prev_time) < threshold && prev_pos == (col, row)
+        } else {
+            false
+        };
+        if is_consecutive {
+            self.click_count += 1;
+        } else {
+            self.click_count = 1;
+        }
+        self.previous_click_time = Some(now);
+        self.previous_click_position = Some((col, row));
+        let is_triple = self.click_count >= 3;
+        let is_double = self.click_count == 2;
+        if is_triple {
+            self.click_count = 0;
+            self.previous_click_time = None;
+            self.previous_click_position = None;
+        }
+        (is_double, is_triple)
+    }
+
+    /// Dispatch a vertical scroll event (ScrollUp/ScrollDown) through the priority chain:
+    /// Shift → horizontal scroll, prompt, file browser, popup, editor/terminal.
+    fn handle_vertical_scroll(
+        &mut self,
+        col: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+        delta: i32,
+    ) -> AnyhowResult<()> {
+        if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+            self.handle_horizontal_scroll(col, row, delta)?;
+        } else if self.handle_prompt_scroll(delta) {
+            // prompt consumed the scroll
+        } else if self.is_file_open_active()
+            && self.is_mouse_over_file_browser(col, row)
+            && self.handle_file_open_scroll(delta)
+        {
+            // file browser consumed the scroll
+        } else if self.is_mouse_over_any_popup(col, row) {
+            self.scroll_popup(delta);
+        } else {
+            if self.terminal_mode && self.is_terminal_buffer(self.active_buffer()) {
+                self.sync_terminal_to_buffer(self.active_buffer());
+                self.terminal_mode = false;
+                self.key_context = crate::input::keybindings::KeyContext::Normal;
+            }
+            self.dismiss_transient_popups();
+            self.handle_mouse_scroll(col, row, delta)?;
+        }
+        Ok(())
+    }
+
     /// Update the current hover target based on mouse position
     /// Returns true if the hover target changed (requiring a re-render)
     pub(super) fn update_hover_target(&mut self, col: u16, row: u16) -> bool {
@@ -390,6 +356,13 @@ impl Editor {
         // If a menu is currently open and we're hovering over a different menu bar item,
         // switch to that menu automatically
         if let Some(active_menu_idx) = self.menu_state.active_menu {
+            let all_menus: Vec<crate::config::Menu> = self
+                .menus
+                .menus
+                .iter()
+                .chain(self.menu_state.plugin_menus.iter())
+                .cloned()
+                .collect();
             if let Some(HoverTarget::MenuBarItem(hovered_menu_idx)) = new_target.clone() {
                 if hovered_menu_idx != active_menu_idx {
                     self.menu_state.open_menu(hovered_menu_idx);
@@ -399,14 +372,6 @@ impl Editor {
 
             // If hovering over a menu dropdown item, check if it's a submenu and open it
             if let Some(HoverTarget::MenuDropdownItem(_, item_idx)) = new_target.clone() {
-                let all_menus: Vec<crate::config::Menu> = self
-                    .menus
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
                 // If this item is the parent of the currently open submenu, keep it open.
                 // This prevents blinking when hovering over the parent item of an open submenu.
                 if self.menu_state.submenu_path.first() == Some(&item_idx) {
@@ -478,14 +443,6 @@ impl Editor {
                     self.menu_state.submenu_path.truncate(depth);
                 }
 
-                let all_menus: Vec<crate::config::Menu> = self
-                    .menus
-                    .menus
-                    .iter()
-                    .chain(self.menu_state.plugin_menus.iter())
-                    .cloned()
-                    .collect();
-
                 // Get the items at this depth
                 if let Some(items) = self
                     .menu_state
@@ -528,6 +485,15 @@ impl Editor {
             }
         }
 
+        if let Some(&HoverTarget::FileExplorerContextMenuItem(item_idx)) = new_target.as_ref() {
+            if let Some(ref mut menu) = self.file_explorer_context_menu {
+                if menu.highlighted != item_idx {
+                    menu.highlighted = item_idx;
+                    return true;
+                }
+            }
+        }
+
         // Handle file explorer status indicator hover - show tooltip
         // Always dismiss existing tooltip first when target changes
         if old_target != new_target
@@ -561,6 +527,20 @@ impl Editor {
     fn update_lsp_hover_state(&mut self, col: u16, row: u16) {
         tracing::trace!(col, row, "update_lsp_hover_state: raw mouse position");
 
+        // Suppress LSP hover when a popup is already visible (e.g. theme info popup,
+        // tab context menu) to avoid hover tooltips overlapping other popups.
+        if self.theme_info_popup.is_some()
+            || self.tab_context_menu.is_some()
+            || self.file_explorer_context_menu.is_some()
+        {
+            if self.mouse_state.lsp_hover_state.is_some() {
+                self.mouse_state.lsp_hover_state = None;
+                self.mouse_state.lsp_hover_request_sent = false;
+                self.dismiss_transient_popups();
+            }
+            return;
+        }
+
         // Check if mouse is over a transient popup - if so, keep hover active
         if self.is_mouse_over_transient_popup(col, row) {
             return;
@@ -571,12 +551,7 @@ impl Editor {
             .cached_layout
             .split_areas
             .iter()
-            .find(|(_, _, content_rect, _, _, _)| {
-                col >= content_rect.x
-                    && col < content_rect.x + content_rect.width
-                    && row >= content_rect.y
-                    && row < content_rect.y + content_rect.height
-            })
+            .find(|(_, _, content_rect, _, _, _)| in_rect(col, row, *content_rect))
             .map(|(split_id, buffer_id, content_rect, _, _, _)| {
                 (*split_id, *buffer_id, *content_rect)
             });
@@ -615,7 +590,7 @@ impl Editor {
             .and_then(|vs| vs.compose_width);
 
         // Convert screen position to buffer byte position
-        let Some(byte_pos) = Self::screen_to_buffer_position(
+        let Some(byte_pos) = super::click_geometry::screen_to_buffer_position(
             col,
             row,
             content_rect,
@@ -625,11 +600,12 @@ impl Editor {
             false, // Don't include gutter
             compose_width,
         ) else {
-            // Mouse is in gutter - clear hover state
+            // Mouse is in the gutter — stop tracking a pending request but keep
+            // any existing popup visible. The popup is only dismissed when the
+            // mouse leaves the editor area entirely (see docstring).
             if self.mouse_state.lsp_hover_state.is_some() {
                 self.mouse_state.lsp_hover_state = None;
                 self.mouse_state.lsp_hover_request_sent = false;
-                self.dismiss_transient_popups();
             }
             return;
         };
@@ -677,17 +653,19 @@ impl Editor {
             tracing::trace!(
                 "update_lsp_hover_state: mouse past line end or empty line, clearing hover"
             );
-            // Mouse is past end of line content - clear hover state and don't trigger new hover
+            // Mouse is past end of line content — stop tracking a pending
+            // request but keep any existing popup visible. The popup is only
+            // dismissed when the mouse leaves the editor area entirely
+            // (see docstring).
             if self.mouse_state.lsp_hover_state.is_some() {
                 self.mouse_state.lsp_hover_state = None;
                 self.mouse_state.lsp_hover_request_sent = false;
-                self.dismiss_transient_popups();
             }
             return;
         }
 
         // Check if mouse is within the hovered symbol range - if so, keep hover active
-        if let Some((start, end)) = self.hover_symbol_range {
+        if let Some((start, end)) = self.hover.symbol_range() {
             if byte_pos >= start && byte_pos < end {
                 // Mouse is still over the hovered symbol - keep hover state
                 return;
@@ -700,8 +678,11 @@ impl Editor {
                 // Same position - keep existing state
                 return;
             }
-            // Position changed outside symbol range - reset state and dismiss popup
-            self.dismiss_transient_popups();
+            // Position changed outside the hovered symbol range. Don't dismiss
+            // the popup here: a new hover request will fire after the debounce
+            // and replace the popup naturally if the mouse settles on another
+            // symbol. Dismissing eagerly tore the popup down whenever the
+            // mouse passed through whitespace between two words (issue #692).
         }
 
         // Start tracking new hover position
@@ -718,6 +699,21 @@ impl Editor {
 
     /// Check if mouse position is over any popup (including non-transient ones like completion)
     fn is_mouse_over_any_popup(&self, col: u16, row: u16) -> bool {
+        // Editor-level popup overlays absorb every click within their outer
+        // rect so the buffer below doesn't receive a stray cursor placement.
+        for (_, popup_area, _, _, _) in &self.cached_layout.global_popup_areas {
+            if in_rect(col, row, *popup_area) {
+                return true;
+            }
+        }
+        // The prompt's suggestions popup also absorbs clicks across its full
+        // outer rect (border + items): clicking the chrome must not move the
+        // buffer cursor below.
+        if let Some(outer) = self.cached_layout.suggestions_outer_area {
+            if in_rect(col, row, outer) {
+                return true;
+            }
+        }
         let layouts = popup_areas_to_layout_info(&self.cached_layout.popup_areas);
         let hit_tester = PopupHitTester::new(&layouts, &self.active_state().popups);
         hit_tester.is_over_popup(col, row)
@@ -730,8 +726,45 @@ impl Editor {
             .is_some_and(|layout| layout.contains(col, row))
     }
 
+    /// Find the split whose content or scrollbar area contains (col, row).
+    /// Returns the split id and its buffer id, or None if not over any split.
+    pub(super) fn split_at_position(&self, col: u16, row: u16) -> Option<(LeafId, BufferId)> {
+        for &(split_id, buffer_id, content_rect, scrollbar_rect, _, _) in
+            &self.cached_layout.split_areas
+        {
+            let in_content = in_rect(col, row, content_rect);
+            let in_scrollbar = scrollbar_rect.width > 0
+                && scrollbar_rect.height > 0
+                && in_rect(col, row, scrollbar_rect);
+            if in_content || in_scrollbar {
+                return Some((split_id, buffer_id));
+            }
+        }
+        None
+    }
+
     /// Compute what hover target is at the given position
     fn compute_hover_target(&self, col: u16, row: u16) -> Option<HoverTarget> {
+        if let Some(ref menu) = self.file_explorer_context_menu {
+            let (menu_x, menu_y) = menu.clamped_position(
+                self.cached_layout.last_frame_width,
+                self.cached_layout.last_frame_height,
+            );
+            let menu_width = super::types::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
+            let menu_height = menu.height();
+
+            if col >= menu_x
+                && col < menu_x + menu_width
+                && row > menu_y
+                && row < menu_y + menu_height - 1
+            {
+                let item_idx = (row - menu_y - 1) as usize;
+                if item_idx < menu.items().len() {
+                    return Some(HoverTarget::FileExplorerContextMenuItem(item_idx));
+                }
+            }
+        }
+
         // Check tab context menu first (it's rendered on top)
         if let Some(ref menu) = self.tab_context_menu {
             let menu_x = menu.position.0;
@@ -756,11 +789,7 @@ impl Editor {
         if let Some((inner_rect, start_idx, _visible_count, total_count)) =
             &self.cached_layout.suggestions_area
         {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-            {
+            if in_rect(col, row, *inner_rect) {
                 let relative_row = (row - inner_rect.y) as usize;
                 let item_idx = start_idx + relative_row;
 
@@ -775,12 +804,7 @@ impl Editor {
         for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items, _, _) in
             self.cached_layout.popup_areas.iter().rev()
         {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-                && *num_items > 0
-            {
+            if in_rect(col, row, *inner_rect) && *num_items > 0 {
                 // Calculate which item is being hovered
                 let relative_row = (row - inner_rect.y) as usize;
                 let item_idx = scroll_offset + relative_row;
@@ -898,11 +922,11 @@ impl Editor {
 
         for (split_id, tab_layout) in &self.cached_layout.tab_layouts {
             match tab_layout.hit_test(col, row) {
-                Some(TabHit::CloseButton(buffer_id)) => {
-                    return Some(HoverTarget::TabCloseButton(buffer_id, *split_id));
+                Some(TabHit::CloseButton(target)) => {
+                    return Some(HoverTarget::TabCloseButton(target, *split_id));
                 }
-                Some(TabHit::TabName(buffer_id)) => {
-                    return Some(HoverTarget::TabName(buffer_id, *split_id));
+                Some(TabHit::TabName(target)) => {
+                    return Some(HoverTarget::TabName(target, *split_id));
                 }
                 Some(TabHit::ScrollLeft)
                 | Some(TabHit::ScrollRight)
@@ -915,18 +939,14 @@ impl Editor {
         for (split_id, _buffer_id, _content_rect, scrollbar_rect, thumb_start, thumb_end) in
             &self.cached_layout.split_areas
         {
-            if col >= scrollbar_rect.x
-                && col < scrollbar_rect.x + scrollbar_rect.width
-                && row >= scrollbar_rect.y
-                && row < scrollbar_rect.y + scrollbar_rect.height
-            {
+            if in_rect(col, row, *scrollbar_rect) {
                 let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
                 let is_on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
 
                 if is_on_thumb {
                     return Some(HoverTarget::ScrollbarThumb(*split_id));
                 } else {
-                    return Some(HoverTarget::ScrollbarTrack(*split_id));
+                    return Some(HoverTarget::ScrollbarTrack(*split_id, relative_row as u16));
                 }
             }
         }
@@ -934,47 +954,37 @@ impl Editor {
         // Check status bar indicators
         if let Some((status_row, _status_x, _status_width)) = self.cached_layout.status_bar_area {
             if row == status_row {
-                // Check line ending indicator area
-                if let Some((le_row, le_start, le_end)) =
-                    self.cached_layout.status_bar_line_ending_area
-                {
-                    if row == le_row && col >= le_start && col < le_end {
-                        return Some(HoverTarget::StatusBarLineEndingIndicator);
-                    }
-                }
-
-                // Check encoding indicator area
-                if let Some((enc_row, enc_start, enc_end)) =
-                    self.cached_layout.status_bar_encoding_area
-                {
-                    if row == enc_row && col >= enc_start && col < enc_end {
-                        return Some(HoverTarget::StatusBarEncodingIndicator);
-                    }
-                }
-
-                // Check language indicator area
-                if let Some((lang_row, lang_start, lang_end)) =
-                    self.cached_layout.status_bar_language_area
-                {
-                    if row == lang_row && col >= lang_start && col < lang_end {
-                        return Some(HoverTarget::StatusBarLanguageIndicator);
-                    }
-                }
-
-                // Check LSP indicator area
-                if let Some((lsp_row, lsp_start, lsp_end)) = self.cached_layout.status_bar_lsp_area
-                {
-                    if row == lsp_row && col >= lsp_start && col < lsp_end {
-                        return Some(HoverTarget::StatusBarLspIndicator);
-                    }
-                }
-
-                // Check warning badge area
-                if let Some((warn_row, warn_start, warn_end)) =
-                    self.cached_layout.status_bar_warning_area
-                {
-                    if row == warn_row && col >= warn_start && col < warn_end {
-                        return Some(HoverTarget::StatusBarWarningBadge);
+                let indicators = [
+                    (
+                        self.cached_layout.status_bar_line_ending_area,
+                        HoverTarget::StatusBarLineEndingIndicator,
+                    ),
+                    (
+                        self.cached_layout.status_bar_encoding_area,
+                        HoverTarget::StatusBarEncodingIndicator,
+                    ),
+                    (
+                        self.cached_layout.status_bar_language_area,
+                        HoverTarget::StatusBarLanguageIndicator,
+                    ),
+                    (
+                        self.cached_layout.status_bar_lsp_area,
+                        HoverTarget::StatusBarLspIndicator,
+                    ),
+                    (
+                        self.cached_layout.status_bar_remote_area,
+                        HoverTarget::StatusBarRemoteIndicator,
+                    ),
+                    (
+                        self.cached_layout.status_bar_warning_area,
+                        HoverTarget::StatusBarWarningBadge,
+                    ),
+                ];
+                for (area, target) in indicators {
+                    if let Some((indicator_row, start, end)) = area {
+                        if row == indicator_row && col >= start && col < end {
+                            return Some(target);
+                        }
                     }
                 }
             }
@@ -1002,6 +1012,13 @@ impl Editor {
     /// Double-click in editor area selects the word under the cursor.
     pub(super) fn handle_mouse_double_click(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
         tracing::debug!("handle_mouse_double_click at col={}, row={}", col, row);
+
+        // Double-click on a suggestion item commits the choice — even for
+        // prompts whose first click only previews. The first click already
+        // selected the row; the second confirms (#1660).
+        if let Some(r) = self.handle_click_suggestions_confirm(col, row) {
+            return r;
+        }
 
         // Handle popups: dismiss if clicking outside, block if clicking inside
         if self.is_mouse_over_any_popup(col, row) {
@@ -1035,11 +1052,7 @@ impl Editor {
         for (split_id, buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
             &split_areas
         {
-            if col >= content_rect.x
-                && col < content_rect.x + content_rect.width
-                && row >= content_rect.y
-                && row < content_rect.y + content_rect.height
-            {
+            if in_rect(col, row, *content_rect) {
                 // Double-clicked on an editor split
                 if self.is_terminal_buffer(*buffer_id) {
                     self.key_context = crate::input::keybindings::KeyContext::Terminal;
@@ -1069,6 +1082,13 @@ impl Editor {
     ) -> AnyhowResult<()> {
         use crate::model::event::Event;
 
+        // Fixed panels (toolbars, headers) are inert — no click focus,
+        // no selection. Scrollable group panels still accept clicks even
+        // when their cursor is hidden.
+        if self.is_non_scrollable_buffer(buffer_id) {
+            return Ok(());
+        }
+
         // Focus this split
         self.focus_split(split_id, buffer_id);
 
@@ -1097,7 +1117,7 @@ impl Editor {
         if let Some(state) = self.buffers.get_mut(&buffer_id) {
             let gutter_width = state.margins.left_total_width() as u16;
 
-            let Some(target_position) = Self::screen_to_buffer_position(
+            let Some(target_position) = super::click_geometry::screen_to_buffer_position(
                 col,
                 row,
                 content_rect,
@@ -1141,6 +1161,23 @@ impl Editor {
         // Now select the word under cursor
         self.handle_action(Action::SelectWord)?;
 
+        // Set up drag state so subsequent drag events extend selection word-by-word
+        if let Some(cursor) = self
+            .split_view_states
+            .get(&leaf_id)
+            .map(|vs| vs.cursors.primary())
+        {
+            // Store both edges of the selected word so we can use the appropriate
+            // anchor when dragging forward (use word start) vs backward (use word end).
+            let sel_start = cursor.selection_start();
+            let sel_end = cursor.selection_end();
+            self.mouse_state.dragging_text_selection = true;
+            self.mouse_state.drag_selection_split = Some(split_id);
+            self.mouse_state.drag_selection_anchor = Some(sel_start);
+            self.mouse_state.drag_selection_by_words = true;
+            self.mouse_state.drag_selection_word_end = Some(sel_end);
+        }
+
         Ok(())
     }
     /// Handle mouse triple click (down event)
@@ -1160,11 +1197,7 @@ impl Editor {
         for (split_id, buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
             &split_areas
         {
-            if col >= content_rect.x
-                && col < content_rect.x + content_rect.width
-                && row >= content_rect.y
-                && row < content_rect.y + content_rect.height
-            {
+            if in_rect(col, row, *content_rect) {
                 if self.is_terminal_buffer(*buffer_id) {
                     return Ok(());
                 }
@@ -1191,6 +1224,10 @@ impl Editor {
         content_rect: ratatui::layout::Rect,
     ) -> AnyhowResult<()> {
         use crate::model::event::Event;
+
+        if self.is_non_scrollable_buffer(buffer_id) {
+            return Ok(());
+        }
 
         // Focus this split
         self.focus_split(split_id, buffer_id);
@@ -1219,7 +1256,7 @@ impl Editor {
         if let Some(state) = self.buffers.get_mut(&buffer_id) {
             let gutter_width = state.margins.left_total_width() as u16;
 
-            let Some(target_position) = Self::screen_to_buffer_position(
+            let Some(target_position) = super::click_geometry::screen_to_buffer_position(
                 col,
                 row,
                 content_rect,
@@ -1273,600 +1310,59 @@ impl Editor {
         row: u16,
         modifiers: crossterm::event::KeyModifiers,
     ) -> AnyhowResult<()> {
-        // Check if click is on tab context menu first
-        if self.tab_context_menu.is_some() {
-            if let Some(result) = self.handle_tab_context_menu_click(col, row) {
-                return result;
-            }
+        if let Some(r) = self.handle_click_context_menus(col, row) {
+            return r;
         }
-
-        // Dismiss transient popups (like hover) when clicking outside them
-        // This check must happen before we process the click elsewhere
         if !self.is_mouse_over_any_popup(col, row) {
             self.dismiss_transient_popups();
         }
-
-        // Check if click is on suggestions (command palette, autocomplete)
-        if let Some((inner_rect, start_idx, _visible_count, total_count)) =
-            &self.cached_layout.suggestions_area.clone()
-        {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-            {
-                let relative_row = (row - inner_rect.y) as usize;
-                let item_idx = start_idx + relative_row;
-
-                if item_idx < *total_count {
-                    // Select and execute the clicked suggestion
-                    if let Some(prompt) = &mut self.prompt {
-                        prompt.selected_suggestion = Some(item_idx);
-                    }
-                    // Execute the suggestion (same as pressing Enter)
-                    return self.handle_action(Action::PromptConfirm);
-                }
-            }
+        if let Some(r) = self.handle_click_suggestions(col, row) {
+            return r;
         }
-
-        // Check if click is on a popup scrollbar first (they're rendered on top)
-        // Collect scroll info first to avoid borrow conflicts
-        let scrollbar_scroll_info: Option<(usize, i32)> =
-            self.cached_layout.popup_areas.iter().rev().find_map(
-                |(
-                    popup_idx,
-                    _popup_rect,
-                    inner_rect,
-                    _scroll_offset,
-                    _num_items,
-                    scrollbar_rect,
-                    total_lines,
-                )| {
-                    let sb_rect = scrollbar_rect.as_ref()?;
-                    if col >= sb_rect.x
-                        && col < sb_rect.x + sb_rect.width
-                        && row >= sb_rect.y
-                        && row < sb_rect.y + sb_rect.height
-                    {
-                        let relative_row = (row - sb_rect.y) as usize;
-                        let track_height = sb_rect.height as usize;
-                        let visible_lines = inner_rect.height as usize;
-
-                        if track_height > 0 && *total_lines > visible_lines {
-                            let max_scroll = total_lines.saturating_sub(visible_lines);
-                            let target_scroll = if track_height > 1 {
-                                (relative_row * max_scroll) / (track_height.saturating_sub(1))
-                            } else {
-                                0
-                            };
-                            Some((*popup_idx, target_scroll as i32))
-                        } else {
-                            Some((*popup_idx, 0))
-                        }
-                    } else {
-                        None
-                    }
-                },
-            );
-
-        if let Some((popup_idx, target_scroll)) = scrollbar_scroll_info {
-            // Set up drag state for popup scrollbar (reuse drag_start_row like editor scrollbar)
-            self.mouse_state.dragging_popup_scrollbar = Some(popup_idx);
-            self.mouse_state.drag_start_row = Some(row);
-            // Get current scroll offset before mutable borrow
-            let current_scroll = self
-                .active_state()
-                .popups
-                .get(popup_idx)
-                .map(|p| p.scroll_offset)
-                .unwrap_or(0);
-            self.mouse_state.drag_start_popup_scroll = Some(current_scroll);
-            // Now do the scroll
-            let state = self.active_state_mut();
-            if let Some(popup) = state.popups.get_mut(popup_idx) {
-                let delta = target_scroll - current_scroll as i32;
-                popup.scroll_by(delta);
-            }
-            return Ok(());
+        if let Some(r) = self.handle_click_prompt_scrollbar(col, row) {
+            return r;
         }
-
-        // Check if click is on a popup content area (they're rendered on top)
-        for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items, _, _) in
-            self.cached_layout.popup_areas.iter().rev()
-        {
-            if col >= inner_rect.x
-                && col < inner_rect.x + inner_rect.width
-                && row >= inner_rect.y
-                && row < inner_rect.y + inner_rect.height
-            {
-                // Calculate relative position within the popup content area
-                let relative_col = (col - inner_rect.x) as usize;
-                let relative_row = (row - inner_rect.y) as usize;
-
-                // First, check if this is a markdown popup with a link
-                let link_url = {
-                    let state = self.active_state();
-                    state
-                        .popups
-                        .top()
-                        .and_then(|popup| popup.link_at_position(relative_col, relative_row))
-                };
-
-                if let Some(url) = link_url {
-                    // Open the URL in the default browser
-                    #[cfg(feature = "runtime")]
-                    if let Err(e) = open::that(&url) {
-                        self.set_status_message(format!("Failed to open URL: {}", e));
-                    } else {
-                        self.set_status_message(format!("Opening: {}", url));
-                    }
-                    return Ok(());
-                }
-
-                // For list popups, handle item selection
-                if *num_items > 0 {
-                    let item_idx = scroll_offset + relative_row;
-
-                    if item_idx < *num_items {
-                        // Select and execute the clicked item
-                        let state = self.active_state_mut();
-                        if let Some(popup) = state.popups.top_mut() {
-                            if let crate::view::popup::PopupContent::List { items: _, selected } =
-                                &mut popup.content
-                            {
-                                *selected = item_idx;
-                            }
-                        }
-                        // Execute the popup selection (same as pressing Enter)
-                        return self.handle_action(Action::PopupConfirm);
-                    }
-                }
-
-                // For text/markdown popups, start text selection
-                let is_text_popup = {
-                    let state = self.active_state();
-                    state.popups.top().is_some_and(|p| {
-                        matches!(
-                            p.content,
-                            crate::view::popup::PopupContent::Text(_)
-                                | crate::view::popup::PopupContent::Markdown(_)
-                        )
-                    })
-                };
-
-                if is_text_popup {
-                    let line = scroll_offset + relative_row;
-                    let popup_idx_copy = *popup_idx; // Copy before mutable borrow
-                    let state = self.active_state_mut();
-                    if let Some(popup) = state.popups.top_mut() {
-                        popup.start_selection(line, relative_col);
-                    }
-                    // Track that we're selecting in a popup
-                    self.mouse_state.selecting_in_popup = Some(popup_idx_copy);
-                    return Ok(());
-                }
-            }
+        if let Some(r) = self.handle_click_popup_scrollbar(col, row) {
+            return r;
         }
-
-        // If click is inside a popup's outer bounds but wasn't handled above,
-        // block it from reaching the editor (e.g., clicking on popup border)
+        if let Some(r) = self.handle_click_global_popups(col, row) {
+            return r;
+        }
+        if let Some(r) = self.handle_click_buffer_popups(col, row) {
+            return r;
+        }
         if self.is_mouse_over_any_popup(col, row) {
             return Ok(());
         }
-
-        // Check if click is on the file browser popup
         if self.is_file_open_active() && self.handle_file_open_click(col, row) {
             return Ok(());
         }
-
-        // Check if click is on menu bar using cached layout
-        if self.menu_bar_visible {
-            if let Some(ref menu_layout) = self.cached_layout.menu_layout {
-                if let Some(menu_idx) = menu_layout.menu_at(col, row) {
-                    // Toggle menu: if same menu is open, close it; otherwise open clicked menu
-                    if self.menu_state.active_menu == Some(menu_idx) {
-                        self.close_menu_with_auto_hide();
-                    } else {
-                        // Dismiss transient popups and clear hover state when opening menu
-                        self.on_editor_focus_lost();
-                        self.menu_state.open_menu(menu_idx);
-                    }
-                    return Ok(());
-                } else if row == 0 {
-                    // Clicked on menu bar background but not on a menu label - close any open menu
-                    self.close_menu_with_auto_hide();
-                    return Ok(());
-                }
-            }
+        if let Some(r) = self.handle_click_menu_bar(col, row) {
+            return r;
         }
-
-        // Check if click is on an open menu dropdown
-        if let Some(active_idx) = self.menu_state.active_menu {
-            let all_menus: Vec<crate::config::Menu> = self
-                .menus
-                .menus
-                .iter()
-                .chain(self.menu_state.plugin_menus.iter())
-                .cloned()
-                .collect();
-
-            if let Some(menu) = all_menus.get(active_idx) {
-                // Handle click on menu dropdown chain (including submenus)
-                if let Some(click_result) = self.handle_menu_dropdown_click(col, row, menu)? {
-                    return click_result;
-                }
-            }
-
-            // Click outside the dropdown - close the menu
-            self.close_menu_with_auto_hide();
-            return Ok(());
+        if let Some(r) = self.handle_click_file_explorer_area(col, row) {
+            return r;
         }
-
-        // Check if click is on file explorer border (for drag resizing).
-        // Must come before the general file explorer click check, because
-        // the border column is inside the explorer area rect.
-        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
-            let border_x = explorer_area.x + explorer_area.width.saturating_sub(1);
-            if col == border_x
-                && row >= explorer_area.y
-                && row < explorer_area.y + explorer_area.height
-            {
-                self.mouse_state.dragging_file_explorer = true;
-                self.mouse_state.drag_start_position = Some((col, row));
-                self.mouse_state.drag_start_explorer_width = Some(self.file_explorer_width_percent);
-                return Ok(());
-            }
+        if let Some(r) = self.handle_click_scrollbar(col, row) {
+            return r;
         }
-
-        // Check if click is on file explorer
-        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
-            if col >= explorer_area.x
-                && col < explorer_area.x + explorer_area.width
-                && row >= explorer_area.y
-                && row < explorer_area.y + explorer_area.height
-            {
-                self.handle_file_explorer_click(col, row, explorer_area)?;
-                return Ok(());
-            }
+        if let Some(r) = self.handle_click_horizontal_scrollbar(col, row) {
+            return r;
         }
-
-        // Check if click is on a scrollbar
-        let scrollbar_hit = self.cached_layout.split_areas.iter().find_map(
-            |(split_id, buffer_id, _content_rect, scrollbar_rect, thumb_start, thumb_end)| {
-                if col >= scrollbar_rect.x
-                    && col < scrollbar_rect.x + scrollbar_rect.width
-                    && row >= scrollbar_rect.y
-                    && row < scrollbar_rect.y + scrollbar_rect.height
-                {
-                    let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
-                    let is_on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
-                    Some((*split_id, *buffer_id, *scrollbar_rect, is_on_thumb))
-                } else {
-                    None
-                }
-            },
-        );
-
-        if let Some((split_id, buffer_id, scrollbar_rect, is_on_thumb)) = scrollbar_hit {
-            self.focus_split(split_id, buffer_id);
-
-            if is_on_thumb {
-                // Click on thumb - start drag from current position (don't jump)
-                self.mouse_state.dragging_scrollbar = Some(split_id);
-                self.mouse_state.drag_start_row = Some(row);
-                // Record the current viewport position
-                if self.is_composite_buffer(buffer_id) {
-                    // For composite buffers, store scroll_row
-                    if let Some(view_state) = self.composite_view_states.get(&(split_id, buffer_id))
-                    {
-                        self.mouse_state.drag_start_composite_scroll_row =
-                            Some(view_state.scroll_row);
-                    }
-                } else if let Some(view_state) = self.split_view_states.get(&split_id) {
-                    self.mouse_state.drag_start_top_byte = Some(view_state.viewport.top_byte);
-                    self.mouse_state.drag_start_view_line_offset =
-                        Some(view_state.viewport.top_view_line_offset);
-                }
-            } else {
-                // Click on track - jump to position
-                self.mouse_state.dragging_scrollbar = Some(split_id);
-                self.handle_scrollbar_jump(col, row, split_id, buffer_id, scrollbar_rect)?;
-            }
-            return Ok(());
+        if let Some(r) = self.handle_click_status_bar(col, row) {
+            return r;
         }
-
-        // Check if click is on horizontal scrollbar
-        let hscrollbar_hit = self
-            .cached_layout
-            .horizontal_scrollbar_areas
-            .iter()
-            .find_map(
-                |(
-                    split_id,
-                    buffer_id,
-                    hscrollbar_rect,
-                    max_content_width,
-                    thumb_start,
-                    thumb_end,
-                )| {
-                    if col >= hscrollbar_rect.x
-                        && col < hscrollbar_rect.x + hscrollbar_rect.width
-                        && row >= hscrollbar_rect.y
-                        && row < hscrollbar_rect.y + hscrollbar_rect.height
-                    {
-                        let relative_col = col.saturating_sub(hscrollbar_rect.x) as usize;
-                        let is_on_thumb = relative_col >= *thumb_start && relative_col < *thumb_end;
-                        Some((
-                            *split_id,
-                            *buffer_id,
-                            *hscrollbar_rect,
-                            *max_content_width,
-                            is_on_thumb,
-                        ))
-                    } else {
-                        None
-                    }
-                },
-            );
-
-        if let Some((split_id, buffer_id, hscrollbar_rect, max_content_width, is_on_thumb)) =
-            hscrollbar_hit
-        {
-            self.focus_split(split_id, buffer_id);
-            self.mouse_state.dragging_horizontal_scrollbar = Some(split_id);
-
-            if is_on_thumb {
-                // Click on thumb - start drag from current position (don't jump)
-                self.mouse_state.drag_start_hcol = Some(col);
-                if let Some(view_state) = self.split_view_states.get(&split_id) {
-                    self.mouse_state.drag_start_left_column = Some(view_state.viewport.left_column);
-                }
-            } else {
-                // Click on track - jump to position
-                self.mouse_state.drag_start_hcol = None;
-                self.mouse_state.drag_start_left_column = None;
-
-                let relative_col = col.saturating_sub(hscrollbar_rect.x) as f64;
-                let track_width = hscrollbar_rect.width as f64;
-                let ratio = if track_width > 1.0 {
-                    (relative_col / (track_width - 1.0)).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-
-                if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-                    let visible_width = view_state.viewport.width as usize;
-                    let max_scroll = max_content_width.saturating_sub(visible_width);
-                    let target_col = (ratio * max_scroll as f64).round() as usize;
-                    view_state.viewport.left_column = target_col.min(max_scroll);
-                    view_state.viewport.set_skip_ensure_visible();
-                }
-            }
-
-            return Ok(());
+        if let Some(r) = self.handle_click_search_options(col, row) {
+            return r;
         }
-
-        // Check if click is on status bar indicators
-        if let Some((status_row, _status_x, _status_width)) = self.cached_layout.status_bar_area {
-            if row == status_row {
-                // Check line ending indicator - click opens line ending selector
-                if let Some((le_row, le_start, le_end)) =
-                    self.cached_layout.status_bar_line_ending_area
-                {
-                    if row == le_row && col >= le_start && col < le_end {
-                        return self.handle_action(Action::SetLineEnding);
-                    }
-                }
-
-                // Check encoding indicator - click opens encoding selector
-                if let Some((enc_row, enc_start, enc_end)) =
-                    self.cached_layout.status_bar_encoding_area
-                {
-                    if row == enc_row && col >= enc_start && col < enc_end {
-                        return self.handle_action(Action::SetEncoding);
-                    }
-                }
-
-                // Check language indicator - click opens language selector
-                if let Some((lang_row, lang_start, lang_end)) =
-                    self.cached_layout.status_bar_language_area
-                {
-                    if row == lang_row && col >= lang_start && col < lang_end {
-                        return self.handle_action(Action::SetLanguage);
-                    }
-                }
-
-                // Check LSP indicator - click opens LSP status popup
-                if let Some((lsp_row, lsp_start, lsp_end)) = self.cached_layout.status_bar_lsp_area
-                {
-                    if row == lsp_row && col >= lsp_start && col < lsp_end {
-                        return self.handle_action(Action::ShowLspStatus);
-                    }
-                }
-
-                // Check warning badge - click opens warning log
-                if let Some((warn_row, warn_start, warn_end)) =
-                    self.cached_layout.status_bar_warning_area
-                {
-                    if row == warn_row && col >= warn_start && col < warn_end {
-                        return self.handle_action(Action::ShowWarnings);
-                    }
-                }
-
-                // Check message area - click opens status log
-                if let Some((msg_row, msg_start, msg_end)) =
-                    self.cached_layout.status_bar_message_area
-                {
-                    if row == msg_row && col >= msg_start && col < msg_end {
-                        return self.handle_action(Action::ShowStatusLog);
-                    }
-                }
-            }
+        if let Some(r) = self.handle_click_split_separator(col, row) {
+            return r;
         }
-
-        // Check if click is on search options checkboxes
-        if let Some(ref layout) = self.cached_layout.search_options_layout.clone() {
-            use crate::view::ui::status_bar::SearchOptionsHover;
-            if let Some(hover) = layout.checkbox_at(col, row) {
-                match hover {
-                    SearchOptionsHover::CaseSensitive => {
-                        return self.handle_action(Action::ToggleSearchCaseSensitive);
-                    }
-                    SearchOptionsHover::WholeWord => {
-                        return self.handle_action(Action::ToggleSearchWholeWord);
-                    }
-                    SearchOptionsHover::Regex => {
-                        return self.handle_action(Action::ToggleSearchRegex);
-                    }
-                    SearchOptionsHover::ConfirmEach => {
-                        return self.handle_action(Action::ToggleSearchConfirmEach);
-                    }
-                    SearchOptionsHover::None => {}
-                }
-            }
+        if let Some(r) = self.handle_click_split_controls(col, row) {
+            return r;
         }
-
-        // Check if click is on a split separator (for drag resizing)
-        for (split_id, direction, sep_x, sep_y, sep_length) in &self.cached_layout.separator_areas {
-            let is_on_separator = match direction {
-                SplitDirection::Horizontal => {
-                    // Horizontal separator: spans full width at a specific y
-                    row == *sep_y && col >= *sep_x && col < sep_x + sep_length
-                }
-                SplitDirection::Vertical => {
-                    // Vertical separator: spans full height at a specific x
-                    col == *sep_x && row >= *sep_y && row < sep_y + sep_length
-                }
-            };
-
-            if is_on_separator {
-                // Start separator drag
-                self.mouse_state.dragging_separator = Some((*split_id, *direction));
-                self.mouse_state.drag_start_position = Some((col, row));
-                // Store the initial ratio
-                if let Some(ratio) = self.split_manager.get_ratio((*split_id).into()) {
-                    self.mouse_state.drag_start_ratio = Some(ratio);
-                }
-                return Ok(());
-            }
-        }
-
-        // Check if click is on a close split button
-        let close_split_click = self
-            .cached_layout
-            .close_split_areas
-            .iter()
-            .find(|(_, btn_row, start_col, end_col)| {
-                row == *btn_row && col >= *start_col && col < *end_col
-            })
-            .map(|(split_id, _, _, _)| *split_id);
-
-        if let Some(split_id) = close_split_click {
-            if let Err(e) = self.split_manager.close_split(split_id) {
-                self.set_status_message(
-                    t!("error.cannot_close_split", error = e.to_string()).to_string(),
-                );
-            } else {
-                // Update active buffer to match the new active split
-                let new_active_split = self.split_manager.active_split();
-                if let Some(buffer_id) = self.split_manager.buffer_for_split(new_active_split) {
-                    self.set_active_buffer(buffer_id);
-                }
-                self.set_status_message(t!("split.closed").to_string());
-            }
-            return Ok(());
-        }
-
-        // Check if click is on a maximize split button
-        let maximize_split_click = self
-            .cached_layout
-            .maximize_split_areas
-            .iter()
-            .find(|(_, btn_row, start_col, end_col)| {
-                row == *btn_row && col >= *start_col && col < *end_col
-            })
-            .map(|(split_id, _, _, _)| *split_id);
-
-        if let Some(_split_id) = maximize_split_click {
-            // Toggle maximize state
-            match self.split_manager.toggle_maximize() {
-                Ok(maximized) => {
-                    if maximized {
-                        self.set_status_message(t!("split.maximized").to_string());
-                    } else {
-                        self.set_status_message(t!("split.restored").to_string());
-                    }
-                }
-                Err(e) => self.set_status_message(e),
-            }
-            return Ok(());
-        }
-
-        // Check if click is on a tab using cached tab layouts (computed during rendering)
-        // Debug: show tab layout info
-        for (split_id, tab_layout) in &self.cached_layout.tab_layouts {
-            tracing::debug!(
-                "Tab layout for split {:?}: bar_area={:?}, left_scroll={:?}, right_scroll={:?}",
-                split_id,
-                tab_layout.bar_area,
-                tab_layout.left_scroll_area,
-                tab_layout.right_scroll_area
-            );
-        }
-
-        let tab_hit = self
-            .cached_layout
-            .tab_layouts
-            .iter()
-            .find_map(|(split_id, tab_layout)| {
-                let hit = tab_layout.hit_test(col, row);
-                tracing::debug!(
-                    "Tab hit_test at ({}, {}) for split {:?} returned {:?}",
-                    col,
-                    row,
-                    split_id,
-                    hit
-                );
-                hit.map(|h| (*split_id, h))
-            });
-
-        if let Some((split_id, hit)) = tab_hit {
-            match hit {
-                TabHit::CloseButton(buffer_id) => {
-                    self.focus_split(split_id, buffer_id);
-                    self.close_tab_in_split(buffer_id, split_id);
-                    return Ok(());
-                }
-                TabHit::TabName(buffer_id) => {
-                    self.focus_split(split_id, buffer_id);
-                    // Start potential tab drag (will only become active after moving threshold)
-                    self.mouse_state.dragging_tab = Some(super::types::TabDragState::new(
-                        buffer_id,
-                        split_id,
-                        (col, row),
-                    ));
-                    return Ok(());
-                }
-                TabHit::ScrollLeft => {
-                    // Scroll tabs left by one tab width (use 5 chars as estimate)
-                    self.set_status_message("ScrollLeft clicked!".to_string());
-                    if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-                        view_state.tab_scroll_offset =
-                            view_state.tab_scroll_offset.saturating_sub(10);
-                    }
-                    return Ok(());
-                }
-                TabHit::ScrollRight => {
-                    // Scroll tabs right by one tab width (use 5 chars as estimate)
-                    self.set_status_message("ScrollRight clicked!".to_string());
-                    if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
-                        view_state.tab_scroll_offset =
-                            view_state.tab_scroll_offset.saturating_add(10);
-                    }
-                    return Ok(());
-                }
-                TabHit::BarBackground => {}
-            }
+        if let Some(r) = self.handle_click_tab_bar(col, row) {
+            return r;
         }
 
         // Check if click is in editor content area
@@ -1887,11 +1383,7 @@ impl Editor {
                 content_rect.width,
                 content_rect.height
             );
-            if col >= content_rect.x
-                && col < content_rect.x + content_rect.width
-                && row >= content_rect.y
-                && row < content_rect.y + content_rect.height
-            {
+            if in_rect(col, row, *content_rect) {
                 // Click in editor - focus split and position cursor
                 tracing::debug!("  -> HIT! calling handle_editor_click");
                 self.handle_editor_click(
@@ -1908,6 +1400,672 @@ impl Editor {
         tracing::debug!("  -> No split area hit");
 
         Ok(())
+    }
+
+    // ── handle_mouse_click helpers ──────────────────────────────────────────
+    // Each returns Some(result) if the click was consumed, None to fall through.
+
+    fn handle_click_context_menus(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        if self.file_explorer_context_menu.is_some() {
+            if let Some(result) = self.handle_file_explorer_context_menu_click(col, row) {
+                return Some(result);
+            }
+        }
+        if self.tab_context_menu.is_some() {
+            if let Some(result) = self.handle_tab_context_menu_click(col, row) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Hit-test (col, row) against the suggestions popup. Returns the index
+    /// of the suggestion under the click, or `None` if the click is outside
+    /// the inner item area or no suggestions are visible.
+    fn suggestion_at(&self, col: u16, row: u16) -> Option<usize> {
+        let (inner_rect, start_idx, _visible_count, total_count) =
+            self.cached_layout.suggestions_area?;
+        if col < inner_rect.x
+            || col >= inner_rect.x + inner_rect.width
+            || row < inner_rect.y
+            || row >= inner_rect.y + inner_rect.height
+        {
+            return None;
+        }
+        let relative_row = (row - inner_rect.y) as usize;
+        let item_idx = start_idx + relative_row;
+        if item_idx < total_count {
+            Some(item_idx)
+        } else {
+            None
+        }
+    }
+
+    fn handle_click_suggestions(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let item_idx = self.suggestion_at(col, row)?;
+        let prompt = self.prompt.as_mut()?;
+        prompt.selected_suggestion = Some(item_idx);
+        let confirms = prompt.prompt_type.click_confirms();
+        if !confirms {
+            // Mirror keyboard navigation / scroll: sync the input
+            // to the selected suggestion so the prompt reflects
+            // what Enter would commit.
+            if let Some(suggestion) = prompt.suggestions.get(item_idx) {
+                prompt.input = suggestion.get_value().to_string();
+                prompt.cursor_pos = prompt.input.len();
+            }
+        }
+        if confirms {
+            return Some(self.handle_action(Action::PromptConfirm));
+        }
+        Some(Ok(()))
+    }
+
+    /// Click handler that always commits the suggestion under the cursor,
+    /// regardless of `click_confirms`. Used for double-clicks so that
+    /// preview-on-click prompts still have a mouse-only commit path.
+    fn handle_click_suggestions_confirm(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let item_idx = self.suggestion_at(col, row)?;
+        let prompt = self.prompt.as_mut()?;
+        prompt.selected_suggestion = Some(item_idx);
+        if let Some(suggestion) = prompt.suggestions.get(item_idx) {
+            prompt.input = suggestion.get_value().to_string();
+            prompt.cursor_pos = prompt.input.len();
+        }
+        Some(self.handle_action(Action::PromptConfirm))
+    }
+
+    /// Click/drag on the floating-overlay prompt's scrollbar
+    /// (issue #1796). Reuses
+    /// `view::ui::scrollbar::ScrollbarState::click_to_offset` for
+    /// the same math the popup-scrollbar handler uses, so thumb
+    /// behaviour is consistent across the editor.
+    fn handle_click_prompt_scrollbar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        use crate::view::ui::scrollbar::ScrollbarState;
+        let sb_rect = self.cached_layout.suggestions_scrollbar_rect?;
+        if col < sb_rect.x
+            || col >= sb_rect.x + sb_rect.width
+            || row < sb_rect.y
+            || row >= sb_rect.y + sb_rect.height
+        {
+            return None;
+        }
+        let prompt = self.prompt.as_mut()?;
+        // Read what the renderer drew so the drag math matches what
+        // the user sees. `suggestions_area` carries
+        // (inner_rect, scroll_start_idx, visible_count, total_count).
+        let visible = self
+            .cached_layout
+            .suggestions_area
+            .map(|(_, _, v, _)| v)
+            .unwrap_or(prompt.suggestions.len().min(10));
+        let total = prompt.suggestions.len();
+        let track_height = sb_rect.height as usize;
+        let click_row = row.saturating_sub(sb_rect.y) as usize;
+        let state = ScrollbarState::new(total, visible, prompt.scroll_offset);
+        prompt.scroll_offset = state.click_to_offset(track_height, click_row);
+        // Hand off to the drag follow-up so subsequent mouse moves
+        // keep tracking the thumb.
+        self.mouse_state.dragging_prompt_scrollbar = true;
+        Some(Ok(()))
+    }
+
+    fn handle_click_popup_scrollbar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        // Collect all needed data before mutating self.
+        let scrollbar_info: Option<(usize, i32)> =
+            self.cached_layout.popup_areas.iter().rev().find_map(
+                |(popup_idx, _popup_rect, inner_rect, _scroll, _n, scrollbar_rect, total_lines)| {
+                    let sb_rect = scrollbar_rect.as_ref()?;
+                    if col >= sb_rect.x
+                        && col < sb_rect.x + sb_rect.width
+                        && row >= sb_rect.y
+                        && row < sb_rect.y + sb_rect.height
+                    {
+                        let relative_row = (row - sb_rect.y) as usize;
+                        let track_height = sb_rect.height as usize;
+                        let visible_lines = inner_rect.height as usize;
+                        if track_height > 0 && *total_lines > visible_lines {
+                            let max_scroll = total_lines.saturating_sub(visible_lines);
+                            let target = if track_height > 1 {
+                                (relative_row * max_scroll) / (track_height.saturating_sub(1))
+                            } else {
+                                0
+                            };
+                            Some((*popup_idx, target as i32))
+                        } else {
+                            Some((*popup_idx, 0))
+                        }
+                    } else {
+                        None
+                    }
+                },
+            );
+        let (popup_idx, target_scroll) = scrollbar_info?;
+        self.mouse_state.dragging_popup_scrollbar = Some(popup_idx);
+        self.mouse_state.drag_start_row = Some(row);
+        let current_scroll = self
+            .active_state()
+            .popups
+            .get(popup_idx)
+            .map(|p| p.scroll_offset)
+            .unwrap_or(0);
+        self.mouse_state.drag_start_popup_scroll = Some(current_scroll);
+        let state = self.active_state_mut();
+        if let Some(popup) = state.popups.get_mut(popup_idx) {
+            popup.scroll_by(target_scroll - current_scroll as i32);
+        }
+        Some(Ok(()))
+    }
+
+    fn handle_click_global_popups(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        for (popup_idx, popup_rect, inner_rect, scroll_offset, num_items) in self
+            .cached_layout
+            .global_popup_areas
+            .clone()
+            .into_iter()
+            .rev()
+        {
+            if popup_rect.width >= 5 {
+                let cb_x = popup_rect.x + popup_rect.width - 4;
+                if row == popup_rect.y && col >= cb_x && col < cb_x + 3 {
+                    return Some(self.handle_action(Action::PopupCancel));
+                }
+            }
+            if in_rect(col, row, inner_rect) && num_items > 0 {
+                let relative_row = (row - inner_rect.y) as usize;
+                let item_idx = scroll_offset + relative_row;
+                if item_idx < num_items {
+                    if let Some(popup) = self.global_popups.get_mut(popup_idx) {
+                        if let crate::view::popup::PopupContent::List { items: _, selected } =
+                            &mut popup.content
+                        {
+                            *selected = item_idx;
+                        }
+                    }
+                    return Some(self.handle_action(Action::PopupConfirm));
+                }
+            }
+        }
+        None
+    }
+
+    fn handle_click_buffer_popups(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        // Check close-button overlay ("[×]") on each popup.
+        let close_hit = self.cached_layout.popup_areas.iter().rev().find_map(
+            |(_idx, popup_rect, _inner, _scroll, _n, _sb, _tl)| {
+                if popup_rect.width < 5 {
+                    return None;
+                }
+                let cb_x = popup_rect.x + popup_rect.width - 4;
+                if row == popup_rect.y && col >= cb_x && col < cb_x + 3 {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+        );
+        if close_hit.is_some() {
+            return Some(self.handle_action(Action::PopupCancel));
+        }
+
+        // Content area clicks — clone to allow &mut self calls inside the loop.
+        let popup_areas = self.cached_layout.popup_areas.clone();
+        for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items, _, _) in
+            popup_areas.iter().rev()
+        {
+            if !in_rect(col, row, *inner_rect) {
+                continue;
+            }
+            let relative_col = (col - inner_rect.x) as usize;
+            let relative_row = (row - inner_rect.y) as usize;
+
+            let link_url = {
+                let state = self.active_state();
+                state
+                    .popups
+                    .top()
+                    .and_then(|p| p.link_at_position(relative_col, relative_row))
+            };
+            if let Some(url) = link_url {
+                #[cfg(feature = "runtime")]
+                if let Err(e) = open::that(&url) {
+                    self.set_status_message(format!("Failed to open URL: {}", e));
+                } else {
+                    self.set_status_message(format!("Opening: {}", url));
+                }
+                return Some(Ok(()));
+            }
+
+            if *num_items > 0 {
+                let item_idx = scroll_offset + relative_row;
+                if item_idx < *num_items {
+                    let state = self.active_state_mut();
+                    if let Some(popup) = state.popups.top_mut() {
+                        if let crate::view::popup::PopupContent::List { items: _, selected } =
+                            &mut popup.content
+                        {
+                            *selected = item_idx;
+                        }
+                    }
+                    return Some(self.handle_action(Action::PopupConfirm));
+                }
+            }
+
+            let is_text_popup = {
+                let state = self.active_state();
+                state.popups.top().is_some_and(|p| {
+                    matches!(
+                        p.content,
+                        crate::view::popup::PopupContent::Text(_)
+                            | crate::view::popup::PopupContent::Markdown(_)
+                    )
+                })
+            };
+            if is_text_popup {
+                let line = scroll_offset + relative_row;
+                let popup_idx_copy = *popup_idx;
+                let state = self.active_state_mut();
+                if let Some(popup) = state.popups.top_mut() {
+                    popup.start_selection(line, relative_col);
+                }
+                self.mouse_state.selecting_in_popup = Some(popup_idx_copy);
+                return Some(Ok(()));
+            }
+        }
+        None
+    }
+
+    fn handle_click_menu_bar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        if self.menu_bar_visible {
+            // Resolve the hit before any &mut operations to avoid borrow conflicts.
+            let hit = self
+                .cached_layout
+                .menu_layout
+                .as_ref()
+                .and_then(|ml| ml.menu_at(col, row));
+            let layout_exists = self.cached_layout.menu_layout.is_some();
+            if layout_exists {
+                if let Some(menu_idx) = hit {
+                    if self.menu_state.active_menu == Some(menu_idx) {
+                        self.close_menu_with_auto_hide();
+                    } else {
+                        self.on_editor_focus_lost();
+                        self.menu_state.open_menu(menu_idx);
+                    }
+                    return Some(Ok(()));
+                } else if row == 0 {
+                    self.close_menu_with_auto_hide();
+                    return Some(Ok(()));
+                }
+            }
+        }
+
+        if let Some(active_idx) = self.menu_state.active_menu {
+            let all_menus: Vec<crate::config::Menu> = self
+                .menus
+                .menus
+                .iter()
+                .chain(self.menu_state.plugin_menus.iter())
+                .cloned()
+                .collect();
+            if let Some(menu) = all_menus.get(active_idx) {
+                match self.handle_menu_dropdown_click(col, row, menu) {
+                    Ok(Some(click_result)) => return Some(click_result),
+                    Ok(None) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            self.close_menu_with_auto_hide();
+            return Some(Ok(()));
+        }
+
+        None
+    }
+
+    fn handle_click_file_explorer_area(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let explorer_area = self.cached_layout.file_explorer_area?;
+        let border_x = explorer_area.x + explorer_area.width.saturating_sub(1);
+        if col == border_x && row >= explorer_area.y && row < explorer_area.y + explorer_area.height
+        {
+            self.mouse_state.dragging_file_explorer = true;
+            self.mouse_state.drag_start_position = Some((col, row));
+            self.mouse_state.drag_start_explorer_width = Some(self.file_explorer_width);
+            return Some(Ok(()));
+        }
+        if in_rect(col, row, explorer_area) {
+            return Some(self.handle_file_explorer_click(col, row, explorer_area));
+        }
+        None
+    }
+
+    fn handle_click_scrollbar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let (split_id, buffer_id, scrollbar_rect, is_on_thumb) =
+            self.cached_layout.split_areas.iter().find_map(
+                |(split_id, buffer_id, _content, scrollbar_rect, thumb_start, thumb_end)| {
+                    if in_rect(col, row, *scrollbar_rect) {
+                        let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
+                        let on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
+                        Some((*split_id, *buffer_id, *scrollbar_rect, on_thumb))
+                    } else {
+                        None
+                    }
+                },
+            )?;
+
+        self.focus_split(split_id, buffer_id);
+        if is_on_thumb {
+            self.mouse_state.dragging_scrollbar = Some(split_id);
+            self.mouse_state.drag_start_row = Some(row);
+            if self.is_composite_buffer(buffer_id) {
+                if let Some(vs) = self.composite_view_states.get(&(split_id, buffer_id)) {
+                    self.mouse_state.drag_start_composite_scroll_row = Some(vs.scroll_row);
+                }
+            } else if let Some(vs) = self.split_view_states.get(&split_id) {
+                self.mouse_state.drag_start_top_byte = Some(vs.viewport.top_byte);
+                self.mouse_state.drag_start_view_line_offset =
+                    Some(vs.viewport.top_view_line_offset);
+            }
+        } else {
+            self.mouse_state.dragging_scrollbar = Some(split_id);
+            if let Err(e) =
+                self.handle_scrollbar_jump(col, row, split_id, buffer_id, scrollbar_rect)
+            {
+                return Some(Err(e));
+            }
+            self.mouse_state.hover_target = Some(HoverTarget::ScrollbarThumb(split_id));
+        }
+        Some(Ok(()))
+    }
+
+    fn handle_click_horizontal_scrollbar(
+        &mut self,
+        col: u16,
+        row: u16,
+    ) -> Option<AnyhowResult<()>> {
+        let (split_id, buffer_id, hscrollbar_rect, max_content_width, is_on_thumb) = self
+            .cached_layout
+            .horizontal_scrollbar_areas
+            .iter()
+            .find_map(
+                |(
+                    split_id,
+                    buffer_id,
+                    hscrollbar_rect,
+                    max_content_width,
+                    thumb_start,
+                    thumb_end,
+                )| {
+                    if col >= hscrollbar_rect.x
+                        && col < hscrollbar_rect.x + hscrollbar_rect.width
+                        && row >= hscrollbar_rect.y
+                        && row < hscrollbar_rect.y + hscrollbar_rect.height
+                    {
+                        let relative_col = col.saturating_sub(hscrollbar_rect.x) as usize;
+                        let on_thumb = relative_col >= *thumb_start && relative_col < *thumb_end;
+                        Some((
+                            *split_id,
+                            *buffer_id,
+                            *hscrollbar_rect,
+                            *max_content_width,
+                            on_thumb,
+                        ))
+                    } else {
+                        None
+                    }
+                },
+            )?;
+
+        self.focus_split(split_id, buffer_id);
+        self.mouse_state.dragging_horizontal_scrollbar = Some(split_id);
+        if is_on_thumb {
+            self.mouse_state.drag_start_hcol = Some(col);
+            if let Some(vs) = self.split_view_states.get(&split_id) {
+                self.mouse_state.drag_start_left_column = Some(vs.viewport.left_column);
+            }
+        } else {
+            self.mouse_state.drag_start_hcol = None;
+            self.mouse_state.drag_start_left_column = None;
+            let relative_col = col.saturating_sub(hscrollbar_rect.x) as f64;
+            let track_width = hscrollbar_rect.width as f64;
+            let ratio = if track_width > 1.0 {
+                (relative_col / (track_width - 1.0)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if let Some(vs) = self.split_view_states.get_mut(&split_id) {
+                let visible_width = vs.viewport.width as usize;
+                let max_scroll = max_content_width.saturating_sub(visible_width);
+                let target_col = (ratio * max_scroll as f64).round() as usize;
+                vs.viewport.left_column = target_col.min(max_scroll);
+                vs.viewport.set_skip_ensure_visible();
+            }
+        }
+        Some(Ok(()))
+    }
+
+    fn handle_click_status_bar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let (status_row, _status_x, _status_width) = self.cached_layout.status_bar_area?;
+        if row != status_row {
+            return None;
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_line_ending_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::SetLineEnding));
+            }
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_encoding_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::SetEncoding));
+            }
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_language_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::SetLanguage));
+            }
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_lsp_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::ShowLspStatus));
+            }
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_remote_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::ShowRemoteIndicatorMenu));
+            }
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_warning_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::ShowWarnings));
+            }
+        }
+        if let Some((r, s, e)) = self.cached_layout.status_bar_message_area {
+            if row == r && col >= s && col < e {
+                return Some(self.handle_action(Action::ShowStatusLog));
+            }
+        }
+        None
+    }
+
+    fn handle_click_search_options(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        use crate::view::ui::status_bar::SearchOptionsHover;
+        let layout = self.cached_layout.search_options_layout.clone()?;
+        match layout.checkbox_at(col, row)? {
+            SearchOptionsHover::CaseSensitive => {
+                Some(self.handle_action(Action::ToggleSearchCaseSensitive))
+            }
+            SearchOptionsHover::WholeWord => {
+                Some(self.handle_action(Action::ToggleSearchWholeWord))
+            }
+            SearchOptionsHover::Regex => Some(self.handle_action(Action::ToggleSearchRegex)),
+            SearchOptionsHover::ConfirmEach => {
+                Some(self.handle_action(Action::ToggleSearchConfirmEach))
+            }
+            SearchOptionsHover::None => None,
+        }
+    }
+
+    fn handle_click_split_separator(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let separator_areas = self.cached_layout.separator_areas.clone();
+        for (split_id, direction, sep_x, sep_y, sep_length) in &separator_areas {
+            let is_on_separator = match direction {
+                SplitDirection::Horizontal => {
+                    row == *sep_y && col >= *sep_x && col < sep_x + sep_length
+                }
+                SplitDirection::Vertical => {
+                    col == *sep_x && row >= *sep_y && row < sep_y + sep_length
+                }
+            };
+            if is_on_separator {
+                self.mouse_state.dragging_separator = Some((*split_id, *direction));
+                self.mouse_state.drag_start_position = Some((col, row));
+                let ratio = self
+                    .split_manager
+                    .get_ratio((*split_id).into())
+                    .or_else(|| self.grouped_split_ratio(*split_id));
+                if let Some(ratio) = ratio {
+                    self.mouse_state.drag_start_ratio = Some(ratio);
+                }
+                return Some(Ok(()));
+            }
+        }
+        None
+    }
+
+    fn handle_click_split_controls(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        let close_split_id = self
+            .cached_layout
+            .close_split_areas
+            .iter()
+            .find(|(_, btn_row, start_col, end_col)| {
+                row == *btn_row && col >= *start_col && col < *end_col
+            })
+            .map(|(split_id, _, _, _)| *split_id);
+        if let Some(split_id) = close_split_id {
+            if let Err(e) = self.split_manager.close_split(split_id) {
+                self.set_status_message(
+                    t!("error.cannot_close_split", error = e.to_string()).to_string(),
+                );
+            } else {
+                let new_active = self.split_manager.active_split();
+                if let Some(buffer_id) = self.split_manager.buffer_for_split(new_active) {
+                    self.set_active_buffer(buffer_id);
+                }
+                self.set_status_message(t!("split.closed").to_string());
+            }
+            return Some(Ok(()));
+        }
+
+        let maximize_hit = self.cached_layout.maximize_split_areas.iter().any(
+            |(_, btn_row, start_col, end_col)| {
+                row == *btn_row && col >= *start_col && col < *end_col
+            },
+        );
+        if maximize_hit {
+            match self.split_manager.toggle_maximize() {
+                Ok(maximized) => {
+                    let msg = if maximized {
+                        t!("split.maximized").to_string()
+                    } else {
+                        t!("split.restored").to_string()
+                    };
+                    self.set_status_message(msg);
+                }
+                Err(e) => self.set_status_message(e),
+            }
+            return Some(Ok(()));
+        }
+
+        None
+    }
+
+    fn handle_click_tab_bar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
+        for (split_id, tab_layout) in &self.cached_layout.tab_layouts {
+            tracing::debug!(
+                "Tab layout for split {:?}: bar_area={:?}, left_scroll={:?}, right_scroll={:?}",
+                split_id,
+                tab_layout.bar_area,
+                tab_layout.left_scroll_area,
+                tab_layout.right_scroll_area
+            );
+        }
+        let tab_hit = self
+            .cached_layout
+            .tab_layouts
+            .iter()
+            .find_map(|(split_id, tab_layout)| {
+                let hit = tab_layout.hit_test(col, row);
+                tracing::debug!(
+                    "Tab hit_test at ({}, {}) for split {:?} returned {:?}",
+                    col,
+                    row,
+                    split_id,
+                    hit
+                );
+                hit.map(|h| (*split_id, h))
+            });
+        let (split_id, hit) = tab_hit?;
+        match hit {
+            TabHit::CloseButton(target) => {
+                match target {
+                    crate::view::split::TabTarget::Buffer(buffer_id) => {
+                        self.focus_split(split_id, buffer_id);
+                        self.close_tab_in_split(buffer_id, split_id);
+                    }
+                    crate::view::split::TabTarget::Group(group_leaf) => {
+                        self.close_buffer_group_by_leaf(group_leaf);
+                    }
+                }
+                Some(Ok(()))
+            }
+            TabHit::TabName(target) => {
+                let direction = self
+                    .split_view_states
+                    .get(&split_id)
+                    .map(|vs| {
+                        let open = &vs.open_buffers;
+                        let cur = vs.active_target();
+                        let cur_idx = open.iter().position(|t| *t == cur);
+                        let new_idx = open.iter().position(|t| *t == target);
+                        match (cur_idx, new_idx) {
+                            (Some(c), Some(n)) if n > c => 1,
+                            (Some(c), Some(n)) if n < c => -1,
+                            _ => 0,
+                        }
+                    })
+                    .unwrap_or(0);
+                self.animate_tab_switch(split_id, direction);
+                match target {
+                    crate::view::split::TabTarget::Buffer(buffer_id) => {
+                        self.focus_split(split_id, buffer_id);
+                        self.promote_buffer_from_preview(buffer_id);
+                        self.mouse_state.dragging_tab = Some(super::types::TabDragState::new(
+                            buffer_id,
+                            split_id,
+                            (col, row),
+                        ));
+                    }
+                    crate::view::split::TabTarget::Group(group_leaf) => {
+                        self.activate_group_tab(split_id, group_leaf);
+                    }
+                }
+                Some(Ok(()))
+            }
+            TabHit::ScrollLeft => {
+                self.set_status_message("ScrollLeft clicked!".to_string());
+                if let Some(vs) = self.split_view_states.get_mut(&split_id) {
+                    vs.tab_scroll_offset = vs.tab_scroll_offset.saturating_sub(10);
+                }
+                Some(Ok(()))
+            }
+            TabHit::ScrollRight => {
+                self.set_status_message("ScrollRight clicked!".to_string());
+                if let Some(vs) = self.split_view_states.get_mut(&split_id) {
+                    vs.tab_scroll_offset = vs.tab_scroll_offset.saturating_add(10);
+                }
+                Some(Ok(()))
+            }
+            TabHit::BarBackground => None,
+        }
     }
 
     /// Handle mouse drag event
@@ -2031,6 +2189,35 @@ impl Editor {
             return Ok(());
         }
 
+        // If dragging the floating-overlay prompt's scrollbar
+        // (issue #1796), update its scroll_offset using the same
+        // math as the click handler. Same shared-widget logic the
+        // popup-scrollbar drag uses below.
+        if self.mouse_state.dragging_prompt_scrollbar {
+            use crate::view::ui::scrollbar::ScrollbarState;
+            if let (Some(sb_rect), Some(prompt)) = (
+                self.cached_layout.suggestions_scrollbar_rect,
+                self.prompt.as_mut(),
+            ) {
+                let visible = self
+                    .cached_layout
+                    .suggestions_area
+                    .map(|(_, _, v, _)| v)
+                    .unwrap_or(prompt.suggestions.len().min(10));
+                let total = prompt.suggestions.len();
+                let track_height = sb_rect.height as usize;
+                // Allow dragging slightly past the top/bottom; clamp
+                // here rather than rejecting so the thumb keeps up
+                // with a fast mouse.
+                let clamped_row =
+                    row.clamp(sb_rect.y, sb_rect.y + sb_rect.height.saturating_sub(1));
+                let click_row = clamped_row.saturating_sub(sb_rect.y) as usize;
+                let state = ScrollbarState::new(total, visible, prompt.scroll_offset);
+                prompt.scroll_offset = state.click_to_offset(track_height, click_row);
+            }
+            return Ok(());
+        }
+
         // If dragging popup scrollbar, update popup scroll position
         if let Some(popup_idx) = self.mouse_state.dragging_popup_scrollbar {
             // Find the popup's scrollbar rect from cached layout
@@ -2093,6 +2280,7 @@ impl Editor {
     /// Handle text selection drag - extends selection from anchor to current position
     fn handle_text_selection_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
         use crate::model::event::Event;
+        use crate::primitives::word_navigation::{find_word_end, find_word_start};
 
         let Some(split_id) = self.mouse_state.drag_selection_split else {
             return Ok(());
@@ -2101,27 +2289,14 @@ impl Editor {
             return Ok(());
         };
 
-        // Find the buffer for this split
-        let buffer_id = self
+        // Find the buffer and content rect for this split in one pass
+        let Some((buffer_id, content_rect)) = self
             .cached_layout
             .split_areas
             .iter()
             .find(|(sid, _, _, _, _, _)| *sid == split_id)
-            .map(|(_, bid, _, _, _, _)| *bid);
-
-        let Some(buffer_id) = buffer_id else {
-            return Ok(());
-        };
-
-        // Find the content rect for this split
-        let content_rect = self
-            .cached_layout
-            .split_areas
-            .iter()
-            .find(|(sid, _, _, _, _, _)| *sid == split_id)
-            .map(|(_, _, rect, _, _, _)| *rect);
-
-        let Some(content_rect) = content_rect else {
+            .map(|(_, bid, rect, _, _, _)| (*bid, *rect))
+        else {
             return Ok(());
         };
 
@@ -2151,7 +2326,7 @@ impl Editor {
         if let Some(state) = self.buffers.get_mut(&buffer_id) {
             let gutter_width = state.margins.left_total_width() as u16;
 
-            let Some(target_position) = Self::screen_to_buffer_position(
+            let Some(target_position) = super::click_geometry::screen_to_buffer_position(
                 col,
                 row,
                 content_rect,
@@ -2162,6 +2337,27 @@ impl Editor {
                 compose_width,
             ) else {
                 return Ok(());
+            };
+
+            // When drag started with double-click, snap to word boundaries.
+            // When dragging forward, anchor at word start and extend to word end.
+            // When dragging backward, anchor at word end and extend to word start,
+            // so the initially double-clicked word stays selected.
+            let (new_position, anchor_position) = if self.mouse_state.drag_selection_by_words {
+                if target_position >= anchor_position {
+                    (
+                        find_word_end(&state.buffer, target_position),
+                        anchor_position,
+                    )
+                } else {
+                    let word_end = self
+                        .mouse_state
+                        .drag_selection_word_end
+                        .unwrap_or(anchor_position);
+                    (find_word_start(&state.buffer, target_position), word_end)
+                }
+            } else {
+                (target_position, anchor_position)
             };
 
             let (primary_cursor_id, old_position, old_anchor, old_sticky_column) = self
@@ -2180,13 +2376,13 @@ impl Editor {
 
             let new_sticky_column = state
                 .buffer
-                .offset_to_position(target_position)
+                .offset_to_position(new_position)
                 .map(|pos| pos.column)
                 .unwrap_or(old_sticky_column);
             let event = Event::MoveCursor {
                 cursor_id: primary_cursor_id,
                 old_position,
-                new_position: target_position,
+                new_position,
                 old_anchor,
                 new_anchor: Some(anchor_position), // Keep anchor to maintain selection
                 old_sticky_column,
@@ -2217,16 +2413,25 @@ impl Editor {
             return Ok(());
         };
 
-        // Calculate the delta in screen space
         let delta = col as i32 - start_col as i32;
         let total_width = self.terminal_width as i32;
 
+        // Drag preserves the variant the user chose. A user editing
+        // columns doesn't want their mode silently flipped to percent
+        // just because they grabbed the divider.
         if total_width > 0 {
-            // Convert screen delta to percentage delta
-            let percent_delta = delta as f32 / total_width as f32;
-            // Clamp the new width between 10% and 50%
-            let new_width = (start_width + percent_delta).clamp(0.1, 0.5);
-            self.file_explorer_width_percent = new_width;
+            use crate::config::ExplorerWidth;
+            self.file_explorer_width = match start_width {
+                ExplorerWidth::Percent(start_pct) => {
+                    let percent_delta = (delta * 100) / total_width;
+                    let new_pct = (start_pct as i32 + percent_delta).clamp(0, 100) as u8;
+                    ExplorerWidth::Percent(new_pct)
+                }
+                ExplorerWidth::Columns(start_cols) => {
+                    let new_cols = (start_cols as i32 + delta).clamp(0, total_width) as u16;
+                    ExplorerWidth::Columns(new_cols)
+                }
+            };
         }
 
         Ok(())
@@ -2272,8 +2477,15 @@ impl Editor {
             let ratio_delta = delta as f32 / total_size as f32;
             let new_ratio = (start_ratio + ratio_delta).clamp(0.1, 0.9);
 
-            // Update the split ratio
-            self.split_manager.set_ratio(split_id, new_ratio);
+            // Update the split ratio. The container may live in the main
+            // split tree or inside a stashed Grouped subtree (buffer group
+            // panels like the theme editor); try the main tree first and
+            // fall back to the grouped subtrees.
+            if self.split_manager.get_ratio(split_id.into()).is_some() {
+                self.split_manager.set_ratio(split_id, new_ratio);
+            } else {
+                self.set_grouped_split_ratio(split_id, new_ratio);
+            }
         }
 
         Ok(())
@@ -2281,6 +2493,22 @@ impl Editor {
 
     /// Handle right-click event
     pub(super) fn handle_right_click(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
+        if let Some(ref menu) = self.file_explorer_context_menu {
+            let (menu_x, menu_y) = menu.clamped_position(
+                self.cached_layout.last_frame_width,
+                self.cached_layout.last_frame_height,
+            );
+            let menu_width = super::types::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
+            let menu_height = menu.height();
+            if col >= menu_x
+                && col < menu_x + menu_width
+                && row >= menu_y
+                && row < menu_y + menu_height
+            {
+                return Ok(());
+            }
+        }
+
         // First check if a tab context menu is open and the click is on a menu item
         if let Some(ref menu) = self.tab_context_menu {
             let menu_x = menu.position.0;
@@ -2299,12 +2527,51 @@ impl Editor {
             }
         }
 
+        if let Some(explorer_area) = self.cached_layout.file_explorer_area {
+            if col >= explorer_area.x
+                && col < explorer_area.x + explorer_area.width
+                && row < explorer_area.y + explorer_area.height
+                && row > explorer_area.y
+            // skip title row
+            {
+                let relative_row = row.saturating_sub(explorer_area.y + 1);
+                let (is_multi, is_root_selected) =
+                    if let Some(ref mut explorer) = self.file_explorer {
+                        let display_nodes = explorer.get_display_nodes();
+                        let scroll_offset = explorer.get_scroll_offset();
+                        let clicked_index = (relative_row as usize) + scroll_offset;
+                        let mut clicked_is_root = false;
+                        if clicked_index < display_nodes.len() {
+                            let (node_id, _) = display_nodes[clicked_index];
+                            explorer.set_selected(Some(node_id));
+                            clicked_is_root = node_id == explorer.tree().root_id();
+                        }
+                        (explorer.has_multi_selection(), clicked_is_root)
+                    } else {
+                        (false, false)
+                    };
+                self.key_context = crate::input::keybindings::KeyContext::FileExplorer;
+                self.tab_context_menu = None;
+                self.file_explorer_context_menu = Some(super::types::FileExplorerContextMenu::new(
+                    col,
+                    row + 1,
+                    is_multi,
+                    is_root_selected,
+                ));
+                return Ok(());
+            }
+        }
+
+        self.file_explorer_context_menu = None;
+
         // Check if right-click is on a tab
         let tab_hit =
             self.cached_layout.tab_layouts.iter().find_map(
                 |(split_id, tab_layout)| match tab_layout.hit_test(col, row) {
-                    Some(TabHit::TabName(buffer_id) | TabHit::CloseButton(buffer_id)) => {
-                        Some((*split_id, buffer_id))
+                    Some(TabHit::TabName(target) | TabHit::CloseButton(target)) => {
+                        // Context menu only makes sense for buffer tabs; groups are
+                        // plugin-managed and closed via the close button.
+                        target.as_buffer().map(|bid| (*split_id, bid))
                     }
                     _ => None,
                 },
@@ -2389,9 +2656,118 @@ impl Editor {
             TabContextMenuItem::CloseAll => {
                 self.close_all_tabs_in_split(leaf_id);
             }
+            TabContextMenuItem::CopyRelativePath => {
+                self.copy_buffer_path(buffer_id, true);
+            }
+            TabContextMenuItem::CopyFullPath => {
+                self.copy_buffer_path(buffer_id, false);
+            }
         }
 
         Ok(())
+    }
+
+    /// Handle keyboard navigation for the file explorer context menu.
+    /// Returns `Some` if the key was consumed, `None` to let normal dispatch continue.
+    pub(super) fn handle_file_explorer_context_menu_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<AnyhowResult<()>> {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyModifiers;
+
+        if modifiers != KeyModifiers::NONE {
+            return None;
+        }
+
+        match code {
+            KeyCode::Up => {
+                if let Some(ref mut menu) = self.file_explorer_context_menu {
+                    menu.prev_item();
+                }
+                Some(Ok(()))
+            }
+            KeyCode::Down => {
+                if let Some(ref mut menu) = self.file_explorer_context_menu {
+                    menu.next_item();
+                }
+                Some(Ok(()))
+            }
+            KeyCode::Enter => {
+                let item = {
+                    let menu = self.file_explorer_context_menu.as_ref()?;
+                    menu.items()[menu.highlighted]
+                };
+                self.file_explorer_context_menu = None;
+                self.execute_file_explorer_context_menu_action(item);
+                Some(Ok(()))
+            }
+            KeyCode::Esc => {
+                self.file_explorer_context_menu = None;
+                Some(Ok(()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle left-click on the file explorer context menu
+    pub(super) fn handle_file_explorer_context_menu_click(
+        &mut self,
+        col: u16,
+        row: u16,
+    ) -> Option<AnyhowResult<()>> {
+        // Extract all needed values while the immutable borrow is live, then mutate.
+        let clicked_item: Option<super::types::FileExplorerContextMenuItem> = {
+            let menu = self.file_explorer_context_menu.as_ref()?;
+            let (menu_x, menu_y) = menu.clamped_position(
+                self.cached_layout.last_frame_width,
+                self.cached_layout.last_frame_height,
+            );
+            let menu_width = super::types::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
+            let menu_height = menu.height();
+
+            if col < menu_x
+                || col >= menu_x + menu_width
+                || row < menu_y
+                || row >= menu_y + menu_height
+            {
+                self.file_explorer_context_menu = None;
+                return Some(Ok(()));
+            }
+
+            if row == menu_y || row == menu_y + menu_height - 1 {
+                return Some(Ok(()));
+            }
+
+            let item_idx = (row - menu_y - 1) as usize;
+            menu.items().get(item_idx).copied()
+        };
+
+        self.file_explorer_context_menu = None;
+        if let Some(item) = clicked_item {
+            self.execute_file_explorer_context_menu_action(item);
+        }
+        Some(Ok(()))
+    }
+
+    fn execute_file_explorer_context_menu_action(
+        &mut self,
+        item: super::types::FileExplorerContextMenuItem,
+    ) {
+        use super::types::FileExplorerContextMenuItem;
+        match item {
+            FileExplorerContextMenuItem::NewFile => self.file_explorer_new_file(),
+            FileExplorerContextMenuItem::NewDirectory => self.file_explorer_new_directory(),
+            FileExplorerContextMenuItem::Rename => self.file_explorer_rename(),
+            FileExplorerContextMenuItem::Cut => self.file_explorer_cut(),
+            FileExplorerContextMenuItem::Copy => self.file_explorer_copy(),
+            FileExplorerContextMenuItem::Paste => self.file_explorer_paste(),
+            FileExplorerContextMenuItem::Duplicate => self.file_explorer_duplicate(),
+            FileExplorerContextMenuItem::Delete => self.file_explorer_delete(),
+            FileExplorerContextMenuItem::CopyFullPath => self.file_explorer_copy_path(false),
+            FileExplorerContextMenuItem::CopyRelativePath => self.file_explorer_copy_path(true),
+        }
     }
 
     /// Show a tooltip for a file explorer status indicator
@@ -2533,6 +2909,7 @@ impl Editor {
 
     /// Get git diff stats for a file (insertions/deletions)
     fn get_git_diff_stats(&self, path: &std::path::Path) -> Option<String> {
+        use crate::services::process_hidden::HideWindow;
         use std::process::Command;
 
         // Run git diff --numstat for the file
@@ -2540,6 +2917,7 @@ impl Editor {
             .args(["diff", "--numstat", "--"])
             .arg(path)
             .current_dir(&self.working_dir)
+            .hide_window()
             .output()
             .ok()?;
 
@@ -2573,6 +2951,7 @@ impl Editor {
             .args(["diff", "--numstat", "--cached", "--"])
             .arg(path)
             .current_dir(&self.working_dir)
+            .hide_window()
             .output()
             .ok()?;
 
@@ -2606,6 +2985,7 @@ impl Editor {
         &self,
         dir_path: &std::path::Path,
     ) -> Option<Vec<std::path::PathBuf>> {
+        use crate::services::process_hidden::HideWindow;
         use std::process::Command;
 
         // Resolve symlinks to get the actual directory path
@@ -2618,6 +2998,7 @@ impl Editor {
             .args(["status", "--porcelain", "--"])
             .arg(&resolved_path)
             .current_dir(&self.working_dir)
+            .hide_window()
             .output()
             .ok()?;
 

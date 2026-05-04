@@ -11,6 +11,8 @@ architectural decision records for Fresh development.
 | [docs-audit-0.2.13.md](docs-audit-0.2.13.md) | Documentation gap analysis for 0.2.9–0.2.13 with validation checklist |
 | [markdown.md](markdown.md) | Markdown compose mode remaining work |
 | [code-review.md](code-review.md) | Code quality improvements to address |
+| [refactoring-planning-prompt.md](refactoring-planning-prompt.md) | LLM prompt for producing a refactoring plan in the shape of the existing `*-refactor-plan.md` docs |
+| [buffer-refactor-plan.md](buffer-refactor-plan.md) | Plan to decompose `model/buffer.rs` into field-cluster sub-structs (`BufferFormat`, `BufferFileKind`, `Persistence`) |
 
 Individual design documents for specific features are preserved alongside
 the unified summary for deep-dive reference.

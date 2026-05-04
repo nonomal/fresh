@@ -987,3 +987,241 @@ fn test_hot_exit_disabled_no_recovery() {
         harness.assert_screen_not_contains("SHOULD_NOT_RECOVER");
     }
 }
+
+// =========================================================================
+// Undo after hot exit recovery should not clear modified flag
+// =========================================================================
+
+/// After hot exit recovery, the buffer's modified flag must remain set even
+/// after pressing undo. Previously, the event log's saved_at_index was left
+/// at 0 after recovery, causing undo to incorrectly clear the modified flag.
+#[test]
+fn test_undo_after_hot_exit_recovery_keeps_modified_flag() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+
+    let file1 = project_dir.join("test.txt");
+    std::fs::write(&file1, "original content").unwrap();
+
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    // Session 1: open file, make an edit, then hot-exit
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+
+        let mut harness = EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+
+        harness.editor_mut().set_session_mode(true);
+        harness.open_file(&file1).unwrap();
+        harness.render().unwrap();
+
+        // Type some text to create a modification
+        harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+        harness.type_text(" EDITED").unwrap();
+        harness.render().unwrap();
+
+        // Tab bar should show modified indicator
+        let tab_bar = harness.screen_row_text(layout::TAB_BAR_ROW as u16);
+        assert!(
+            tab_bar.contains('*'),
+            "Tab should show modified indicator after editing.\nTab bar: {tab_bar}"
+        );
+
+        // Shutdown with hot exit (preserves unsaved changes)
+        harness.shutdown(true).unwrap();
+    }
+
+    // Session 2: restore workspace, then press undo
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+
+        let mut harness = EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+
+        let restored = harness.startup(true, &[]).unwrap();
+        assert!(restored, "Workspace should be restored");
+        harness.render().unwrap();
+
+        // Tab bar should show modified indicator after recovery
+        let tab_bar = harness.screen_row_text(layout::TAB_BAR_ROW as u16);
+        assert!(
+            tab_bar.contains('*'),
+            "Tab should show modified indicator after hot exit recovery.\nTab bar: {tab_bar}"
+        );
+
+        // Verify recovered content is present
+        harness.assert_screen_contains("EDITED");
+
+        // Press undo — this should NOT clear the modified indicator,
+        // because the recovered content still differs from the on-disk file
+        harness
+            .send_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+            .unwrap();
+        harness.render().unwrap();
+
+        // The tab bar should STILL show the modified indicator
+        let tab_bar = harness.screen_row_text(layout::TAB_BAR_ROW as u16);
+        assert!(
+            tab_bar.contains('*'),
+            "Tab should still show modified indicator after undo following hot exit recovery.\nTab bar: {tab_bar}"
+        );
+
+        // The recovered content should still be visible (undo had nothing to undo)
+        harness.assert_screen_contains("EDITED");
+    }
+}
+
+// =========================================================================
+// Issue #1550 — Hot exit data must not be lost when fresh is also used in
+// another folder.
+//
+// Standalone (non-session) Fresh launches share a single user data dir, but
+// each working directory has its own workspace file. Before the fix, all
+// folders also shared a single flat recovery directory, so when folder B's
+// editor exited it deleted the unnamed-buffer recovery files belonging to
+// folder A. Folder A's saved files were still listed in its workspace, but
+// the unnamed buffer they referenced was gone — exactly the symptom in the
+// bug report.
+//
+// The fix scopes the standalone-mode recovery directory by working_dir
+// (`recovery/default/{cwd_hash}/`), so each folder's exit only touches its
+// own recovery files.
+// =========================================================================
+
+/// After exiting Fresh in folder A and then opening / closing it in folder B,
+/// the unsaved unnamed buffer from folder A must still be restorable.
+#[test]
+fn test_unnamed_buffer_survives_use_in_another_folder() {
+    let temp_dir = TempDir::new().unwrap();
+    let folder_a = temp_dir.path().join("folder_a");
+    let folder_b = temp_dir.path().join("folder_b");
+    std::fs::create_dir(&folder_a).unwrap();
+    std::fs::create_dir(&folder_b).unwrap();
+
+    // Single shared dir context — represents the same user/installation
+    // running Fresh in two different working directories.
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    // Folder A: full startup → unnamed buffer with content → shutdown.
+    // Calling `startup` is what arms the recovery session lock so that the
+    // matching `shutdown` actually performs the cleanup that historically
+    // deleted other folders' recovery files.
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+
+        let mut harness = EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(folder_a.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+
+        harness.startup(true, &[]).unwrap();
+        harness.new_buffer().unwrap();
+        harness.type_text("FOLDER_A_UNSAVED").unwrap();
+        harness.render().unwrap();
+
+        harness.shutdown(true).unwrap();
+    }
+
+    // Folder B: same dance with different content. With a global recovery
+    // directory, this shutdown wipes folder A's unnamed-buffer recovery file.
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+
+        let mut harness = EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(folder_b.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+
+        harness.startup(true, &[]).unwrap();
+        harness.new_buffer().unwrap();
+        harness.type_text("FOLDER_B_UNSAVED").unwrap();
+        harness.render().unwrap();
+
+        harness.shutdown(true).unwrap();
+    }
+
+    // Re-open folder A: the unnamed buffer should still be there with its
+    // unsaved content. Without the per-CWD recovery scope this fails because
+    // folder B's shutdown wiped folder A's recovery files.
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+
+        let mut harness = EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(folder_a.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+
+        let restored = harness.startup(true, &[]).unwrap();
+        assert!(restored, "Folder A workspace should be restored");
+        harness.render().unwrap();
+
+        harness.assert_screen_contains("FOLDER_A_UNSAVED");
+        harness.assert_screen_not_contains("FOLDER_B_UNSAVED");
+    }
+
+    // Sanity-check the symmetric case too: folder B's unnamed buffer must
+    // also still be intact.
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+
+        let mut harness = EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(folder_b.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap();
+
+        let restored = harness.startup(true, &[]).unwrap();
+        assert!(restored, "Folder B workspace should be restored");
+        harness.render().unwrap();
+
+        harness.assert_screen_contains("FOLDER_B_UNSAVED");
+        harness.assert_screen_not_contains("FOLDER_A_UNSAVED");
+    }
+}

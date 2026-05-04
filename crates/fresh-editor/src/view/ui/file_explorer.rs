@@ -43,6 +43,7 @@ impl FileExplorerRenderer {
         theme: &Theme,
         close_button_hovered: bool,
         remote_connection: Option<&str>,
+        cut_paths: &[PathBuf],
     ) {
         let search_active = view.is_search_active();
 
@@ -68,15 +69,16 @@ impl FileExplorerRenderer {
         // Available width for content (subtract borders and cursor indicator)
         let content_width = area.width.saturating_sub(3) as usize;
 
+        let multi_selection = view.multi_selection();
+
         // Create list items for visible nodes only
         let items: Vec<ListItem> = visible_items
             .iter()
             .enumerate()
             .map(|(viewport_idx, &(node_id, indent))| {
-                // The actual index in the full list
                 let actual_idx = scroll_offset + viewport_idx;
                 let is_selected = selected_index == Some(actual_idx);
-                // Get match positions for highlighting
+                let is_multi_selected = multi_selection.contains(&node_id);
                 let fuzzy_match = if search_active {
                     view.get_match_for_node(node_id)
                 } else {
@@ -87,12 +89,14 @@ impl FileExplorerRenderer {
                     node_id,
                     indent,
                     is_selected,
+                    is_multi_selected,
                     is_focused,
                     files_with_unsaved_changes,
                     decorations,
                     theme,
                     content_width,
                     fuzzy_match.as_ref(),
+                    cut_paths,
                 )
             })
             .collect();
@@ -123,8 +127,20 @@ impl FileExplorerRenderer {
             format!(" File Explorer{} ", keybinding_suffix)
         };
 
-        // Title style: inverted colors (dark on light) when focused using theme colors
-        let (title_style, border_style) = if is_focused {
+        // Title style: use warning colors when remote is disconnected,
+        // otherwise inverted colors (dark on light) when focused.
+        let remote_disconnected = remote_connection
+            .map(|c| c.contains("(Disconnected)"))
+            .unwrap_or(false);
+        let (title_style, border_style) = if remote_disconnected {
+            (
+                Style::default()
+                    .fg(theme.status_error_indicator_fg)
+                    .bg(theme.status_error_indicator_bg)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.status_error_indicator_bg),
+            )
+        } else if is_focused {
             (
                 Style::default()
                     .fg(theme.editor_bg)
@@ -209,12 +225,14 @@ impl FileExplorerRenderer {
         node_id: NodeId,
         indent: usize,
         is_selected: bool,
+        is_multi_selected: bool,
         is_focused: bool,
         files_with_unsaved_changes: &HashSet<PathBuf>,
         decorations: &FileExplorerDecorationCache,
         theme: &Theme,
         content_width: usize,
         fuzzy_match: Option<&FuzzyMatch>,
+        cut_paths: &[PathBuf],
     ) -> ListItem<'static> {
         let node = view.tree().get_node(node_id).expect("Node should exist");
 
@@ -223,7 +241,7 @@ impl FileExplorerRenderer {
 
         // Calculate the left side width for padding calculation
         let indent_width = indent * 2;
-        let indicator_width = if node.is_dir() { 2 } else { 2 }; // "▼ " or "  "
+        let indicator_width = 2; // "▼ " or "  "
         let name_width = str_width(&node.entry.name);
         let left_side_width = indent_width + indicator_width + name_width;
 
@@ -253,7 +271,11 @@ impl FileExplorerRenderer {
         }
 
         // Name styling using theme colors
-        let base_fg = if is_selected && is_focused {
+        let is_pending_cut = cut_paths.iter().any(|cp| cp == &node.entry.path);
+
+        let base_fg = if is_pending_cut {
+            theme.line_number_fg
+        } else if (is_selected || is_multi_selected) && is_focused {
             theme.editor_fg
         } else if node
             .entry
@@ -309,10 +331,10 @@ impl FileExplorerRenderer {
             Some(("●".to_string(), theme.diagnostic_warning_fg))
         } else if let Some(decoration) = direct_decoration {
             let symbol = Self::decoration_symbol(&decoration.symbol);
-            Some((symbol, Self::decoration_color(decoration)))
+            Some((symbol, Self::decoration_color(decoration, theme)))
         } else {
             bubbled_decoration
-                .map(|decoration| ("●".to_string(), Self::decoration_color(decoration)))
+                .map(|decoration| ("●".to_string(), Self::decoration_color(decoration, theme)))
         };
 
         // Calculate right-side content width
@@ -350,7 +372,12 @@ impl FileExplorerRenderer {
             ));
         }
 
-        ListItem::new(Line::from(spans)).style(Style::default().bg(theme.editor_bg))
+        let row_bg = if (is_selected || is_multi_selected) && is_focused {
+            theme.selection_bg
+        } else {
+            theme.editor_bg
+        };
+        ListItem::new(Line::from(spans)).style(Style::default().bg(row_bg))
     }
 
     fn decoration_symbol(symbol: &str) -> String {
@@ -361,9 +388,16 @@ impl FileExplorerRenderer {
             .unwrap_or_else(|| " ".to_string())
     }
 
-    fn decoration_color(decoration: &crate::view::file_tree::FileExplorerDecoration) -> Color {
-        let [r, g, b] = decoration.color;
-        Color::Rgb(r, g, b)
+    fn decoration_color(
+        decoration: &crate::view::file_tree::FileExplorerDecoration,
+        theme: &Theme,
+    ) -> Color {
+        match &decoration.color {
+            fresh_core::api::OverlayColorSpec::Rgb(r, g, b) => Color::Rgb(*r, *g, *b),
+            fresh_core::api::OverlayColorSpec::ThemeKey(key) => {
+                theme.resolve_theme_key(key).unwrap_or(theme.editor_fg)
+            }
+        }
     }
 
     /// Render a file/directory name with matched characters highlighted

@@ -6,6 +6,7 @@
 //! - Reset buffer settings
 //! - Config dump, save, and reload
 
+use crate::types::LspServerConfig;
 use rust_i18n::t;
 
 use crate::config::Config;
@@ -56,15 +57,22 @@ impl Editor {
         }
     }
 
-    /// Toggle menu bar visibility
+    /// Toggle menu bar visibility.
+    ///
+    /// `editor.show_menu_bar` is a global preference, so the toggle updates the
+    /// runtime config and persists the change to the user config layer (same
+    /// pattern as the file-explorer toggles). See issue #1156.
     pub fn toggle_menu_bar(&mut self) {
-        self.menu_bar_visible = !self.menu_bar_visible;
+        let new_value = !self.menu_bar_visible;
+        self.config_mut().editor.show_menu_bar = new_value;
+        self.menu_bar_visible = new_value;
         // When explicitly toggling, clear auto-show state
         self.menu_bar_auto_shown = false;
         // Close any open menu when hiding the menu bar
         if !self.menu_bar_visible {
             self.menu_state.close_menu();
         }
+        self.persist_config_change("/editor/show_menu_bar", serde_json::Value::Bool(new_value));
         let status = if self.menu_bar_visible {
             t!("toggle.menu_bar_shown")
         } else {
@@ -105,9 +113,26 @@ impl Editor {
         self.status_bar_visible
     }
 
+    /// Toggle prompt line visibility
+    pub fn toggle_prompt_line(&mut self) {
+        self.prompt_line_visible = !self.prompt_line_visible;
+        let status = if self.prompt_line_visible {
+            t!("toggle.prompt_line_shown")
+        } else {
+            t!("toggle.prompt_line_hidden")
+        };
+        self.set_status_message(status.to_string());
+    }
+
+    /// Get prompt line visibility
+    pub fn prompt_line_visible(&self) -> bool {
+        self.prompt_line_visible
+    }
+
     /// Toggle vertical scrollbar visibility
     pub fn toggle_vertical_scrollbar(&mut self) {
-        self.config.editor.show_vertical_scrollbar = !self.config.editor.show_vertical_scrollbar;
+        let new_value = !self.config.editor.show_vertical_scrollbar;
+        self.config_mut().editor.show_vertical_scrollbar = new_value;
         let status = if self.config.editor.show_vertical_scrollbar {
             t!("toggle.vertical_scrollbar_shown")
         } else {
@@ -118,8 +143,8 @@ impl Editor {
 
     /// Toggle horizontal scrollbar visibility
     pub fn toggle_horizontal_scrollbar(&mut self) {
-        self.config.editor.show_horizontal_scrollbar =
-            !self.config.editor.show_horizontal_scrollbar;
+        let new_value = !self.config.editor.show_horizontal_scrollbar;
+        self.config_mut().editor.show_horizontal_scrollbar = new_value;
         let status = if self.config.editor.show_horizontal_scrollbar {
             t!("toggle.horizontal_scrollbar_shown")
         } else {
@@ -136,6 +161,7 @@ impl Editor {
         // Determine settings from config using buffer's stored language
         let mut whitespace = WhitespaceVisibility::from_editor_config(&self.config.editor);
         let mut auto_close = self.config.editor.auto_close;
+        let mut word_characters = String::new();
         let (tab_size, use_tabs) = if let Some(state) = self.buffers.get(&buffer_id) {
             let language = &state.language;
             if let Some(lang_config) = self.config.languages.get(language) {
@@ -147,15 +173,18 @@ impl Editor {
                         auto_close = lang_auto_close;
                     }
                 }
+                if let Some(ref wc) = lang_config.word_characters {
+                    word_characters = wc.clone();
+                }
                 (
                     lang_config.tab_size.unwrap_or(self.config.editor.tab_size),
-                    lang_config.use_tabs,
+                    lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs),
                 )
             } else {
-                (self.config.editor.tab_size, false)
+                (self.config.editor.tab_size, self.config.editor.use_tabs)
             }
         } else {
-            (self.config.editor.tab_size, false)
+            (self.config.editor.tab_size, self.config.editor.use_tabs)
         };
 
         // Apply settings to buffer
@@ -164,6 +193,7 @@ impl Editor {
             state.buffer_settings.use_tabs = use_tabs;
             state.buffer_settings.auto_close = auto_close;
             state.buffer_settings.whitespace = whitespace;
+            state.buffer_settings.word_characters = word_characters;
         }
 
         self.set_status_message(t!("toggle.buffer_settings_reset").to_string());
@@ -194,8 +224,12 @@ impl Editor {
     }
 
     /// Toggle mouse hover for LSP on/off
+    ///
+    /// On Windows, this also switches the mouse tracking mode: mode 1003
+    /// (all motion) when enabled, mode 1002 (cell motion) when disabled.
     pub fn toggle_mouse_hover(&mut self) {
-        self.config.editor.mouse_hover_enabled = !self.config.editor.mouse_hover_enabled;
+        let new_value = !self.config.editor.mouse_hover_enabled;
+        self.config_mut().editor.mouse_hover_enabled = new_value;
 
         if self.config.editor.mouse_hover_enabled {
             self.set_status_message(t!("toggle.mouse_hover_enabled").to_string());
@@ -204,6 +238,19 @@ impl Editor {
             self.mouse_state.lsp_hover_state = None;
             self.mouse_state.lsp_hover_request_sent = false;
             self.set_status_message(t!("toggle.mouse_hover_disabled").to_string());
+        }
+
+        // On Windows, switch mouse tracking mode to match
+        #[cfg(windows)]
+        {
+            let mode = if self.config.editor.mouse_hover_enabled {
+                fresh_winterm::MouseMode::AllMotion
+            } else {
+                fresh_winterm::MouseMode::CellMotion
+            };
+            if let Err(e) = fresh_winterm::set_mouse_mode(mode) {
+                tracing::error!("Failed to switch mouse mode: {}", e);
+            }
         }
     }
 
@@ -223,7 +270,8 @@ impl Editor {
 
     /// Toggle inlay hints visibility
     pub fn toggle_inlay_hints(&mut self) {
-        self.config.editor.enable_inlay_hints = !self.config.editor.enable_inlay_hints;
+        let new_value = !self.config.editor.enable_inlay_hints;
+        self.config_mut().editor.enable_inlay_hints = new_value;
 
         if self.config.editor.enable_inlay_hints {
             // Re-request inlay hints for the active buffer
@@ -241,7 +289,11 @@ impl Editor {
     /// Dump the current configuration to the user's config file
     pub fn dump_config(&mut self) {
         // Create the config directory if it doesn't exist
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.config_dir) {
+        if let Err(e) = self
+            .authority
+            .filesystem
+            .create_dir_all(&self.dir_context.config_dir)
+        {
             self.set_status_message(
                 t!("error.config_dir_failed", error = e.to_string()).to_string(),
             );
@@ -289,7 +341,8 @@ impl Editor {
     /// Returns Ok(()) on success, or an error message on failure
     pub fn save_config(&self) -> Result<(), String> {
         // Create the config directory if it doesn't exist
-        self.filesystem
+        self.authority
+            .filesystem
             .create_dir_all(&self.dir_context.config_dir)
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
 
@@ -306,10 +359,13 @@ impl Editor {
     /// Uses the layered config system to properly merge with defaults.
     pub fn reload_config(&mut self) {
         let old_theme = self.config.theme.clone();
-        self.config = Config::load_with_layers(&self.dir_context, &self.working_dir);
+        self.set_config(Config::load_with_layers(
+            &self.dir_context,
+            &self.working_dir,
+        ));
 
         // Refresh cached raw user config for plugins
-        self.user_config_raw = Config::read_user_config_raw(&self.working_dir);
+        self.set_user_config_raw(Config::read_user_config_raw(&self.working_dir));
 
         // Apply theme change if needed
         if old_theme != self.config.theme {
@@ -322,7 +378,7 @@ impl Editor {
         }
 
         // Always reload keybindings (complex types don't implement PartialEq)
-        self.keybindings = KeybindingResolver::new(&self.config);
+        *self.keybindings.write().unwrap() = KeybindingResolver::new(&self.config);
 
         // Update clipboard configuration
         self.clipboard.apply_config(&self.config.clipboard);
@@ -331,12 +387,22 @@ impl Editor {
         self.menu_bar_visible = self.config.editor.show_menu_bar;
         self.tab_bar_visible = self.config.editor.show_tab_bar;
         self.status_bar_visible = self.config.editor.show_status_bar;
+        self.prompt_line_visible = self.config.editor.show_prompt_line;
 
         // Update LSP configs
         if let Some(ref mut lsp) = self.lsp {
-            for (language, lsp_config) in &self.config.lsp {
-                lsp.set_language_config(language.clone(), lsp_config.clone());
+            for (language, lsp_configs) in &self.config.lsp {
+                lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
             }
+            // Configure universal (global) LSP servers
+            let universal_servers: Vec<LspServerConfig> = self
+                .config
+                .universal_lsp
+                .values()
+                .flat_map(|lc| lc.as_slice().to_vec())
+                .filter(|c| c.enabled)
+                .collect();
+            lsp.set_universal_configs(universal_servers);
         }
 
         // Emit event so plugins know config changed
@@ -357,7 +423,8 @@ impl Editor {
         use crate::view::theme::ThemeLoader;
 
         let theme_loader = ThemeLoader::new(self.dir_context.themes_dir());
-        self.theme_registry = theme_loader.load_all();
+        self.theme_registry = std::sync::Arc::new(theme_loader.load_all(&[]));
+        self.expanded_menus_cache.invalidate();
 
         // Update shared theme cache for plugin access
         *self.theme_cache.write().unwrap() = self.theme_registry.to_json_map();

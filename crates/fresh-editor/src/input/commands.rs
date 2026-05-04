@@ -79,6 +79,7 @@ pub struct Suggestion {
 }
 
 impl Suggestion {
+    /// Create an active (selectable) suggestion
     pub fn new(text: String) -> Self {
         Self {
             text,
@@ -90,63 +91,41 @@ impl Suggestion {
         }
     }
 
-    pub fn with_description(text: String, description: String) -> Self {
+    /// Create a disabled (greyed-out) suggestion used for hints or errors
+    pub fn disabled(text: String) -> Self {
         Self {
             text,
-            description: Some(description),
+            description: None,
             value: None,
-            disabled: false,
+            disabled: true,
             keybinding: None,
             source: None,
         }
     }
 
-    pub fn with_description_and_disabled(
-        text: String,
-        description: String,
-        disabled: bool,
-    ) -> Self {
-        Self {
-            text,
-            description: Some(description),
-            value: None,
-            disabled,
-            keybinding: None,
-            source: None,
-        }
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
+        self
     }
 
-    pub fn with_all(
-        text: String,
-        description: Option<String>,
-        disabled: bool,
-        keybinding: Option<String>,
-    ) -> Self {
-        Self {
-            text,
-            description,
-            value: None,
-            disabled,
-            keybinding,
-            source: None,
-        }
+    pub fn with_value(mut self, value: String) -> Self {
+        self.value = Some(value);
+        self
     }
 
-    pub fn with_source(
-        text: String,
-        description: Option<String>,
-        disabled: bool,
-        keybinding: Option<String>,
-        source: Option<CommandSource>,
-    ) -> Self {
-        Self {
-            text,
-            description,
-            value: None,
-            disabled,
-            keybinding,
-            source,
-        }
+    pub fn with_keybinding(mut self, keybinding: Option<String>) -> Self {
+        self.keybinding = keybinding;
+        self
+    }
+
+    pub fn with_source(mut self, source: Option<CommandSource>) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub fn set_disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
     }
 
     pub fn get_value(&self) -> &str {
@@ -267,6 +246,21 @@ static COMMAND_DEFS: &[CommandDef] = &[
         contexts: &[],
         custom_contexts: &[context_keys::SESSION_MODE],
     },
+    // Quick Open variants
+    CommandDef {
+        name_key: "cmd.quick_open_buffers",
+        desc_key: "cmd.quick_open_buffers_desc",
+        action: || Action::QuickOpenBuffers,
+        contexts: &[],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.quick_open_files",
+        desc_key: "cmd.quick_open_files_desc",
+        action: || Action::QuickOpenFiles,
+        contexts: &[],
+        custom_contexts: &[],
+    },
     // Edit operations
     CommandDef {
         name_key: "cmd.undo",
@@ -293,6 +287,20 @@ static COMMAND_DEFS: &[CommandDef] = &[
         name_key: "cmd.copy_with_formatting",
         desc_key: "cmd.copy_with_formatting_desc",
         action: || Action::CopyWithTheme(String::new()),
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.copy_file_path",
+        desc_key: "cmd.copy_file_path_desc",
+        action: || Action::CopyFilePath,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.copy_relative_file_path",
+        desc_key: "cmd.copy_relative_file_path_desc",
+        action: || Action::CopyRelativeFilePath,
         contexts: &[Normal],
         custom_contexts: &[],
     },
@@ -711,6 +719,13 @@ static COMMAND_DEFS: &[CommandDef] = &[
         custom_contexts: &[],
     },
     CommandDef {
+        name_key: "cmd.toggle_prompt_line",
+        desc_key: "cmd.toggle_prompt_line_desc",
+        action: || Action::TogglePromptLine,
+        contexts: &[Normal, FileExplorer, Terminal],
+        custom_contexts: &[],
+    },
+    CommandDef {
         name_key: "cmd.toggle_vertical_scrollbar",
         desc_key: "cmd.toggle_vertical_scrollbar_desc",
         action: || Action::ToggleVerticalScrollbar,
@@ -792,6 +807,27 @@ static COMMAND_DEFS: &[CommandDef] = &[
         name_key: "cmd.toggle_line_wrap",
         desc_key: "cmd.toggle_line_wrap_desc",
         action: || Action::ToggleLineWrap,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.toggle_current_line_highlight",
+        desc_key: "cmd.toggle_current_line_highlight_desc",
+        action: || Action::ToggleCurrentLineHighlight,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.toggle_page_view",
+        desc_key: "cmd.toggle_page_view_desc",
+        action: || Action::TogglePageView,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.set_page_width",
+        desc_key: "cmd.set_page_width_desc",
+        action: || Action::SetPageWidth,
         contexts: &[Normal],
         custom_contexts: &[],
     },
@@ -1111,6 +1147,13 @@ static COMMAND_DEFS: &[CommandDef] = &[
         custom_contexts: &[],
     },
     CommandDef {
+        name_key: "cmd.show_remote_indicator_menu",
+        desc_key: "cmd.show_remote_indicator_menu_desc",
+        action: || Action::ShowRemoteIndicatorMenu,
+        contexts: &[],
+        custom_contexts: &[],
+    },
+    CommandDef {
         name_key: "cmd.clear_warnings",
         desc_key: "cmd.clear_warnings_desc",
         action: || Action::ClearWarnings,
@@ -1122,6 +1165,13 @@ static COMMAND_DEFS: &[CommandDef] = &[
         name_key: "cmd.dump_config",
         desc_key: "cmd.dump_config_desc",
         action: || Action::DumpConfig,
+        contexts: &[],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.redraw_screen",
+        desc_key: "cmd.redraw_screen_desc",
+        action: || Action::RedrawScreen,
         contexts: &[],
         custom_contexts: &[],
     },
@@ -1248,11 +1298,66 @@ static COMMAND_DEFS: &[CommandDef] = &[
         contexts: &[],
         custom_contexts: &[],
     },
+    // Process control (Unix job-control suspend)
+    CommandDef {
+        name_key: "cmd.suspend_process",
+        desc_key: "cmd.suspend_process_desc",
+        action: || Action::SuspendProcess,
+        contexts: &[Normal, FileExplorer, Terminal],
+        custom_contexts: &[],
+    },
     // Plugin development
     CommandDef {
         name_key: "cmd.load_plugin_from_buffer",
         desc_key: "cmd.load_plugin_from_buffer_desc",
         action: || Action::LoadPluginFromBuffer,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    // User init.ts
+    CommandDef {
+        name_key: "cmd.init_reload",
+        desc_key: "cmd.init_reload_desc",
+        action: || Action::InitReload,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.init_edit",
+        desc_key: "cmd.init_edit_desc",
+        action: || Action::InitEdit,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.init_check",
+        desc_key: "cmd.init_check_desc",
+        action: || Action::InitCheck,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    // Live Grep (issue #1796) — `cmd.live_grep` itself is registered
+    // by the live_grep plugin (palette title is plugin-controlled);
+    // these are the editor-side actions that should also be palette-
+    // discoverable so the user can find them by name.
+    CommandDef {
+        name_key: "cmd.resume_live_grep",
+        desc_key: "cmd.resume_live_grep_desc",
+        action: || Action::ResumeLiveGrep,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.toggle_utility_dock",
+        desc_key: "cmd.toggle_utility_dock_desc",
+        action: || Action::ToggleUtilityDock,
+        contexts: &[Normal],
+        custom_contexts: &[],
+    },
+    CommandDef {
+        name_key: "cmd.open_terminal_in_dock",
+        desc_key: "cmd.open_terminal_in_dock_desc",
+        action: || Action::OpenTerminalInDock,
         contexts: &[Normal],
         custom_contexts: &[],
     },
@@ -1320,12 +1425,10 @@ pub fn filter_commands(
             let available = is_available(&cmd);
             let keybinding = keybinding_resolver
                 .get_keybinding_for_action(&cmd.action, current_context_ref.clone());
-            Suggestion::with_all(
-                cmd.name.clone(),
-                Some(cmd.description),
-                !available,
-                keybinding,
-            )
+            Suggestion::new(cmd.name.clone())
+                .with_description(cmd.description)
+                .set_disabled(!available)
+                .with_keybinding(keybinding)
         })
         .collect();
 

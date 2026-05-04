@@ -10,20 +10,13 @@ use rust_i18n::t;
 use crate::input::multi_cursor::{
     add_cursor_above, add_cursor_at_next_match, add_cursor_below, AddCursorResult,
 };
-use crate::model::buffer::Buffer;
-use crate::model::cursor::Position2D;
+use crate::model::buffer_position::byte_to_2d;
 use crate::model::event::{CursorId, Event};
-use crate::primitives::word_navigation::{find_word_start_left, find_word_start_right};
+use crate::primitives::word_navigation::{
+    find_vi_word_end, find_word_start_left, find_word_start_right,
+};
 
 use super::Editor;
-
-/// Convert byte offset to 2D position (line, column)
-fn byte_to_2d(buffer: &Buffer, byte_pos: usize) -> Position2D {
-    let line = buffer.get_line_number(byte_pos);
-    let line_start = buffer.line_start_offset(line).unwrap_or(0);
-    let column = byte_pos.saturating_sub(line_start);
-    Position2D { line, column }
-}
 
 // These are the clipboard and multi-cursor operations on Editor.
 //
@@ -335,28 +328,39 @@ impl Editor {
         use crate::view::prompt::PromptType;
 
         let available_themes = self.theme_registry.list();
-        let current_theme_name = &self.theme.name;
+        // Resolve the config value (portable form) to a canonical registry
+        // key so the picker can pre-highlight the current theme.
+        let resolved_current = self
+            .theme_registry
+            .resolve_key(&self.config.theme.0)
+            .unwrap_or_else(|| self.config.theme.0.clone());
+        let current_theme_key = resolved_current.as_str();
 
-        // Find the index of the current theme
+        // Find the index of the current theme (match by key first, then name)
         let current_index = available_themes
             .iter()
-            .position(|info| info.name == *current_theme_name)
+            .position(|info| info.key == *current_theme_key)
+            .or_else(|| {
+                let normalized = crate::view::theme::normalize_theme_name(current_theme_key);
+                available_themes.iter().position(|info| {
+                    crate::view::theme::normalize_theme_name(&info.name) == normalized
+                })
+            })
             .unwrap_or(0);
 
         let suggestions: Vec<crate::input::commands::Suggestion> = available_themes
             .iter()
             .map(|info| {
-                let is_current = info.name == *current_theme_name;
-                let description = match (is_current, info.pack.is_empty()) {
-                    (true, true) => Some("(current)".to_string()),
-                    (true, false) => Some(format!("{} (current)", info.pack)),
-                    (false, true) => None,
-                    (false, false) => Some(info.pack.clone()),
+                let is_current = Some(info) == available_themes.get(current_index);
+                let description = if is_current {
+                    Some(format!("{} (current)", info.key))
+                } else {
+                    Some(info.key.clone())
                 };
                 crate::input::commands::Suggestion {
                     text: info.name.clone(),
                     description,
-                    value: Some(info.name.clone()),
+                    value: Some(info.key.clone()),
                     disabled: false,
                     keybinding: None,
                     source: None,
@@ -373,7 +377,7 @@ impl Editor {
         if let Some(prompt) = self.prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
                 prompt.selected_suggestion = Some(current_index);
-                prompt.input = current_theme_name.to_string();
+                prompt.input = current_theme_key.to_string();
                 prompt.cursor_pos = prompt.input.len();
             }
         }
@@ -425,8 +429,7 @@ impl Editor {
                     self.active_event_log_mut().append(bulk_edit);
                 }
             } else if let Some(event) = events.into_iter().next() {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
 
             if !deletions.is_empty() {
@@ -484,8 +487,7 @@ impl Editor {
                     self.active_event_log_mut().append(bulk_edit);
                 }
             } else if let Some(event) = events.into_iter().next() {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
 
             if !deletions.is_empty() {
@@ -606,8 +608,7 @@ impl Editor {
                 self.active_event_log_mut().append(bulk_edit);
             }
         } else if let Some(event) = events.into_iter().next() {
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
+            self.log_and_apply_event(&event);
         }
 
         self.status_message = Some(t!("clipboard.pasted").to_string());
@@ -643,9 +644,71 @@ impl Editor {
         self.clipboard.get_internal().to_string()
     }
 
+    /// Copy a buffer's file path to the clipboard.
+    ///
+    /// When `relative` is true the path is made relative to the workspace root;
+    /// if the file lives outside the workspace the absolute path is used as a
+    /// safe fallback (the user still gets a usable path rather than nothing).
+    /// When `relative` is false the absolute path is always copied.
+    ///
+    /// If the buffer has no associated file (unsaved scratch buffer) or the
+    /// buffer id is unknown, a status message is shown and the clipboard is
+    /// left untouched.
+    pub fn copy_buffer_path(&mut self, buffer_id: crate::model::event::BufferId, relative: bool) {
+        let path = self
+            .buffers
+            .get(&buffer_id)
+            .and_then(|state| state.buffer.file_path().map(|p| p.to_path_buf()));
+        let Some(path) = path else {
+            self.status_message = Some(t!("clipboard.no_file_path").to_string());
+            return;
+        };
+
+        let path_str = if relative {
+            path.strip_prefix(&self.working_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path.to_string_lossy().into_owned()
+        };
+
+        self.clipboard.copy(path_str.clone());
+        self.status_message = Some(t!("clipboard.copied_path", path = &path_str).to_string());
+    }
+
+    /// Copy the active buffer's file path. See [`Self::copy_buffer_path`].
+    pub fn copy_active_buffer_path(&mut self, relative: bool) {
+        let buffer_id = self.active_buffer();
+        self.copy_buffer_path(buffer_id, relative);
+    }
+
     /// Add a cursor at the next occurrence of the selected text
-    /// If no selection, first selects the entire word at cursor position
+    /// If no selection, first selects the entire word at cursor position.
+    ///
+    /// When an active substring search has placed the cursor at a match
+    /// (cursor inside `search_state.matches[i]..matches[i] + match_lengths[i]`),
+    /// the search match is selected instead of the surrounding word.  This
+    /// way subsequent presses look for the search substring rather than the
+    /// whole word, which would skip other substring occurrences (issue #1697).
     pub fn add_cursor_at_next_match(&mut self) {
+        if let Some(range) = self.search_match_at_primary_cursor() {
+            let primary_id = self.active_cursors().primary_id();
+            let primary = self.active_cursors().primary();
+            let event = Event::MoveCursor {
+                cursor_id: primary_id,
+                old_position: primary.position,
+                new_position: range.end,
+                old_anchor: primary.anchor,
+                new_anchor: Some(range.start),
+                old_sticky_column: primary.sticky_column,
+                new_sticky_column: 0,
+            };
+            self.active_event_log_mut().append(event.clone());
+            self.apply_event_to_active_buffer(&event);
+            return;
+        }
+
         let cursors = self.active_cursors().clone();
         let state = self.active_state_mut();
         match add_cursor_at_next_match(state, &cursors) {
@@ -788,6 +851,50 @@ impl Editor {
         }
 
         // Copy text from all ranges
+        let mut text = String::new();
+        let state = self.active_state_mut();
+        for range in ranges {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let range_text = state.get_text_range(range.start, range.end);
+            text.push_str(&range_text);
+        }
+
+        if !text.is_empty() {
+            let len = text.len();
+            self.clipboard.copy(text);
+            self.status_message = Some(t!("clipboard.yanked", count = len).to_string());
+        }
+    }
+
+    /// Yank (copy) from cursor to vim word end (inclusive)
+    pub fn yank_vi_word_end(&mut self) {
+        let cursor_positions: Vec<_> = self
+            .active_cursors()
+            .iter()
+            .map(|(_, c)| c.position)
+            .collect();
+        let ranges: Vec<_> = {
+            let state = self.active_state();
+            cursor_positions
+                .into_iter()
+                .filter_map(|start| {
+                    let word_end = find_vi_word_end(&state.buffer, start);
+                    let end = (word_end + 1).min(state.buffer.len());
+                    if end > start {
+                        Some(start..end)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if ranges.is_empty() {
+            return;
+        }
+
         let mut text = String::new();
         let state = self.active_state_mut();
         for range in ranges {

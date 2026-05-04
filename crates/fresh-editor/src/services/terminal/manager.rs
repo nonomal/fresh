@@ -20,7 +20,9 @@
 
 use super::term::TerminalState;
 use crate::services::async_bridge::AsyncBridge;
+use crate::services::authority::TerminalWrapper;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
@@ -156,6 +158,7 @@ impl TerminalManager {
         cwd: Option<std::path::PathBuf>,
         log_path: Option<std::path::PathBuf>,
         backing_path: Option<std::path::PathBuf>,
+        terminal_wrapper: crate::services::authority::TerminalWrapper,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.next_id);
         self.next_id += 1;
@@ -185,21 +188,42 @@ impl TerminalManager {
                     }
                 })?;
 
-            // Detect shell
-            let shell = detect_shell();
+            // The active authority's terminal wrapper drives the shell
+            // command unconditionally — local wraps `detect_shell()` with
+            // no args; container/remote authorities re-parent into
+            // `docker exec -w …`, `ssh …`, etc. `manages_cwd` says
+            // whether the wrapper's args already establish cwd (in which
+            // case `CommandBuilder::cwd()` is skipped).
+            let TerminalWrapper {
+                command: shell,
+                args: cmd_args,
+                manages_cwd: skip_cwd,
+            } = terminal_wrapper;
             tracing::info!("Spawning terminal with shell: {}", shell);
 
-            // Build command
             let mut cmd = CommandBuilder::new(&shell);
-            if let Some(ref dir) = cwd {
-                cmd.cwd(dir);
+            for arg in &cmd_args {
+                cmd.arg(arg);
+            }
+            if !skip_cwd {
+                if let Some(ref dir) = cwd {
+                    // Hand the shell a non-verbatim path. Fresh canonicalizes
+                    // working_dir at startup, which on Windows yields
+                    // `\\?\C:\…`. PowerShell can't infer a drive from a
+                    // verbatim path and falls back to the fully-qualified
+                    // provider form, producing prompts like
+                    // `PS Microsoft.PowerShell.Core\FileSystem::\\?\C:\…>`.
+                    cmd.cwd(strip_verbatim_prefix(dir).as_ref());
+                }
             }
 
-            // On Windows, set environment variables that help with ConPTY
+            // Set TERM so programs like less know the terminal capabilities.
+            // The built-in emulator is alacritty-based so xterm-256color is appropriate.
+            cmd.env("TERM", "xterm-256color");
+
+            // On Windows, set additional environment variables that help with ConPTY
             #[cfg(windows)]
             {
-                // Set TERM to help shells understand they're in a terminal
-                cmd.env("TERM", "xterm-256color");
                 // Ensure PROMPT is set for cmd.exe
                 if shell.to_lowercase().contains("cmd") {
                     cmd.env("PROMPT", "$P$G");
@@ -533,6 +557,52 @@ impl Drop for TerminalManager {
     }
 }
 
+/// Convert a Windows verbatim path (`\\?\C:\…` or `\\?\UNC\server\share\…`)
+/// into its non-verbatim equivalent (`C:\…` or `\\server\share\…`).
+///
+/// Returns the input unchanged on non-Windows platforms or for paths that
+/// have no verbatim prefix.
+pub(crate) fn strip_verbatim_prefix(path: &std::path::Path) -> Cow<'_, std::path::Path> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(p)) => p,
+            _ => return Cow::Borrowed(path),
+        };
+
+        let mut rebuilt = std::path::PathBuf::new();
+        match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                rebuilt.push(format!("{}:\\", drive as char));
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                rebuilt.push(format!(
+                    r"\\{}\{}\",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                ));
+            }
+            _ => return Cow::Borrowed(path),
+        }
+        // Skip the original RootDir (which the rebuilt prefix already includes)
+        // and append the rest of the components.
+        for component in components {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            rebuilt.push(component.as_os_str());
+        }
+        Cow::Owned(rebuilt)
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
+    }
+}
+
 /// Detect the user's shell
 pub fn detect_shell() -> String {
     // Try $SHELL environment variable first
@@ -596,5 +666,48 @@ mod tests {
     fn test_detect_shell() {
         let shell = detect_shell();
         assert!(!shell.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn strip_verbatim_prefix_is_noop_on_unix() {
+        use std::path::Path;
+        let p = Path::new("/home/user/project");
+        assert_eq!(strip_verbatim_prefix(p).as_ref(), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_removes_verbatim_disk() {
+        use std::path::{Path, PathBuf};
+        let verbatim = PathBuf::from(r"\\?\C:\Users\HP\OneDrive\Desktop\PY'PGMS");
+        let stripped = strip_verbatim_prefix(&verbatim);
+        assert_eq!(
+            stripped.as_ref(),
+            Path::new(r"C:\Users\HP\OneDrive\Desktop\PY'PGMS"),
+            "verbatim disk prefix should be replaced with plain drive form"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_removes_verbatim_unc() {
+        use std::path::{Path, PathBuf};
+        let verbatim = PathBuf::from(r"\\?\UNC\server\share\dir\file");
+        let stripped = strip_verbatim_prefix(&verbatim);
+        assert_eq!(
+            stripped.as_ref(),
+            Path::new(r"\\server\share\dir\file"),
+            "verbatim UNC prefix should be replaced with plain UNC form"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_passes_plain_paths_through() {
+        use std::path::{Path, PathBuf};
+        let plain = PathBuf::from(r"C:\Users\HP\project");
+        let result = strip_verbatim_prefix(&plain);
+        assert_eq!(result.as_ref(), Path::new(r"C:\Users\HP\project"));
     }
 }

@@ -27,6 +27,16 @@ pub struct SettingsLayout {
     pub cancel_button: Option<Rect>,
     /// Reset button area
     pub reset_button: Option<Rect>,
+    /// Clear category button area (shown in page header for nullable categories)
+    pub clear_category_button: Option<Rect>,
+    /// Sections rendered under expanded categories: (cat_idx, section_idx, area).
+    pub sections: Vec<(usize, usize, Rect)>,
+    /// Disclosure-chevron areas for expandable categories: (cat_idx, area).
+    pub category_disclosures: Vec<(usize, Rect)>,
+    /// Categories panel area (for mouse-wheel detection).
+    pub categories_panel_area: Option<Rect>,
+    /// Categories panel scrollbar area (for drag).
+    pub categories_scrollbar_area: Option<Rect>,
     /// Settings panel area (for scroll hit testing)
     pub settings_panel_area: Option<Rect>,
     /// Scrollbar area (for drag detection)
@@ -59,6 +69,8 @@ pub struct ItemLayout {
     pub area: Rect,
     /// Control-specific layout info
     pub control: ControlLayoutInfo,
+    /// Area of the [Inherit] button (only for nullable, explicitly-set items)
+    pub inherit_button: Option<Rect>,
 }
 
 impl SettingsLayout {
@@ -74,6 +86,11 @@ impl SettingsLayout {
             save_button: None,
             cancel_button: None,
             reset_button: None,
+            clear_category_button: None,
+            sections: Vec::new(),
+            category_disclosures: Vec::new(),
+            categories_panel_area: None,
+            categories_scrollbar_area: None,
             settings_panel_area: None,
             scrollbar_area: None,
             search_scrollbar_area: None,
@@ -86,13 +103,31 @@ impl SettingsLayout {
         self.categories.push((index, area));
     }
 
+    /// Add a section row (under an expanded category) for hit-testing.
+    pub fn add_section(&mut self, cat_idx: usize, section_idx: usize, area: Rect) {
+        self.sections.push((cat_idx, section_idx, area));
+    }
+
+    /// Register the disclosure-chevron area for an expandable category.
+    pub fn add_category_disclosure(&mut self, cat_idx: usize, area: Rect) {
+        self.category_disclosures.push((cat_idx, area));
+    }
+
     /// Add a setting item to the layout
-    pub fn add_item(&mut self, index: usize, path: String, area: Rect, control: ControlLayoutInfo) {
+    pub fn add_item(
+        &mut self,
+        index: usize,
+        path: String,
+        area: Rect,
+        control: ControlLayoutInfo,
+        inherit_button: Option<Rect>,
+    ) {
         self.items.push(ItemLayout {
             index,
             path,
             area,
             control,
+            inherit_button,
         });
     }
 
@@ -138,11 +173,38 @@ impl SettingsLayout {
                 return Some(SettingsHit::ResetButton);
             }
         }
+        if let Some(ref clear_cat) = self.clear_category_button {
+            if point_in_rect(*clear_cat, x, y) {
+                return Some(SettingsHit::ClearCategoryButton);
+            }
+        }
 
-        // Check categories
+        // Check categories tree (chevrons → sections → category rows; chevron
+        // first so clicking just the disclosure toggles expansion without
+        // changing the body-panel selection).
+        for (cat_idx, area) in &self.category_disclosures {
+            if point_in_rect(*area, x, y) {
+                return Some(SettingsHit::CategoryDisclosure(*cat_idx));
+            }
+        }
+        for (cat_idx, section_idx, area) in &self.sections {
+            if point_in_rect(*area, x, y) {
+                return Some(SettingsHit::CategorySection(*cat_idx, *section_idx));
+            }
+        }
         for (index, area) in &self.categories {
             if point_in_rect(*area, x, y) {
                 return Some(SettingsHit::Category(*index));
+            }
+        }
+        if let Some(ref scrollbar) = self.categories_scrollbar_area {
+            if point_in_rect(*scrollbar, x, y) {
+                return Some(SettingsHit::CategoriesScrollbar);
+            }
+        }
+        if let Some(ref panel) = self.categories_panel_area {
+            if point_in_rect(*panel, x, y) {
+                return Some(SettingsHit::CategoriesPanel);
             }
         }
 
@@ -170,6 +232,13 @@ impl SettingsLayout {
         // Check setting items
         for item in &self.items {
             if point_in_rect(item.area, x, y) {
+                // Check inherit button first (highest priority within item)
+                if let Some(ref inherit_area) = item.inherit_button {
+                    if point_in_rect(*inherit_area, x, y) {
+                        return Some(SettingsHit::ControlInherit(item.index));
+                    }
+                }
+
                 // Check specific control areas
                 match &item.control {
                     ControlLayoutInfo::Toggle(toggle_area) => {
@@ -189,7 +258,7 @@ impl SettingsLayout {
                             return Some(SettingsHit::ControlIncrement(item.index));
                         }
                         if point_in_rect(*value, x, y) {
-                            return Some(SettingsHit::Item(item.index));
+                            return Some(SettingsHit::ControlNumberValue(item.index));
                         }
                     }
                     ControlLayoutInfo::Dropdown {
@@ -216,9 +285,12 @@ impl SettingsLayout {
                         }
                     }
                     ControlLayoutInfo::TextList { rows } => {
-                        for (row_idx, row_area) in rows.iter().enumerate() {
-                            if point_in_rect(*row_area, x, y) {
-                                return Some(SettingsHit::ControlTextListRow(item.index, row_idx));
+                        for &(data_idx, row_area) in rows.iter() {
+                            if point_in_rect(row_area, x, y) {
+                                return Some(SettingsHit::ControlTextListRow(
+                                    item.index,
+                                    data_idx.unwrap_or(usize::MAX),
+                                ));
                             }
                         }
                     }
@@ -232,17 +304,42 @@ impl SettingsLayout {
                                 return Some(SettingsHit::ControlMapAddNew(item.index));
                             }
                         }
-                        for (row_idx, row_area) in entry_rows.iter().enumerate() {
-                            if point_in_rect(*row_area, x, y) {
-                                return Some(SettingsHit::ControlMapRow(item.index, row_idx));
+                        for &(data_idx, row_area) in entry_rows.iter() {
+                            if point_in_rect(row_area, x, y) {
+                                return Some(SettingsHit::ControlMapRow(item.index, data_idx));
                             }
                         }
                     }
                     ControlLayoutInfo::ObjectArray { entry_rows } => {
-                        for (row_idx, row_area) in entry_rows.iter().enumerate() {
-                            if point_in_rect(*row_area, x, y) {
-                                return Some(SettingsHit::ControlMapRow(item.index, row_idx));
+                        for &(data_idx, row_area) in entry_rows.iter() {
+                            if point_in_rect(row_area, x, y) {
+                                return Some(SettingsHit::ControlMapRow(item.index, data_idx));
                             }
+                        }
+                    }
+                    ControlLayoutInfo::DualList(dual_layout) => {
+                        use crate::view::controls::DualListHit;
+                        if let Some(hit) = dual_layout.hit_test(x, y) {
+                            return Some(match hit {
+                                DualListHit::AvailableRow(row) => {
+                                    SettingsHit::ControlDualListAvailable(item.index, row)
+                                }
+                                DualListHit::IncludedRow(row) => {
+                                    SettingsHit::ControlDualListIncluded(item.index, row)
+                                }
+                                DualListHit::AddButton => {
+                                    SettingsHit::ControlDualListAdd(item.index)
+                                }
+                                DualListHit::RemoveButton => {
+                                    SettingsHit::ControlDualListRemove(item.index)
+                                }
+                                DualListHit::MoveUpButton => {
+                                    SettingsHit::ControlDualListMoveUp(item.index)
+                                }
+                                DualListHit::MoveDownButton => {
+                                    SettingsHit::ControlDualListMoveDown(item.index)
+                                }
+                            });
                         }
                     }
                     ControlLayoutInfo::Json { edit_area } => {
@@ -284,6 +381,15 @@ pub enum SettingsHit {
     Background,
     /// Click on a category (index)
     Category(usize),
+    /// Click on the chevron of an expandable category — toggles expansion
+    /// without changing the body-panel selection.
+    CategoryDisclosure(usize),
+    /// Click on a section row inside an expanded category in the tree view.
+    CategorySection(usize, usize),
+    /// Click on the categories panel itself (for mouse-wheel scroll).
+    CategoriesPanel,
+    /// Click on the categories panel scrollbar (for drag).
+    CategoriesScrollbar,
     /// Click on a setting item (index)
     Item(usize),
     /// Click on a search result (index in search_results)
@@ -294,6 +400,9 @@ pub enum SettingsHit {
     ControlDecrement(usize),
     /// Click on number increment button
     ControlIncrement(usize),
+    /// Click on the value area between the brackets of a number control —
+    /// should focus the item and enter inline editing mode.
+    ControlNumberValue(usize),
     /// Click on dropdown button
     ControlDropdown(usize),
     /// Click on dropdown option (item_idx, option_idx)
@@ -306,6 +415,20 @@ pub enum SettingsHit {
     ControlMapRow(usize, usize),
     /// Click on map add-new row (item_idx)
     ControlMapAddNew(usize),
+    /// Click on inherit button (item_idx) - unset a nullable value
+    ControlInherit(usize),
+    /// Click on dual-list available row (item_idx, row_idx)
+    ControlDualListAvailable(usize, usize),
+    /// Click on dual-list included row (item_idx, row_idx)
+    ControlDualListIncluded(usize, usize),
+    /// Click on dual-list add button (item_idx)
+    ControlDualListAdd(usize),
+    /// Click on dual-list remove button (item_idx)
+    ControlDualListRemove(usize),
+    /// Click on dual-list move-up button (item_idx)
+    ControlDualListMoveUp(usize),
+    /// Click on dual-list move-down button (item_idx)
+    ControlDualListMoveDown(usize),
     /// Click on layer button
     LayerButton,
     /// Click on edit config file button
@@ -316,6 +439,8 @@ pub enum SettingsHit {
     CancelButton,
     /// Click on reset button
     ResetButton,
+    /// Click on clear category button (for nullable categories)
+    ClearCategoryButton,
     /// Click on settings panel scrollbar
     Scrollbar,
     /// Click on settings panel (scrollable area)
@@ -384,6 +509,7 @@ mod tests {
             "/test".to_string(),
             Rect::new(35, 10, 50, 2),
             ControlLayoutInfo::Toggle(Rect::new(37, 11, 15, 1)),
+            None,
         );
 
         // Click on toggle control
@@ -391,5 +517,45 @@ mod tests {
 
         // Click on item but not on toggle
         assert_eq!(layout.hit_test(35, 10), Some(SettingsHit::Item(0)));
+    }
+
+    /// Reproducer for issue #1825: clicking on the value area between the
+    /// brackets of a Number control used to return `Item`, which only
+    /// changes selection. It must now return a dedicated hit that the mouse
+    /// handler can route to "start editing".
+    #[test]
+    fn test_hit_test_number_value_area() {
+        let modal = Rect::new(10, 5, 80, 30);
+        let mut layout = SettingsLayout::new(modal);
+
+        let item_area = Rect::new(35, 10, 50, 1);
+        let decrement = Rect::new(50, 10, 3, 1);
+        let increment = Rect::new(54, 10, 3, 1);
+        let value = Rect::new(42, 10, 7, 1);
+
+        layout.add_item(
+            0,
+            "/tab_size".to_string(),
+            item_area,
+            ControlLayoutInfo::Number {
+                decrement,
+                increment,
+                value,
+            },
+            None,
+        );
+
+        assert_eq!(
+            layout.hit_test(45, 10),
+            Some(SettingsHit::ControlNumberValue(0))
+        );
+        assert_eq!(
+            layout.hit_test(51, 10),
+            Some(SettingsHit::ControlDecrement(0))
+        );
+        assert_eq!(
+            layout.hit_test(55, 10),
+            Some(SettingsHit::ControlIncrement(0))
+        );
     }
 }

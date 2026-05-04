@@ -21,6 +21,8 @@ pub mod types;
 #[cfg(feature = "runtime")]
 pub mod config_io;
 #[cfg(feature = "runtime")]
+pub mod init_script;
+#[cfg(feature = "runtime")]
 pub mod state;
 #[cfg(feature = "runtime")]
 pub mod workspace;
@@ -56,3 +58,10 @@ pub mod gui;
 // WASM-specific modules
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+// Test-only observation API. Compiled with the `runtime` feature so the
+// terminal binary's library form exposes it for integration tests, but
+// never reachable from production call sites — see test_api.rs and
+// docs/internal/e2e-test-migration-design.md.
+#[cfg(feature = "runtime")]
+pub mod test_api;

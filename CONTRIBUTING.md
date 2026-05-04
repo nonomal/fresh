@@ -20,15 +20,16 @@ When it is disabled (the default), no windowing or GPU crates are compiled.
 ## Commit Hygiene
 
 - Commit messages must describe the **motivation / goal** of each commit, not just what changed
-- Separate bug fixes from new functionality into distinct commits
-- Individual commits should pass `cargo check --all-targets` and `cargo fmt`
+- Prefer separate commits for unrelated bug fixes and new functionality when it's cheap to split; don't force a split when the fix is tightly coupled to the feature
 - If your change touches GUI code, also verify: `cargo check --all-targets --features gui`
+- Individual commits should pass `cargo check --all-targets`, `cargo fmt`, and `cargo clippy` (the crate denies several lints that `check` alone misses)
+- If ignoring a return value (let _ = ... pattern), be sure it's legit in that specific case, and that the return value indeed can be safely ignored.
 
 ## Testing
 
-1. **Reproduce Before Fixing**: When fixing bugs, add tests (e2e if it's a user-facing bug) — **first** reproduce the issue in a test that fails or times out, **then** add the fix that makes the test pass.
+1. **Reproduce Before Claiming**: Every behavioral claim in a commit (bug fix *or* new feature) must be backed by a test that fails (or times out) without the change. The same test should pass with the fix. The reproducer test can be in the same commit as the fix or in a separate commit, as long as the above is true (fails without fix, passes with fix).
 
-2. **E2E Tests for New Flows**: Any new user flow or feature must include an end-to-end (e2e) test. E2E tests send keyboard/mouse events and examine the final rendered output, do not examine internal state.
+2. **E2E Tests Observe, Not Inspect**: Any new user flow must include an end-to-end test that drives keyboard/mouse events and asserts only on rendered output. Do not call accessors that return model, view, or context state — if an invariant isn't visible on screen, cover it with a unit test on the component.
 
 3. **No timeouts or time-sensitive tests**: Use "semantic waiting" (waiting for specific state changes/events) instead of fixed timers to ensure test stability. Wait indefinitely, don't put timeouts inside tests (cargo nextest will timeout externally).
 
@@ -38,15 +39,25 @@ When it is disabled (the default), no windowing or GPU crates are compiled.
 
 ## Code Guidelines
 
-1. **Cross-Platform Consistency**: Avoid hard-coding newline or CRLF related logic, consider the buffer mode.
+1. **Cross-Platform Consistency**: Don't hard-code platform-variant primitives — newlines, path separators, line endings, case sensitivity. Consider and use the buffer mode (CRLF vs LF, language, etc), `std::path` APIs, and their relatives.
 
 2. **Avoid full-buffer scans**: The editor is designed to handle huge files via lazy, viewport-localized operations. Prefer algorithms that operate on visible/relevant ranges rather than scanning the entire buffer.
 
 3. **LSP**: Ensure LSP interactions follow the correct lifecycle (e.g., `didOpen` must always precede other requests to avoid server-side errors). Use the appropriate existing helpers for this pattern.
 
-4. **Regenerate plugin types and schemas**: After modifying the plugin API or config types:
+4. **Use the `FileSystem` trait for all filesystem access**: Never use `std::fs` directly in editor code. The `FileSystem` trait (`model/filesystem.rs`) abstracts over local and remote (SSH) filesystems. Use it for reading files, listing directories, checking metadata, etc. This ensures features work transparently on remote hosts.
+
+5. **Use `ProcessSpawner` for spawning external commands**: Never use `std::process::Command` directly. The `ProcessSpawner` trait (`services/remote/spawner.rs`) routes process execution through either `LocalProcessSpawner` or `RemoteProcessSpawner`, so plugins and core features (like `git ls-files` in the file finder) work on remote hosts.
+
+6. **Regenerate plugin types and schemas**: After modifying the plugin API or config types:
    - **TypeScript definitions** (`plugins/lib/fresh.d.ts`): Auto-generated from Rust types with `#[derive(TS)]`. Run: `cargo test -p fresh-plugin-runtime write_fresh_dts_file -- --ignored`
    - **JSON schemas** (`plugins/config-schema.json`, `plugins/schemas/theme.schema.json`): Auto-generated from Rust types with `#[derive(JsonSchema)]`. Run: `./scripts/gen_schema.sh`
-   - **Package schema** (`plugins/schemas/package.schema.json`): Manually maintained - edit directly when adding new language pack fields
+   - **Package schema** (`plugins/schemas/package.schema.json`): Auto-generated from Rust types with `#[derive(JsonSchema)]`. Run: `./scripts/gen_schema.sh`
 
-5. **Type check plugins**: Run `crates/fresh-editor/plugins/check-types.sh` (requires `tsc`)
+7. **Type check plugins**: Run `crates/fresh-editor/plugins/check-types.sh` (requires `tsc`)
+
+8. **Enumerate cross-cutting state**: Before shipping a mutation, list every other subsystem that holds a reference to what you changed (open buffers, LSP sessions, cursors, cached IDs, background watchers) and update or invalidate them. Stale references are the single most common source of follow-up PRs.
+
+9. **Narrow recovery paths**: When you add a fallback or retry, trigger it on the *specific* error it was designed for, not on `Err(_)` or catch-all branches. Broad recovery silently hides correctness bugs.
+
+10. **Locale keys go in every locale**: i18n `t!()` keys - update *all* files under `crates/fresh-editor/locales/` with real translations. Don't commit English placeholders.

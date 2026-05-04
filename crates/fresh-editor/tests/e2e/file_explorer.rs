@@ -1094,18 +1094,18 @@ fn test_scroll_allows_cursor_to_top() {
     // The test: when we press Up, the cursor should move WITHIN the viewport
     // for (viewport_height - 1) times before the view scrolls.
 
-    // Track which files are visible to detect scrolling
+    // Track which files are visible to detect scrolling. Only scan rows
+    // that start with the explorer's left border so the tab bar and
+    // status bar (which reflect the current preview buffer and would
+    // change with every cursor move) don't leak into the viewport check.
     let get_visible_files = |screen: &str| -> Vec<String> {
         screen
             .lines()
+            .filter(|line| line.starts_with('│'))
             .filter_map(|line| {
-                // Look for lines with file names (fileXX.txt pattern)
-                if line.contains("file") && line.contains(".txt") {
-                    // Extract the file number
-                    for word in line.split_whitespace() {
-                        if word.starts_with("file") && word.ends_with(".txt") {
-                            return Some(word.to_string());
-                        }
+                for word in line.split_whitespace() {
+                    if word.starts_with("file") && word.ends_with(".txt") {
+                        return Some(word.to_string());
                     }
                 }
                 None
@@ -2016,10 +2016,10 @@ fn test_file_explorer_new_file_opens_rename_prompt_and_buffer() {
     let screen_after = harness.screen_to_string();
     println!("Screen after new file:\n{}", screen_after);
 
-    // A rename prompt should be visible (asking for the new file name)
+    // A prompt should be visible asking for the new file name
     assert!(
-        screen_after.contains("Rename to:"),
-        "A rename prompt should appear after creating new file. Screen:\n{}",
+        screen_after.contains("New file name:"),
+        "A new file name prompt should appear after creating new file. Screen:\n{}",
         screen_after
     );
 
@@ -2029,14 +2029,14 @@ fn test_file_explorer_new_file_opens_rename_prompt_and_buffer() {
     // so user can type the desired name from scratch
     let prompt_line = screen_after
         .lines()
-        .find(|l| l.contains("Rename to:"))
+        .find(|l| l.contains("New file name:"))
         .unwrap_or("");
     println!("Prompt line: '{}'", prompt_line);
 
-    // Verify prompt is empty (just "Rename to:" without any filename after)
-    // The prompt line should end with "Rename to:" followed by only whitespace
+    // Verify prompt is empty (just "New file name:" without any filename after)
+    // The prompt line should end with "New file name:" followed by only whitespace
     assert!(
-        prompt_line.trim() == "Rename to:" || prompt_line.trim().ends_with("Rename to:"),
+        prompt_line.trim() == "New file name:" || prompt_line.trim().ends_with("New file name:"),
         "Prompt should start empty (no pre-filled filename). Got: '{}'",
         prompt_line
     );
@@ -2650,7 +2650,8 @@ fn test_file_explorer_escape_clears_search() {
         "Should still be in FileExplorer context after Escape"
     );
 
-    // Press Escape again - should still stay in file explorer (no focus change)
+    // Press Escape again - should now exit file explorer focus to the editor
+    // (Escape with no active search transfers focus)
     harness
         .send_key(KeyCode::Esc, KeyModifiers::empty())
         .unwrap();
@@ -2659,9 +2660,9 @@ fn test_file_explorer_escape_clears_search() {
     assert!(
         matches!(
             harness.editor().get_key_context(),
-            fresh::input::keybindings::KeyContext::FileExplorer
+            fresh::input::keybindings::KeyContext::Normal
         ),
-        "Should remain in FileExplorer context after second Escape"
+        "Should exit FileExplorer context on second Escape (no search to clear)"
     );
 }
 
@@ -2772,6 +2773,310 @@ fn test_dotfiles_hidden_by_default_and_toggle_controls_visibility() {
         !screen.contains("inner.txt"),
         "Children of hidden dirs should NOT be visible when 'Show hidden files' is off.\nScreen:\n{}",
         screen
+    );
+}
+
+/// Regression test for https://github.com/sinelaw/fresh/issues/1388:
+/// A file that is both a dotfile and matched by .gitignore should stay hidden
+/// while "Show Gitignored Files" is off, even if "Show Hidden Files" is on.
+/// Previously the explorer classified such files as Hidden first and only
+/// consulted the hidden-files toggle, letting gitignored dotfiles slip in.
+#[test]
+fn test_hidden_gitignored_file_respects_gitignore_toggle() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    fs::write(project_root.join(".gitignore"), ".DS_Store\n").unwrap();
+    fs::write(project_root.join(".DS_Store"), "macos junk").unwrap();
+    fs::write(project_root.join("visible_file.txt"), "visible").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .wait_for_file_explorer_item("visible_file.txt")
+        .unwrap();
+
+    // Turn on "Show hidden files". "Show gitignored files" stays off.
+    harness.editor_mut().file_explorer_toggle_hidden();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains(".gitignore"),
+        ".gitignore is hidden but not gitignored; should be visible with \
+         show_hidden=true.\nScreen:\n{}",
+        screen
+    );
+    assert!(
+        !screen.contains(".DS_Store"),
+        ".DS_Store is gitignored AND hidden; it should stay out of the \
+         explorer while 'Show Gitignored Files' is off, regardless of \
+         'Show Hidden Files'.\nScreen:\n{}",
+        screen
+    );
+
+    // Turning on "Show gitignored files" reveals the file.
+    harness.editor_mut().file_explorer_toggle_gitignored();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains(".DS_Store"),
+        ".DS_Store should be visible when both 'Show Hidden Files' and \
+         'Show Gitignored Files' are on.\nScreen:\n{}",
+        screen
+    );
+}
+
+/// Editing .gitignore in the editor and saving must reload the patterns
+/// so the file explorer picks up the new rules without a restart.
+#[test]
+fn test_saving_gitignore_reloads_ignore_patterns() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    // Canonicalize so path comparisons match the tree's internal form on
+    // macOS (tempdirs live under /var/folders → /private/var/folders).
+    let project_root = harness.project_dir().unwrap().canonicalize().unwrap();
+
+    // Start with a .gitignore that does NOT match .target_file.
+    let gitignore_path = project_root.join(".gitignore");
+    fs::write(&gitignore_path, "other_pattern\n").unwrap();
+    fs::write(project_root.join(".target_file"), "content").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+
+    // Show hidden so .target_file would be visible on the hidden-filter side.
+    harness.editor_mut().file_explorer_toggle_hidden();
+    harness.wait_for_file_explorer_item(".target_file").unwrap();
+    assert!(
+        !harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&project_root.join(".target_file"), false),
+        "pre-save: .target_file should be visible (not yet gitignored)"
+    );
+
+    // Open .gitignore, append `.target_file`, save.
+    harness.editor_mut().open_file(&gitignore_path).unwrap();
+    harness.editor_mut().focus_editor();
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text(".target_file\n").unwrap();
+    harness.editor_mut().save().unwrap();
+    harness.render().unwrap();
+
+    // Sanity: the on-disk file really has the new rule.
+    let disk = fs::read_to_string(&gitignore_path).unwrap();
+    assert!(
+        disk.contains(".target_file"),
+        "pre-check: .gitignore on disk must contain .target_file after save. Got:\n{}",
+        disk
+    );
+
+    // After save, the new rule should be live — no restart, no manual refresh.
+    assert!(
+        harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&project_root.join(".target_file"), false),
+        "post-save: .target_file should be filtered out by the reloaded .gitignore. \
+         On-disk .gitignore:\n{}",
+        disk
+    );
+}
+
+/// Nested .gitignore — editing a per-directory .gitignore must reload patterns
+/// for that specific directory (not just the root).
+#[test]
+fn test_saving_nested_gitignore_reloads_for_that_dir() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap().canonicalize().unwrap();
+    let subdir = project_root.join("subdir");
+    fs::create_dir(&subdir).unwrap();
+
+    let nested_gitignore = subdir.join(".gitignore");
+    fs::write(&nested_gitignore, "\n").unwrap();
+    fs::write(subdir.join(".target_file"), "content").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.editor_mut().file_explorer_toggle_hidden();
+    harness.render().unwrap();
+
+    // Before: subdir/.target_file is not matched by any loaded gitignore.
+    assert!(
+        !harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&subdir.join(".target_file"), false),
+        "pre-save: nested .target_file should not be filtered yet"
+    );
+
+    // Edit the nested .gitignore.
+    harness.editor_mut().open_file(&nested_gitignore).unwrap();
+    harness.editor_mut().focus_editor();
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text(".target_file\n").unwrap();
+    harness.editor_mut().save().unwrap();
+    harness.render().unwrap();
+
+    // Reloaded — the subdir-scoped rule is live.
+    assert!(
+        harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&subdir.join(".target_file"), false),
+        "post-save: nested .target_file should be filtered by the reloaded per-dir .gitignore"
+    );
+    // And it doesn't leak upward: a sibling file at the root is not affected.
+    fs::write(project_root.join(".target_file"), "content").unwrap();
+    assert!(
+        !harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&project_root.join(".target_file"), false),
+        "a nested .gitignore rule must not filter a same-named file at the project root"
+    );
+}
+
+/// External edits to a .gitignore must be picked up by the file-tree poll,
+/// and deleting a .gitignore must drop its rules.
+#[test]
+fn test_external_gitignore_edit_and_delete_reload_via_poll() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap().canonicalize().unwrap();
+
+    let gitignore_path = project_root.join(".gitignore");
+    fs::write(&gitignore_path, "foo.txt\n").unwrap();
+    fs::write(project_root.join("foo.txt"), "").unwrap();
+    fs::write(project_root.join("bar.txt"), "").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    let check = |h: &EditorTestHarness, name: &str| {
+        h.editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&project_root.join(name), false)
+    };
+    assert!(
+        check(&harness, "foo.txt"),
+        "initial: foo.txt should be gitignored"
+    );
+    assert!(
+        !check(&harness, "bar.txt"),
+        "initial: bar.txt should not be gitignored"
+    );
+
+    // Sleep past typical 1s mtime granularity so the edit produces a distinct
+    // mtime. External write + poll tick.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(&gitignore_path, "bar.txt\n").unwrap();
+    harness.advance_time(std::time::Duration::from_secs(5));
+    harness.editor_mut().poll_file_tree_changes();
+
+    assert!(
+        !check(&harness, "foo.txt"),
+        "after external edit: foo.txt should be visible"
+    );
+    assert!(
+        check(&harness, "bar.txt"),
+        "after external edit: bar.txt should be gitignored"
+    );
+
+    // Delete .gitignore — the dropped entry should no longer filter anything.
+    fs::remove_file(&gitignore_path).unwrap();
+    harness.advance_time(std::time::Duration::from_secs(5));
+    harness.editor_mut().poll_file_tree_changes();
+
+    assert!(
+        !check(&harness, "foo.txt"),
+        "after delete: foo.txt should be visible"
+    );
+    assert!(
+        !check(&harness, "bar.txt"),
+        "after delete: bar.txt should be visible"
+    );
+}
+
+/// Creating a .gitignore externally in an already-expanded directory must
+/// be picked up by the poll: the dir's mtime bumps, refresh_node re-lists,
+/// and the rules for that dir get loaded for the first time.
+#[test]
+fn test_externally_creating_gitignore_loads_rules_via_poll() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap().canonicalize().unwrap();
+
+    fs::write(project_root.join("foo.txt"), "").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    // Sanity: no gitignore loaded at start.
+    assert_eq!(
+        harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .loaded_gitignore_dirs()
+            .len(),
+        0
+    );
+
+    // Prime the dir-mtime store so the later change is detected as a
+    // difference, not as a first-sighting. Two ticks: spawn + receive.
+    harness.advance_time(std::time::Duration::from_secs(5));
+    harness.editor_mut().poll_file_tree_changes();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    harness.advance_time(std::time::Duration::from_secs(5));
+    harness.editor_mut().poll_file_tree_changes();
+
+    // Externally create a .gitignore that matches foo.txt. Sleep past 1s
+    // filesystem mtime granularity so the parent dir's mtime is distinguishable.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(project_root.join(".gitignore"), "foo.txt\n").unwrap();
+
+    // First tick spawns the bg dir-poll; subsequent ticks process its
+    // results (where refresh_node + reload-gitignore runs). Advance time
+    // past the poll interval on every iteration so the guard lets us in.
+    let foo = project_root.join("foo.txt");
+    let mut picked_up = false;
+    for _ in 0..50 {
+        harness.advance_time(std::time::Duration::from_secs(5));
+        harness.editor_mut().poll_file_tree_changes();
+        if harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .is_ignored(&foo, false)
+        {
+            picked_up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        picked_up,
+        "new .gitignore should be loaded via dir-mtime poll + refresh path"
     );
 }
 
@@ -2905,4 +3210,538 @@ fn test_file_explorer_border_drag_resizes() {
         drag_delta,
         actual_delta
     );
+}
+
+/// Test that clicking a markdown file in the file explorer keeps focus on the explorer,
+/// so pressing Enter does NOT modify the buffer.
+/// Reproduces bug: clicking a .md file in the explorer and pressing Enter leaks
+/// the keypress into the buffer (inserts a newline) even though the explorer should
+/// have focus. This appears to be related to the markdown source plugin.
+#[test]
+fn test_file_explorer_click_markdown_enter_does_not_modify_buffer() {
+    let mut harness = EditorTestHarness::with_temp_project(80, 24).unwrap();
+    let project_dir = harness.project_dir().unwrap();
+
+    let test_content = "hello";
+    fs::write(project_dir.join("readme.md"), test_content).unwrap();
+
+    // Open file explorer with Ctrl+E (focuses the explorer)
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    // Wait for the file to appear in the tree
+    harness.wait_for_file_explorer_item("readme.md").unwrap();
+
+    // Find the file's position on screen so we can click it
+    harness.render().unwrap();
+    let (click_col, click_row) = harness
+        .find_text_on_screen("readme.md")
+        .expect("readme.md should be visible in the file explorer");
+
+    // Click on the file in the explorer — this opens it but focus should stay on explorer
+    harness.mouse_click(click_col, click_row).unwrap();
+    harness.render().unwrap();
+
+    // Wait for the file to be opened in a buffer
+    harness
+        .wait_until(|h| h.screen_to_string().contains("hello"))
+        .unwrap();
+
+    // Focus is on the file explorer. Pressing Enter should NOT modify the buffer.
+    // Bug: for markdown files, Enter leaks through and inserts a newline.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    let content = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        content, "hello",
+        "After clicking a markdown file in the explorer, Enter should not modify the buffer \
+         (focus should be on the explorer). But buffer content changed to {:?} — \
+         the keypress leaked into the buffer.",
+        content
+    );
+}
+
+/// Test that git status markers clear after an external commit.
+/// The editor polls `.git/index` mtime and refreshes decorations automatically.
+/// Regression test for https://github.com/sinelaw/fresh/issues/1431
+#[test]
+#[cfg_attr(windows, ignore)]
+fn test_file_explorer_git_markers_clear_after_external_commit() {
+    use std::process::Command;
+
+    let repo = GitTestRepo::new();
+    repo.setup_git_explorer_plugin();
+    repo.create_file("file1.txt", "hello");
+    repo.create_file("file2.txt", "world");
+    repo.git_add_all();
+    repo.git_commit("Initial commit");
+
+    // Create working-copy modifications so "M" markers appear
+    fs::write(repo.path.join("file1.txt"), "modified").unwrap();
+    fs::write(repo.path.join("file2.txt"), "also modified").unwrap();
+
+    let mut harness = EditorTestHarness::with_working_dir(120, 40, repo.path.clone()).unwrap();
+
+    harness.editor_mut().toggle_file_explorer();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    // Wait for "M" markers to appear on modified files
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen
+                .lines()
+                .any(|line| line.contains("file1.txt") && line.contains("M"))
+        })
+        .unwrap();
+
+    // Ensure initial .git/index mtime is recorded by the file tree poller
+    harness.advance_time(std::time::Duration::from_secs(5));
+    harness.editor_mut().poll_file_tree_changes();
+
+    // Wait for filesystem mtime granularity (1 second) so the commit
+    // produces a different .git/index mtime than what was already recorded.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Commit all changes externally (simulating a user running git in another terminal)
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo.path)
+        .output()
+        .expect("git add failed");
+    Command::new("git")
+        .args(["commit", "-m", "commit changes"])
+        .current_dir(&repo.path)
+        .output()
+        .expect("git commit failed");
+
+    // Advance time past poll interval — poll_file_tree_changes now also
+    // checks .git/index mtime and fires the plugin hook on change.
+    harness.advance_time(std::time::Duration::from_secs(5));
+
+    // wait_until drives the editor tick loop; the integrated git index
+    // check inside poll_file_tree_changes detects the mtime change.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            !screen
+                .lines()
+                .any(|line| line.contains("file1.txt") && line.contains("M"))
+        })
+        .unwrap();
+
+    // Also verify file2 has no marker
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen
+            .lines()
+            .any(|line| line.contains("file2.txt") && line.contains("M")),
+        "file2.txt should not have an M marker after external commit"
+    );
+}
+
+/// The rendered file explorer panel has a hard minimum width of 5 columns,
+/// independent of whatever the config or the restored workspace tries to
+/// set it to. A 0/1/2-column explorer has no room for a readable tree and
+/// leaves the drag border stuck against the screen edge; clamping here
+/// keeps the UI recoverable even if a user hand-edits their config to a
+/// near-zero value.
+#[test]
+fn test_file_explorer_minimum_render_width_is_5_cols() {
+    use fresh::config::{Config, ExplorerWidth};
+    let mut config = Config::default();
+    config.file_explorer.width = ExplorerWidth::Columns(1);
+
+    let mut harness = EditorTestHarness::with_config(100, 40, config).unwrap();
+
+    harness
+        .send_key(KeyCode::Char('e'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+    assert!(harness.editor().file_explorer_visible());
+
+    let cols = find_explorer_border_col(&harness) + 1;
+    assert_eq!(
+        cols, 5,
+        "explorer must never render narrower than 5 cols regardless of config; got {}.\nScreen:\n{}",
+        cols,
+        harness.screen_to_string()
+    );
+}
+
+/// Test that FileExplorerSide::Left renders explorer on the left (default behavior)
+#[test]
+fn test_file_explorer_side_left() {
+    use fresh::config::{Config, ExplorerWidth, FileExplorerSide};
+
+    let mut config = Config::default();
+    config.file_explorer.side = FileExplorerSide::Left;
+    config.file_explorer.width = ExplorerWidth::Columns(30); // Fixed width for predictable test
+
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join("test.txt"), "test").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    let border_col = find_explorer_border_col(&harness);
+
+    // File explorer should be on the left side (~30% of 120 = ~36 cols is default width)
+    // Border should be around column 35-40 (well before the middle of screen at 60)
+    assert!(
+        border_col < 60,
+        "File explorer should be on the left side (border at col {}). Screen:\n{}",
+        border_col,
+        harness.screen_to_string()
+    );
+}
+
+/// Test that FileExplorerSide::Right renders explorer on the right side
+#[test]
+fn test_file_explorer_side_right() {
+    use fresh::config::{Config, ExplorerWidth, FileExplorerSide};
+
+    let mut config = Config::default();
+    config.file_explorer.side = FileExplorerSide::Right;
+    config.file_explorer.width = ExplorerWidth::Columns(30); // Fixed width for predictable test
+
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join("test.txt"), "test").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    let border_col = find_explorer_border_col(&harness);
+
+    // File explorer should be on the right side (terminal width 120, so right side starts around col 80)
+    assert!(
+        border_col > 60,
+        "File explorer should be on the right side (border at col {}). Screen:\n{}",
+        border_col,
+        harness.screen_to_string()
+    );
+}
+
+/// Test that workspace serialization correctly persists file explorer side
+#[test]
+fn test_file_explorer_side_workspace_serialization() {
+    use fresh::config::{Config, FileExplorerSide};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let project_dir = temp_dir.path().to_path_buf();
+    fs::write(project_dir.join("file.txt"), "content").unwrap();
+
+    // Create config with side set to Right
+    let mut config = Config::default();
+    config.file_explorer.side = FileExplorerSide::Right;
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 40, config, project_dir.clone())
+            .unwrap();
+
+    // Show file explorer
+    harness.editor_mut().toggle_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    // Verify it's on the right
+    let border_col = find_explorer_border_col(&harness);
+    assert!(
+        border_col > 60,
+        "File explorer should be on right side (border at col {}). Screen:\n{}",
+        border_col,
+        harness.screen_to_string()
+    );
+
+    // Save the workspace and reload
+    harness.editor_mut().save_workspace().unwrap();
+}
+
+// ----- Context menu: duplicate / copy path (issue #1576) -----
+
+/// Duplicate the selected file: a sibling named "<stem> copy.<ext>" must
+/// appear on disk after invoking the action.
+#[test]
+fn test_file_explorer_duplicate_file_creates_copy_sibling() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    fs::write(project_root.join("alpha.txt"), "hello").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.wait_for_file_explorer_item("alpha.txt").unwrap();
+
+    // Move selection from the (auto-expanded) root onto alpha.txt.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    harness.editor_mut().file_explorer_duplicate();
+    harness
+        .wait_until(|h| h.editor().working_dir().join("alpha copy.txt").exists())
+        .unwrap();
+
+    let original = project_root.join("alpha.txt");
+    let copy = project_root.join("alpha copy.txt");
+    assert!(original.exists(), "original alpha.txt must remain");
+    assert!(copy.exists(), "duplicate alpha copy.txt must exist");
+    assert_eq!(
+        fs::read_to_string(&copy).unwrap(),
+        fs::read_to_string(&original).unwrap(),
+        "duplicate's contents must match the source"
+    );
+}
+
+/// Duplicating when "<stem> copy.<ext>" already exists must pick the next
+/// numbered name ("<stem> copy 2.<ext>") rather than overwriting.
+#[test]
+fn test_file_explorer_duplicate_increments_when_copy_exists() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    fs::write(project_root.join("alpha.txt"), "hello").unwrap();
+    fs::write(project_root.join("alpha copy.txt"), "old copy").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.wait_for_file_explorer_item("alpha.txt").unwrap();
+
+    // Tree order is alphabetical, so two Downs land on "alpha.txt"
+    // ("alpha copy.txt" sorts first).
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    harness.editor_mut().file_explorer_duplicate();
+    harness
+        .wait_until(|h| h.editor().working_dir().join("alpha copy 2.txt").exists())
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(project_root.join("alpha copy.txt")).unwrap(),
+        "old copy",
+        "the pre-existing 'alpha copy.txt' must NOT be overwritten"
+    );
+    assert_eq!(
+        fs::read_to_string(project_root.join("alpha copy 2.txt")).unwrap(),
+        "hello",
+        "the new duplicate must contain alpha.txt's content"
+    );
+}
+
+/// Duplicating a directory must recursively copy its contents under a new
+/// "<name> copy" sibling.
+#[test]
+fn test_file_explorer_duplicate_directory_copies_recursively() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    fs::create_dir(project_root.join("src")).unwrap();
+    fs::write(project_root.join("src/main.rs"), "fn main() {}").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.wait_for_file_explorer_item("src").unwrap();
+
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    harness.editor_mut().file_explorer_duplicate();
+    harness
+        .wait_until(|h| {
+            h.editor()
+                .working_dir()
+                .join("src copy")
+                .join("main.rs")
+                .exists()
+        })
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(project_root.join("src copy/main.rs")).unwrap(),
+        "fn main() {}",
+        "duplicated directory must contain a copy of main.rs"
+    );
+}
+
+/// Copy Full Path puts the absolute path of the selected node on the
+/// internal clipboard.
+#[test]
+fn test_file_explorer_copy_full_path() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join("alpha.txt"), "hello").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.wait_for_file_explorer_item("alpha.txt").unwrap();
+
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Read the actual selected-node path from the explorer rather than
+    // reconstructing it from `project_dir()`. On macOS CI the working dir
+    // can be a symlinked tempdir (`/tmp` → `/private/tmp`, `/var/folders`
+    // → `/private/var/folders`), so reconstruction and the tree's own
+    // path representation can differ as strings even when they point to
+    // the same file.
+    let selected_path = harness
+        .editor()
+        .file_explorer()
+        .and_then(|fe| fe.get_selected_entry())
+        .map(|e| e.path.clone())
+        .expect("explorer must have a selected entry after Down");
+    assert_eq!(
+        selected_path.file_name().and_then(|n| n.to_str()),
+        Some("alpha.txt"),
+        "Down from the auto-expanded root should land on alpha.txt; got {:?}",
+        selected_path
+    );
+
+    // Force internal-only clipboard so the test doesn't read/write the
+    // host's real clipboard and stays parallel-safe in CI.
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    harness.editor_mut().file_explorer_copy_path(false);
+
+    let copied = harness.editor().clipboard_content_for_test();
+    assert_eq!(
+        copied,
+        selected_path.to_string_lossy(),
+        "Copy Full Path must put the selected node's absolute path on the clipboard"
+    );
+}
+
+/// Copy Relative Path strips the project root prefix.
+#[test]
+fn test_file_explorer_copy_relative_path() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::create_dir(project_root.join("src")).unwrap();
+    fs::write(project_root.join("src/main.rs"), "fn main() {}").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.wait_for_file_explorer_item("src").unwrap();
+
+    // Down once to select "src", expand, Down again to land on "main.rs".
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_file_explorer_item("main.rs").unwrap();
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Sanity-check selection so the test fails loudly if explorer ordering
+    // shifts under us, instead of silently asserting against the wrong path.
+    let selected_path = harness
+        .editor()
+        .file_explorer()
+        .and_then(|fe| fe.get_selected_entry())
+        .map(|e| e.path.clone())
+        .expect("explorer must have a selected entry");
+    assert_eq!(
+        selected_path.file_name().and_then(|n| n.to_str()),
+        Some("main.rs"),
+        "selection should be on main.rs after Down, Right, Down; got {:?}",
+        selected_path
+    );
+
+    harness.editor_mut().set_clipboard_for_test(String::new());
+    harness.editor_mut().file_explorer_copy_path(true);
+
+    let copied = harness.editor().clipboard_content_for_test();
+    // Compute the expected relative path the same way file_explorer_copy_path
+    // does — strip the working_dir prefix from the actual selected-node path.
+    // `working_dir` and `selected_path` come from the same source (the
+    // editor's own state), so the prefix-strip must succeed and the result
+    // is independent of any tempdir-symlink quirks.
+    let working_dir = harness.editor().working_dir().to_path_buf();
+    let expected = selected_path
+        .strip_prefix(&working_dir)
+        .expect("selected path must live under working_dir");
+    assert_eq!(
+        copied,
+        expected.to_string_lossy(),
+        "Copy Relative Path must produce the project-relative path"
+    );
+}
+
+/// Regression: duplicating a tracked file inside a git repo must fire the
+/// `after_file_explorer_change` plugin hook so git_explorer rescans and the
+/// new file picks up its `U` (untracked) badge — without the hook, the
+/// freshly-duplicated file rendered with no decoration until the user
+/// triggered some other event (focus change, save, …). See PR #1841.
+#[test]
+#[cfg_attr(windows, ignore)] // Git plugin tests are flaky on Windows CI
+fn test_file_explorer_duplicate_refreshes_git_decorations() {
+    let repo = GitTestRepo::new();
+    repo.setup_git_explorer_plugin();
+    repo.create_file("alpha.txt", "tracked content");
+    repo.git_add_all();
+    repo.git_commit("seed");
+
+    let mut harness = EditorTestHarness::with_working_dir(120, 40, repo.path.clone()).unwrap();
+
+    harness.editor_mut().toggle_file_explorer();
+    harness.wait_for_screen_contains("File Explorer").unwrap();
+    harness.wait_for_file_explorer_item("alpha.txt").unwrap();
+
+    // Walk Down past the auto-created plugins/ directory (setup_git_explorer_plugin
+    // installs the plugin under <repo>/plugins/, which sorts before files in the
+    // default Type sort) until alpha.txt is selected, then bail out.
+    let mut steps = 0;
+    loop {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        harness.render().unwrap();
+        let name = harness
+            .editor()
+            .file_explorer()
+            .and_then(|fe| fe.get_selected_entry())
+            .and_then(|e| {
+                e.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_owned)
+            });
+        if name.as_deref() == Some("alpha.txt") {
+            break;
+        }
+        steps += 1;
+        assert!(
+            steps < 10,
+            "could not reach alpha.txt by pressing Down (got {:?})",
+            name
+        );
+    }
+
+    harness.editor_mut().file_explorer_duplicate();
+
+    // The duplicate lands as `alpha copy.txt`. The git_explorer plugin
+    // refreshes asynchronously off `after_file_explorer_change`; wait for
+    // the screen to show the new file *and* its `U` badge on the same line.
+    // Looking only for the file (no badge) would race the plugin's rescan
+    // and pass even if the hook were silently dropped.
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .lines()
+                .any(|line| line.contains("alpha copy.txt") && line.contains('U'))
+        })
+        .unwrap();
 }

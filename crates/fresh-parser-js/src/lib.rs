@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Declaration, ExportDefaultDeclarationKind, Statement};
 use oxc_codegen::Codegen;
+use oxc_isolated_declarations::{IsolatedDeclarations, IsolatedDeclarationsOptions};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
@@ -59,6 +60,72 @@ pub fn transpile_typescript(source: &str, filename: &str) -> Result<String> {
     Ok(codegen_ret.code)
 }
 
+/// Emit a TypeScript declaration file (`.d.ts`) from TypeScript source.
+///
+/// Uses oxc's isolated-declarations transformer — no full type checker is
+/// required, but the source must follow TypeScript's
+/// [isolated declarations](https://www.typescriptlang.org/tsconfig#isolatedDeclarations)
+/// rules: every exported value needs an explicit type annotation.
+///
+/// Fresh runs this over every TypeScript plugin at load time so the
+/// plugin's public types (anything the file `export`s plus any
+/// `declare global` / module-augmentation blocks) are available to
+/// downstream plugins and to the user's `init.ts` without manual
+/// `.d.ts` maintenance.
+///
+/// The source is forced into **module** mode before the transform runs:
+/// isolated-declarations only hides non-exported symbols when the input
+/// AST has at least one `ImportDeclaration`/`ExportDeclaration`. For a
+/// plain-script input it instead emits a `declare` for every top-level
+/// declaration, leaking internal interfaces, constants, and function
+/// signatures into the aggregate `plugins.d.ts`. Many Fresh plugins
+/// have no `import`/`export` statement (they're top-level calls on the
+/// ambient `editor` global), so we append the canonical empty-export
+/// marker `export {};` when the source doesn't already have module
+/// syntax. `SourceType::with_module(true)` on the parser alone is not
+/// enough — the transform looks at the AST, not the parser flag.
+///
+/// Returns the generated `.d.ts` source as a string. Non-fatal
+/// diagnostics from the isolated-declarations pass are surfaced in
+/// the error path when they render an empty emit unusable; benign
+/// diagnostics (e.g. "defaults exported without explicit types")
+/// are tolerated and the caller simply gets a partial emit.
+pub fn emit_isolated_declarations(source: &str, filename: &str) -> Result<String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(filename)
+        .unwrap_or_default()
+        .with_module(true);
+
+    let module_marked;
+    let effective_source: &str = if has_es_module_syntax(source) {
+        source
+    } else {
+        module_marked = format!("{source}\nexport {{}};\n");
+        &module_marked
+    };
+
+    let parser_ret = Parser::new(&allocator, effective_source, source_type).parse();
+    if !parser_ret.errors.is_empty() {
+        let errors: Vec<String> = parser_ret.errors.iter().map(|e| e.to_string()).collect();
+        return Err(anyhow!(
+            "isolated-declarations parse errors in {}: {}",
+            filename,
+            errors.join("; ")
+        ));
+    }
+
+    let emit = IsolatedDeclarations::new(&allocator, IsolatedDeclarationsOptions::default())
+        .build(&parser_ret.program);
+
+    // Codegen the declaration AST back to source. We deliberately do
+    // NOT fail on `emit.errors` — isolated-declarations emits one per
+    // exported value that lacks an explicit type, and we want the
+    // partial emit anyway (the consumer can still use the surfaces
+    // the plugin annotated correctly).
+    let codegen_ret = Codegen::new().build(&emit.program);
+    Ok(codegen_ret.code)
+}
+
 /// Check if source contains ES module syntax (imports or exports)
 /// This determines if the code needs bundling to work with QuickJS eval
 pub fn has_es_module_syntax(source: &str) -> bool {
@@ -76,6 +143,140 @@ pub fn has_es_module_syntax(source: &str) -> bool {
 /// Kept for backwards compatibility
 pub fn has_es_imports(source: &str) -> bool {
     source.contains("import ") && source.contains(" from ")
+}
+
+/// Extract plugin dependency names from `import ... from "fresh:plugin/NAME"` statements.
+///
+/// Recognizes all import forms:
+/// - `import type { Foo } from "fresh:plugin/bar"`
+/// - `import { Foo } from "fresh:plugin/bar"`
+/// - `import * as Bar from "fresh:plugin/bar"`
+/// - `import Bar from "fresh:plugin/bar"`
+///
+/// Returns a deduplicated list of plugin names (the part after `fresh:plugin/`).
+pub fn extract_plugin_dependencies(source: &str) -> Vec<String> {
+    let prefix = "fresh:plugin/";
+    let mut deps = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        // Must be an import line with our scheme
+        if !trimmed.starts_with("import ") || !trimmed.contains(prefix) {
+            continue;
+        }
+        // Extract the string between quotes after "from"
+        if let Some(from_idx) = trimmed.find(" from ") {
+            let after_from = &trimmed[from_idx + 6..]; // skip " from "
+            let after_from = after_from.trim();
+            // Extract quoted string (single or double quotes)
+            let quote_char = after_from.chars().next();
+            if let Some(q) = quote_char {
+                if q == '"' || q == '\'' {
+                    if let Some(end) = after_from[1..].find(q) {
+                        let module_path = &after_from[1..1 + end];
+                        if let Some(plugin_name) = module_path.strip_prefix(prefix) {
+                            if !plugin_name.is_empty() && seen.insert(plugin_name.to_string()) {
+                                deps.push(plugin_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    deps
+}
+
+/// Topological sort of plugins by dependency order (dependencies first).
+///
+/// Returns `Ok(sorted_names)` with plugins in load order, or `Err(cycle)` with
+/// the names of plugins involved in a dependency cycle.
+///
+/// Plugins with no dependencies are sorted alphabetically for determinism.
+pub fn topological_sort_plugins(
+    plugin_names: &[String],
+    dependencies: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<Vec<String>> {
+    use std::collections::HashMap;
+
+    // Build adjacency and in-degree maps
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for name in plugin_names {
+        in_degree.entry(name.as_str()).or_insert(0);
+    }
+
+    for name in plugin_names {
+        if let Some(deps) = dependencies.get(name) {
+            for dep in deps {
+                // Only count dependencies on plugins that exist in our set
+                if in_degree.contains_key(dep.as_str()) {
+                    *in_degree.entry(name.as_str()).or_insert(0) += 1;
+                    dependents
+                        .entry(dep.as_str())
+                        .or_default()
+                        .push(name.as_str());
+                } else {
+                    return Err(anyhow!(
+                        "Plugin '{}' depends on '{}', which is not installed or not enabled",
+                        name,
+                        dep
+                    ));
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm
+    let mut queue: Vec<&str> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&name, _)| name)
+        .collect();
+    // Sort the initial queue alphabetically for determinism
+    queue.sort();
+
+    let mut result: Vec<String> = Vec::with_capacity(plugin_names.len());
+
+    while let Some(current) = queue.first().copied() {
+        queue.remove(0);
+        result.push(current.to_string());
+
+        if let Some(deps) = dependents.get(current) {
+            let mut newly_ready = Vec::new();
+            for &dependent in deps {
+                if let Some(deg) = in_degree.get_mut(dependent) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        newly_ready.push(dependent);
+                    }
+                }
+            }
+            // Sort newly ready plugins alphabetically for determinism
+            newly_ready.sort();
+            queue.extend(newly_ready);
+            queue.sort(); // maintain overall alphabetical order among ready nodes
+        }
+    }
+
+    if result.len() != plugin_names.len() {
+        // Some plugins are in a cycle — find them
+        let in_result: HashSet<&str> = result.iter().map(|s| s.as_str()).collect();
+        let cycle_plugins: Vec<String> = plugin_names
+            .iter()
+            .filter(|n| !in_result.contains(n.as_str()))
+            .cloned()
+            .collect();
+        return Err(anyhow!(
+            "Plugin dependency cycle detected among: {}. These plugins will not be loaded.",
+            cycle_plugins.join(", ")
+        ));
+    }
+
+    Ok(result)
 }
 
 /// Module metadata for scoped bundling
@@ -650,6 +851,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn emit_isolated_declarations_script_hides_internals() {
+        // Script-style plugin: no `import`, no `export`. Before we forced
+        // module mode, isolated-declarations treated every top-level
+        // declaration as publicly visible and leaked `interface Internal`,
+        // `declare const internal`, `declare function internal()` into
+        // the emit. Module mode keeps the output empty for a file with
+        // no exports.
+        let source = r#"
+            interface Internal { x: number; }
+            const internalConst: Internal = { x: 1 };
+            function internalFn(): void {}
+        "#;
+        let dts = emit_isolated_declarations(source, "script_plugin.ts").unwrap();
+        assert!(
+            !dts.contains("Internal"),
+            "non-exported interface leaked into .d.ts: {dts}"
+        );
+        assert!(
+            !dts.contains("internalConst"),
+            "non-exported const leaked into .d.ts: {dts}"
+        );
+        assert!(
+            !dts.contains("internalFn"),
+            "non-exported function leaked into .d.ts: {dts}"
+        );
+    }
+
+    #[test]
+    fn emit_isolated_declarations_keeps_exports_and_registry_augmentation() {
+        // A plugin that has no `import`/`export` statements in the
+        // value plane but does augment `FreshPluginRegistry` still has
+        // to land its `declare global` block in the emit — that's what
+        // makes `editor.getPluginApi("foo")` typed in init.ts.
+        let source = r#"
+            export type FooApi = { doThing(): void };
+            declare global {
+                interface FreshPluginRegistry {
+                    foo: FooApi;
+                }
+            }
+            const internal = 42;
+        "#;
+        let dts = emit_isolated_declarations(source, "foo.ts").unwrap();
+        assert!(dts.contains("FooApi"), "exported type missing: {dts}");
+        assert!(
+            dts.contains("FreshPluginRegistry"),
+            "registry augmentation missing: {dts}"
+        );
+        assert!(!dts.contains("internal"), "internal const leaked: {dts}");
+    }
+
+    #[test]
     fn test_transpile_basic_typescript() {
         let source = r#"
             const x: number = 42;
@@ -797,5 +1050,142 @@ const x = foo() + bar();"#;
         assert!(stripped.contains("function greet()"));
         assert!(stripped.contains("interface User"));
         assert!(stripped.contains("const x = foo() + bar();"));
+    }
+
+    #[test]
+    fn test_extract_plugin_dependencies_basic() {
+        let source = r#"
+import type { SomeType } from "fresh:plugin/utility-plugin";
+import { helper } from "fresh:plugin/core-lib";
+const editor = getEditor();
+"#;
+        let deps = extract_plugin_dependencies(source);
+        assert_eq!(deps, vec!["utility-plugin", "core-lib"]);
+    }
+
+    #[test]
+    fn test_extract_plugin_dependencies_various_import_forms() {
+        let source = r#"
+import type { A } from "fresh:plugin/plugin-a";
+import { B } from "fresh:plugin/plugin-b";
+import * as C from "fresh:plugin/plugin-c";
+import D from "fresh:plugin/plugin-d";
+import { E } from './local-file';
+import { F } from "../other-file";
+"#;
+        let deps = extract_plugin_dependencies(source);
+        assert_eq!(deps, vec!["plugin-a", "plugin-b", "plugin-c", "plugin-d"]);
+    }
+
+    #[test]
+    fn test_extract_plugin_dependencies_deduplicates() {
+        let source = r#"
+import type { A } from "fresh:plugin/shared";
+import { B } from "fresh:plugin/shared";
+"#;
+        let deps = extract_plugin_dependencies(source);
+        assert_eq!(deps, vec!["shared"]);
+    }
+
+    #[test]
+    fn test_extract_plugin_dependencies_single_quotes() {
+        let source = r#"
+import type { A } from 'fresh:plugin/single-quoted';
+"#;
+        let deps = extract_plugin_dependencies(source);
+        assert_eq!(deps, vec!["single-quoted"]);
+    }
+
+    #[test]
+    fn test_extract_plugin_dependencies_no_deps() {
+        let source = r#"
+const editor = getEditor();
+import { helper } from "./lib/utils";
+"#;
+        let deps = extract_plugin_dependencies(source);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_topological_sort_no_deps() {
+        let names = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let deps = std::collections::HashMap::new();
+        let result = topological_sort_plugins(&names, &deps).unwrap();
+        // Should be alphabetical when no dependencies
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_topological_sort_linear_chain() {
+        let names = vec!["c".to_string(), "b".to_string(), "a".to_string()];
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["b".to_string()]);
+        let result = topological_sort_plugins(&names, &deps).unwrap();
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_topological_sort_diamond() {
+        // D depends on B and C; B and C depend on A
+        let names = vec![
+            "d".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+        ];
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["a".to_string()]);
+        deps.insert("d".to_string(), vec!["b".to_string(), "c".to_string()]);
+        let result = topological_sort_plugins(&names, &deps).unwrap();
+        // A must come first, then B and C (alphabetical), then D
+        assert_eq!(result, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_topological_sort_cycle_detection() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string()]);
+        deps.insert("b".to_string(), vec!["c".to_string()]);
+        deps.insert("c".to_string(), vec!["a".to_string()]);
+        let result = topological_sort_plugins(&names, &deps);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cycle"), "Error should mention cycle: {}", err);
+    }
+
+    #[test]
+    fn test_topological_sort_missing_dependency() {
+        let names = vec!["a".to_string()];
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("a".to_string(), vec!["nonexistent".to_string()]);
+        let result = topological_sort_plugins(&names, &deps);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not installed"),
+            "Error should mention missing dep: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_topological_sort_independent_plugins_alphabetical() {
+        // Mix of dependent and independent plugins
+        let names = vec![
+            "zebra".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ];
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("gamma".to_string(), vec!["alpha".to_string()]);
+        let result = topological_sort_plugins(&names, &deps).unwrap();
+        // alpha must come before gamma; beta and zebra are independent
+        let alpha_pos = result.iter().position(|s| s == "alpha").unwrap();
+        let gamma_pos = result.iter().position(|s| s == "gamma").unwrap();
+        assert!(alpha_pos < gamma_pos);
     }
 }

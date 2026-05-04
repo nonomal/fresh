@@ -3,12 +3,14 @@
 use crate::input::keybindings::Action;
 use crate::input::line_move::{move_lines, LineMoveDirection};
 use crate::model::buffer::{Buffer, LineEnding};
-use crate::model::cursor::{Cursors, Position2D, SelectionMode};
+use crate::model::buffer_position::{byte_to_2d, pos_2d_to_byte};
+use crate::model::cursor::{Cursor, Cursors, Position2D, SelectionMode};
 use crate::model::event::{CursorId, Event};
 use crate::primitives::display_width::{byte_offset_at_visual_column, str_width};
 use crate::primitives::highlighter::HighlightCategory;
+use crate::primitives::indent_pattern::PatternIndentCalculator;
 use crate::primitives::word_navigation::{
-    find_word_end, find_word_end_right, find_word_start, find_word_start_left,
+    find_vi_word_end, find_word_end, find_word_end_right, find_word_start, find_word_start_left,
     find_word_start_right,
 };
 use crate::state::EditorState;
@@ -21,29 +23,6 @@ enum BlockDirection {
     Right,
     Up,
     Down,
-}
-
-/// Convert byte offset to 2D position (line, column)
-fn byte_to_2d(buffer: &Buffer, byte_pos: usize) -> Position2D {
-    let line = buffer.get_line_number(byte_pos);
-    let line_start = buffer.line_start_offset(line).unwrap_or(0);
-    let column = byte_pos.saturating_sub(line_start);
-    Position2D { line, column }
-}
-
-/// Convert 2D position to byte offset
-fn pos_2d_to_byte(buffer: &Buffer, pos: Position2D) -> usize {
-    let line_start = buffer.line_start_offset(pos.line).unwrap_or(0);
-    // Get line content to check bounds
-    let line_content = buffer.get_line(pos.line).unwrap_or_default();
-    // Clamp column to line length (excluding newline)
-    let line_len = if line_content.last() == Some(&b'\n') {
-        line_content.len().saturating_sub(1)
-    } else {
-        line_content.len()
-    };
-    let clamped_col = pos.column.min(line_len);
-    line_start + clamped_col
 }
 
 /// Calculate the visual column (display width) at the cursor position.
@@ -145,7 +124,14 @@ fn collect_line_starts(
     // Collect all line starts by iterating through lines using a single iterator
     // The iterator naturally handles the trailing empty line case without infinite loops
     while let Some((line_start, _)) = iter.next_line() {
+        // If the selection ends exactly at a line's start (and spans at least one line),
+        // that line has no selected content and should not be included (fixes #1304).
+        // When start_pos == end_pos (no selection / single point), we still include the
+        // line the cursor is on.
         if line_start > end_pos || line_start > buffer_len {
+            break;
+        }
+        if line_start == end_pos && line_start > start_pos {
             break;
         }
         line_starts.push(line_start);
@@ -197,6 +183,54 @@ fn add_move_cursor_event(
         old_sticky_column,
         new_sticky_column: 0,
     });
+}
+
+/// Move each cursor to the position returned by `new_pos_fn`, respecting
+/// `deselect_on_move`: collapses any selection or preserves the anchor.
+fn move_each_cursor(
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    mut new_pos_fn: impl FnMut(&Cursor) -> usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        let new_pos = new_pos_fn(cursor);
+        let new_anchor = if cursor.deselect_on_move {
+            None
+        } else {
+            cursor.anchor
+        };
+        add_move_cursor_event(
+            events,
+            cursor_id,
+            cursor.position,
+            new_pos,
+            cursor.anchor,
+            new_anchor,
+            cursor.sticky_column,
+        );
+    }
+}
+
+/// Move each cursor to the position returned by `new_pos_fn` while extending
+/// the selection (anchor stays fixed at its current location).
+fn select_each_cursor(
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    mut new_pos_fn: impl FnMut(&Cursor) -> usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        let new_pos = new_pos_fn(cursor);
+        let anchor = cursor.anchor.unwrap_or(cursor.position);
+        add_move_cursor_event(
+            events,
+            cursor_id,
+            cursor.position,
+            new_pos,
+            cursor.anchor,
+            Some(anchor),
+            cursor.sticky_column,
+        );
+    }
 }
 
 /// Handle block selection movement
@@ -424,7 +458,15 @@ pub fn get_auto_close_char(ch: char, auto_close: bool, language: &str) -> Option
     }
 }
 
-/// Calculate the correct indent for a closing delimiter using tree-sitter.
+/// Calculate the correct indent for a closing delimiter.
+///
+/// Uses tree-sitter when available, otherwise falls back to pattern-based
+/// delimiter matching which works for any C-style language (braces, brackets, parens).
+///
+/// TODO: Consider adding Sublime Text-style regex indent rules (`increaseIndentPattern`/
+/// `decreaseIndentPattern` per language) as a middle tier between tree-sitter and pattern
+/// matching. This would handle language-specific constructs (e.g., Python's `:`, Ruby's
+/// `end`) without requiring a full tree-sitter grammar for each language.
 fn calculate_closing_delimiter_indent(
     state: &mut EditorState,
     insert_position: usize,
@@ -438,7 +480,16 @@ fn calculate_closing_delimiter_indent(
             .calculate_dedent_for_delimiter(&state.buffer, insert_position, ch, language, tab_size)
             .unwrap_or(0)
     } else {
-        0
+        // No tree-sitter language available — use pattern-based fallback.
+        // This handles all C-style languages (Dart, Kotlin, Swift, etc.) by
+        // scanning backwards for the matching unmatched opening delimiter.
+        PatternIndentCalculator::calculate_dedent_for_delimiter(
+            &state.buffer,
+            insert_position,
+            ch,
+            tab_size,
+        )
+        .unwrap_or(0)
     }
 }
 
@@ -687,6 +738,7 @@ fn collect_insert_cursor_data(state: &mut EditorState, cursors: &Cursors) -> Vec
 }
 
 /// Handle InsertChar action - insert character at each cursor position.
+#[allow(clippy::too_many_arguments)]
 fn insert_char_events(
     state: &mut EditorState,
     cursors: &Cursors,
@@ -866,6 +918,993 @@ fn transform_case<F>(
     }
 }
 
+fn handle_insert_newline(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    tab_size: usize,
+    auto_indent: bool,
+    auto_close: bool,
+    _estimated_line_length: usize,
+) {
+    // Sort cursors by position (reverse order) to avoid position shifts
+    let mut cursor_vec: Vec<_> = cursors.iter().collect();
+    cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
+
+    // Collect deletions and positions for indentation
+    let deletions: Vec<_> = cursor_vec
+        .iter()
+        .filter_map(|(cursor_id, cursor)| {
+            cursor
+                .selection_range()
+                .map(|range| (*cursor_id, range.clone(), range.start))
+        })
+        .collect();
+
+    let indent_positions: Vec<_> = cursor_vec
+        .iter()
+        .map(|(cursor_id, cursor)| {
+            let indent_position = cursor
+                .selection_range()
+                .map(|r| r.start)
+                .unwrap_or(cursor.position);
+            (*cursor_id, indent_position)
+        })
+        .collect();
+
+    // Get text for deletions and build delete events
+    for (cursor_id, range, _start) in deletions {
+        let deleted_text = state.get_text_range(range.start, range.end);
+        events.push(Event::Delete {
+            range,
+            deleted_text,
+            cursor_id,
+        });
+    }
+
+    // Now process insertions
+    let line_ending = state.buffer.line_ending().as_str();
+    for (cursor_id, indent_position) in indent_positions {
+        // Calculate indent for new line
+        let mut text = line_ending.to_string();
+
+        // Check for bracket expansion: cursor between matching brackets like {|}
+        // Only applies to braces, brackets, and parentheses (not quotes)
+        let bracket_expansion = if auto_close && indent_position > 0 {
+            let char_before = state
+                .buffer
+                .slice_bytes(indent_position.saturating_sub(1)..indent_position)
+                .first()
+                .copied();
+            let char_after = if indent_position < state.buffer.len() {
+                state
+                    .buffer
+                    .slice_bytes(indent_position..indent_position + 1)
+                    .first()
+                    .copied()
+            } else {
+                None
+            };
+
+            // Check if we're between matching brackets (not quotes)
+            matches!(
+                (char_before, char_after),
+                (Some(b'('), Some(b')')) | (Some(b'['), Some(b']')) | (Some(b'{'), Some(b'}'))
+            )
+        } else {
+            false
+        };
+
+        // Track cursor line position for bracket expansion
+        // After bracket expansion, cursor should be at end of cursor line, not at end of closing bracket line
+        let mut cursor_line_end_position: Option<usize> = None;
+
+        if auto_indent {
+            let use_tabs = state.buffer_settings.use_tabs;
+            let indent_width_opt = match state.highlighter.language() {
+                Some(language) => state.indent_calculator.borrow_mut().calculate_indent(
+                    &state.buffer,
+                    indent_position,
+                    language,
+                    tab_size,
+                ),
+                // Fallback for files without syntax highlighting (e.g., .txt)
+                None => Some(
+                    crate::primitives::indent::IndentCalculator::calculate_indent_no_language(
+                        &state.buffer,
+                        indent_position,
+                        tab_size,
+                    ),
+                ),
+            };
+            if let Some(indent_width) = indent_width_opt {
+                let indent_str = indent_to_string(indent_width, use_tabs, tab_size);
+                text.push_str(&indent_str);
+
+                if bracket_expansion {
+                    cursor_line_end_position =
+                        Some(indent_position + line_ending.len() + indent_str.len());
+                    let opening_bracket_indent =
+                        crate::primitives::indent::IndentCalculator::get_line_indent_at_position(
+                            &state.buffer,
+                            indent_position.saturating_sub(1),
+                            tab_size,
+                        );
+                    text.push_str(line_ending);
+                    text.push_str(&indent_to_string(
+                        opening_bracket_indent,
+                        use_tabs,
+                        tab_size,
+                    ));
+                }
+            }
+        }
+
+        // Calculate where cursor will end up after insert
+        let cursor_after_insert = indent_position + text.len();
+
+        events.push(Event::Insert {
+            position: indent_position,
+            text,
+            cursor_id,
+        });
+
+        // For bracket expansion, move cursor back to the cursor line
+        // (not the closing bracket line where it ends up after insert)
+        if let Some(cursor_line_end) = cursor_line_end_position {
+            // Get current cursor state to build the MoveCursor event
+            if let Some(cursor) = cursors.get(cursor_id) {
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: cursor_after_insert,
+                    new_position: cursor_line_end,
+                    old_anchor: None, // No selection after bracket expansion
+                    new_anchor: None,
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: cursor_line_end, // Reset sticky column
+                });
+            }
+        }
+    }
+}
+
+fn handle_dedent_selection(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    tab_size: usize,
+    estimated_line_length: usize,
+) {
+    // Dedent selected lines and preserve selections
+    // Collect all line starts from all cursors first to avoid position shifts
+    use std::collections::BTreeMap;
+    let mut all_line_deletions: BTreeMap<usize, (usize, String)> = BTreeMap::new();
+    let mut cursor_info = Vec::new();
+
+    for (cursor_id, cursor) in cursors.iter() {
+        let has_selection = cursor.selection_range().is_some();
+
+        let (start_pos, end_pos) = if let Some(range) = cursor.selection_range() {
+            (range.start, range.end)
+        } else {
+            // No selection - dedent current line
+            let iter = state
+                .buffer
+                .line_iterator(cursor.position, estimated_line_length);
+            let line_start = iter.current_position();
+            (line_start, cursor.position)
+        };
+
+        // Find all line starts in the range using helper function
+        let line_starts =
+            collect_line_starts(&mut state.buffer, start_pos, end_pos, estimated_line_length);
+
+        // For each line start, calculate what to delete
+        for &line_start in &line_starts {
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                all_line_deletions.entry(line_start)
+            {
+                let (chars_to_remove, deleted_text) =
+                    calculate_leading_whitespace_removal(&state.buffer, line_start, tab_size);
+
+                if chars_to_remove > 0 {
+                    e.insert((chars_to_remove, deleted_text));
+                }
+            }
+        }
+
+        // Store cursor info for later restoration
+        cursor_info.push((
+            cursor_id,
+            cursor.position,
+            cursor.anchor,
+            cursor.sticky_column,
+            has_selection,
+            start_pos,
+            end_pos,
+        ));
+    }
+
+    // Create delete events in reverse order to avoid position shifts
+    let first_cursor_id = cursors.iter().next().unwrap().0;
+    for (&line_start, (chars_to_remove, deleted_text)) in all_line_deletions.iter().rev() {
+        events.push(Event::Delete {
+            range: line_start..line_start + chars_to_remove,
+            deleted_text: deleted_text.clone(),
+            cursor_id: first_cursor_id,
+        });
+    }
+
+    // Calculate new cursor/selection positions and add MoveCursor events
+    for (
+        cursor_id,
+        old_position,
+        old_anchor,
+        old_sticky_column,
+        has_selection,
+        start_pos,
+        end_pos,
+    ) in cursor_info
+    {
+        // Calculate how many chars were removed before start_pos and end_pos
+        let mut removed_before_start = 0;
+        let mut removed_before_end = 0;
+        let mut removed_before_position = 0;
+
+        for (&line_start, &(chars_to_remove, _)) in &all_line_deletions {
+            if line_start < start_pos {
+                removed_before_start += chars_to_remove;
+            }
+            if line_start <= end_pos {
+                removed_before_end += chars_to_remove;
+            }
+            if line_start < old_position {
+                removed_before_position += chars_to_remove;
+            }
+        }
+
+        if has_selection {
+            // Had selection - restore it with adjusted positions
+            let new_anchor = start_pos.saturating_sub(removed_before_start);
+            let new_position = end_pos.saturating_sub(removed_before_end);
+            add_move_cursor_event(
+                events,
+                cursor_id,
+                old_position,
+                new_position,
+                old_anchor,
+                Some(new_anchor),
+                old_sticky_column,
+            );
+        } else {
+            // No selection - just move cursor back by amount removed before it
+            let new_position = old_position.saturating_sub(removed_before_position);
+            add_move_cursor_event(
+                events,
+                cursor_id,
+                old_position,
+                new_position,
+                old_anchor,
+                None,
+                old_sticky_column,
+            );
+        }
+    }
+}
+
+fn handle_insert_tab(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    tab_size: usize,
+    estimated_line_length: usize,
+) {
+    // Insert a tab character or spaces based on language config
+    let tab_str = if state.buffer_settings.use_tabs {
+        "\t".to_string()
+    } else {
+        " ".repeat(tab_size)
+    };
+
+    // Check if any cursor has a selection
+    let has_selection = cursors
+        .iter()
+        .any(|(_, cursor)| cursor.selection_range().is_some());
+
+    if has_selection {
+        // Indent selected lines and preserve selections
+        // Collect all line starts from all cursors first to avoid position shifts
+        use std::collections::BTreeSet;
+        let mut all_line_starts = BTreeSet::new();
+        let mut cursor_info = Vec::new();
+
+        for (cursor_id, cursor) in cursors.iter() {
+            if let Some(range) = cursor.selection_range() {
+                let (start_pos, end_pos) = (range.start, range.end);
+
+                // Find all line starts in the range using helper function
+                let line_starts = collect_line_starts(
+                    &mut state.buffer,
+                    start_pos,
+                    end_pos,
+                    estimated_line_length,
+                );
+
+                // Add to global set (automatically deduplicates and sorts)
+                all_line_starts.extend(line_starts.iter());
+
+                // Store cursor info for later restoration
+                cursor_info.push((
+                    cursor_id,
+                    cursor.position,
+                    cursor.anchor,
+                    cursor.sticky_column,
+                    start_pos,
+                    end_pos,
+                ));
+            }
+        }
+
+        // Create insert events for all line starts in reverse order
+        // This ensures later positions aren't shifted by earlier insertions
+        let first_cursor_id = cursors.iter().next().unwrap().0;
+        for &line_start in all_line_starts.iter().rev() {
+            events.push(Event::Insert {
+                position: line_start,
+                text: tab_str.clone(),
+                cursor_id: first_cursor_id,
+            });
+        }
+
+        // Calculate new selection positions and add MoveCursor events
+        let indent_len = tab_str.len();
+        for (cursor_id, old_position, old_anchor, old_sticky_column, start_pos, end_pos) in
+            cursor_info
+        {
+            // Count how many indents were inserted at or before each position
+            // Use <= for anchor because we insert at line starts, and positions >= line_start shift
+            // Use < for position to avoid double-counting the indent at position itself
+            let indents_at_or_before_anchor = all_line_starts
+                .iter()
+                .filter(|&&pos| pos <= start_pos)
+                .count();
+            let indents_before_position =
+                all_line_starts.iter().filter(|&&pos| pos < end_pos).count();
+
+            let new_anchor = start_pos + (indents_at_or_before_anchor * indent_len);
+            let new_position = end_pos + (indents_before_position * indent_len);
+
+            add_move_cursor_event(
+                events,
+                cursor_id,
+                old_position,
+                new_position,
+                old_anchor,
+                Some(new_anchor),
+                old_sticky_column,
+            );
+        }
+    } else {
+        // No selection - insert tab character at cursor position
+        // Sort cursors by position (reverse order) to avoid position shifts
+        let mut cursor_vec: Vec<_> = cursors.iter().collect();
+        cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
+
+        // Insert tabs
+        for (cursor_id, cursor) in cursor_vec {
+            events.push(Event::Insert {
+                position: cursor.position,
+                text: tab_str.clone(),
+                cursor_id,
+            });
+        }
+    }
+}
+
+fn handle_move_up(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    estimated_line_length: usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        // When a selection is active in normal (non-Emacs-mark) mode,
+        // vertical motion starts from the TOP edge of the selection,
+        // matching VSCode/Sublime/browser behavior (issue #1566).
+        let from_pos = if cursor.deselect_on_move {
+            cursor
+                .selection_range()
+                .map(|r| r.start)
+                .unwrap_or(cursor.position)
+        } else {
+            cursor.position
+        };
+
+        // Calculate visual column first (iterator is dropped after this call)
+        let (current_visual_column, _) =
+            calculate_visual_column(&mut state.buffer, from_pos, estimated_line_length);
+
+        // Use sticky_column if set (now stores visual column), otherwise use current visual column
+        let goal_visual_column = if cursor.sticky_column > 0 {
+            cursor.sticky_column
+        } else {
+            current_visual_column
+        };
+
+        // Now create iterator for navigation
+        let mut iter = state.buffer.line_iterator(from_pos, estimated_line_length);
+
+        if let Some((prev_line_start, prev_line_content)) = iter.prev() {
+            // Calculate byte offset from visual column, ensuring valid character boundary
+            let prev_line_text = prev_line_content.trim_end_matches('\n');
+            let byte_offset = byte_offset_at_visual_column(prev_line_text, goal_visual_column);
+            let new_pos = prev_line_start + byte_offset;
+
+            // Preserve anchor if deselect_on_move is false (Emacs mark mode)
+            let new_anchor = if cursor.deselect_on_move {
+                None
+            } else {
+                cursor.anchor
+            };
+            events.push(Event::MoveCursor {
+                cursor_id,
+                old_position: cursor.position,
+                new_position: new_pos,
+                old_anchor: cursor.anchor,
+                new_anchor,
+                old_sticky_column: cursor.sticky_column,
+                new_sticky_column: goal_visual_column, // Preserve the goal visual column
+            });
+        }
+    }
+}
+
+fn handle_move_down(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    estimated_line_length: usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        // When a selection is active in normal (non-Emacs-mark) mode,
+        // vertical motion starts from the BOTTOM edge of the selection,
+        // matching VSCode/Sublime/browser behavior (issue #1566).
+        let from_pos = if cursor.deselect_on_move {
+            cursor
+                .selection_range()
+                .map(|r| r.end)
+                .unwrap_or(cursor.position)
+        } else {
+            cursor.position
+        };
+
+        // Calculate visual column first (iterator is dropped after this call)
+        let (current_visual_column, _) =
+            calculate_visual_column(&mut state.buffer, from_pos, estimated_line_length);
+
+        // Use sticky_column if set (now stores visual column), otherwise use current visual column
+        let goal_visual_column = if cursor.sticky_column > 0 {
+            cursor.sticky_column
+        } else {
+            current_visual_column
+        };
+
+        // Now create iterator for navigation
+        let mut iter = state.buffer.line_iterator(from_pos, estimated_line_length);
+
+        // Consume current line
+        iter.next_line();
+
+        if let Some((next_line_start, next_line_content)) = iter.next_line() {
+            // Calculate byte offset from visual column, ensuring valid character boundary
+            let next_line_text = next_line_content.trim_end_matches('\n');
+            let byte_offset = byte_offset_at_visual_column(next_line_text, goal_visual_column);
+            let new_pos = next_line_start + byte_offset;
+
+            // Preserve anchor if deselect_on_move is false (Emacs mark mode)
+            let new_anchor = if cursor.deselect_on_move {
+                None
+            } else {
+                cursor.anchor
+            };
+            events.push(Event::MoveCursor {
+                cursor_id,
+                old_position: cursor.position,
+                new_position: new_pos,
+                old_anchor: cursor.anchor,
+                new_anchor,
+                old_sticky_column: cursor.sticky_column,
+                new_sticky_column: goal_visual_column, // Preserve the goal visual column
+            });
+        }
+    }
+}
+
+fn handle_move_page_up(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    viewport_height: u16,
+    estimated_line_length: usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        // Move up by viewport height
+        let lines_to_move = viewport_height.saturating_sub(1) as usize;
+        let mut iter = state
+            .buffer
+            .line_iterator(cursor.position, estimated_line_length);
+        let current_line_start = iter.current_position();
+        let current_column = cursor.position - current_line_start;
+
+        // Use sticky_column if set, otherwise use current column
+        let goal_column = if cursor.sticky_column > 0 {
+            cursor.sticky_column
+        } else {
+            current_column
+        };
+
+        let mut new_pos = cursor.position;
+        for _ in 0..lines_to_move {
+            if let Some((line_start, line_content)) = iter.prev() {
+                let line_len = line_content.trim_end_matches('\n').len();
+                new_pos = line_start + goal_column.min(line_len);
+            } else {
+                new_pos = 0;
+                break;
+            }
+        }
+
+        // Preserve anchor if deselect_on_move is false (Emacs mark mode)
+        let new_anchor = if cursor.deselect_on_move {
+            None
+        } else {
+            cursor.anchor
+        };
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: cursor.position,
+            new_position: new_pos,
+            old_anchor: cursor.anchor,
+            new_anchor,
+            old_sticky_column: cursor.sticky_column,
+            new_sticky_column: goal_column, // Preserve the goal column
+        });
+    }
+}
+
+fn handle_move_page_down(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    viewport_height: u16,
+    estimated_line_length: usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        // Move down by viewport height
+        let lines_to_move = viewport_height.saturating_sub(1) as usize;
+        let mut iter = state
+            .buffer
+            .line_iterator(cursor.position, estimated_line_length);
+        let current_line_start = iter.current_position();
+        let current_column = cursor.position - current_line_start;
+
+        // Use sticky_column if set, otherwise use current column
+        let goal_column = if cursor.sticky_column > 0 {
+            cursor.sticky_column
+        } else {
+            current_column
+        };
+
+        // Consume current line
+        iter.next_line();
+
+        let mut new_pos = cursor.position;
+        for _ in 0..lines_to_move {
+            if let Some((line_start, line_content)) = iter.next_line() {
+                let line_len = line_content.trim_end_matches('\n').len();
+                new_pos = line_start + goal_column.min(line_len);
+            } else {
+                // Reached end of buffer - clamp to last valid position
+                new_pos = max_cursor_position(&state.buffer);
+                break;
+            }
+        }
+
+        // Preserve anchor if deselect_on_move is false (Emacs mark mode)
+        let new_anchor = if cursor.deselect_on_move {
+            None
+        } else {
+            cursor.anchor
+        };
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: cursor.position,
+            new_position: new_pos,
+            old_anchor: cursor.anchor,
+            new_anchor,
+            old_sticky_column: cursor.sticky_column,
+            new_sticky_column: goal_column, // Preserve the goal column
+        });
+    }
+}
+
+fn handle_select_page_up(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    viewport_height: u16,
+    estimated_line_length: usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        let lines_to_move = viewport_height.saturating_sub(1) as usize;
+        let mut iter = state
+            .buffer
+            .line_iterator(cursor.position, estimated_line_length);
+        let current_line_start = iter.current_position();
+        let current_column = cursor.position - current_line_start;
+        let anchor = cursor.anchor.unwrap_or(cursor.position);
+
+        // Use sticky_column if set, otherwise use current column
+        let goal_column = if cursor.sticky_column > 0 {
+            cursor.sticky_column
+        } else {
+            current_column
+        };
+
+        let mut new_pos = cursor.position;
+        for _ in 0..lines_to_move {
+            if let Some((line_start, line_content)) = iter.prev() {
+                let line_len = line_content.trim_end_matches('\n').len();
+                new_pos = line_start + goal_column.min(line_len);
+            } else {
+                new_pos = 0;
+                break;
+            }
+        }
+
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: cursor.position,
+            new_position: new_pos,
+            old_anchor: cursor.anchor,
+            new_anchor: Some(anchor),
+            old_sticky_column: cursor.sticky_column,
+            new_sticky_column: goal_column, // Preserve the goal column
+        });
+    }
+}
+
+fn handle_select_page_down(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    viewport_height: u16,
+    estimated_line_length: usize,
+) {
+    for (cursor_id, cursor) in cursors.iter() {
+        let lines_to_move = viewport_height.saturating_sub(1) as usize;
+        let mut iter = state
+            .buffer
+            .line_iterator(cursor.position, estimated_line_length);
+        let current_line_start = iter.current_position();
+        let current_column = cursor.position - current_line_start;
+        let anchor = cursor.anchor.unwrap_or(cursor.position);
+
+        // Use sticky_column if set, otherwise use current column
+        let goal_column = if cursor.sticky_column > 0 {
+            cursor.sticky_column
+        } else {
+            current_column
+        };
+
+        // Consume current line
+        iter.next_line();
+
+        let mut new_pos = cursor.position;
+        for _ in 0..lines_to_move {
+            if let Some((line_start, line_content)) = iter.next_line() {
+                let line_len = line_content.trim_end_matches('\n').len();
+                new_pos = line_start + goal_column.min(line_len);
+            } else {
+                // Reached end of buffer - clamp to last valid position
+                new_pos = max_cursor_position(&state.buffer);
+                break;
+            }
+        }
+
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: cursor.position,
+            new_position: new_pos,
+            old_anchor: cursor.anchor,
+            new_anchor: Some(anchor),
+            old_sticky_column: cursor.sticky_column,
+            new_sticky_column: goal_column, // Preserve the goal column
+        });
+    }
+}
+
+fn handle_delete_backward(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    tab_size: usize,
+    auto_close: bool,
+    estimated_line_length: usize,
+) {
+    // Sort cursors by position (reverse order) to avoid position shifts
+    let mut cursor_vec: Vec<_> = cursors.iter().collect();
+    cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
+
+    // Collect all deletions first, checking for smart dedent and auto-pair deletion
+    let deletions: Vec<_> = cursor_vec
+        .iter()
+        .filter_map(|(cursor_id, cursor)| {
+            if let Some(range) = cursor.selection_range() {
+                Some((*cursor_id, range))
+            } else if cursor.position > 0 {
+                // Smart backspace: if cursor is after only whitespace indentation,
+                // dedent by one indent unit instead of deleting a single character.
+                // Deletes from just before the cursor (not from line start) so the
+                // cursor naturally ends up at the right position.
+                let iter = state
+                    .buffer
+                    .line_iterator(cursor.position, estimated_line_length);
+                let line_start = iter.current_position();
+                let prefix_len = cursor.position - line_start;
+
+                if prefix_len > 0 {
+                    let prefix_bytes = state.buffer.slice_bytes(line_start..cursor.position);
+                    let all_whitespace = prefix_bytes.iter().all(|&b| b == b' ' || b == b'\t');
+
+                    if all_whitespace && !prefix_bytes.is_empty() {
+                        let last_byte = *prefix_bytes.last().unwrap();
+                        let chars_to_remove = if last_byte == b'\t' {
+                            1
+                        } else {
+                            // Count trailing spaces and remove up to tab_size
+                            let trailing_spaces = prefix_bytes
+                                .iter()
+                                .rev()
+                                .take_while(|&&b| b == b' ')
+                                .count();
+                            trailing_spaces.min(tab_size)
+                        };
+                        if chars_to_remove > 0 {
+                            return Some((
+                                *cursor_id,
+                                cursor.position - chars_to_remove..cursor.position,
+                            ));
+                        }
+                    }
+                }
+
+                // Normal backspace: delete one character
+                // Use prev_char_boundary to delete one code point at a time
+                // This allows "layer-by-layer" deletion of Thai combining marks
+                // In CRLF files, this also ensures we delete \r\n as a unit
+                let delete_from = state.buffer.prev_char_boundary(cursor.position);
+                let delete_from = adjust_position_for_crlf_left(&state.buffer, delete_from);
+
+                // Check for auto-pair deletion when auto_close is enabled
+                // Note: Auto-pairs are ASCII-only, so we can safely check single bytes
+                if auto_close && cursor.position < state.buffer.len() {
+                    let char_before = state
+                        .buffer
+                        .slice_bytes(delete_from..cursor.position)
+                        .first()
+                        .copied();
+                    let char_after = state
+                        .buffer
+                        .slice_bytes(cursor.position..cursor.position + 1)
+                        .first()
+                        .copied();
+
+                    // Check if we're between matching brackets/quotes
+                    let is_matching_pair = matches!(
+                        (char_before, char_after),
+                        (Some(b'('), Some(b')'))
+                            | (Some(b'['), Some(b']'))
+                            | (Some(b'{'), Some(b'}'))
+                            | (Some(b'"'), Some(b'"'))
+                            | (Some(b'\''), Some(b'\''))
+                            | (Some(b'`'), Some(b'`'))
+                    );
+
+                    if is_matching_pair {
+                        // Delete both opening and closing characters
+                        Some((*cursor_id, delete_from..cursor.position + 1))
+                    } else {
+                        Some((*cursor_id, delete_from..cursor.position))
+                    }
+                } else {
+                    Some((*cursor_id, delete_from..cursor.position))
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Get text and create delete events
+    apply_deletions(state, deletions, events);
+}
+
+fn handle_toggle_case(state: &mut EditorState, cursors: &Cursors, events: &mut Vec<Event>) {
+    // Toggle case of char under cursor (vim ~ behavior) and advance cursor
+    for (cursor_id, cursor) in cursors.iter() {
+        let pos = cursor.position;
+        let buf_len = state.buffer.len();
+        if pos >= buf_len {
+            continue;
+        }
+        let next_pos = state.buffer.next_grapheme_boundary(pos);
+        if next_pos <= pos || next_pos > buf_len {
+            continue;
+        }
+        let text = state.get_text_range(pos, next_pos);
+        if text.is_empty() || text == "\n" || text == "\r\n" {
+            continue;
+        }
+        let toggled: String = text
+            .chars()
+            .map(|c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().to_string()
+                } else {
+                    c.to_uppercase().to_string()
+                }
+            })
+            .collect();
+        if toggled != text {
+            events.push(Event::Delete {
+                range: pos..next_pos,
+                deleted_text: text,
+                cursor_id,
+            });
+            events.push(Event::Insert {
+                position: pos,
+                text: toggled,
+                cursor_id,
+            });
+        }
+        // Advance cursor to next character
+        let advance_pos = next_pos.min(buf_len);
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: pos,
+            new_position: advance_pos,
+            old_anchor: cursor.anchor,
+            new_anchor: None,
+            old_sticky_column: cursor.sticky_column,
+            new_sticky_column: 0,
+        });
+    }
+}
+
+fn handle_sort_lines(state: &mut EditorState, cursors: &Cursors, events: &mut Vec<Event>) {
+    // Sort selected lines alphabetically
+    // Process cursors in reverse order to avoid position shifts
+    let line_ending = state.buffer.line_ending().as_str();
+    let mut selections: Vec<_> = cursors
+        .iter()
+        .filter_map(|(cursor_id, cursor)| cursor.selection_range().map(|range| (cursor_id, range)))
+        .collect();
+    selections.sort_by_key(|(_, range)| std::cmp::Reverse(range.start));
+
+    for (cursor_id, range) in selections {
+        let text = state.get_text_range(range.start, range.end);
+        // Split into lines, preserving the original line ending style
+        let mut lines: Vec<&str> = text.lines().collect();
+        // Check if original text ends with a newline
+        let ends_with_newline = text.ends_with('\n') || text.ends_with("\r\n");
+
+        if lines.len() > 1 {
+            lines.sort();
+            let mut sorted_text = lines.join(line_ending);
+            if ends_with_newline {
+                sorted_text.push_str(line_ending);
+            }
+
+            if sorted_text != text {
+                events.push(Event::Delete {
+                    range: range.clone(),
+                    deleted_text: text,
+                    cursor_id,
+                });
+                events.push(Event::Insert {
+                    position: range.start,
+                    text: sorted_text,
+                    cursor_id,
+                });
+            }
+        }
+    }
+}
+
+fn handle_duplicate_line(
+    state: &mut EditorState,
+    cursors: &Cursors,
+    events: &mut Vec<Event>,
+    estimated_line_length: usize,
+) {
+    // Duplicate the current line (or selected lines) below
+    // Process cursors in reverse order to avoid position shifts
+    let mut cursor_data: Vec<_> = cursors
+        .iter()
+        .filter_map(|(cursor_id, cursor)| {
+            if let Some(range) = cursor.selection_range() {
+                // Has selection: duplicate selected lines
+                let start_line = state.buffer.get_line_number(range.start);
+                let end_line = state
+                    .buffer
+                    .get_line_number(range.end.saturating_sub(1).max(range.start));
+                let line_start = state.buffer.line_start_offset(start_line)?;
+                // Get end of last line
+                let mut iter = state.buffer.line_iterator(
+                    state.buffer.line_start_offset(end_line)?,
+                    estimated_line_length,
+                );
+                let end_line_start = iter.current_position();
+                iter.next_line().map(|(_, content)| {
+                    let line_end = end_line_start + content.len();
+                    (cursor_id, line_start, line_end)
+                })
+            } else {
+                // No selection: duplicate current line
+                let mut iter = state
+                    .buffer
+                    .line_iterator(cursor.position, estimated_line_length);
+                let line_start = iter.current_position();
+                iter.next_line().map(|(_, content)| {
+                    let line_end = line_start + content.len();
+                    (cursor_id, line_start, line_end)
+                })
+            }
+        })
+        .collect();
+    cursor_data.sort_by_key(|(_, start, _)| std::cmp::Reverse(*start));
+
+    for (cursor_id, line_start, line_end) in cursor_data {
+        let line_text = state.get_text_range(line_start, line_end);
+        let line_ending = state.buffer.line_ending().as_str();
+        // If the line doesn't end with a newline, prepend one
+        let has_trailing_newline = line_text.ends_with('\n') || line_text.ends_with("\r\n");
+        let insert_text = if has_trailing_newline {
+            line_text
+        } else {
+            format!("{}{}", line_ending, line_text)
+        };
+        let insert_len = insert_text.len();
+        events.push(Event::Insert {
+            position: line_end,
+            text: insert_text,
+            cursor_id,
+        });
+
+        // Move cursor to start of the newly duplicated line.
+        // After the Insert, apply_insert places cursor at line_end + insert_len.
+        // The new line starts at line_end (if original had trailing newline)
+        // or line_end + line_ending.len() (if we prepended a newline).
+        let new_line_start = if has_trailing_newline {
+            line_end
+        } else {
+            line_end + line_ending.len()
+        };
+        let cursor = cursors.get(cursor_id);
+        let old_sticky = cursor.map(|c| c.sticky_column).unwrap_or(0);
+        events.push(Event::MoveCursor {
+            cursor_id,
+            old_position: line_end + insert_len,
+            new_position: new_line_start,
+            old_anchor: None,
+            new_anchor: None,
+            old_sticky_column: old_sticky,
+            new_sticky_column: 0,
+        });
+    }
+}
+
 /// Convert an action into a sequence of events that can be applied to the editor state
 ///
 /// # Parameters
@@ -881,6 +1920,7 @@ fn transform_case<F>(
 /// # Returns
 /// * `Some(Vec<Event>)` - Events to apply for this action
 /// * `None` - If the action doesn't generate events (like Quit, Save, etc.)
+#[allow(clippy::too_many_arguments)]
 pub fn action_to_events(
     state: &mut EditorState,
     cursors: &mut Cursors,
@@ -925,838 +1965,185 @@ pub fn action_to_events(
         }
 
         Action::InsertNewline => {
-            // Sort cursors by position (reverse order) to avoid position shifts
-            let mut cursor_vec: Vec<_> = cursors.iter().collect();
-            cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
-
-            // Collect deletions and positions for indentation
-            let deletions: Vec<_> = cursor_vec
-                .iter()
-                .filter_map(|(cursor_id, cursor)| {
-                    cursor
-                        .selection_range()
-                        .map(|range| (*cursor_id, range.clone(), range.start))
-                })
-                .collect();
-
-            let indent_positions: Vec<_> = cursor_vec
-                .iter()
-                .map(|(cursor_id, cursor)| {
-                    let indent_position = cursor
-                        .selection_range()
-                        .map(|r| r.start)
-                        .unwrap_or(cursor.position);
-                    (*cursor_id, indent_position)
-                })
-                .collect();
-
-            // Get text for deletions and build delete events
-            for (cursor_id, range, _start) in deletions {
-                let deleted_text = state.get_text_range(range.start, range.end);
-                events.push(Event::Delete {
-                    range,
-                    deleted_text,
-                    cursor_id,
-                });
-            }
-
-            // Now process insertions
-            let line_ending = state.buffer.line_ending().as_str();
-            for (cursor_id, indent_position) in indent_positions {
-                // Calculate indent for new line
-                let mut text = line_ending.to_string();
-
-                // Check for bracket expansion: cursor between matching brackets like {|}
-                // Only applies to braces, brackets, and parentheses (not quotes)
-                let bracket_expansion = if auto_close && indent_position > 0 {
-                    let char_before = state
-                        .buffer
-                        .slice_bytes(indent_position.saturating_sub(1)..indent_position)
-                        .first()
-                        .copied();
-                    let char_after = if indent_position < state.buffer.len() {
-                        state
-                            .buffer
-                            .slice_bytes(indent_position..indent_position + 1)
-                            .first()
-                            .copied()
-                    } else {
-                        None
-                    };
-
-                    // Check if we're between matching brackets (not quotes)
-                    matches!(
-                        (char_before, char_after),
-                        (Some(b'('), Some(b')'))
-                            | (Some(b'['), Some(b']'))
-                            | (Some(b'{'), Some(b'}'))
-                    )
-                } else {
-                    false
-                };
-
-                // Track cursor line position for bracket expansion
-                // After bracket expansion, cursor should be at end of cursor line, not at end of closing bracket line
-                let mut cursor_line_end_position: Option<usize> = None;
-
-                if auto_indent {
-                    let use_tabs = state.buffer_settings.use_tabs;
-                    if let Some(language) = state.highlighter.language() {
-                        // Use tree-sitter-based indent when we have a highlighter
-                        if let Some(indent_width) = state
-                            .indent_calculator
-                            .borrow_mut()
-                            .calculate_indent(&state.buffer, indent_position, language, tab_size)
-                        {
-                            let indent_str = indent_to_string(indent_width, use_tabs, tab_size);
-                            text.push_str(&indent_str);
-
-                            // For bracket expansion, add another newline with dedented closing bracket
-                            if bracket_expansion {
-                                // Record where cursor should end up (end of cursor line)
-                                cursor_line_end_position =
-                                    Some(indent_position + line_ending.len() + indent_str.len());
-
-                                // Calculate the dedent for the closing bracket line
-                                // It should match the indent of the line containing the opening bracket
-                                let opening_bracket_indent =
-                                    crate::primitives::indent::IndentCalculator::get_line_indent_at_position(
-                                        &state.buffer,
-                                        indent_position.saturating_sub(1),
-                                        tab_size,
-                                    );
-                                text.push_str(line_ending);
-                                text.push_str(&indent_to_string(
-                                    opening_bracket_indent,
-                                    use_tabs,
-                                    tab_size,
-                                ));
-                            }
-                        }
-                    } else {
-                        // Fallback for files without syntax highlighting (e.g., .txt)
-                        let indent_width =
-                            crate::primitives::indent::IndentCalculator::calculate_indent_no_language(
-                                &state.buffer,
-                                indent_position,
-                                tab_size,
-                            );
-                        let indent_str = indent_to_string(indent_width, use_tabs, tab_size);
-                        text.push_str(&indent_str);
-
-                        // For bracket expansion in non-language files
-                        if bracket_expansion {
-                            // Record where cursor should end up (end of cursor line)
-                            cursor_line_end_position =
-                                Some(indent_position + line_ending.len() + indent_str.len());
-
-                            let opening_bracket_indent =
-                                crate::primitives::indent::IndentCalculator::get_line_indent_at_position(
-                                    &state.buffer,
-                                    indent_position.saturating_sub(1),
-                                    tab_size,
-                                );
-                            text.push_str(line_ending);
-                            text.push_str(&indent_to_string(
-                                opening_bracket_indent,
-                                use_tabs,
-                                tab_size,
-                            ));
-                        }
-                    }
-                }
-
-                // Calculate where cursor will end up after insert
-                let cursor_after_insert = indent_position + text.len();
-
-                events.push(Event::Insert {
-                    position: indent_position,
-                    text,
-                    cursor_id,
-                });
-
-                // For bracket expansion, move cursor back to the cursor line
-                // (not the closing bracket line where it ends up after insert)
-                if let Some(cursor_line_end) = cursor_line_end_position {
-                    // Get current cursor state to build the MoveCursor event
-                    if let Some(cursor) = cursors.get(cursor_id) {
-                        events.push(Event::MoveCursor {
-                            cursor_id,
-                            old_position: cursor_after_insert,
-                            new_position: cursor_line_end,
-                            old_anchor: None, // No selection after bracket expansion
-                            new_anchor: None,
-                            old_sticky_column: cursor.sticky_column,
-                            new_sticky_column: cursor_line_end, // Reset sticky column
-                        });
-                    }
-                }
-            }
+            handle_insert_newline(
+                state,
+                cursors,
+                &mut events,
+                tab_size,
+                auto_indent,
+                auto_close,
+                estimated_line_length,
+            );
         }
 
         Action::DedentSelection => {
-            // Dedent selected lines and preserve selections
-            // Collect all line starts from all cursors first to avoid position shifts
-            use std::collections::BTreeMap;
-            let mut all_line_deletions: BTreeMap<usize, (usize, String)> = BTreeMap::new();
-            let mut cursor_info = Vec::new();
-
-            for (cursor_id, cursor) in cursors.iter() {
-                let has_selection = cursor.selection_range().is_some();
-
-                let (start_pos, end_pos) = if let Some(range) = cursor.selection_range() {
-                    (range.start, range.end)
-                } else {
-                    // No selection - dedent current line
-                    let iter = state
-                        .buffer
-                        .line_iterator(cursor.position, estimated_line_length);
-                    let line_start = iter.current_position();
-                    (line_start, cursor.position)
-                };
-
-                // Find all line starts in the range using helper function
-                let line_starts = collect_line_starts(
-                    &mut state.buffer,
-                    start_pos,
-                    end_pos,
-                    estimated_line_length,
-                );
-
-                // For each line start, calculate what to delete
-                for &line_start in &line_starts {
-                    if let std::collections::btree_map::Entry::Vacant(e) =
-                        all_line_deletions.entry(line_start)
-                    {
-                        let (chars_to_remove, deleted_text) = calculate_leading_whitespace_removal(
-                            &state.buffer,
-                            line_start,
-                            tab_size,
-                        );
-
-                        if chars_to_remove > 0 {
-                            e.insert((chars_to_remove, deleted_text));
-                        }
-                    }
-                }
-
-                // Store cursor info for later restoration
-                cursor_info.push((
-                    cursor_id,
-                    cursor.position,
-                    cursor.anchor,
-                    cursor.sticky_column,
-                    has_selection,
-                    start_pos,
-                    end_pos,
-                ));
-            }
-
-            // Create delete events in reverse order to avoid position shifts
-            let first_cursor_id = cursors.iter().next().unwrap().0;
-            for (&line_start, (chars_to_remove, deleted_text)) in all_line_deletions.iter().rev() {
-                events.push(Event::Delete {
-                    range: line_start..line_start + chars_to_remove,
-                    deleted_text: deleted_text.clone(),
-                    cursor_id: first_cursor_id,
-                });
-            }
-
-            // Calculate new cursor/selection positions and add MoveCursor events
-            for (
-                cursor_id,
-                old_position,
-                old_anchor,
-                old_sticky_column,
-                has_selection,
-                start_pos,
-                end_pos,
-            ) in cursor_info
-            {
-                // Calculate how many chars were removed before start_pos and end_pos
-                let mut removed_before_start = 0;
-                let mut removed_before_end = 0;
-                let mut removed_before_position = 0;
-
-                for (&line_start, &(chars_to_remove, _)) in &all_line_deletions {
-                    if line_start < start_pos {
-                        removed_before_start += chars_to_remove;
-                    }
-                    if line_start <= end_pos {
-                        removed_before_end += chars_to_remove;
-                    }
-                    if line_start < old_position {
-                        removed_before_position += chars_to_remove;
-                    }
-                }
-
-                if has_selection {
-                    // Had selection - restore it with adjusted positions
-                    let new_anchor = start_pos.saturating_sub(removed_before_start);
-                    let new_position = end_pos.saturating_sub(removed_before_end);
-                    add_move_cursor_event(
-                        &mut events,
-                        cursor_id,
-                        old_position,
-                        new_position,
-                        old_anchor,
-                        Some(new_anchor),
-                        old_sticky_column,
-                    );
-                } else {
-                    // No selection - just move cursor back by amount removed before it
-                    let new_position = old_position.saturating_sub(removed_before_position);
-                    add_move_cursor_event(
-                        &mut events,
-                        cursor_id,
-                        old_position,
-                        new_position,
-                        old_anchor,
-                        None,
-                        old_sticky_column,
-                    );
-                }
-            }
+            handle_dedent_selection(state, cursors, &mut events, tab_size, estimated_line_length);
         }
 
         Action::InsertTab => {
-            // Insert a tab character or spaces based on language config
-            let tab_str = if state.buffer_settings.use_tabs {
-                "\t".to_string()
-            } else {
-                " ".repeat(tab_size)
-            };
-
-            // Check if any cursor has a selection
-            let has_selection = cursors
-                .iter()
-                .any(|(_, cursor)| cursor.selection_range().is_some());
-
-            if has_selection {
-                // Indent selected lines and preserve selections
-                // Collect all line starts from all cursors first to avoid position shifts
-                use std::collections::BTreeSet;
-                let mut all_line_starts = BTreeSet::new();
-                let mut cursor_info = Vec::new();
-
-                for (cursor_id, cursor) in cursors.iter() {
-                    if let Some(range) = cursor.selection_range() {
-                        let (start_pos, end_pos) = (range.start, range.end);
-
-                        // Find all line starts in the range using helper function
-                        let line_starts = collect_line_starts(
-                            &mut state.buffer,
-                            start_pos,
-                            end_pos,
-                            estimated_line_length,
-                        );
-
-                        // Add to global set (automatically deduplicates and sorts)
-                        all_line_starts.extend(line_starts.iter());
-
-                        // Store cursor info for later restoration
-                        cursor_info.push((
-                            cursor_id,
-                            cursor.position,
-                            cursor.anchor,
-                            cursor.sticky_column,
-                            start_pos,
-                            end_pos,
-                        ));
-                    }
-                }
-
-                // Create insert events for all line starts in reverse order
-                // This ensures later positions aren't shifted by earlier insertions
-                let first_cursor_id = cursors.iter().next().unwrap().0;
-                for &line_start in all_line_starts.iter().rev() {
-                    events.push(Event::Insert {
-                        position: line_start,
-                        text: tab_str.clone(),
-                        cursor_id: first_cursor_id,
-                    });
-                }
-
-                // Calculate new selection positions and add MoveCursor events
-                let indent_len = tab_str.len();
-                for (cursor_id, old_position, old_anchor, old_sticky_column, start_pos, end_pos) in
-                    cursor_info
-                {
-                    // Count how many indents were inserted at or before each position
-                    // Use <= for anchor because we insert at line starts, and positions >= line_start shift
-                    // Use < for position to avoid double-counting the indent at position itself
-                    let indents_at_or_before_anchor = all_line_starts
-                        .iter()
-                        .filter(|&&pos| pos <= start_pos)
-                        .count();
-                    let indents_before_position =
-                        all_line_starts.iter().filter(|&&pos| pos < end_pos).count();
-
-                    let new_anchor = start_pos + (indents_at_or_before_anchor * indent_len);
-                    let new_position = end_pos + (indents_before_position * indent_len);
-
-                    add_move_cursor_event(
-                        &mut events,
-                        cursor_id,
-                        old_position,
-                        new_position,
-                        old_anchor,
-                        Some(new_anchor),
-                        old_sticky_column,
-                    );
-                }
-            } else {
-                // No selection - insert tab character at cursor position
-                // Sort cursors by position (reverse order) to avoid position shifts
-                let mut cursor_vec: Vec<_> = cursors.iter().collect();
-                cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
-
-                // Insert tabs
-                for (cursor_id, cursor) in cursor_vec {
-                    events.push(Event::Insert {
-                        position: cursor.position,
-                        text: tab_str.clone(),
-                        cursor_id,
-                    });
-                }
-            }
+            handle_insert_tab(state, cursors, &mut events, tab_size, estimated_line_length);
         }
 
         // Basic movement - move each cursor
         // Uses grapheme cluster boundaries for proper handling of combining characters
         Action::MoveLeft => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = state.buffer.prev_grapheme_boundary(cursor.position);
-                let new_pos = adjust_position_for_crlf_left(&state.buffer, new_pos);
-
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column on horizontal movement
-                });
-            }
+            // Collapse selection to LEFT edge when deselect_on_move (issue #1566).
+            move_each_cursor(cursors, &mut events, |c| {
+                if c.deselect_on_move {
+                    if let Some(range) = c.selection_range() {
+                        return range.start;
+                    }
+                }
+                let p = state.buffer.prev_grapheme_boundary(c.position);
+                adjust_position_for_crlf_left(&state.buffer, p)
+            });
         }
 
         Action::MoveRight => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let max_pos = max_cursor_position(&state.buffer);
-                let new_pos = next_position_for_crlf(&state.buffer, cursor.position, max_pos);
-
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column on horizontal movement
-                });
-            }
+            // Collapse selection to RIGHT edge when deselect_on_move (issue #1566).
+            let max_pos = max_cursor_position(&state.buffer);
+            move_each_cursor(cursors, &mut events, |c| {
+                if c.deselect_on_move {
+                    if let Some(range) = c.selection_range() {
+                        return range.end.min(max_pos);
+                    }
+                }
+                next_position_for_crlf(&state.buffer, c.position, max_pos)
+            });
         }
 
         Action::MoveUp => {
-            for (cursor_id, cursor) in cursors.iter() {
-                // Calculate visual column first (iterator is dropped after this call)
-                let (current_visual_column, _) = calculate_visual_column(
-                    &mut state.buffer,
-                    cursor.position,
-                    estimated_line_length,
-                );
-
-                // Use sticky_column if set (now stores visual column), otherwise use current visual column
-                let goal_visual_column = if cursor.sticky_column > 0 {
-                    cursor.sticky_column
-                } else {
-                    current_visual_column
-                };
-
-                // Now create iterator for navigation
-                let mut iter = state
-                    .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-
-                if let Some((prev_line_start, prev_line_content)) = iter.prev() {
-                    // Calculate byte offset from visual column, ensuring valid character boundary
-                    let prev_line_text = prev_line_content.trim_end_matches('\n');
-                    let byte_offset =
-                        byte_offset_at_visual_column(prev_line_text, goal_visual_column);
-                    let new_pos = prev_line_start + byte_offset;
-
-                    // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                    let new_anchor = if cursor.deselect_on_move {
-                        None
-                    } else {
-                        cursor.anchor
-                    };
-                    events.push(Event::MoveCursor {
-                        cursor_id,
-                        old_position: cursor.position,
-                        new_position: new_pos,
-                        old_anchor: cursor.anchor,
-                        new_anchor,
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: goal_visual_column, // Preserve the goal visual column
-                    });
-                }
-            }
+            handle_move_up(state, cursors, &mut events, estimated_line_length);
         }
 
         Action::MoveDown => {
-            for (cursor_id, cursor) in cursors.iter() {
-                // Calculate visual column first (iterator is dropped after this call)
-                let (current_visual_column, _) = calculate_visual_column(
-                    &mut state.buffer,
-                    cursor.position,
-                    estimated_line_length,
-                );
-
-                // Use sticky_column if set (now stores visual column), otherwise use current visual column
-                let goal_visual_column = if cursor.sticky_column > 0 {
-                    cursor.sticky_column
-                } else {
-                    current_visual_column
-                };
-
-                // Now create iterator for navigation
-                let mut iter = state
-                    .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-
-                // Consume current line
-                iter.next_line();
-
-                if let Some((next_line_start, next_line_content)) = iter.next_line() {
-                    // Calculate byte offset from visual column, ensuring valid character boundary
-                    let next_line_text = next_line_content.trim_end_matches('\n');
-                    let byte_offset =
-                        byte_offset_at_visual_column(next_line_text, goal_visual_column);
-                    let new_pos = next_line_start + byte_offset;
-
-                    // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                    let new_anchor = if cursor.deselect_on_move {
-                        None
-                    } else {
-                        cursor.anchor
-                    };
-                    events.push(Event::MoveCursor {
-                        cursor_id,
-                        old_position: cursor.position,
-                        new_position: new_pos,
-                        old_anchor: cursor.anchor,
-                        new_anchor,
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: goal_visual_column, // Preserve the goal visual column
-                    });
-                }
-            }
+            handle_move_down(state, cursors, &mut events, estimated_line_length);
         }
 
         Action::MoveLineStart => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let mut iter = state
+            move_each_cursor(cursors, &mut events, |c| {
+                state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                if let Some((line_start, _)) = iter.next_line() {
-                    // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                    let new_anchor = if cursor.deselect_on_move {
-                        None
-                    } else {
-                        cursor.anchor
-                    };
-                    events.push(Event::MoveCursor {
-                        cursor_id,
-                        old_position: cursor.position,
-                        new_position: line_start,
-                        old_anchor: cursor.anchor,
-                        new_anchor,
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
-                }
-            }
+                    .line_iterator(c.position, estimated_line_length)
+                    .next_line()
+                    .map(|(ls, _)| ls)
+                    .unwrap_or(c.position)
+            });
         }
 
         Action::MoveLineEnd => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let mut iter = state
+            // Cursor lands at the first byte of line ending (LF: on \n; CRLF: on \r).
+            move_each_cursor(cursors, &mut events, |c| {
+                state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                if let Some((line_start, line_content)) = iter.next_line() {
-                    // In both LF and CRLF mode, cursor lands at the first byte of line ending
-                    // For LF: cursor on \n. For CRLF: cursor on \r (before both \r\n)
-                    let line_end = line_start + content_len_without_line_ending(&line_content);
-
-                    // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                    let new_anchor = if cursor.deselect_on_move {
-                        None
-                    } else {
-                        cursor.anchor
-                    };
-                    events.push(Event::MoveCursor {
-                        cursor_id,
-                        old_position: cursor.position,
-                        new_position: line_end,
-                        old_anchor: cursor.anchor,
-                        new_anchor,
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
-                }
-            }
+                    .line_iterator(c.position, estimated_line_length)
+                    .next_line()
+                    .map(|(ls, lc)| ls + content_len_without_line_ending(&lc))
+                    .unwrap_or(c.position)
+            });
         }
 
         Action::MoveWordLeft => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = find_word_start_left(&state.buffer, cursor.position);
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            move_each_cursor(cursors, &mut events, |c| {
+                find_word_start_left(&state.buffer, c.position)
+            });
         }
 
         Action::MoveWordRight => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = find_word_start_right(&state.buffer, cursor.position);
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            move_each_cursor(cursors, &mut events, |c| {
+                find_word_start_right(&state.buffer, c.position)
+            });
         }
 
         Action::MoveWordEnd => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = find_word_end_right(&state.buffer, cursor.position);
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            move_each_cursor(cursors, &mut events, |c| {
+                find_word_end_right(&state.buffer, c.position)
+            });
+        }
+
+        Action::ViMoveWordEnd => {
+            move_each_cursor(cursors, &mut events, |c| {
+                find_vi_word_end(&state.buffer, c.position)
+            });
+        }
+
+        Action::MoveLeftInLine => {
+            move_each_cursor(cursors, &mut events, |c| {
+                let new_pos = state.buffer.prev_grapheme_boundary(c.position);
+                let new_pos = adjust_position_for_crlf_left(&state.buffer, new_pos);
+                let mut iter = state
+                    .buffer
+                    .line_iterator(c.position, estimated_line_length);
+                let line_start = iter.next_line().map(|(ls, _)| ls).unwrap_or(0);
+                new_pos.max(line_start)
+            });
+        }
+
+        Action::MoveRightInLine => {
+            let max_pos = max_cursor_position(&state.buffer);
+            move_each_cursor(cursors, &mut events, |c| {
+                let new_pos = next_position_for_crlf(&state.buffer, c.position, max_pos);
+                let mut iter = state
+                    .buffer
+                    .line_iterator(c.position, estimated_line_length);
+                let line_last_char = iter
+                    .next_line()
+                    .map(|(ls, lc)| {
+                        let content_len = content_len_without_line_ending(&lc);
+                        if content_len > 0 {
+                            ls + content_len - 1
+                        } else {
+                            ls
+                        }
+                    })
+                    .unwrap_or(max_pos);
+                new_pos.min(line_last_char)
+            });
         }
 
         Action::MoveDocumentStart => {
-            for (cursor_id, cursor) in cursors.iter() {
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: 0,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            move_each_cursor(cursors, &mut events, |_| 0);
         }
 
         Action::MoveDocumentEnd => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let max_pos = max_cursor_position(&state.buffer);
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: max_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            let max_pos = max_cursor_position(&state.buffer);
+            move_each_cursor(cursors, &mut events, |_| max_pos);
         }
 
         Action::MovePageUp => {
-            for (cursor_id, cursor) in cursors.iter() {
-                // Move up by viewport height
-                let lines_to_move = viewport_height.saturating_sub(1) as usize;
-                let mut iter = state
-                    .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let current_line_start = iter.current_position();
-                let current_column = cursor.position - current_line_start;
-
-                // Use sticky_column if set, otherwise use current column
-                let goal_column = if cursor.sticky_column > 0 {
-                    cursor.sticky_column
-                } else {
-                    current_column
-                };
-
-                let mut new_pos = cursor.position;
-                for _ in 0..lines_to_move {
-                    if let Some((line_start, line_content)) = iter.prev() {
-                        let line_len = line_content.trim_end_matches('\n').len();
-                        new_pos = line_start + goal_column.min(line_len);
-                    } else {
-                        new_pos = 0;
-                        break;
-                    }
-                }
-
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: goal_column, // Preserve the goal column
-                });
-            }
+            handle_move_page_up(
+                state,
+                cursors,
+                &mut events,
+                viewport_height,
+                estimated_line_length,
+            );
         }
 
         Action::MovePageDown => {
-            for (cursor_id, cursor) in cursors.iter() {
-                // Move down by viewport height
-                let lines_to_move = viewport_height.saturating_sub(1) as usize;
-                let mut iter = state
-                    .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let current_line_start = iter.current_position();
-                let current_column = cursor.position - current_line_start;
-
-                // Use sticky_column if set, otherwise use current column
-                let goal_column = if cursor.sticky_column > 0 {
-                    cursor.sticky_column
-                } else {
-                    current_column
-                };
-
-                // Consume current line
-                iter.next_line();
-
-                let mut new_pos = cursor.position;
-                for _ in 0..lines_to_move {
-                    if let Some((line_start, line_content)) = iter.next_line() {
-                        let line_len = line_content.trim_end_matches('\n').len();
-                        new_pos = line_start + goal_column.min(line_len);
-                    } else {
-                        // Reached end of buffer - clamp to last valid position
-                        new_pos = max_cursor_position(&state.buffer);
-                        break;
-                    }
-                }
-
-                // Preserve anchor if deselect_on_move is false (Emacs mark mode)
-                let new_anchor = if cursor.deselect_on_move {
-                    None
-                } else {
-                    cursor.anchor
-                };
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor,
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: goal_column, // Preserve the goal column
-                });
-            }
+            handle_move_page_down(
+                state,
+                cursors,
+                &mut events,
+                viewport_height,
+                estimated_line_length,
+            );
         }
 
         // Selection movement - same as regular movement but keeps anchor
         // Uses grapheme cluster boundaries for proper handling of combining characters
         Action::SelectLeft => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = state.buffer.prev_grapheme_boundary(cursor.position);
-                let new_pos = adjust_position_for_crlf_left(&state.buffer, new_pos);
-
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            select_each_cursor(cursors, &mut events, |c| {
+                let p = state.buffer.prev_grapheme_boundary(c.position);
+                adjust_position_for_crlf_left(&state.buffer, p)
+            });
         }
 
         Action::SelectRight => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let max_pos = max_cursor_position(&state.buffer);
-                let new_pos = next_position_for_crlf(&state.buffer, cursor.position, max_pos);
-
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            let max_pos = max_cursor_position(&state.buffer);
+            select_each_cursor(cursors, &mut events, |c| {
+                next_position_for_crlf(&state.buffer, c.position, max_pos)
+            });
         }
 
         Action::SelectUp => {
@@ -1828,424 +2215,163 @@ pub fn action_to_events(
         }
 
         Action::SelectToParagraphUp => {
-            // Jump to previous empty line while extending selection
-            for (cursor_id, cursor) in cursors.iter() {
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
+            select_each_cursor(cursors, &mut events, |c| {
                 let mut iter = state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-
-                // Move to previous line first
+                    .line_iterator(c.position, estimated_line_length);
                 let mut found_pos = None;
                 while let Some((line_start, line_content)) = iter.prev() {
-                    // Check if this is an empty line (only whitespace/newline)
                     let trimmed = line_content.trim_end_matches(['\n', '\r']);
                     if trimmed.is_empty() || trimmed.chars().all(char::is_whitespace) {
                         found_pos = Some(line_start);
                         break;
                     }
                 }
-
-                // If no empty line found, go to start of buffer
-                let new_pos = found_pos.unwrap_or(0);
-
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0,
-                });
-            }
+                found_pos.unwrap_or(0)
+            });
         }
 
         Action::SelectToParagraphDown => {
-            // Jump to next empty line while extending selection
-            for (cursor_id, cursor) in cursors.iter() {
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
+            select_each_cursor(cursors, &mut events, |c| {
                 let mut iter = state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-
-                // Skip current line
+                    .line_iterator(c.position, estimated_line_length);
                 iter.next_line();
-
-                // Find next empty line
                 let mut found_pos = None;
                 while let Some((line_start, line_content)) = iter.next_line() {
-                    // Check if this is an empty line (only whitespace/newline)
                     let trimmed = line_content.trim_end_matches(['\n', '\r']);
                     if trimmed.is_empty() || trimmed.chars().all(char::is_whitespace) {
                         found_pos = Some(line_start);
                         break;
                     }
                 }
-
-                // If no empty line found, go to end of buffer
-                let new_pos = found_pos.unwrap_or(state.buffer.len());
-
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0,
-                });
-            }
+                found_pos.unwrap_or(state.buffer.len())
+            });
         }
 
         Action::SelectLineStart => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let mut iter = state
+            select_each_cursor(cursors, &mut events, |c| {
+                state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-
-                if let Some((line_start, _)) = iter.next_line() {
-                    events.push(Event::MoveCursor {
-                        cursor_id,
-                        old_position: cursor.position,
-                        new_position: line_start,
-                        old_anchor: cursor.anchor,
-                        new_anchor: Some(anchor),
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
-                }
-            }
+                    .line_iterator(c.position, estimated_line_length)
+                    .next_line()
+                    .map(|(ls, _)| ls)
+                    .unwrap_or(c.position)
+            });
         }
 
         Action::SelectLineEnd => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let mut iter = state
+            // Cursor lands at the first byte of line ending (LF: on \n; CRLF: on \r).
+            select_each_cursor(cursors, &mut events, |c| {
+                state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-
-                if let Some((line_start, line_content)) = iter.next_line() {
-                    // In both LF and CRLF mode, cursor lands at the first byte of line ending
-                    // For LF: cursor on \n. For CRLF: cursor on \r (before both \r\n)
-                    let line_end = line_start + content_len_without_line_ending(&line_content);
-
-                    events.push(Event::MoveCursor {
-                        cursor_id,
-                        old_position: cursor.position,
-                        new_position: line_end,
-                        old_anchor: cursor.anchor,
-                        new_anchor: Some(anchor),
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
-                }
-            }
+                    .line_iterator(c.position, estimated_line_length)
+                    .next_line()
+                    .map(|(ls, lc)| ls + content_len_without_line_ending(&lc))
+                    .unwrap_or(c.position)
+            });
         }
 
         Action::SelectWordLeft => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = find_word_start_left(&state.buffer, cursor.position);
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            select_each_cursor(cursors, &mut events, |c| {
+                find_word_start_left(&state.buffer, c.position)
+            });
         }
 
         Action::SelectWordRight => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = find_word_start_right(&state.buffer, cursor.position);
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            select_each_cursor(cursors, &mut events, |c| {
+                find_word_start_right(&state.buffer, c.position)
+            });
         }
 
         Action::SelectWordEnd => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let new_pos = find_word_end_right(&state.buffer, cursor.position);
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            select_each_cursor(cursors, &mut events, |c| {
+                find_word_end_right(&state.buffer, c.position)
+            });
+        }
+
+        Action::ViSelectWordEnd => {
+            select_each_cursor(cursors, &mut events, |c| {
+                find_vi_word_end(&state.buffer, c.position)
+            });
         }
 
         Action::SelectDocumentStart => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: 0,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            select_each_cursor(cursors, &mut events, |_| 0);
         }
 
         Action::SelectDocumentEnd => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let max_pos = max_cursor_position(&state.buffer);
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: max_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: 0, // Reset sticky column
-                });
-            }
+            let max_pos = max_cursor_position(&state.buffer);
+            select_each_cursor(cursors, &mut events, |_| max_pos);
         }
 
         Action::SelectPageUp => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let lines_to_move = viewport_height.saturating_sub(1) as usize;
-                let mut iter = state
-                    .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let current_line_start = iter.current_position();
-                let current_column = cursor.position - current_line_start;
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-
-                // Use sticky_column if set, otherwise use current column
-                let goal_column = if cursor.sticky_column > 0 {
-                    cursor.sticky_column
-                } else {
-                    current_column
-                };
-
-                let mut new_pos = cursor.position;
-                for _ in 0..lines_to_move {
-                    if let Some((line_start, line_content)) = iter.prev() {
-                        let line_len = line_content.trim_end_matches('\n').len();
-                        new_pos = line_start + goal_column.min(line_len);
-                    } else {
-                        new_pos = 0;
-                        break;
-                    }
-                }
-
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: goal_column, // Preserve the goal column
-                });
-            }
+            handle_select_page_up(
+                state,
+                cursors,
+                &mut events,
+                viewport_height,
+                estimated_line_length,
+            );
         }
 
         Action::SelectPageDown => {
-            for (cursor_id, cursor) in cursors.iter() {
-                let lines_to_move = viewport_height.saturating_sub(1) as usize;
-                let mut iter = state
-                    .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let current_line_start = iter.current_position();
-                let current_column = cursor.position - current_line_start;
-                let anchor = cursor.anchor.unwrap_or(cursor.position);
-
-                // Use sticky_column if set, otherwise use current column
-                let goal_column = if cursor.sticky_column > 0 {
-                    cursor.sticky_column
-                } else {
-                    current_column
-                };
-
-                // Consume current line
-                iter.next_line();
-
-                let mut new_pos = cursor.position;
-                for _ in 0..lines_to_move {
-                    if let Some((line_start, line_content)) = iter.next_line() {
-                        let line_len = line_content.trim_end_matches('\n').len();
-                        new_pos = line_start + goal_column.min(line_len);
-                    } else {
-                        // Reached end of buffer - clamp to last valid position
-                        new_pos = max_cursor_position(&state.buffer);
-                        break;
-                    }
-                }
-
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: cursor.position,
-                    new_position: new_pos,
-                    old_anchor: cursor.anchor,
-                    new_anchor: Some(anchor),
-                    old_sticky_column: cursor.sticky_column,
-                    new_sticky_column: goal_column, // Preserve the goal column
-                });
-            }
+            handle_select_page_down(
+                state,
+                cursors,
+                &mut events,
+                viewport_height,
+                estimated_line_length,
+            );
         }
 
         Action::SelectAll => {
             // Select entire buffer for primary cursor only
+            // Note: RemoveSecondaryCursors is handled in handle_key, not as an event
             let primary_id = cursors.primary_id();
             let primary_cursor = cursors.primary();
             let max_pos = max_cursor_position(&state.buffer);
-            events.push(Event::MoveCursor {
-                cursor_id: primary_id,
-                old_position: primary_cursor.position,
-                new_position: max_pos,
-                old_anchor: primary_cursor.anchor,
-                new_anchor: Some(0),
-                old_sticky_column: primary_cursor.sticky_column,
-                new_sticky_column: 0, // Reset sticky column
-            });
-            // Note: RemoveSecondaryCursors is handled in handle_key, not as an event
+            add_move_cursor_event(
+                &mut events,
+                primary_id,
+                primary_cursor.position,
+                max_pos,
+                primary_cursor.anchor,
+                Some(0),
+                primary_cursor.sticky_column,
+            );
         }
 
         Action::SelectWord => {
             for (cursor_id, cursor) in cursors.iter() {
-                // Find word boundaries at current position
-                // First find the start of the word we're in/adjacent to
+                // First find the start of the word we're in/adjacent to,
+                // then the end from that start (not from cursor) to select the current word.
                 let word_start = find_word_start(&state.buffer, cursor.position);
-                // Then find the end of that word (from the start, not from cursor)
-                // This ensures we select the current word, not the next one
                 let word_end = find_word_end(&state.buffer, word_start);
 
                 if word_start < word_end {
-                    events.push(Event::MoveCursor {
+                    add_move_cursor_event(
+                        &mut events,
                         cursor_id,
-                        old_position: cursor.position,
-                        new_position: word_end,
-                        old_anchor: cursor.anchor,
-                        new_anchor: Some(word_start),
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
+                        cursor.position,
+                        word_end,
+                        cursor.anchor,
+                        Some(word_start),
+                        cursor.sticky_column,
+                    );
                 }
             }
         }
 
         Action::DeleteBackward => {
-            // Sort cursors by position (reverse order) to avoid position shifts
-            let mut cursor_vec: Vec<_> = cursors.iter().collect();
-            cursor_vec.sort_by_key(|(_, c)| std::cmp::Reverse(c.position));
-
-            // Collect all deletions first, checking for smart dedent and auto-pair deletion
-            let deletions: Vec<_> = cursor_vec
-                .iter()
-                .filter_map(|(cursor_id, cursor)| {
-                    if let Some(range) = cursor.selection_range() {
-                        Some((*cursor_id, range))
-                    } else if cursor.position > 0 {
-                        // Smart backspace: if cursor is after only whitespace indentation,
-                        // dedent by one indent unit instead of deleting a single character.
-                        // Deletes from just before the cursor (not from line start) so the
-                        // cursor naturally ends up at the right position.
-                        let iter = state
-                            .buffer
-                            .line_iterator(cursor.position, estimated_line_length);
-                        let line_start = iter.current_position();
-                        let prefix_len = cursor.position - line_start;
-
-                        if prefix_len > 0 {
-                            let prefix_bytes =
-                                state.buffer.slice_bytes(line_start..cursor.position);
-                            let all_whitespace =
-                                prefix_bytes.iter().all(|&b| b == b' ' || b == b'\t');
-
-                            if all_whitespace {
-                                let last_byte = prefix_bytes[prefix_len - 1];
-                                let chars_to_remove = if last_byte == b'\t' {
-                                    1
-                                } else {
-                                    // Count trailing spaces and remove up to tab_size
-                                    let trailing_spaces = prefix_bytes
-                                        .iter()
-                                        .rev()
-                                        .take_while(|&&b| b == b' ')
-                                        .count();
-                                    trailing_spaces.min(tab_size)
-                                };
-                                if chars_to_remove > 0 {
-                                    return Some((
-                                        *cursor_id,
-                                        cursor.position - chars_to_remove..cursor.position,
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Normal backspace: delete one character
-                        // Use prev_char_boundary to delete one code point at a time
-                        // This allows "layer-by-layer" deletion of Thai combining marks
-                        // In CRLF files, this also ensures we delete \r\n as a unit
-                        let delete_from = state.buffer.prev_char_boundary(cursor.position);
-                        let delete_from = adjust_position_for_crlf_left(&state.buffer, delete_from);
-
-                        // Check for auto-pair deletion when auto_close is enabled
-                        // Note: Auto-pairs are ASCII-only, so we can safely check single bytes
-                        if auto_close && cursor.position < state.buffer.len() {
-                            let char_before = state
-                                .buffer
-                                .slice_bytes(delete_from..cursor.position)
-                                .first()
-                                .copied();
-                            let char_after = state
-                                .buffer
-                                .slice_bytes(cursor.position..cursor.position + 1)
-                                .first()
-                                .copied();
-
-                            // Check if we're between matching brackets/quotes
-                            let is_matching_pair = matches!(
-                                (char_before, char_after),
-                                (Some(b'('), Some(b')'))
-                                    | (Some(b'['), Some(b']'))
-                                    | (Some(b'{'), Some(b'}'))
-                                    | (Some(b'"'), Some(b'"'))
-                                    | (Some(b'\''), Some(b'\''))
-                                    | (Some(b'`'), Some(b'`'))
-                            );
-
-                            if is_matching_pair {
-                                // Delete both opening and closing characters
-                                Some((*cursor_id, delete_from..cursor.position + 1))
-                            } else {
-                                Some((*cursor_id, delete_from..cursor.position))
-                            }
-                        } else {
-                            Some((*cursor_id, delete_from..cursor.position))
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Get text and create delete events
-            apply_deletions(state, deletions, &mut events);
+            handle_delete_backward(
+                state,
+                cursors,
+                &mut events,
+                tab_size,
+                auto_close,
+                estimated_line_length,
+            );
         }
 
         Action::DeleteForward => {
@@ -2319,6 +2445,29 @@ pub fn action_to_events(
                 .collect();
 
             // Now get text and create events
+            apply_deletions(state, deletions, &mut events);
+        }
+
+        Action::DeleteViWordEnd => {
+            // Delete from cursor to vim word end (inclusive of last char)
+            let deletions: Vec<_> = cursors
+                .iter()
+                .filter_map(|(cursor_id, cursor)| {
+                    if let Some(range) = cursor.selection_range() {
+                        Some((cursor_id, range))
+                    } else {
+                        let word_end = find_vi_word_end(&state.buffer, cursor.position);
+                        // +1 because vim 'de' is inclusive of the last character
+                        let end = (word_end + 1).min(state.buffer.len());
+                        if cursor.position < end {
+                            Some((cursor_id, cursor.position..end))
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .collect();
+
             apply_deletions(state, deletions, &mut events);
         }
 
@@ -2448,137 +2597,43 @@ pub fn action_to_events(
             transform_case(state, cursors, &mut events, |s| s.to_lowercase());
         }
 
+        Action::ToggleCase => {
+            handle_toggle_case(state, cursors, &mut events);
+        }
+
         Action::SortLines => {
-            // Sort selected lines alphabetically
-            // Process cursors in reverse order to avoid position shifts
-            let line_ending = state.buffer.line_ending().as_str();
-            let mut selections: Vec<_> = cursors
-                .iter()
-                .filter_map(|(cursor_id, cursor)| {
-                    cursor.selection_range().map(|range| (cursor_id, range))
-                })
-                .collect();
-            selections.sort_by_key(|(_, range)| std::cmp::Reverse(range.start));
-
-            for (cursor_id, range) in selections {
-                let text = state.get_text_range(range.start, range.end);
-                // Split into lines, preserving the original line ending style
-                let mut lines: Vec<&str> = text.lines().collect();
-                // Check if original text ends with a newline
-                let ends_with_newline = text.ends_with('\n') || text.ends_with("\r\n");
-
-                if lines.len() > 1 {
-                    lines.sort();
-                    let mut sorted_text = lines.join(line_ending);
-                    if ends_with_newline {
-                        sorted_text.push_str(line_ending);
-                    }
-
-                    if sorted_text != text {
-                        events.push(Event::Delete {
-                            range: range.clone(),
-                            deleted_text: text,
-                            cursor_id,
-                        });
-                        events.push(Event::Insert {
-                            position: range.start,
-                            text: sorted_text,
-                            cursor_id,
-                        });
-                    }
-                }
-            }
+            handle_sort_lines(state, cursors, &mut events);
         }
 
         Action::OpenLine => {
-            // Insert a newline at cursor position but don't move cursor
-            // (like pressing Enter but staying on current line)
+            // Insert a newline at the cursor position and immediately
+            // move the cursor back — Emacs C-o semantics ("open a
+            // blank line after the cursor without advancing it").
+            // Without the follow-up MoveCursor, `apply_insert`
+            // advances the cursor by `text.len()` and OpenLine becomes
+            // indistinguishable from Enter.
             let line_ending = state.buffer.line_ending().as_str();
+            let len = line_ending.len();
             for (cursor_id, cursor) in cursors.iter() {
                 events.push(Event::Insert {
                     position: cursor.position,
                     text: line_ending.to_string(),
                     cursor_id,
                 });
+                events.push(Event::MoveCursor {
+                    cursor_id,
+                    old_position: cursor.position + len,
+                    new_position: cursor.position,
+                    old_anchor: cursor.anchor,
+                    new_anchor: cursor.anchor,
+                    old_sticky_column: cursor.sticky_column,
+                    new_sticky_column: cursor.sticky_column,
+                });
             }
         }
 
         Action::DuplicateLine => {
-            // Duplicate the current line (or selected lines) below
-            // Process cursors in reverse order to avoid position shifts
-            let mut cursor_data: Vec<_> = cursors
-                .iter()
-                .filter_map(|(cursor_id, cursor)| {
-                    if let Some(range) = cursor.selection_range() {
-                        // Has selection: duplicate selected lines
-                        let start_line = state.buffer.get_line_number(range.start);
-                        let end_line = state
-                            .buffer
-                            .get_line_number(range.end.saturating_sub(1).max(range.start));
-                        let line_start = state.buffer.line_start_offset(start_line)?;
-                        // Get end of last line
-                        let mut iter = state.buffer.line_iterator(
-                            state.buffer.line_start_offset(end_line)?,
-                            estimated_line_length,
-                        );
-                        let end_line_start = iter.current_position();
-                        iter.next_line().map(|(_, content)| {
-                            let line_end = end_line_start + content.len();
-                            (cursor_id, line_start, line_end)
-                        })
-                    } else {
-                        // No selection: duplicate current line
-                        let mut iter = state
-                            .buffer
-                            .line_iterator(cursor.position, estimated_line_length);
-                        let line_start = iter.current_position();
-                        iter.next_line().map(|(_, content)| {
-                            let line_end = line_start + content.len();
-                            (cursor_id, line_start, line_end)
-                        })
-                    }
-                })
-                .collect();
-            cursor_data.sort_by_key(|(_, start, _)| std::cmp::Reverse(*start));
-
-            for (cursor_id, line_start, line_end) in cursor_data {
-                let line_text = state.get_text_range(line_start, line_end);
-                let line_ending = state.buffer.line_ending().as_str();
-                // If the line doesn't end with a newline, prepend one
-                let has_trailing_newline = line_text.ends_with('\n') || line_text.ends_with("\r\n");
-                let insert_text = if has_trailing_newline {
-                    line_text
-                } else {
-                    format!("{}{}", line_ending, line_text)
-                };
-                let insert_len = insert_text.len();
-                events.push(Event::Insert {
-                    position: line_end,
-                    text: insert_text,
-                    cursor_id,
-                });
-
-                // Move cursor to start of the newly duplicated line.
-                // After the Insert, apply_insert places cursor at line_end + insert_len.
-                // The new line starts at line_end (if original had trailing newline)
-                // or line_end + line_ending.len() (if we prepended a newline).
-                let new_line_start = if has_trailing_newline {
-                    line_end
-                } else {
-                    line_end + line_ending.len()
-                };
-                let cursor = cursors.get(cursor_id);
-                let old_sticky = cursor.map(|c| c.sticky_column).unwrap_or(0);
-                events.push(Event::MoveCursor {
-                    cursor_id,
-                    old_position: line_end + insert_len,
-                    new_position: new_line_start,
-                    old_anchor: None,
-                    new_anchor: None,
-                    old_sticky_column: old_sticky,
-                    new_sticky_column: 0,
-                });
-            }
+            handle_duplicate_line(state, cursors, &mut events, estimated_line_length);
         }
 
         Action::Recenter => {
@@ -2655,22 +2710,34 @@ pub fn action_to_events(
         | Action::PrevSplit
         | Action::Copy
         | Action::CopyWithTheme(_)
+        | Action::CopyFilePath
+        | Action::CopyRelativeFilePath
         | Action::Cut
         | Action::Paste
         | Action::YankWordForward
         | Action::YankWordBackward
         | Action::YankToLineEnd
         | Action::YankToLineStart
+        | Action::YankViWordEnd
         | Action::AddCursorNextMatch
         | Action::AddCursorAbove
         | Action::AddCursorBelow
         | Action::CommandPalette
         | Action::QuickOpen
+        | Action::QuickOpenBuffers
+        | Action::QuickOpenFiles
+        | Action::OpenLiveGrep
+        | Action::ResumeLiveGrep
+        | Action::LiveGrepExportQuickfix
+        | Action::ToggleUtilityDock
+        | Action::OpenTerminalInDock
+        | Action::CycleLiveGrepProvider
         | Action::ShowHelp
         | Action::ToggleLineWrap
+        | Action::ToggleCurrentLineHighlight
         | Action::ToggleReadOnly
-        | Action::ToggleComposeMode
-        | Action::SetComposeWidth
+        | Action::TogglePageView
+        | Action::SetPageWidth
         | Action::IncreaseSplitSize
         | Action::DecreaseSplitSize
         | Action::ToggleMaximizeSplit
@@ -2683,9 +2750,11 @@ pub fn action_to_events(
         | Action::ShowWarnings
         | Action::ShowStatusLog
         | Action::ShowLspStatus
+        | Action::ShowRemoteIndicatorMenu
         | Action::ClearWarnings
         | Action::SmartHome
         | Action::ToggleComment
+        | Action::DabbrevExpand
         | Action::ToggleFold
         | Action::SetBookmark(_)
         | Action::JumpToBookmark(_)
@@ -2743,10 +2812,14 @@ pub fn action_to_events(
         | Action::PopupPageDown
         | Action::PopupConfirm
         | Action::PopupCancel
+        | Action::PopupFocus
+        | Action::CompletionAccept
+        | Action::CompletionDismiss
         | Action::ToggleFileExplorer
         | Action::ToggleMenuBar
         | Action::ToggleTabBar
         | Action::ToggleStatusBar
+        | Action::TogglePromptLine
         | Action::ToggleVerticalScrollbar
         | Action::ToggleHorizontalScrollbar
         | Action::FocusFileExplorer
@@ -2769,6 +2842,16 @@ pub fn action_to_events(
         | Action::FileExplorerToggleGitignored
         | Action::FileExplorerSearchClear
         | Action::FileExplorerSearchBackspace
+        | Action::FileExplorerCopy
+        | Action::FileExplorerCut
+        | Action::FileExplorerPaste
+        | Action::FileExplorerDuplicate
+        | Action::FileExplorerCopyFullPath
+        | Action::FileExplorerCopyRelativePath
+        | Action::FileExplorerExtendSelectionUp
+        | Action::FileExplorerExtendSelectionDown
+        | Action::FileExplorerToggleSelect
+        | Action::FileExplorerSelectAll
         | Action::LspCompletion
         | Action::LspGotoDefinition
         | Action::LspReferences
@@ -2785,6 +2868,7 @@ pub fn action_to_events(
         | Action::ToggleScrollSync
         | Action::ToggleMouseCapture
         | Action::DumpConfig
+        | Action::RedrawScreen
         | Action::Search
         | Action::FindInSelection
         | Action::FindNext
@@ -2832,6 +2916,7 @@ pub fn action_to_events(
         | Action::SettingsHelp
         | Action::SettingsIncrement
         | Action::SettingsDecrement
+        | Action::SettingsInherit
         | Action::SetTabSize
         | Action::SetLineEnding
         | Action::SetEncoding
@@ -2846,10 +2931,16 @@ pub fn action_to_events(
         | Action::ShellCommandReplace
         | Action::CalibrateInput
         | Action::EventDebug
+        | Action::SuspendProcess
         | Action::LoadPluginFromBuffer
+        | Action::InitReload
+        | Action::InitEdit
+        | Action::InitCheck
         | Action::OpenKeybindingEditor
         | Action::AddRuler
-        | Action::RemoveRuler => return None,
+        | Action::RemoveRuler
+        | Action::CompositeNextHunk
+        | Action::CompositePrevHunk => return None,
 
         // Block/rectangular selection actions
         Action::BlockSelectLeft => {
@@ -2876,18 +2967,16 @@ pub fn action_to_events(
                     .buffer
                     .line_iterator(cursor.position, estimated_line_length);
                 if let Some((line_start, line_content)) = iter.next_line() {
-                    // Include newline if present
                     let line_end = line_start + line_content.len();
-
-                    events.push(Event::MoveCursor {
+                    add_move_cursor_event(
+                        &mut events,
                         cursor_id,
-                        old_position: cursor.position,
-                        new_position: line_end,
-                        old_anchor: cursor.anchor,
-                        new_anchor: Some(line_start),
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
+                        cursor.position,
+                        line_end,
+                        cursor.anchor,
+                        Some(line_start),
+                        cursor.sticky_column,
+                    );
                 }
             }
         }
@@ -2897,18 +2986,17 @@ pub fn action_to_events(
             for (cursor_id, cursor) in cursors.iter() {
                 if let Some(anchor) = cursor.anchor {
                     // Already have a selection - expand by one word to the right
-                    // First move to the start of the next word, then to its end
                     let next_word_start = find_word_start_right(&state.buffer, cursor.position);
                     let new_end = find_word_end(&state.buffer, next_word_start);
-                    events.push(Event::MoveCursor {
+                    add_move_cursor_event(
+                        &mut events,
                         cursor_id,
-                        old_position: cursor.position,
-                        new_position: new_end,
-                        old_anchor: cursor.anchor,
-                        new_anchor: Some(anchor),
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
+                        cursor.position,
+                        new_end,
+                        cursor.anchor,
+                        Some(anchor),
+                        cursor.sticky_column,
+                    );
                 } else {
                     // No selection - select from cursor to end of current word
                     let word_start = find_word_start(&state.buffer, cursor.position);
@@ -2918,25 +3006,22 @@ pub fn action_to_events(
                     // select from current position to end of next word
                     let (final_start, final_end) =
                         if word_start == word_end || cursor.position == word_end {
-                            // Find the next word (skip non-word characters to find it)
                             let next_start = find_word_start_right(&state.buffer, cursor.position);
                             let next_end = find_word_end(&state.buffer, next_start);
-                            // Select FROM cursor position TO the end of next word
                             (cursor.position, next_end)
                         } else {
-                            // On a word char - select from cursor to end of current word
                             (cursor.position, word_end)
                         };
 
-                    events.push(Event::MoveCursor {
+                    add_move_cursor_event(
+                        &mut events,
                         cursor_id,
-                        old_position: cursor.position,
-                        new_position: final_end,
-                        old_anchor: cursor.anchor,
-                        new_anchor: Some(final_start),
-                        old_sticky_column: cursor.sticky_column,
-                        new_sticky_column: 0, // Reset sticky column
-                    });
+                        cursor.position,
+                        final_end,
+                        cursor.anchor,
+                        Some(final_start),
+                        cursor.sticky_column,
+                    );
                 }
             }
         }
@@ -5614,13 +5699,18 @@ mod property_tests {
                 }
             }
             // Filter to those in range, considering that we start from the line containing start_pos
+            // A line start at exactly end_pos is excluded when end_pos > start_pos (the selection
+            // ends at a line boundary, so that line has no selected content)
             let first_line_start = expected_line_starts.iter()
                 .filter(|&&pos| pos <= start_pos)
                 .max()
                 .copied()
                 .unwrap_or(0);
             let expected_in_range: Vec<usize> = expected_line_starts.iter()
-                .filter(|&&pos| pos >= first_line_start && pos <= end_pos)
+                .filter(|&&pos| {
+                    pos >= first_line_start
+                        && (pos < end_pos || (pos == end_pos && pos == start_pos))
+                })
                 .copied()
                 .collect();
 
@@ -5679,16 +5769,15 @@ mod property_tests {
 
             let line_starts = collect_line_starts(&mut buffer, 0, buffer_len, 80);
 
-            // Expected: 1 (for position 0) + num_trailing_newlines (one for each \n creates a new line start)
-            // But we only count line starts that are <= end_pos
-            // If prefix is empty and we have N newlines, we should have positions: 0, 1, 2, ..., N
-            // But the last one at position N would be > buffer_len - 1 only if it's the synthetic empty line
-            let expected_count = if prefix.is_empty() {
-                // Just newlines: positions 0, 1, 2, ..., up to buffer_len
-                num_trailing_newlines.min(buffer_len) + 1
+            // Expected line starts: position 0, then one for each \n.
+            // The last \n creates a line start at buffer_len, but since start_pos=0 < end_pos=buffer_len,
+            // a line start at exactly end_pos is excluded (no selected content on that line).
+            // So the count is: 1 (pos 0) + num_trailing_newlines - 1 (last excluded) = num_trailing_newlines
+            // when num_trailing_newlines > 0. When num_trailing_newlines == 0, count is 1 (just pos 0).
+            let expected_count = if num_trailing_newlines > 0 {
+                num_trailing_newlines
             } else {
-                // prefix + newlines
-                1 + num_trailing_newlines
+                1
             };
 
             prop_assert_eq!(

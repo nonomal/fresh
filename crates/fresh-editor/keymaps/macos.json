@@ -194,9 +194,10 @@
       "when": "normal"
     },
     {
+      "comment": "Alt+Right -> End of word (macOS Option+Right convention; stops at word end, not past trailing whitespace)",
       "key": "Right",
       "modifiers": ["alt"],
-      "action": "move_word_right",
+      "action": "move_word_end",
       "args": {},
       "when": "normal"
     },
@@ -210,7 +211,7 @@
     {
       "key": "Right",
       "modifiers": ["alt", "shift"],
-      "action": "select_word_right",
+      "action": "select_word_end",
       "args": {},
       "when": "normal"
     },
@@ -225,7 +226,7 @@
     {
       "key": "Right",
       "modifiers": ["ctrl"],
-      "action": "move_word_right",
+      "action": "move_word_end",
       "args": {},
       "when": "normal"
     },
@@ -240,7 +241,7 @@
     {
       "key": "Right",
       "modifiers": ["ctrl", "shift"],
-      "action": "select_word_right",
+      "action": "select_word_end",
       "args": {},
       "when": "normal"
     },
@@ -358,18 +359,10 @@
       "when": "prompt"
     },
     {
-      "comment": "Ctrl+U -> Delete to prompt start (Unix readline)",
-      "key": "u",
-      "modifiers": ["ctrl"],
-      "action": "prompt_delete_to_start",
-      "args": {},
-      "when": "prompt"
-    },
-    {
       "comment": "Ctrl+K -> Delete to prompt end (Unix readline)",
       "key": "k",
       "modifiers": ["ctrl"],
-      "action": "prompt_delete_to_end",
+      "action": "prompt_delete_to_line_end",
       "args": {},
       "when": "prompt"
     },
@@ -377,7 +370,7 @@
       "comment": "Ctrl+W -> Delete word backward (Unix readline)",
       "key": "w",
       "modifiers": ["ctrl"],
-      "action": "prompt_delete_word_left",
+      "action": "prompt_delete_word_backward",
       "args": {},
       "when": "prompt"
     },
@@ -385,70 +378,70 @@
       "comment": "Disable Alt+0-9 (Mac international keyboard conflict with special chars)",
       "key": "0",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "1",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "2",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "3",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "4",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "5",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "6",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "7",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "8",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     },
     {
       "key": "9",
       "modifiers": ["alt"],
-      "action": "none",
+      "action": "noop",
       "args": {},
       "when": "normal"
     }

@@ -125,6 +125,41 @@ fn find_word_end_right(line: &str, from_column: usize, line_length: usize) -> us
 
 impl Editor {
     // =========================================================================
+    // Layout Flush (synchronous state materialization)
+    // =========================================================================
+
+    /// Force-materialize render-dependent state for all visible splits.
+    ///
+    /// This is the editor's equivalent of iOS `layoutIfNeeded()` or browser
+    /// forced reflow. It ensures that `CompositeViewState` entries exist for
+    /// any visible composite buffer, using the split's current viewport
+    /// dimensions. After calling this, commands like `compositeNextHunk` can
+    /// safely read and modify view state that would otherwise only exist after
+    /// the next render cycle.
+    pub fn flush_layout(&mut self) {
+        use crate::view::composite_view::CompositeViewState;
+
+        let visible = self
+            .split_manager
+            .get_visible_buffers(ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: self.terminal_width,
+                height: self.terminal_height,
+            });
+
+        for (split_id, buffer_id, _area) in &visible {
+            // Only process composite buffers
+            if let Some(composite) = self.composite_buffers.get(buffer_id) {
+                let pane_count = composite.pane_count();
+                self.composite_view_states
+                    .entry((*split_id, *buffer_id))
+                    .or_insert_with(|| CompositeViewState::new(*buffer_id, pane_count));
+            }
+        }
+    }
+
+    // =========================================================================
     // Composite Buffer Methods
     // =========================================================================
 
@@ -199,7 +234,7 @@ impl Editor {
             80,
             24,
             crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-            std::sync::Arc::clone(&self.filesystem),
+            std::sync::Arc::clone(&self.authority.filesystem),
         );
         state.is_composite_buffer = true;
         state.editing_disabled = true;
@@ -261,32 +296,73 @@ impl Editor {
         }
     }
 
-    /// Navigate to the next hunk in a composite buffer's diff view
-    pub fn composite_next_hunk(&mut self, split_id: LeafId, buffer_id: BufferId) -> bool {
-        if let (Some(composite), Some(view_state)) = (
-            self.composite_buffers.get(&buffer_id),
-            self.composite_view_states.get_mut(&(split_id, buffer_id)),
-        ) {
-            if let Some(next_row) = composite.alignment.next_hunk_row(view_state.scroll_row) {
-                view_state.scroll_row = next_row;
-                return true;
-            }
-        }
-        false
+    /// Navigate to the next hunk using the active split.
+    pub fn composite_next_hunk_active(&mut self, buffer_id: BufferId) -> bool {
+        let split_id = self.split_manager.active_split();
+        self.composite_next_hunk(split_id, buffer_id)
     }
 
-    /// Navigate to the previous hunk in a composite buffer's diff view
-    pub fn composite_prev_hunk(&mut self, split_id: LeafId, buffer_id: BufferId) -> bool {
-        if let (Some(composite), Some(view_state)) = (
+    /// Navigate to the previous hunk using the active split.
+    pub fn composite_prev_hunk_active(&mut self, buffer_id: BufferId) -> bool {
+        let split_id = self.split_manager.active_split();
+        self.composite_prev_hunk(split_id, buffer_id)
+    }
+
+    /// Navigate to the next hunk in a composite buffer's diff view.
+    /// Centers the hunk header in the viewport and moves the cursor to it.
+    pub fn composite_next_hunk(&mut self, split_id: LeafId, buffer_id: BufferId) -> bool {
+        let viewport_height = self.get_composite_viewport_height(split_id);
+        let moved = if let (Some(composite), Some(view_state)) = (
             self.composite_buffers.get(&buffer_id),
             self.composite_view_states.get_mut(&(split_id, buffer_id)),
         ) {
-            if let Some(prev_row) = composite.alignment.prev_hunk_row(view_state.scroll_row) {
-                view_state.scroll_row = prev_row;
-                return true;
+            // Search from cursor position (not scroll position) to avoid
+            // finding the same hunk when scroll is offset for centering
+            if let Some(next_row) = composite.alignment.next_hunk_row(view_state.cursor_row) {
+                view_state.cursor_row = next_row;
+                // Scroll so the hunk header is ~1/3 from the top of the viewport
+                let context_above = viewport_height / 3;
+                view_state.scroll_row = next_row.saturating_sub(context_above);
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        // Keep the EditorState / split-view cursor in lockstep with the
+        // composite view so the status bar's Ln/Col reflects the new row.
+        // Arrow keys do this via handle_cursor_movement_action; hunk
+        // navigation used to skip it, leaving "Ln 1" stale after n/p.
+        if moved {
+            self.sync_editor_cursor_from_composite(split_id, buffer_id);
         }
-        false
+        moved
+    }
+
+    /// Navigate to the previous hunk in a composite buffer's diff view.
+    /// Centers the hunk header in the viewport and moves the cursor to it.
+    pub fn composite_prev_hunk(&mut self, split_id: LeafId, buffer_id: BufferId) -> bool {
+        let viewport_height = self.get_composite_viewport_height(split_id);
+        let moved = if let (Some(composite), Some(view_state)) = (
+            self.composite_buffers.get(&buffer_id),
+            self.composite_view_states.get_mut(&(split_id, buffer_id)),
+        ) {
+            if let Some(prev_row) = composite.alignment.prev_hunk_row(view_state.cursor_row) {
+                view_state.cursor_row = prev_row;
+                let context_above = viewport_height / 3;
+                view_state.scroll_row = prev_row.saturating_sub(context_above);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if moved {
+            self.sync_editor_cursor_from_composite(split_id, buffer_id);
+        }
+        moved
     }
 
     /// Scroll a composite buffer view
@@ -819,10 +895,19 @@ impl Editor {
                 CursorMovement::WordRight,
                 false,
             ),
-            Action::MoveWordEnd => self.handle_cursor_movement_action(
+            Action::MoveWordEnd | Action::ViMoveWordEnd => self.handle_cursor_movement_action(
                 split_id,
                 buffer_id,
                 CursorMovement::WordEnd,
+                false,
+            ),
+            Action::MoveLeftInLine => {
+                self.handle_cursor_movement_action(split_id, buffer_id, CursorMovement::Left, false)
+            }
+            Action::MoveRightInLine => self.handle_cursor_movement_action(
+                split_id,
+                buffer_id,
+                CursorMovement::Right,
                 false,
             ),
 
@@ -863,7 +948,7 @@ impl Editor {
                 CursorMovement::WordRight,
                 true,
             ),
-            Action::SelectWordEnd => self.handle_cursor_movement_action(
+            Action::SelectWordEnd | Action::ViSelectWordEnd => self.handle_cursor_movement_action(
                 split_id,
                 buffer_id,
                 CursorMovement::WordEnd,
@@ -990,6 +1075,7 @@ impl Editor {
         layout_config: fresh_core::api::CompositeLayoutConfig,
         source_configs: Vec<fresh_core::api::CompositeSourceConfig>,
         hunks: Option<Vec<fresh_core::api::CompositeHunk>>,
+        initial_focus_hunk: Option<usize>,
         _request_id: Option<u64>,
     ) {
         use crate::model::composite_buffer::{
@@ -1057,6 +1143,13 @@ impl Editor {
 
             let alignment = LineAlignment::from_hunks(&diff_hunks, old_line_count, new_line_count);
             self.set_composite_alignment(buffer_id, alignment);
+        }
+
+        // Store initial focus hunk for the first render to apply
+        if initial_focus_hunk.is_some() {
+            if let Some(composite) = self.composite_buffers.get_mut(&buffer_id) {
+                composite.initial_focus_hunk = initial_focus_hunk;
+            }
         }
 
         tracing::info!(

@@ -63,7 +63,7 @@ pub mod layout {
 }
 use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::{FileSystem, StdFileSystem};
-use fresh::primitives::highlight_engine::HighlightEngine;
+use fresh::primitives::highlight_engine::{HighlightEngine, HighlightStats};
 use fresh::services::fs::{BackendMetrics, SlowFileSystem, SlowFsConfig};
 use fresh::services::time_source::{SharedTimeSource, TestTimeSource};
 use fresh::{app::Editor, config::Config};
@@ -121,6 +121,26 @@ pub fn copy_plugin_lib(plugins_dir: &Path) {
     }
 }
 
+/// Recursively copy `<src>` into `<dst>`, creating `<dst>` if missing.
+/// Existing files at the destination are overwritten (for re-runs).
+fn mirror_plugins_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            mirror_plugins_dir(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Configuration options for creating an EditorTestHarness.
 ///
 /// Use the builder pattern to configure the harness:
@@ -140,8 +160,15 @@ pub struct HarnessOptions {
     /// Create a "project_root" subdirectory for deterministic paths in snapshots.
     /// When true, `project_dir()` returns this subdirectory path.
     pub create_project_root: bool,
-    /// Create an empty plugins directory to prevent embedded plugin loading.
-    /// Defaults to true for test isolation.
+    /// Disable plugin loading (embedded + user) for test isolation.
+    /// Defaults to true. Set to false (via `without_empty_plugins_dir()`)
+    /// for tests that exercise plugin behavior — they then either pre-
+    /// populate `<working_dir>/plugins/` (which the harness mirrors into
+    /// `<config_dir>/plugins/`) or rely on the embedded plugins fallback.
+    ///
+    /// (Field name kept for source-compat with existing callers; the
+    /// historical "create empty plugins dir" mechanism is gone — see
+    /// issue #1722.)
     pub create_empty_plugins_dir: bool,
     /// Shared DirectoryContext. If None, creates a new one for test isolation.
     pub dir_context: Option<DirectoryContext>,
@@ -156,11 +183,23 @@ pub struct HarnessOptions {
     /// Defaults to false (uses empty registry for fast test startup).
     /// Set to true only for tests that need syntax highlighting or shebang detection.
     pub use_full_grammar_registry: bool,
+    /// Force the embedded-plugins fallback to fire regardless of whether
+    /// the test created `<working_dir>/plugins/`. The harness's normal
+    /// "directory presence == user controls plugins" rule is for test
+    /// isolation; tests reproducing user-visible plugin behavior (e.g.
+    /// the #1722 regression test) need to override it to match
+    /// production semantics. Defaults to false.
+    pub force_embedded_plugins: bool,
+    /// Per-test fake-devcontainer state. Set by [`HarnessOptions::with_fake_devcontainer`];
+    /// moved into the harness on `create()` so the lock + tempdir live as long as the test.
+    /// Unix-only: the fake CLI is a bash script that doesn't run on Windows.
+    #[cfg(unix)]
+    pub fake_devcontainer: Option<FakeDevcontainerHandle>,
 }
 
 impl HarnessOptions {
     /// Create new options with default settings.
-    /// - `create_empty_plugins_dir`: true (prevents embedded plugin loading)
+    /// - `create_empty_plugins_dir`: true (disables plugin loading for isolation)
     /// - `create_project_root`: false
     pub fn new() -> Self {
         Self {
@@ -173,7 +212,19 @@ impl HarnessOptions {
             filesystem: None,
             preserve_keybinding_map: false,
             use_full_grammar_registry: false,
+            force_embedded_plugins: false,
+            #[cfg(unix)]
+            fake_devcontainer: None,
         }
+    }
+
+    /// Force the embedded-plugins fallback to fire regardless of test
+    /// fixtures under `<working_dir>/plugins/`. Use only when reproducing
+    /// production plugin-loading behavior in a test (e.g. issue #1722
+    /// regression).
+    pub fn with_forced_embedded_plugins(mut self) -> Self {
+        self.force_embedded_plugins = true;
+        self
     }
 
     /// Set a custom editor configuration.
@@ -193,21 +244,24 @@ impl HarnessOptions {
     /// Use `harness.project_dir()` to get the path.
     pub fn with_project_root(mut self) -> Self {
         self.create_project_root = true;
-        // When using project_root, don't auto-create plugins dir inside it
-        // to avoid breaking tests that check project contents or create their own plugins
+        // Tests using project_root often install their own plugin fixtures
+        // and need plugin loading enabled; opt them out of the no-plugins
+        // default.
         self.create_empty_plugins_dir = false;
         self
     }
 
-    /// Create an empty plugins directory to prevent embedded plugin loading.
-    /// This is enabled by default for test isolation.
+    /// Disable plugin loading for the test (default for isolation). Method
+    /// name kept for source-compat with existing tests.
     pub fn with_empty_plugins_dir(mut self) -> Self {
         self.create_empty_plugins_dir = true;
         self
     }
 
-    /// Don't create an empty plugins directory.
-    /// Embedded plugins may be loaded if no plugins directory exists.
+    /// Enable plugin loading for the test (embedded plugins fire, and any
+    /// fixtures in `<working_dir>/plugins/` are mirrored into the editor's
+    /// scanned `<config_dir>/plugins/`). Method name kept for source-compat
+    /// with existing tests.
     pub fn without_empty_plugins_dir(mut self) -> Self {
         self.create_empty_plugins_dir = false;
         self
@@ -246,6 +300,85 @@ impl HarnessOptions {
         self.use_full_grammar_registry = true;
         self
     }
+
+    /// Wire the test process so that `devcontainer` and `docker` resolve
+    /// to the in-tree fake CLIs at `scripts/fake-devcontainer/bin`. The
+    /// returned `HarnessOptions` carries a per-test state directory and
+    /// a process-global mutex guard so concurrent harness instances
+    /// don't clobber each other's `FAKE_DEVCONTAINER_STATE`.
+    ///
+    /// The fake state path is reachable via
+    /// [`EditorTestHarness::fake_devcontainer_state`].
+    ///
+    /// Sets `FAKE_DC_UP_DELAY_MS=0` so build-progress lines are emitted
+    /// without sleeps; tests that want to exercise streaming should
+    /// override the env var explicitly after this call.
+    ///
+    /// Unix-only: the fake CLI is a bash script (`#!/usr/bin/env bash`)
+    /// that doesn't run on native Windows, and the PATH manipulation
+    /// below uses `:` as the separator. The test files that opt in
+    /// (`devcontainer_attach_e2e`, `devcontainer_spec_repros`,
+    /// `devcontainer_spec_conformance`) are gated to `cfg(unix)` in
+    /// `tests/e2e/plugins/mod.rs`, so this stays available everywhere
+    /// they compile.
+    #[cfg(unix)]
+    pub fn with_fake_devcontainer(mut self) -> Self {
+        let fake_bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/fake-devcontainer/bin")
+            .canonicalize()
+            .expect("scripts/fake-devcontainer/bin must exist relative to CARGO_MANIFEST_DIR");
+
+        let temp = TempDir::new().expect("tempdir for fake-devcontainer state");
+        let state_path = temp.path().to_path_buf();
+
+        // Serialize against other harness instances using the fake CLI:
+        // FAKE_DEVCONTAINER_STATE is process-global env, so a parallel
+        // test setting its own state would steal ours mid-run.
+        let guard = fake_devcontainer_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // PATH prepend is idempotent — every harness call points at the
+        // same in-tree fake bin dir, so racing threads only ever
+        // converge on the same prefix.
+        let path = std::env::var("PATH").unwrap_or_default();
+        let already_on_path = path.split(':').any(|p| std::path::Path::new(p) == fake_bin);
+        if !already_on_path {
+            std::env::set_var("PATH", format!("{}:{}", fake_bin.display(), path));
+        }
+        std::env::set_var("FAKE_DEVCONTAINER_STATE", &state_path);
+        std::env::set_var("FAKE_DC_UP_DELAY_MS", "0");
+
+        self.fake_devcontainer = Some(FakeDevcontainerHandle {
+            _guard: guard,
+            _temp: temp,
+            state_path,
+        });
+        self
+    }
+}
+
+/// Lock that serializes harness instances using the fake devcontainer CLI.
+/// Held in `FakeDevcontainerHandle::_guard` for the lifetime of the test.
+#[cfg(unix)]
+fn fake_devcontainer_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// State directory + lock guard for a single harness's fake-devcontainer
+/// session. Kept inside `EditorTestHarness` so dropping the harness
+/// drops the guard (releasing the lock for the next test) and the
+/// tempdir (cleaning up state files).
+#[cfg(unix)]
+pub struct FakeDevcontainerHandle {
+    /// Held for the harness's lifetime so concurrent tests can't race
+    /// on the global `FAKE_DEVCONTAINER_STATE` env var.
+    _guard: std::sync::MutexGuard<'static, ()>,
+    /// Tempdir kept alive for the harness's lifetime.
+    _temp: TempDir,
+    /// Path to the fake's state directory (`<temp>/`).
+    pub state_path: PathBuf,
 }
 
 /// A wrapper that captures CrosstermBackend output for vt100 parsing
@@ -313,6 +446,32 @@ pub fn strip_osc8(s: &str) -> String {
     result
 }
 
+/// Find `text` in the row formed by joining `cell_symbols` and return the
+/// **cell column** (not byte offset) where the match starts.
+///
+/// `str::find` returns a byte offset into the joined row, but a single
+/// cell can hold a multi-byte symbol (e.g. `│` is 3 UTF-8 bytes). Casting
+/// the byte offset directly to a column would yield values past the
+/// buffer width whenever the row contains box-drawing or other non-ASCII
+/// glyphs, which then causes `Buffer::index_of` to panic with
+/// "index outside of buffer".
+pub fn find_text_in_row<'a, I: IntoIterator<Item = &'a str>>(
+    cell_symbols: I,
+    text: &str,
+) -> Option<u16> {
+    let mut row_text = String::new();
+    let mut byte_to_col: Vec<u16> = Vec::new();
+    for (col, sym) in cell_symbols.into_iter().enumerate() {
+        let col = u16::try_from(col).ok()?;
+        for _ in 0..sym.len() {
+            byte_to_col.push(col);
+        }
+        row_text.push_str(sym);
+    }
+    let byte_offset = row_text.find(text)?;
+    Some(byte_to_col[byte_offset])
+}
+
 /// Virtual editor environment for testing
 /// Captures all rendering output without displaying to actual terminal
 pub struct EditorTestHarness {
@@ -324,6 +483,13 @@ pub struct EditorTestHarness {
 
     /// Optional temp directory (kept alive for the duration of the test)
     _temp_dir: Option<TempDir>,
+
+    /// Optional fake-devcontainer state (kept alive for the duration
+    /// of the test). The `Drop` of this field releases the global lock
+    /// so the next test can claim it.
+    /// Unix-only: see [`HarnessOptions::with_fake_devcontainer`].
+    #[cfg(unix)]
+    fake_devcontainer: Option<FakeDevcontainerHandle>,
 
     /// Optional metrics for slow filesystem backend
     fs_metrics: Option<Arc<BackendMetrics>>,
@@ -381,12 +547,14 @@ impl EditorTestHarness {
     /// )?;
     /// ```
     pub fn create(width: u16, height: u16, options: HarnessOptions) -> anyhow::Result<Self> {
+        let mut t = crate::common::timing::Timer::start("harness::create");
         // Create temp directory if we don't have a shared dir_context
         let temp_dir = if options.dir_context.is_none() || options.create_project_root {
             Some(TempDir::new()?)
         } else {
             None
         };
+        t.phase("temp_dir");
 
         // Determine the base path for our temp directory
         let temp_base = temp_dir.as_ref().map(|d| d.path().to_path_buf());
@@ -407,13 +575,37 @@ impl EditorTestHarness {
                 .expect("temp_dir must exist when no working_dir provided")
         };
 
-        // Create empty plugins directory if requested
-        if options.create_empty_plugins_dir {
-            let plugins_dir = working_dir.join("plugins");
-            if !plugins_dir.exists() {
-                std::fs::create_dir(&plugins_dir)?;
-            }
+        t.phase("working_dir_setup");
+        // Plugin loading. Historically the harness created an empty
+        // `<working_dir>/plugins/` so the editor would scan it and
+        // skip the embedded fallback (suppression by directory
+        // presence). The editor no longer scans `<working_dir>/plugins/`
+        // (issue #1722), but the harness keeps the directory-presence
+        // contract for tests:
+        //
+        //   * `<working_dir>/plugins/` exists       → user controls the
+        //     plugin set; embedded fallback is off, and any contents
+        //     are mirrored into `<config_dir>/plugins/` (which the
+        //     editor does scan).
+        //   * `<working_dir>/plugins/` doesn't exist → embedded loads
+        //     normally (used by tests that exercise bundled plugins).
+        //
+        // The default `create_empty_plugins_dir = true` continues to
+        // mean "auto-create the dir to opt out of embedded". The plugin
+        // runtime is always active so tests can introspect it via
+        // `plugin_manager().state_snapshot_handle()` etc.
+        let working_plugins_path = working_dir.join("plugins");
+        if options.create_empty_plugins_dir && !working_plugins_path.exists() {
+            std::fs::create_dir(&working_plugins_path)?;
         }
+        let user_controls_plugins = working_plugins_path.is_dir();
+        let working_plugins_populated = working_plugins_path
+            .read_dir()
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false);
+        let enable_plugins_for_editor = true;
+
+        t.phase("plugin_dir_setup");
 
         // Get or create DirectoryContext
         let dir_context = options.dir_context.unwrap_or_else(|| {
@@ -423,6 +615,7 @@ impl EditorTestHarness {
                     .expect("temp_dir must exist when no dir_context provided"),
             )
         });
+        t.phase("dir_context");
 
         // Create TestTimeSource for controllable time in tests
         let test_time_source = Arc::new(TestTimeSource::new());
@@ -432,11 +625,26 @@ impl EditorTestHarness {
         // If no config provided, use defaults; if config provided, respect its settings
         let config_was_provided = options.config.is_some();
         let mut config = options.config.unwrap_or_default();
-        // Only override auto_indent/auto_close if no config was explicitly provided
+        // Only override auto_indent/auto_close/animations if no config was
+        // explicitly provided. Animations span multiple render ticks, so
+        // tests that drive the UI via single `render()` calls and then
+        // inspect the screen would see mid-slide frames instead of the
+        // settled result. Tests that want to exercise the animation
+        // layer pass their own Config with `animations: true`.
         if !config_was_provided {
             config.editor.auto_indent = false; // Disable for simpler testing
             config.editor.auto_close = false; // Disable for simpler testing
+            config.editor.animations = false;
         }
+        // Always force the prompt line to be visible in tests so layout-
+        // sensitive assertions (scrolling, scrollbar invariants, status bar
+        // positioning, content_area_rows) stay stable. The user-facing
+        // default is auto-hide (show_prompt_line=false); tests that need
+        // to exercise the auto-hide path do so via the runtime toggle
+        // (`editor.toggle_prompt_line()`) or the Settings UI rather than
+        // by passing a config, so the override here never gets in their
+        // way.
+        config.editor.show_prompt_line = true;
         // Force "default" keybinding map for consistent test behavior across platforms
         // (Config::default() uses platform-specific keymaps which breaks test assumptions)
         // Skip this if the test explicitly wants to preserve its keymap (e.g., testing emacs bindings)
@@ -446,9 +654,27 @@ impl EditorTestHarness {
         config.check_for_updates = false; // Disable update checking in tests
 
         // Initialize i18n with the config's locale before creating the editor
-        // This ensures menu defaults are created with the correct translations
+        // This ensures menu defaults are created with the correct translations.
+        //
+        // TODO(flakiness): this mutates a *process-global* locale
+        // (`rust_i18n::set_locale`). Cargo runs all test functions in one
+        // process in parallel, so harness-created tests can race each other:
+        // a German-locale harness can flip the global to `de` while an
+        // unrelated test is asserting on English UI strings, producing
+        // intermittent failures like
+        // `e2e::locale::test_default_locale_shows_english_search_options`
+        // when the full suite is run in parallel. (The tests in
+        // `tests/e2e/locale.rs` use a module-local mutex, which serializes
+        // them against each other but not against the rest of the suite.)
+        //
+        // Pre-exists this branch; see master for identical parallel-run
+        // failures. A robust fix means either moving rust_i18n locale into
+        // a thread-local, or holding a *global* (process-wide) test lock
+        // around every harness-driven render. Not worth the scope creep
+        // from this perf fix; flagging here so the next reader knows.
         fresh::i18n::init_with_config(config.locale.as_option());
         config.editor.double_click_time_ms = 10; // Fast double-click for faster tests
+        t.phase("config_and_i18n");
 
         // Create filesystem backend (custom, slow, or default)
         let (filesystem, fs_metrics): (Arc<dyn FileSystem + Send + Sync>, _) =
@@ -463,9 +689,12 @@ impl EditorTestHarness {
                 (Arc::new(StdFileSystem), None)
             };
 
+        t.phase("filesystem");
+
         // Create terminal
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend)?;
+        t.phase("terminal");
 
         // Create grammar registry if requested (slow, only for tests that need syntax highlighting)
         let grammar_registry = if options.use_full_grammar_registry {
@@ -475,6 +704,30 @@ impl EditorTestHarness {
         } else {
             None // Use empty registry for fast test startup
         };
+
+        // Mirror any plugins the test pre-populated under
+        // `<working_dir>/plugins/` into `<config_dir>/plugins/` (which the
+        // editor scans). Tests historically set up plugin fixtures via
+        // `copy_plugin()` against `working_dir/plugins/`; the editor no
+        // longer scans that path (issue #1722), so we forward the fixtures
+        // here to keep the test API working without touching every caller.
+        //
+        // When the test pre-populated its own plugins, treat that as an
+        // explicit "use exactly these" request and disable the embedded
+        // plugin fallback so the bundled set doesn't leak in. This matches
+        // the pre-#1722 behavior, where any `working_dir/plugins/` (even
+        // empty) suppressed embedded loading.
+        t.phase("grammar_registry");
+
+        if working_plugins_populated {
+            let target = dir_context.config_dir.join("plugins");
+            mirror_plugins_dir(&working_plugins_path, &target)?;
+        }
+        t.phase("mirror_plugins");
+        // Embedded loads only when the test isn't taking control. The
+        // `force_embedded_plugins` escape hatch overrides this for tests
+        // that need production plugin-loading semantics (see #1722).
+        let enable_embedded_plugins = options.force_embedded_plugins || !user_controls_plugins;
 
         // Create editor
         let mut editor = Editor::for_test(
@@ -487,15 +740,22 @@ impl EditorTestHarness {
             filesystem,
             Some(time_source),
             grammar_registry,
+            enable_plugins_for_editor,
+            enable_embedded_plugins,
         )?;
+
+        t.phase("Editor::for_test");
 
         // Process any pending plugin commands
         editor.process_async_messages();
+        t.phase("process_async_messages");
 
-        Ok(EditorTestHarness {
+        let h = EditorTestHarness {
             editor,
             terminal,
             _temp_dir: temp_dir,
+            #[cfg(unix)]
+            fake_devcontainer: options.fake_devcontainer,
             fs_metrics,
             _tokio_runtime: None,
             time_source: test_time_source,
@@ -507,7 +767,9 @@ impl EditorTestHarness {
             vt100_parser: vt100::Parser::new(height, width, 0),
             term_width: width,
             term_height: height,
-        })
+        };
+        t.finish();
+        Ok(h)
     }
 
     // =========================================================================
@@ -543,6 +805,49 @@ impl EditorTestHarness {
             height,
             HarnessOptions::new()
                 .with_project_root()
+                .with_config(config),
+        )
+    }
+
+    /// Same as [`with_temp_project`] but with TypeScript plugin loading
+    /// disabled. Reserved for tests whose code paths provably do not
+    /// observe plugin behavior — every plugin-loading test boundary is
+    /// ~440 ms of TS transpile + QuickJS evaluation, so the suite-wide
+    /// savings are large.
+    ///
+    /// **Don't reach for this casually.** Disabling plugins removes any
+    /// hooks they install (`editor_initialized`, buffer-changed
+    /// reactions, command registrations). Currently used only by
+    /// scenarios whose contract guarantees no plugin interaction:
+    /// `BufferScenario` (text + caret only, dispatched through core
+    /// `Action`s) and `TraceScenario` (forward + undo trace on the same
+    /// core dispatch). Other scenario runners (Input, Modal, Layout,
+    /// etc.) keep plugins enabled so their tests preserve coverage of
+    /// any plugin-side effect that could reach the asserted state.
+    pub fn with_temp_project_no_plugins(width: u16, height: u16) -> anyhow::Result<Self> {
+        Self::create(
+            width,
+            height,
+            HarnessOptions::new()
+                .with_project_root()
+                .with_empty_plugins_dir(),
+        )
+    }
+
+    /// Same as [`with_temp_project_and_config`] but with plugins
+    /// disabled. See [`with_temp_project_no_plugins`] for when this is
+    /// safe to use.
+    pub fn with_temp_project_and_config_no_plugins(
+        width: u16,
+        height: u16,
+        config: Config,
+    ) -> anyhow::Result<Self> {
+        Self::create(
+            width,
+            height,
+            HarnessOptions::new()
+                .with_project_root()
+                .with_empty_plugins_dir()
                 .with_config(config),
         )
     }
@@ -659,12 +964,31 @@ impl EditorTestHarness {
             .map(|d| d.path().join("project_root"))
     }
 
-    /// Get the recovery directory path for this test harness
-    /// The recovery directory is isolated per-test under the temp directory
-    pub fn recovery_dir(&self) -> Option<PathBuf> {
-        self._temp_dir
+    /// Path to the per-test fake-devcontainer state directory, set up
+    /// by [`HarnessOptions::with_fake_devcontainer`]. Returns `None`
+    /// for harnesses that didn't opt into the fake CLI. Tests use this
+    /// to read `last_id`, container `logs` files, etc.
+    /// Unix-only: see [`HarnessOptions::with_fake_devcontainer`].
+    #[cfg(unix)]
+    pub fn fake_devcontainer_state(&self) -> Option<&Path> {
+        self.fake_devcontainer
             .as_ref()
-            .map(|d| d.path().join("data").join("recovery"))
+            .map(|h| h.state_path.as_path())
+    }
+
+    /// Get the recovery directory path for this test harness.
+    ///
+    /// Returns the *scoped* directory where the editor actually writes
+    /// recovery files. In standalone mode (no `set_session_name`) the path
+    /// is `<base>/default/<encoded_working_dir>/`, so each working directory
+    /// keeps its own recovery files (issue #1550).
+    pub fn recovery_dir(&self) -> Option<PathBuf> {
+        let base = self
+            ._temp_dir
+            .as_ref()
+            .map(|d| d.path().join("data").join("recovery"))?;
+        let hash = fresh::workspace::encode_path_for_filename(self.editor.working_dir());
+        Some(base.join("default").join(hash))
     }
 
     /// Take ownership of the temp directory, preventing it from being cleaned up
@@ -673,6 +997,21 @@ impl EditorTestHarness {
     /// Returns the TempDir which should be kept alive until the test ends.
     pub fn take_temp_dir(&mut self) -> Option<TempDir> {
         self._temp_dir.take()
+    }
+
+    /// Borrow the harness's temp directory path. Used by
+    /// `PersistenceScenario` to write fixture files the editor will
+    /// then open. None if the harness wasn't created with a
+    /// project root.
+    pub fn temp_dir_path(&self) -> Option<&Path> {
+        self._temp_dir.as_ref().map(|t| t.path())
+    }
+
+    /// Enable software-cursor-only mode (no hardware cursor).
+    /// Use this in tests that need REVERSED cell styling on cursor positions,
+    /// e.g. when verifying that cursor styling doesn't bleed through overlays.
+    pub fn set_software_cursor_only(&mut self, enabled: bool) {
+        self.editor.set_software_cursor_only(enabled);
     }
 
     /// Enable shadow buffer validation
@@ -684,14 +1023,18 @@ impl EditorTestHarness {
 
     /// Open a file in the editor
     pub fn open_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        let mut t = crate::common::timing::Timer::start("harness::open_file");
         self.editor.open_file(path)?;
+        t.phase("editor.open_file");
         self.render()?;
+        t.phase("render");
 
         // Initialize shadow string with the file content (if available)
         // For large files with lazy loading, shadow validation is not supported
         self.shadow_string = self.get_buffer_content().unwrap_or_default();
         self.shadow_cursor = self.cursor_position();
-
+        t.phase("shadow_init");
+        t.finish();
         Ok(())
     }
 
@@ -702,7 +1045,21 @@ impl EditorTestHarness {
         &mut self,
         content: &str,
     ) -> anyhow::Result<crate::common::fixtures::TestFixture> {
-        let fixture = crate::common::fixtures::TestFixture::new("test_buffer.txt", content)?;
+        self.load_buffer_from_text_named("test_buffer.txt", content)
+    }
+
+    /// Like [`load_buffer_from_text`], but the on-disk fixture uses
+    /// the given filename. Choose the extension to drive
+    /// language-detection — `"x.rs"` → Rust, `"x.py"` → Python,
+    /// `"x.yaml"` → YAML, etc. Needed for theorems whose behavior
+    /// depends on the buffer's language (toggle-comment prefix,
+    /// auto-close of quote chars, etc.).
+    pub fn load_buffer_from_text_named(
+        &mut self,
+        filename: &str,
+        content: &str,
+    ) -> anyhow::Result<crate::common::fixtures::TestFixture> {
+        let fixture = crate::common::fixtures::TestFixture::new(filename, content)?;
         self.open_file(&fixture.path)?;
         Ok(fixture)
     }
@@ -813,6 +1170,8 @@ impl EditorTestHarness {
             modifiers: KeyModifiers::empty(),
         };
         self.send_mouse(mouse_up)?;
+        // Process any async messages that may have been generated by the mouse event
+        let _ = self.editor.process_async_messages();
         self.render()?;
         Ok(())
     }
@@ -833,6 +1192,26 @@ impl EditorTestHarness {
             column: col,
             row,
             modifiers: KeyModifiers::SHIFT,
+        };
+        self.send_mouse(mouse_up)?;
+        self.render()?;
+        Ok(())
+    }
+
+    /// Simulate a right-click at specific coordinates
+    pub fn mouse_right_click(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
+        let mouse_down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        self.send_mouse(mouse_down)?;
+        let mouse_up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Right),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
         };
         self.send_mouse(mouse_up)?;
         self.render()?;
@@ -1098,6 +1477,18 @@ impl EditorTestHarness {
             .map(|cell| cell.contents().to_string())
     }
 
+    /// Cursor position the vt100 parser sees, as `(col, row)`. Used
+    /// by the scenario framework's `RoundTripGrid` observable
+    /// (Phase 8 / TerminalIoScenario).
+    pub fn vt100_cursor_position(&self) -> Option<(u16, u16)> {
+        let (row, col) = self.vt100_parser.screen().cursor_position();
+        if row >= self.term_height || col >= self.term_width {
+            None
+        } else {
+            Some((col, row))
+        }
+    }
+
     /// Get the current terminal buffer (what would be displayed)
     pub fn buffer(&self) -> &ratatui::buffer::Buffer {
         self.terminal.backend().buffer()
@@ -1256,15 +1647,15 @@ impl EditorTestHarness {
         let (width, height) = (buffer.area.width, buffer.area.height);
 
         for y in 0..height {
-            let mut row_text = String::new();
-            for x in 0..width {
-                let pos = buffer.index_of(x, y);
-                if let Some(cell) = buffer.content.get(pos) {
-                    row_text.push_str(cell.symbol());
-                }
-            }
-            if let Some(col) = row_text.find(text) {
-                return Some((col as u16, y));
+            let symbols = (0..width).map(|x| {
+                buffer
+                    .content
+                    .get(buffer.index_of(x, y))
+                    .map(|cell| cell.symbol())
+                    .unwrap_or("")
+            });
+            if let Some(col) = find_text_in_row(symbols, text) {
+                return Some((col, y));
             }
         }
         None
@@ -1333,6 +1724,16 @@ impl EditorTestHarness {
         &mut self.editor
     }
 
+    /// Access the editor through the semantic test API.
+    ///
+    /// This is the entry point used by theorem-style tests under
+    /// `tests/semantic/`. Those tests deliberately do not use
+    /// `editor_mut()` or any other internal accessor — see
+    /// `docs/internal/e2e-test-migration-design.md` §2.1.
+    pub fn api_mut(&mut self) -> &mut dyn fresh::test_api::EditorTestApi {
+        &mut self.editor
+    }
+
     /// Check if editor wants to quit
     pub fn should_quit(&self) -> bool {
         self.editor.should_quit()
@@ -1368,9 +1769,28 @@ impl EditorTestHarness {
         workspace_enabled: bool,
         cli_files: &[std::path::PathBuf],
     ) -> anyhow::Result<bool> {
+        self.startup_with_force_restore(workspace_enabled, false, cli_files)
+    }
+
+    /// Variant of [`Self::startup`] that can force workspace restore even
+    /// when `editor.restore_previous_session` is disabled — mirrors the
+    /// `--restore` CLI flag in `main.rs`.
+    pub fn startup_with_force_restore(
+        &mut self,
+        workspace_enabled: bool,
+        force_restore: bool,
+        cli_files: &[std::path::PathBuf],
+    ) -> anyhow::Result<bool> {
+        let restore_full_session = workspace_enabled
+            && (force_restore || self.editor.config().editor.restore_previous_session);
         let mut restored = false;
-        if workspace_enabled {
+        if restore_full_session {
             restored = self.editor.try_restore_workspace().unwrap_or(false);
+        } else {
+            // Session restore opted out, but hot-exit content (unsaved
+            // modified files + unnamed buffers with content) is still
+            // restored — matches production behaviour in `main.rs`.
+            let _ = self.editor.try_restore_hot_exit_buffers();
         }
 
         let has_cli_files = !cli_files.is_empty();
@@ -1762,6 +2182,19 @@ impl EditorTestHarness {
         )
     }
 
+    /// Get highlight performance stats (TextMate engine only).
+    pub fn highlight_stats(&self) -> Option<&HighlightStats> {
+        self.editor.active_state().highlighter.highlight_stats()
+    }
+
+    /// Reset highlight performance counters.
+    pub fn reset_highlight_stats(&mut self) {
+        self.editor
+            .active_state_mut()
+            .highlighter
+            .reset_highlight_stats();
+    }
+
     /// Get the shadow string (for property testing)
     pub fn get_shadow_string(&self) -> &str {
         &self.shadow_string
@@ -1799,18 +2232,44 @@ impl EditorTestHarness {
         (pos.x, pos.y)
     }
 
+    /// Render and report whether the hardware cursor was shown, and where.
+    ///
+    /// Returns `Some((x, y))` if ratatui's `Terminal::draw` ended the frame
+    /// by calling `show_cursor` + `set_cursor_position` — i.e. the editor
+    /// populated `Frame::cursor_position`. Returns `None` if `hide_cursor`
+    /// was called — i.e. `Frame::cursor_position` was `None`.
+    ///
+    /// Detection uses a sentinel: before `draw`, we move the backend's
+    /// cursor to `(0, 0)`. `Terminal::draw` only updates the backend
+    /// position when the frame asked for the cursor to be shown, so if the
+    /// position stays at the sentinel afterward, the frame hid it. The
+    /// editor never places its hardware cursor at `(0, 0)` (row 0 is the
+    /// menu bar), so the sentinel is unambiguous.
+    pub fn render_observing_cursor(&mut self) -> anyhow::Result<Option<(u16, u16)>> {
+        self.terminal
+            .set_cursor_position(ratatui::layout::Position::new(0, 0))?;
+        self.render()?;
+        let pos = self.terminal.get_cursor_position().unwrap_or_default();
+        if pos.x == 0 && pos.y == 0 {
+            Ok(None)
+        } else {
+            Ok(Some((pos.x, pos.y)))
+        }
+    }
+
     /// Find all visible cursors on screen
     /// Returns a vec of (x, y, character_at_cursor, is_primary)
     /// Primary cursor is detected at hardware cursor position
     /// Secondary cursors are detected by REVERSED style modifier or inactive cursor background
     pub fn find_all_cursors(&mut self) -> Vec<(u16, u16, String, bool)> {
-        use ratatui::style::{Color, Modifier};
+        use ratatui::style::Modifier;
         let mut cursors = Vec::new();
 
         // Get hardware cursor position (primary cursor)
         let (hw_x, hw_y) = self.screen_cursor_position();
 
         // Get the buffer to read cell content
+        let theme_inactive_cursor = self.editor.theme().inactive_cursor;
         let buffer = self.terminal.backend().buffer();
         let content_start = layout::CONTENT_START_ROW as u16;
         let content_end = buffer
@@ -1828,13 +2287,9 @@ impl EditorTestHarness {
             }
         }
 
-        // Find secondary cursors (cells with REVERSED modifier or inactive cursor background)
-        // Inactive cursor colors from theme.rs: Rgb(100,100,100) (dark), Rgb(180,180,180) (light), DarkGray (base16)
-        let inactive_cursor_colors = [
-            Color::Rgb(100, 100, 100),
-            Color::Rgb(180, 180, 180),
-            Color::DarkGray,
-        ];
+        // Inactive cursor bg is taken from the active theme; any cell matching
+        // that bg in the content area is treated as a secondary cursor.
+        let inactive_cursor_bg = theme_inactive_cursor;
 
         for y in content_start..content_end {
             for x in 0..buffer.area.width {
@@ -1852,7 +2307,7 @@ impl EditorTestHarness {
                 let pos = buffer.index_of(x, y);
                 if let Some(cell) = buffer.content.get(pos) {
                     let is_reversed = cell.modifier.contains(Modifier::REVERSED);
-                    let has_inactive_cursor_bg = inactive_cursor_colors.contains(&cell.bg);
+                    let has_inactive_cursor_bg = cell.bg == inactive_cursor_bg;
                     if is_reversed || has_inactive_cursor_bg {
                         cursors.push((x, y, cell.symbol().to_string(), false));
                     }
@@ -1989,9 +2444,10 @@ impl EditorTestHarness {
         self.render()?;
         Ok(())
     }
-    /// Wait indefinitely for async operations until condition is met
-    /// Repeatedly processes async messages until condition is met (no timeout)
-    /// Use this for semantic events that must eventually occur
+    /// Wait indefinitely for async operations until condition is met.
+    /// Runs a full editor tick each iteration — the same work the real event
+    /// loop performs between frames — so that hover timers, debounced requests,
+    /// diagnostic pulls, and all other periodic checks fire naturally.
     ///
     /// Note: Uses a short real wall-clock sleep between iterations to allow
     /// async I/O operations (running on tokio runtime) time to complete.
@@ -2000,12 +2456,26 @@ impl EditorTestHarness {
         F: FnMut(&Self) -> bool,
     {
         const WAIT_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+        // Dump the screen periodically so CI logs show what the test sees while stuck
+        const SCREEN_DUMP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
         tracing::info!("waiting...");
+        let start = std::time::Instant::now();
+        let mut last_dump = start;
         loop {
-            self.process_async_and_render()?;
+            self.tick_and_render()?;
             if condition(self) {
                 return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now.duration_since(last_dump) >= SCREEN_DUMP_INTERVAL {
+                let elapsed = now.duration_since(start);
+                tracing::warn!(
+                    "wait_until still pending after {:.1}s — screen:\n{}",
+                    elapsed.as_secs_f64(),
+                    self.screen_to_string()
+                );
+                last_dump = now;
             }
             // Sleep for real wall-clock time to allow async I/O operations to complete
             // These run on the tokio runtime and need actual time, not logical time
@@ -2174,5 +2644,34 @@ mod tests {
         let harness = EditorTestHarness::new(80, 24).unwrap();
         let content = harness.get_buffer_content().unwrap();
         assert_eq!(content, ""); // New buffer is empty
+    }
+
+    #[test]
+    fn find_text_in_row_returns_cell_column_not_byte_offset() {
+        // Mixed-width row: 30 box-drawing cells (`│`, 3 bytes each), 70
+        // ASCII spaces, then "ALPHA". Joined byte length is 30*3 + 70 + 5
+        // = 165 bytes, but ALPHA's cell column is 100 in a 120-cell row.
+        // Before the byte→cell translation, callers got byte offset 160
+        // back, which then panicked in `Buffer::index_of` because it's
+        // past the 120-cell buffer width.
+        let mut cells: Vec<&str> = Vec::with_capacity(120);
+        cells.extend(std::iter::repeat_n("│", 30));
+        cells.extend(std::iter::repeat_n(" ", 70));
+        cells.extend(["A", "L", "P", "H", "A"]);
+        // Pad out to a 120-wide row so the test mirrors the dashboard's
+        // actual buffer width.
+        cells.extend(std::iter::repeat_n(" ", 120 - cells.len()));
+
+        let col = find_text_in_row(cells.iter().copied(), "ALPHA");
+        assert_eq!(col, Some(100));
+    }
+
+    #[test]
+    fn find_text_in_row_handles_pure_ascii() {
+        // For all-ASCII rows the cell column equals the byte offset, so
+        // this just guards against regressions in the simple path.
+        let row = ["a", "b", "c", "d", "e", "f"];
+        assert_eq!(find_text_in_row(row.iter().copied(), "cd"), Some(2));
+        assert_eq!(find_text_in_row(row.iter().copied(), "zz"), None);
     }
 }

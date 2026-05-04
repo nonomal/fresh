@@ -8,7 +8,7 @@ use crate::model::event::{
     PopupPositionData,
 };
 use crate::model::filesystem::FileSystem;
-use crate::model::marker::MarkerList;
+use crate::model::marker::{MarkerId, MarkerList};
 use crate::primitives::detected_language::DetectedLanguage;
 use crate::primitives::grammar::GrammarRegistry;
 use crate::primitives::highlight_engine::HighlightEngine;
@@ -17,6 +17,7 @@ use crate::primitives::reference_highlighter::ReferenceHighlighter;
 use crate::primitives::text_property::TextPropertyManager;
 use crate::view::bracket_highlight_overlay::BracketHighlightOverlay;
 use crate::view::conceal::ConcealManager;
+use crate::view::folding::LspFoldRanges;
 use crate::view::margin::{MarginAnnotation, MarginContent, MarginManager, MarginPosition};
 use crate::view::overlay::{Overlay, OverlayFace, OverlayManager, UnderlineStyle};
 use crate::view::popup::{
@@ -26,19 +27,55 @@ use crate::view::reference_highlight_overlay::ReferenceHighlightOverlay;
 use crate::view::soft_break::SoftBreakManager;
 use crate::view::virtual_text::VirtualTextManager;
 use anyhow::Result;
-use lsp_types::FoldingRange;
 use ratatui::style::{Color, Style};
 use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// A marker whose position was displaced by a deletion.
+/// Stored in LogEntry (for single edits) or Event::BulkEdit (for bulk edits).
+/// On undo, the marker is restored to its exact original position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DisplacedMarker {
+    /// Marker from the main marker_list (virtual text, overlays)
+    Main { id: u64, position: usize },
+    /// Marker from margins.indicator_markers (breakpoints, line indicators)
+    Margin { id: u64, position: usize },
+}
+
+impl DisplacedMarker {
+    /// Encode as (u64, usize) for compact storage. Uses high bit to tag source.
+    pub fn encode(&self) -> (u64, usize) {
+        match self {
+            Self::Main { id, position } => (*id, *position),
+            Self::Margin { id, position } => (*id | (1u64 << 63), *position),
+        }
+    }
+
+    /// Decode from (u64, usize) compact representation.
+    pub fn decode(tagged_id: u64, position: usize) -> Self {
+        if (tagged_id >> 63) == 1 {
+            Self::Margin {
+                id: tagged_id & !(1u64 << 63),
+                position,
+            }
+        } else {
+            Self::Main {
+                id: tagged_id,
+                position,
+            }
+        }
+    }
+}
 
 /// Display mode for a buffer
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMode {
     /// Plain source rendering
     Source,
-    /// Semi-WYSIWYG compose rendering
-    Compose,
+    /// Document-style page view with centered content, concealed markers,
+    /// and plugin-driven word wrapping (previously called "compose mode")
+    PageView,
 }
 
 /// Per-buffer user settings that should be preserved across file reloads (auto-revert).
@@ -73,6 +110,10 @@ pub struct BufferSettings {
     /// Whether to surround selected text with matching pairs when typing a delimiter.
     /// Set based on global + language config.
     pub auto_surround: bool,
+
+    /// Extra characters (beyond alphanumeric + `_`) considered part of
+    /// identifiers for this language. Used by completion providers.
+    pub word_characters: String,
 }
 
 impl Default for BufferSettings {
@@ -83,6 +124,7 @@ impl Default for BufferSettings {
             tab_size: 4,
             auto_close: true,
             auto_surround: true,
+            word_characters: String::new(),
         }
     }
 }
@@ -143,6 +185,11 @@ pub struct EditorState {
     /// but navigation, selection, and copy are still allowed
     pub editing_disabled: bool,
 
+    /// Whether this buffer can be scrolled (default true). Fixed buffer-group
+    /// panels (toolbars, headers, footers) set this to false so the mouse
+    /// wheel is ignored and no scrollbar is drawn.
+    pub scrollable: bool,
+
     /// Per-buffer user settings (tab size, indentation style, etc.)
     /// These settings are preserved across file reloads (auto-revert)
     pub buffer_settings: BufferSettings,
@@ -165,8 +212,10 @@ pub struct EditorState {
     /// Cached LSP semantic tokens (converted to buffer byte ranges)
     pub semantic_tokens: Option<SemanticTokenStore>,
 
-    /// Last-known LSP folding ranges for this buffer
-    pub folding_ranges: Vec<FoldingRange>,
+    /// Last-known LSP folding ranges for this buffer, tracked by byte markers
+    /// so they auto-adjust when content is inserted or deleted around them
+    /// (issue #1571).
+    pub folding_ranges: LspFoldRanges,
 
     /// The detected language ID for this buffer (e.g., "rust", "csharp", "text").
     /// Used for LSP config lookup and internal identification.
@@ -177,6 +226,24 @@ pub struct EditorState {
     // TODO: Consider embedding `DetectedLanguage` directly in `EditorState`
     // instead of copying its fields, to avoid duplication between the two structs.
     pub display_name: String,
+
+    /// Per-logical-line visual-row-count cache (pipeline-output).
+    /// Populated by both the renderer (as a side effect of rendering a
+    /// visible frame) and the scroll-math miss handler.  Entries are
+    /// keyed on every pipeline input; mutations to any input produce a
+    /// different key so stale entries are never returned — see
+    /// `docs/internal/line-wrap-cache-plan.md`.
+    pub line_wrap_cache: crate::view::line_wrap_cache::LineWrapCache,
+
+    /// Whole-buffer prefix-sum index over per-line visual row counts.
+    /// Sits one tier above `line_wrap_cache`: answers
+    /// "what visual row contains byte B?" / "what byte sits at row R?"
+    /// in O(log N_lines) for scrollbar drag, scrollbar render, and
+    /// `ensure_visible` wrapped scrolling.  Built lazily from
+    /// `line_wrap_cache`; same invalidation source (pipeline-input
+    /// version + geometry).  See
+    /// `crate::view::visual_row_index` for invariants.
+    pub visual_row_index: crate::view::visual_row_index::VisualRowIndex,
 }
 
 impl EditorState {
@@ -219,6 +286,7 @@ impl EditorState {
             text_properties: TextPropertyManager::new(),
             show_cursors: true,
             editing_disabled: false,
+            scrollable: true,
             buffer_settings: BufferSettings::default(),
             reference_highlighter: ReferenceHighlighter::new(),
             is_composite_buffer: false,
@@ -226,9 +294,11 @@ impl EditorState {
             reference_highlight_overlay: ReferenceHighlightOverlay::new(),
             bracket_highlight_overlay: BracketHighlightOverlay::new(),
             semantic_tokens: None,
-            folding_ranges: Vec::new(),
+            folding_ranges: LspFoldRanges::new(),
             language: "text".to_string(),
             display_name: "Text".to_string(),
+            line_wrap_cache: crate::view::line_wrap_cache::LineWrapCache::default(),
+            visual_row_index: crate::view::visual_row_index::VisualRowIndex::default(),
         }
     }
 
@@ -278,7 +348,11 @@ impl EditorState {
         fs: Arc<dyn FileSystem + Send + Sync>,
     ) -> anyhow::Result<Self> {
         let buffer = Buffer::load_from_file(path, large_file_threshold, fs)?;
-        let detected = DetectedLanguage::from_path_builtin(path, registry);
+        let first_line = buffer.first_line_lossy();
+        let detected = registry
+            .find_by_path(path, first_line.as_deref())
+            .map(|entry| DetectedLanguage::from_entry(entry, registry))
+            .unwrap_or_else(DetectedLanguage::plain_text);
         let mut state = Self::new_from_buffer(buffer);
         state.apply_language(detected);
         Ok(state)
@@ -301,7 +375,9 @@ impl EditorState {
         fs: Arc<dyn FileSystem + Send + Sync>,
     ) -> anyhow::Result<Self> {
         let buffer = Buffer::load_from_file(path, large_file_threshold, fs)?;
-        let detected = DetectedLanguage::from_path(path, registry, languages);
+        let first_line = buffer.first_line_lossy();
+        let detected =
+            DetectedLanguage::from_path(path, first_line.as_deref(), registry, languages);
         let mut state = Self::new_from_buffer(buffer);
         state.apply_language(detected);
         Ok(state)
@@ -334,7 +410,9 @@ impl EditorState {
         // Insert text into buffer
         self.buffer.insert(position, text);
 
-        // Invalidate highlight cache for edited range
+        // Notify highlighter of the insert (adjusts checkpoint marker positions)
+        // and invalidate span cache for the edited range.
+        self.highlighter.notify_insert(position, text.len());
         self.highlighter
             .invalidate_range(position..position + text.len());
 
@@ -380,11 +458,22 @@ impl EditorState {
         // For forward delete: cursor was at range.start, so no deleted newlines are before it.
         let primary_newlines_removed = if cursor_id == cursors.primary_id() {
             let cursor_pos = cursors.get(cursor_id).map_or(range.start, |c| c.position);
-            let bytes_before_cursor = cursor_pos.saturating_sub(range.start).min(len);
+            let bytes_before_cursor = cursor_pos
+                .saturating_sub(range.start)
+                .min(len)
+                .min(deleted_text.len());
             deleted_text[..bytes_before_cursor].matches('\n').count()
         } else {
             0
         };
+
+        // Drop virtual texts whose anchors are being erased. This is what
+        // makes inlay hints disappear immediately when the range containing
+        // them is deleted; without this the marker would just clamp to
+        // range.start and the hint would linger at the wrong position until
+        // the next LSP refresh.
+        self.virtual_texts
+            .remove_in_range(&mut self.marker_list, range.start, range.end);
 
         // CRITICAL: Adjust markers BEFORE modifying buffer
         self.marker_list.adjust_for_delete(range.start, len);
@@ -393,7 +482,9 @@ impl EditorState {
         // Delete from buffer
         self.buffer.delete(range.clone());
 
-        // Invalidate highlight cache for edited range
+        // Notify highlighter of the delete (adjusts checkpoint marker positions)
+        // and invalidate span cache for the edited range.
+        self.highlighter.notify_delete(range.start, len);
         self.highlighter.invalidate_range(range.clone());
 
         // Note: reference_highlight_overlay uses markers that auto-adjust,
@@ -589,7 +680,7 @@ impl EditorState {
 
             Event::ShowPopup { popup } => {
                 let popup_obj = convert_popup_data_to_popup(popup);
-                self.popups.show(popup_obj);
+                self.popups.show_or_replace(popup_obj);
             }
 
             Event::HidePopup => {
@@ -684,16 +775,69 @@ impl EditorState {
             Event::BulkEdit {
                 new_snapshot,
                 new_cursors,
+                edits,
+                displaced_markers,
                 ..
             } => {
                 // Restore the target buffer state (piece tree + buffers) for this event.
-                // - For original application: this is set after apply_events_as_bulk_edit
                 // - For undo: snapshots are swapped, so new_snapshot is the original state
                 // - For redo: new_snapshot is the state after edits
                 // Restoring buffers alongside the tree is critical because
                 // consolidate_after_save() can replace buffers between snapshot and restore.
                 if let Some(snapshot) = new_snapshot {
                     self.buffer.restore_buffer_state(snapshot);
+                }
+
+                // Replay marker adjustments from the edit list.
+                // For redo: same adjustments as the forward path.
+                // For undo: inverse() has swapped del/ins, so adjustments are reversed.
+                // Edits are in descending position order — process as-is so later
+                // positions are adjusted first (no cascading shift errors).
+                //
+                // For replacements (del > 0 AND ins > 0 at same position), we only
+                // adjust for the net delta to avoid the marker-at-boundary problem
+                // where sequential delete+insert pushes markers incorrectly.
+                for &(pos, del_len, ins_len) in edits {
+                    if del_len > 0 && ins_len > 0 {
+                        // Replacement: adjust by net delta only
+                        if ins_len > del_len {
+                            let net = ins_len - del_len;
+                            self.marker_list.adjust_for_insert(pos, net);
+                            self.margins.adjust_for_insert(pos, net);
+                        } else if del_len > ins_len {
+                            let net = del_len - ins_len;
+                            self.marker_list.adjust_for_delete(pos, net);
+                            self.margins.adjust_for_delete(pos, net);
+                        }
+                        // If equal: net delta 0, no adjustment needed
+                    } else if del_len > 0 {
+                        self.marker_list.adjust_for_delete(pos, del_len);
+                        self.margins.adjust_for_delete(pos, del_len);
+                    } else if ins_len > 0 {
+                        self.marker_list.adjust_for_insert(pos, ins_len);
+                        self.margins.adjust_for_insert(pos, ins_len);
+                    }
+                }
+
+                // Restore displaced markers to their original positions.
+                // This fixes markers that were inside a deleted range and collapsed
+                // to the deletion boundary — they're now moved back to their exact
+                // original positions after the text has been restored by undo.
+                if !displaced_markers.is_empty() {
+                    self.restore_displaced_markers(displaced_markers);
+                }
+
+                // Clear ephemeral decorations — their source systems will re-push
+                // correct positions after the edit notification.
+                self.virtual_texts.clear(&mut self.marker_list);
+
+                use crate::view::overlay::OverlayNamespace;
+                let namespaces = ["lsp-diagnostic", "reference-highlight", "bracket-highlight"];
+                for ns in &namespaces {
+                    self.overlays.clear_namespace(
+                        &OverlayNamespace::from_string(ns.to_string()),
+                        &mut self.marker_list,
+                    );
                 }
 
                 // Update cursor positions
@@ -714,6 +858,67 @@ impl EditorState {
                     Some(pos) => crate::model::buffer::LineNumber::Absolute(pos.line),
                     None => crate::model::buffer::LineNumber::Absolute(0),
                 };
+            }
+        }
+    }
+
+    /// Capture positions of markers strictly inside a deleted range.
+    /// Call this BEFORE applying the delete. Returns encoded displaced markers.
+    pub fn capture_displaced_markers(&self, range: &Range<usize>) -> Vec<(u64, usize)> {
+        let mut displaced = Vec::new();
+        if range.is_empty() {
+            return displaced;
+        }
+        for (marker_id, start, _end) in self.marker_list.query_range(range.start, range.end) {
+            if start > range.start && start < range.end {
+                displaced.push(
+                    DisplacedMarker::Main {
+                        id: marker_id.0,
+                        position: start,
+                    }
+                    .encode(),
+                );
+            }
+        }
+        for (marker_id, start, _end) in self.margins.query_indicator_range(range.start, range.end) {
+            if start > range.start && start < range.end {
+                displaced.push(
+                    DisplacedMarker::Margin {
+                        id: marker_id.0,
+                        position: start,
+                    }
+                    .encode(),
+                );
+            }
+        }
+        displaced
+    }
+
+    /// Capture displaced markers for multiple delete ranges (BulkEdit).
+    pub fn capture_displaced_markers_bulk(
+        &self,
+        edits: &[(usize, usize, String)],
+    ) -> Vec<(u64, usize)> {
+        let mut displaced = Vec::new();
+        for (pos, del_len, _text) in edits {
+            if *del_len > 0 {
+                displaced.extend(self.capture_displaced_markers(&(*pos..*pos + *del_len)));
+            }
+        }
+        displaced
+    }
+
+    /// Restore displaced markers to their exact original positions.
+    pub fn restore_displaced_markers(&mut self, displaced: &[(u64, usize)]) {
+        for &(tagged_id, original_pos) in displaced {
+            let dm = DisplacedMarker::decode(tagged_id, original_pos);
+            match dm {
+                DisplacedMarker::Main { id, position } => {
+                    self.marker_list.set_position(MarkerId(id), position);
+                }
+                DisplacedMarker::Margin { id, position } => {
+                    self.margins.set_indicator_position(MarkerId(id), position);
+                }
             }
         }
     }
@@ -757,22 +962,31 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
             color: Color::Rgb(color.0, color.1, color.2),
         },
         EventOverlayFace::Style { options } => {
+            use crate::view::theme::named_color_from_str;
             use ratatui::style::Modifier;
 
-            // Build fallback style from RGB values
+            // Build fallback style from RGB values or named colors
             let mut style = Style::default();
 
-            // Extract foreground color (RGB fallback or default white)
+            // Extract foreground color (RGB, named color, or default white)
             if let Some(ref fg) = options.fg {
                 if let Some((r, g, b)) = fg.as_rgb() {
                     style = style.fg(Color::Rgb(r, g, b));
+                } else if let Some(key) = fg.as_theme_key() {
+                    if let Some(color) = named_color_from_str(key) {
+                        style = style.fg(color);
+                    }
                 }
             }
 
-            // Extract background color (RGB fallback)
+            // Extract background color (RGB, named color, or fallback)
             if let Some(ref bg) = options.bg {
                 if let Some((r, g, b)) = bg.as_rgb() {
                     style = style.bg(Color::Rgb(r, g, b));
+                } else if let Some(key) = bg.as_theme_key() {
+                    if let Some(color) = named_color_from_str(key) {
+                        style = style.bg(color);
+                    }
                 }
             }
 
@@ -794,16 +1008,18 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
                 style = style.add_modifier(modifiers);
             }
 
-            // Extract theme keys
+            // Extract theme keys (exclude recognized named colors, already resolved above)
             let fg_theme = options
                 .fg
                 .as_ref()
                 .and_then(|c| c.as_theme_key())
+                .filter(|key| named_color_from_str(key).is_none())
                 .map(String::from);
             let bg_theme = options
                 .bg
                 .as_ref()
                 .and_then(|c| c.as_theme_key())
+                .filter(|key| named_color_from_str(key).is_none())
                 .map(String::from);
 
             // If theme keys are provided, use ThemedStyle for runtime resolution
@@ -821,7 +1037,7 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
 }
 
 /// Convert popup data to the actual popup object
-fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
+pub(crate) fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
     let content = match &data.content {
         crate::model::event::PopupContentData::Text(lines) => PopupContent::Text(lines.clone()),
         crate::model::event::PopupContentData::List { items, selected } => PopupContent::List {
@@ -832,6 +1048,7 @@ fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
                     detail: item.detail.clone(),
                     icon: item.icon.clone(),
                     data: item.data.clone(),
+                    disabled: false,
                 })
                 .collect(),
             selected: *selected,
@@ -845,6 +1062,9 @@ fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
         PopupPositionData::Fixed { x, y } => PopupPosition::Fixed { x, y },
         PopupPositionData::Centered => PopupPosition::Centered,
         PopupPositionData::BottomRight => PopupPosition::BottomRight,
+        PopupPositionData::AboveStatusBarAt { x, status_row } => {
+            PopupPosition::AboveStatusBarAt { x, status_row }
+        }
     };
 
     // Map the explicit kind hint to PopupKind for input handling
@@ -852,6 +1072,45 @@ fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
         crate::model::event::PopupKindHint::Completion => PopupKind::Completion,
         crate::model::event::PopupKindHint::List => PopupKind::List,
         crate::model::event::PopupKindHint::Text => PopupKind::Text,
+    };
+
+    // Kind-implied resolver default: a popup whose kind is
+    // `Completion` always confirms by inserting the selected
+    // completion, regardless of who built it. Other kinds need an
+    // explicit resolver (LSP confirm, plugin action, LSP status, code
+    // action) because the same `List` kind is used for all four, so we
+    // can't infer which feature owns the popup from its kind alone.
+    let resolver = match kind {
+        PopupKind::Completion => crate::view::popup::PopupResolver::Completion,
+        _ => crate::view::popup::PopupResolver::None,
+    };
+
+    // Popups that appear under the user's cursor without an explicit
+    // user gesture default to *unfocused* so the next keystroke drives
+    // the buffer rather than the popup. The user grabs focus with
+    // `popup_focus` (default `Alt+T`). Popups that the user
+    // *explicitly* invokes (completion via Tab, list/action choosers
+    // via plugin commands, …) keep the historical focused-on-show
+    // behavior — type-to-filter and arrow-nav need to "just work"
+    // without an extra keystroke.
+    // Only `PopupKindHint` variants reach this path — Completion, List,
+    // Text. Hover/Action popups are constructed directly in editor code
+    // (`lsp_requests.rs`) and set their own `focused` flag.
+    let focused = match kind {
+        // Completion popups are user-invoked (type-to-trigger / explicit
+        // `lsp_completion`), so type-to-filter and arrow-nav need to
+        // "just work" without the user pressing the focus-popup key.
+        PopupKind::Completion => true,
+        // List popups are typically explicit user invocations (plugin
+        // action popups, status-bar menus). Keep them focused on show.
+        PopupKind::List => true,
+        // Text popups are auto-shown informational overlays —
+        // unfocused so they don't swallow the user's next keystroke.
+        PopupKind::Text => false,
+        // Direct-construction kinds (Hover, Action) are not produced by
+        // `Event::ShowPopup`; default to unfocused if ever reached so
+        // an auto-shown overlay doesn't grab the keyboard by accident.
+        PopupKind::Hover | PopupKind::Action => false,
     };
 
     Popup {
@@ -868,6 +1127,10 @@ fn convert_popup_data_to_popup(data: &PopupData) -> Popup {
         background_style: Style::default().bg(Color::Rgb(30, 30, 30)),
         scroll_offset: 0,
         text_selection: None,
+        accept_key_hint: None,
+        resolver,
+        focused,
+        focus_key_hint: None,
     }
 }
 
@@ -904,6 +1167,52 @@ impl EditorState {
     pub fn prepare_for_render(&mut self, top_byte: usize, height: u16) -> Result<()> {
         self.buffer.prepare_viewport(top_byte, height as usize)?;
         Ok(())
+    }
+
+    /// Resolve all plugin-injected virtual-line anchor byte positions
+    /// for this buffer.  Sorted ascending.
+    ///
+    /// Used by `Viewport::scroll_down` / `scroll_up` /
+    /// `find_max_visual_scroll_position` so the scroll math counts the
+    /// rows the renderer actually draws (e.g. markdown_compose's
+    /// `┌─┬─┐` table borders) when computing `max_scroll_row`.  Without
+    /// this, mouse wheel and PageDown clamp to a row count that
+    /// ignores virtual lines and stop short of the buffer's real tail.
+    ///
+    /// Empty when no plugin has added virtual lines.
+    pub fn collect_virtual_line_positions(&self) -> Vec<usize> {
+        if self.virtual_texts.is_empty() {
+            return Vec::new();
+        }
+        let mut v: Vec<usize> = self
+            .virtual_texts
+            .query_lines_in_range(&self.marker_list, 0, self.buffer.len() + 1)
+            .into_iter()
+            .map(|(pos, _vt)| pos)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Resolve all plugin-injected soft-break `(byte_position, indent)`
+    /// pairs for this buffer.
+    ///
+    /// Returns a sorted slice suitable for passing to `Viewport::scroll_up` /
+    /// `scroll_down`, which use it to keep their visual-row counting in
+    /// lock-step with the renderer (which applies these same breaks via
+    /// `apply_soft_breaks`).  The `indent` field is the column count of
+    /// hanging-indent spaces the plugin asked the renderer to inject
+    /// after the break — the wrap counter needs it to compute the
+    /// continuation segment's effective width correctly.
+    ///
+    /// Empty when no plugin is wrapping the buffer.
+    pub fn collect_soft_break_positions(&self) -> Vec<(usize, u16)> {
+        if self.soft_breaks.is_empty() {
+            return Vec::new();
+        }
+        // query_viewport already returns pairs sorted by ascending position.
+        self.soft_breaks
+            .query_viewport(0, self.buffer.len() + 1, &self.marker_list)
     }
 
     // ========== DocumentModel Helper Methods ==========

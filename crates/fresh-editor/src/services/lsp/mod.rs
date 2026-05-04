@@ -17,7 +17,7 @@
 //! │                              │                                          │
 //! │                              ▼                                          │
 //! │  ┌─────────────────────────────────────────────────────────────────┐   │
-//! │  │  with_lsp_for_buffer() helper                                    │   │
+//! │  │  with_lsp_for_buffer() helper                              │   │
 //! │  │  - Ensures didOpen is sent before any request                   │   │
 //! │  │  - Lazy text fetching (only if didOpen needed)                  │   │
 //! │  │  - Per-server-instance tracking via handle IDs                  │   │
@@ -121,3 +121,31 @@ pub mod semantic_tokens;
 
 // Re-export for public API (used by tests)
 pub use crate::types::LspServerConfig;
+
+/// Check whether an LSP server command is resolvable as an executable.
+///
+/// Delegates to the `which` crate, which handles the cross-platform
+/// edge cases our previous hand-rolled probe missed:
+///
+/// - **Windows `PATHEXT`**: Node-based LSPs (`typescript-language-server`,
+///   `vscode-html-language-server`, etc.) install as `.cmd` shims under
+///   `npm -g`. A bare `.exe` check treated those as missing.
+/// - **Unix executable bit**: `path.is_file()` is true for non-executable
+///   files; `which` additionally checks `mode & 0o111 != 0`.
+/// - **Symlinks, broken symlinks, absolute-path commands, quoted PATH
+///   entries, and Windows App Execution Aliases** — all handled.
+///
+/// Returns `false` for empty strings so callers don't need to special-case
+/// unset-command configs.
+///
+/// Intentionally uncached: called at most a few times per user-driven
+/// action (pill click, spawn attempt) and the OS dentry cache already
+/// makes repeat `$PATH` walks essentially free. A stale cache would
+/// actively hurt: freshly-installed binaries wouldn't be picked up until
+/// the TTL expired.
+pub fn command_exists(command: &str) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    which::which(command).is_ok()
+}

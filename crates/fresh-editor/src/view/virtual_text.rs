@@ -80,8 +80,17 @@ pub struct VirtualText {
     pub marker_id: MarkerId,
     /// Text to display (for LineAbove/LineBelow, this is the full line content)
     pub text: String,
-    /// Styling (typically dimmed/gray for hints)
+    /// Fallback styling, used when the theme-key fields below are unset OR
+    /// the keys don't resolve in the active theme.  The renderer composes
+    /// the final style by overlaying any resolved theme colours on top of
+    /// this fallback (see [`VirtualText::resolved_style`]).
     pub style: Style,
+    /// Optional theme key for the foreground colour (e.g.
+    /// `"editor.line_number_fg"`).  Resolved on every render so the line
+    /// follows live theme changes.
+    pub fg_theme_key: Option<String>,
+    /// Optional theme key for the background colour.
+    pub bg_theme_key: Option<String>,
     /// Where to render relative to the marker position
     pub position: VirtualTextPosition,
     /// Priority for ordering multiple items at same position (higher = later)
@@ -90,6 +99,29 @@ pub struct VirtualText {
     pub string_id: Option<String>,
     /// Optional namespace for bulk removal (like Overlay's namespace)
     pub namespace: Option<VirtualTextNamespace>,
+}
+
+impl VirtualText {
+    /// Resolve the on-screen `Style` for this entry against a live theme.
+    ///
+    /// Theme keys take precedence over the fallback `style`'s fg/bg.  If a
+    /// key fails to resolve (e.g. the theme doesn't define it), the
+    /// fallback colour is kept.  Modifiers from `style` (bold/italic/etc.)
+    /// always survive.
+    pub fn resolved_style(&self, theme: &crate::view::theme::Theme) -> Style {
+        let mut style = self.style;
+        if let Some(ref key) = self.fg_theme_key {
+            if let Some(color) = theme.resolve_theme_key(key) {
+                style = style.fg(color);
+            }
+        }
+        if let Some(ref key) = self.bg_theme_key {
+            if let Some(color) = theme.resolve_theme_key(key) {
+                style = style.bg(color);
+            }
+        }
+        style
+    }
 }
 
 /// Unique identifier for a virtual text entry
@@ -105,6 +137,12 @@ pub struct VirtualTextManager {
     texts: HashMap<VirtualTextId, VirtualText>,
     /// Next ID to assign
     next_id: u64,
+    /// Monotonic version, bumped on every mutation.  Folded into
+    /// `pipeline_inputs_version` so that adding / removing virtual
+    /// lines (e.g. markdown_compose's table borders) invalidates
+    /// `LineWrapCache` / `VisualRowIndex` entries — same mechanism
+    /// `SoftBreakManager` and `ConcealManager` use.
+    version: u32,
 }
 
 impl VirtualTextManager {
@@ -113,7 +151,21 @@ impl VirtualTextManager {
         Self {
             texts: HashMap::new(),
             next_id: 0,
+            version: 0,
         }
+    }
+
+    /// Monotonic version. Increments on every mutation to virtual text
+    /// state. Used by `pipeline_inputs_version` to invalidate scroll-math
+    /// caches keyed off `EditorState`.
+    #[inline]
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    #[inline]
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Add a virtual text entry
@@ -150,12 +202,63 @@ impl VirtualTextManager {
                 marker_id,
                 text,
                 style,
+                fg_theme_key: None,
+                bg_theme_key: None,
                 position: vtext_position,
                 priority,
                 string_id: None,
                 namespace: None,
             },
         );
+        self.bump_version();
+
+        id
+    }
+
+    /// Add an inline virtual text entry whose foreground/background colours
+    /// are stored as theme keys (resolved at render time so theme changes
+    /// apply live).
+    ///
+    /// `style` is the fallback used when a theme key fails to resolve;
+    /// `fg_theme_key` / `bg_theme_key` are the keys passed to
+    /// `Theme::resolve_theme_key` (e.g. `"editor.line_number_fg"`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_theme_keys(
+        &mut self,
+        marker_list: &mut MarkerList,
+        position: usize,
+        text: String,
+        style: Style,
+        fg_theme_key: Option<String>,
+        bg_theme_key: Option<String>,
+        vtext_position: VirtualTextPosition,
+        priority: i32,
+    ) -> VirtualTextId {
+        debug_assert!(
+            vtext_position.is_inline(),
+            "add_with_theme_keys requires BeforeChar or AfterChar"
+        );
+
+        let marker_id = marker_list.create(position, false);
+
+        let id = VirtualTextId(self.next_id);
+        self.next_id += 1;
+
+        self.texts.insert(
+            id,
+            VirtualText {
+                marker_id,
+                text,
+                style,
+                fg_theme_key,
+                bg_theme_key,
+                position: vtext_position,
+                priority,
+                string_id: None,
+                namespace: None,
+            },
+        );
+        self.bump_version();
 
         id
     }
@@ -185,6 +288,52 @@ impl VirtualTextManager {
                 marker_id,
                 text,
                 style,
+                fg_theme_key: None,
+                bg_theme_key: None,
+                position: vtext_position,
+                priority,
+                string_id: Some(string_id),
+                namespace: None,
+            },
+        );
+        self.bump_version();
+
+        id
+    }
+
+    /// String-id form of [`add_with_theme_keys`] — same as
+    /// [`add_with_id`] but stores theme keys for live theme updates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_id_and_theme_keys(
+        &mut self,
+        marker_list: &mut MarkerList,
+        position: usize,
+        text: String,
+        style: Style,
+        fg_theme_key: Option<String>,
+        bg_theme_key: Option<String>,
+        vtext_position: VirtualTextPosition,
+        priority: i32,
+        string_id: String,
+    ) -> VirtualTextId {
+        debug_assert!(
+            vtext_position.is_inline(),
+            "add_with_id_and_theme_keys requires BeforeChar or AfterChar"
+        );
+
+        let marker_id = marker_list.create(position, false);
+
+        let id = VirtualTextId(self.next_id);
+        self.next_id += 1;
+
+        self.texts.insert(
+            id,
+            VirtualText {
+                marker_id,
+                text,
+                style,
+                fg_theme_key,
+                bg_theme_key,
                 position: vtext_position,
                 priority,
                 string_id: Some(string_id),
@@ -218,6 +367,39 @@ impl VirtualTextManager {
         namespace: VirtualTextNamespace,
         priority: i32,
     ) -> VirtualTextId {
+        self.add_line_with_theme_keys(
+            marker_list,
+            position,
+            text,
+            style,
+            None,
+            None,
+            placement,
+            namespace,
+            priority,
+        )
+    }
+
+    /// Add a virtual line whose foreground/background colours are stored
+    /// as theme keys (resolved at render time so theme changes apply
+    /// live).
+    ///
+    /// `style` is the fallback used when a theme key fails to resolve;
+    /// `fg_theme_key` / `bg_theme_key` are the keys passed to
+    /// `Theme::resolve_theme_key` (e.g. `"editor.line_number_fg"`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_line_with_theme_keys(
+        &mut self,
+        marker_list: &mut MarkerList,
+        position: usize,
+        text: String,
+        style: Style,
+        fg_theme_key: Option<String>,
+        bg_theme_key: Option<String>,
+        placement: VirtualTextPosition,
+        namespace: VirtualTextNamespace,
+        priority: i32,
+    ) -> VirtualTextId {
         debug_assert!(
             placement.is_line(),
             "add_line requires LineAbove or LineBelow"
@@ -234,12 +416,15 @@ impl VirtualTextManager {
                 marker_id,
                 text,
                 style,
+                fg_theme_key,
+                bg_theme_key,
                 position: placement,
                 priority,
                 string_id: None,
                 namespace: Some(namespace),
             },
         );
+        self.bump_version();
 
         id
     }
@@ -266,6 +451,9 @@ impl VirtualTextManager {
                 removed = true;
             }
         }
+        if removed {
+            self.bump_version();
+        }
         removed
     }
 
@@ -286,9 +474,13 @@ impl VirtualTextManager {
             .collect();
 
         // Delete markers and remove entries
+        let removed = !markers_to_delete.is_empty();
         for (id, marker_id) in markers_to_delete {
             marker_list.delete(marker_id);
             self.texts.remove(&id);
+        }
+        if removed {
+            self.bump_version();
         }
     }
 
@@ -296,6 +488,7 @@ impl VirtualTextManager {
     pub fn remove(&mut self, marker_list: &mut MarkerList, id: VirtualTextId) -> bool {
         if let Some(vtext) = self.texts.remove(&id) {
             marker_list.delete(vtext.marker_id);
+            self.bump_version();
             true
         } else {
             false
@@ -304,10 +497,60 @@ impl VirtualTextManager {
 
     /// Clear all virtual text entries
     pub fn clear(&mut self, marker_list: &mut MarkerList) {
+        let was_non_empty = !self.texts.is_empty();
         for vtext in self.texts.values() {
             marker_list.delete(vtext.marker_id);
         }
         self.texts.clear();
+        if was_non_empty {
+            self.bump_version();
+        }
+    }
+
+    /// Remove all virtual text entries whose marker position lies within the
+    /// half-open byte range `[start, end)`.
+    ///
+    /// This must be called BEFORE the underlying buffer/marker list is
+    /// adjusted for a deletion, otherwise the affected markers will already
+    /// have been clamped to the deletion start and appear to fall outside
+    /// the range. Used by the editor to drop stale inlay hints whose
+    /// anchors have been erased by the user (a fresh LSP response will
+    /// repopulate them if still applicable).
+    ///
+    /// Returns the number of entries removed.
+    pub fn remove_in_range(
+        &mut self,
+        marker_list: &mut MarkerList,
+        start: usize,
+        end: usize,
+    ) -> usize {
+        if start >= end {
+            return 0;
+        }
+
+        let to_remove: Vec<VirtualTextId> = self
+            .texts
+            .iter()
+            .filter_map(|(id, vtext)| {
+                let pos = marker_list.get_position(vtext.marker_id)?;
+                if pos >= start && pos < end {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = to_remove.len();
+        for id in to_remove {
+            if let Some(vtext) = self.texts.remove(&id) {
+                marker_list.delete(vtext.marker_id);
+            }
+        }
+        if count > 0 {
+            self.bump_version();
+        }
+        count
     }
 
     /// Get the number of virtual text entries
@@ -403,10 +646,14 @@ impl VirtualTextManager {
             })
             .collect();
 
+        let removed = !to_remove.is_empty();
         for id in to_remove {
             if let Some(vtext) = self.texts.remove(&id) {
                 marker_list.delete(vtext.marker_id);
             }
+        }
+        if removed {
+            self.bump_version();
         }
     }
 

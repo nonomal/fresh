@@ -85,8 +85,10 @@ pub fn render_number_input_aligned(
     let value_spans = if state.editing() {
         build_editing_spans(&value_str, state, value_color, colors)
     } else {
+        // Right-align the digits to MIN_WIDTH and append the trailing
+        // reserved cell so the visible layout matches editing mode.
         vec![Span::styled(
-            format!("{:^5}", value_str),
+            format!("{:>width$} ", value_str, width = VALUE_CELL_MIN_WIDTH),
             Style::default().fg(value_color),
         )]
     };
@@ -112,7 +114,8 @@ pub fn render_number_input_aligned(
 
     let final_label_width = actual_label_width + 2;
     let value_start = area.x + final_label_width;
-    let value_width = 7;
+    // 2 brackets + MIN_WIDTH digit cells + 1 trailing cursor cell.
+    let value_width = (VALUE_CELL_MIN_WIDTH as u16) + 1 + 2;
 
     let dec_start = value_start + value_width + 1;
     let dec_width = 3;
@@ -128,8 +131,15 @@ pub fn render_number_input_aligned(
     }
 }
 
+/// Minimum visible width of the digit area (right-aligned). The total
+/// inner cell is one cell wider — the trailing reserved cell holds the
+/// block cursor when it's at end-of-text, so typing doesn't shove the
+/// digits leftward as the cursor advances. Values longer than this
+/// width still render in full and grow the cell to the right.
+pub(super) const VALUE_CELL_MIN_WIDTH: usize = 3;
+
 /// Build spans for the editing value with cursor and selection highlighting
-fn build_editing_spans(
+pub(super) fn build_editing_spans(
     value: &str,
     state: &NumberInputState,
     value_color: ratatui::style::Color,
@@ -142,10 +152,27 @@ fn build_editing_spans(
     let cursor_style = Style::default()
         .fg(value_color)
         .add_modifier(Modifier::REVERSED);
-    let selection_style = Style::default().fg(colors.value).bg(colors.focused);
+    // Use a colour distinct from the row's focus highlight (`colors.focused`),
+    // otherwise selecting the value while the row is focused renders as
+    // bg-on-bg and the user can't tell the value is selected.
+    let selection_style = Style::default().fg(colors.value).bg(colors.selection_bg);
 
     let chars: Vec<char> = value.chars().collect();
+    let cursor_at_end = selection_range.is_none() && cursor_pos >= chars.len();
+
+    // Layout: [leading padding][digits][trailing reserved cell]
+    // The trailing cell is always 1 char wide so the digits stay
+    // right-aligned at the same column whether the cursor is on a digit
+    // or past the last one. It holds the cursor block at end-of-text,
+    // and a plain space otherwise.
+    let inner_width = (chars.len() + 1).max(VALUE_CELL_MIN_WIDTH + 1);
+    let leading = inner_width - chars.len() - 1;
+
     let mut spans = Vec::new();
+
+    if leading > 0 {
+        spans.push(Span::raw(" ".repeat(leading)));
+    }
 
     if let Some((sel_start, sel_end)) = selection_range {
         // Render with selection highlighting
@@ -167,33 +194,30 @@ fn build_editing_spans(
             let after: String = chars[sel_end_clamped..].iter().collect();
             spans.push(Span::styled(after, normal_style));
         }
-    } else {
-        // Render with cursor (no selection)
-        // Text before cursor
-        if cursor_pos > 0 && cursor_pos <= chars.len() {
-            let before: String = chars[..cursor_pos].iter().collect();
-            spans.push(Span::styled(before, normal_style));
-        } else if cursor_pos == 0 {
-            // Cursor at start, no text before
-        } else {
-            // Cursor beyond text - show all text
+
+        // Trailing reserved cell (no cursor visible during selection)
+        spans.push(Span::raw(" "));
+    } else if cursor_at_end {
+        // Cursor sits in the trailing reserved cell — render every digit
+        // normally and place the block cursor in that last cell.
+        if !chars.is_empty() {
             spans.push(Span::styled(value.to_string(), normal_style));
         }
-
-        // Cursor character (shown as reversed)
-        if cursor_pos < chars.len() {
-            let cursor_char = chars[cursor_pos].to_string();
-            spans.push(Span::styled(cursor_char, cursor_style));
-
-            // Text after cursor
-            if cursor_pos + 1 < chars.len() {
-                let after: String = chars[cursor_pos + 1..].iter().collect();
-                spans.push(Span::styled(after, normal_style));
-            }
-        } else {
-            // Cursor at end - show block cursor
-            spans.push(Span::styled(" ", cursor_style));
+        spans.push(Span::styled(" ", cursor_style));
+    } else {
+        // Cursor on a digit: render before/cursor/after, then the
+        // trailing reserved cell as a plain space.
+        if cursor_pos > 0 {
+            let before: String = chars[..cursor_pos].iter().collect();
+            spans.push(Span::styled(before, normal_style));
         }
+        let cursor_char = chars[cursor_pos].to_string();
+        spans.push(Span::styled(cursor_char, cursor_style));
+        if cursor_pos + 1 < chars.len() {
+            let after: String = chars[cursor_pos + 1..].iter().collect();
+            spans.push(Span::styled(after, normal_style));
+        }
+        spans.push(Span::raw(" "));
     }
 
     spans

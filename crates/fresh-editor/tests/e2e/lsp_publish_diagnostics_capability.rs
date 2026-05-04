@@ -22,7 +22,7 @@ use crate::common::harness::EditorTestHarness;
 /// 2. Checks for `publishDiagnostics` in the JSON
 /// 3. Logs whether the capability was found
 /// 4. Only sends diagnostics on didOpen/didChange if the capability was present
-fn create_strict_server_script() -> std::path::PathBuf {
+fn create_strict_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r#"#!/bin/bash
 
 # Log file path (passed as first argument)
@@ -37,19 +37,24 @@ HAS_PUBLISH_DIAGNOSTICS=0
 # Function to read a message
 read_message() {
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        # Strip carriage return (LSP uses CRLF line endings)
+        line="${line%$'\r'}"
+        # Empty line marks end of headers
+        if [ -z "$line" ]; then
             break
         fi
+        # Parse "Key: Value" header
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -57,7 +62,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -113,17 +118,29 @@ while true; do
         "textDocument/inlayHint")
             send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
             ;;
-        "$/cancelRequest")
+        "textDocument/completion")
+            if [ -n "$msg_id" ]; then
+                send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+            fi
+            ;;
+        "$/cancelRequest"|"initialized")
+            # Notifications - no response needed
             ;;
         "shutdown")
             send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
             break
             ;;
+        *)
+            # Respond to any unhandled requests to prevent pending request buildup
+            if [ -n "$msg_id" ]; then
+                send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+            fi
+            ;;
     esac
 done
 "#;
 
-    let script_path = std::env::temp_dir().join("fake_lsp_strict_server.sh");
+    let script_path = dir.join("fake_lsp_strict_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write strict server script");
 
     #[cfg(unix)]
@@ -141,7 +158,7 @@ done
 
 /// Create a fake LSP server that always sends publishDiagnostics regardless
 /// of client capabilities (mimics clangd behavior).
-fn create_permissive_server_script() -> std::path::PathBuf {
+fn create_permissive_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = r#"#!/bin/bash
 
 # Log file path (passed as first argument)
@@ -153,19 +170,24 @@ LOG_FILE="${1:-/tmp/fake_lsp_permissive_log.txt}"
 # Function to read a message
 read_message() {
     local content_length=0
-    while IFS=: read -r key value; do
-        key=$(echo "$key" | tr -d '\r\n')
-        value=$(echo "$value" | tr -d '\r\n ')
-        if [ "$key" = "Content-Length" ]; then
-            content_length=$value
-        fi
-        if [ -z "$key" ]; then
+    while IFS= read -r line; do
+        # Strip carriage return (LSP uses CRLF line endings)
+        line="${line%$'\r'}"
+        # Empty line marks end of headers
+        if [ -z "$line" ]; then
             break
         fi
+        # Parse "Key: Value" header
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
     done
 
-    if [ $content_length -gt 0 ]; then
-        dd bs=1 count=$content_length 2>/dev/null
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
     fi
 }
 
@@ -173,7 +195,7 @@ read_message() {
 send_message() {
     local message="$1"
     local length=${#message}
-    echo -en "Content-Length: $length\r\n\r\n$message"
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
 }
 
 # Main loop
@@ -218,17 +240,29 @@ while true; do
         "textDocument/inlayHint")
             send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
             ;;
-        "$/cancelRequest")
+        "textDocument/completion")
+            if [ -n "$msg_id" ]; then
+                send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":[]}'
+            fi
+            ;;
+        "$/cancelRequest"|"initialized")
+            # Notifications - no response needed
             ;;
         "shutdown")
             send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
             break
             ;;
+        *)
+            # Respond to any unhandled requests to prevent pending request buildup
+            if [ -n "$msg_id" ]; then
+                send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+            fi
+            ;;
     esac
 done
 "#;
 
-    let script_path = std::env::temp_dir().join("fake_lsp_permissive_server.sh");
+    let script_path = dir.join("fake_lsp_permissive_server.sh");
     std::fs::write(&script_path, script).expect("Failed to write permissive server script");
 
     #[cfg(unix)]
@@ -258,9 +292,8 @@ fn test_strict_server_sends_diagnostics_with_capability() -> anyhow::Result<()> 
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_strict_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_strict_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("strict_server_log.txt");
     let test_file = temp_dir.path().join("test.py");
     std::fs::write(&test_file, "def main():\n    x = 1\n")?;
@@ -268,7 +301,7 @@ fn test_strict_server_sends_diagnostics_with_capability() -> anyhow::Result<()> 
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "python".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -277,14 +310,23 @@ fn test_strict_server_sends_diagnostics_with_capability() -> anyhow::Result<()> 
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    // Use HarnessOptions to create an empty plugins dir, preventing embedded
+    // plugin loading. Embedded plugins may send LSP requests (completion,
+    // hover, etc.) that the fake bash script doesn't handle, causing the
+    // editor's pending request queue to grow and potentially stall.
+    let mut harness = EditorTestHarness::create(
         120,
         30,
-        config,
-        temp_dir.path().to_path_buf(),
+        crate::common::harness::HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
     )?;
 
     // Open the Python test file (triggers initialize + didOpen)
@@ -320,9 +362,8 @@ fn test_permissive_server_sends_diagnostics_without_capability() -> anyhow::Resu
         .with_env_filter("fresh=debug")
         .try_init();
 
-    let script_path = create_permissive_server_script();
-
     let temp_dir = tempfile::tempdir()?;
+    let script_path = create_permissive_server_script(temp_dir.path());
     let log_file = temp_dir.path().join("permissive_server_log.txt");
     let test_file = temp_dir.path().join("test.c");
     std::fs::write(&test_file, "int main() { return 0; }\n")?;
@@ -330,7 +371,7 @@ fn test_permissive_server_sends_diagnostics_without_capability() -> anyhow::Resu
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "c".to_string(),
-        fresh::services::lsp::LspServerConfig {
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
             command: script_path.to_string_lossy().to_string(),
             args: vec![log_file.to_string_lossy().to_string()],
             enabled: true,
@@ -339,14 +380,19 @@ fn test_permissive_server_sends_diagnostics_without_capability() -> anyhow::Resu
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    let mut harness = EditorTestHarness::create(
         120,
         30,
-        config,
-        temp_dir.path().to_path_buf(),
+        crate::common::harness::HarnessOptions::new()
+            .with_config(config)
+            .with_working_dir(temp_dir.path().to_path_buf()),
     )?;
 
     // Open the C test file

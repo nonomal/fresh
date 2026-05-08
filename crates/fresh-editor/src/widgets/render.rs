@@ -696,9 +696,8 @@ fn render_collected(
             for &abs_idx in &visible_indices[start..end] {
                 let node = &nodes[abs_idx];
                 let item_key = item_keys.get(abs_idx).cloned().unwrap_or_default();
-                let is_expanded = node.has_children
-                    && !item_key.is_empty()
-                    && prev_expanded.contains(&item_key);
+                let is_expanded =
+                    node.has_children && !item_key.is_empty() && prev_expanded.contains(&item_key);
                 let rendered = render_tree_row(node, is_expanded);
                 let mut entry = rendered.entry;
                 let is_selected = abs_idx as i32 == effective_sel_abs;

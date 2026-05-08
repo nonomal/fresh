@@ -298,14 +298,8 @@ impl Editor {
                 // per-item key lives in `payload.key`.
                 let mut handled_specially = false;
                 if hit.widget_kind == "tree" && hit.event_type == "expand" {
-                    if let Some(item_key) =
-                        hit.payload.get("key").and_then(|v| v.as_str())
-                    {
-                        self.handle_widget_tree_expand_toggle(
-                            panel_id,
-                            &hit.widget_key,
-                            item_key,
-                        );
+                    if let Some(item_key) = hit.payload.get("key").and_then(|v| v.as_str()) {
+                        self.handle_widget_tree_expand_toggle(panel_id, &hit.widget_key, item_key);
                         handled_specially = true;
                     }
                 }

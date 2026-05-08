@@ -3758,11 +3758,7 @@ impl Editor {
                 scroll_offset,
                 expanded_keys,
             }) => (*selected_index, *scroll_offset, expanded_keys.clone()),
-            _ => (
-                spec_sel,
-                0u32,
-                std::collections::HashSet::<String>::new(),
-            ),
+            _ => (spec_sel, 0u32, std::collections::HashSet::<String>::new()),
         };
         // Build the visible-index list using the same rule as the
         // renderer: a node is visible iff every ancestor is expanded.
@@ -3851,11 +3847,7 @@ impl Editor {
                 scroll_offset,
                 expanded_keys,
             }) => (*selected_index, *scroll_offset, expanded_keys.clone()),
-            _ => (
-                spec_sel,
-                0u32,
-                std::collections::HashSet::<String>::new(),
-            ),
+            _ => (spec_sel, 0u32, std::collections::HashSet::<String>::new()),
         };
         if cur_sel < 0 {
             return;
@@ -3946,15 +3938,14 @@ impl Editor {
                 Some(p) => p,
                 None => return,
             };
-            let (cur_scroll, cur_sel, mut expanded) =
-                match panel.instance_states.get(widget_key) {
-                    Some(crate::widgets::WidgetInstanceState::Tree {
-                        scroll_offset,
-                        selected_index,
-                        expanded_keys,
-                    }) => (*scroll_offset, *selected_index, expanded_keys.clone()),
-                    _ => (0u32, -1i32, std::collections::HashSet::<String>::new()),
-                };
+            let (cur_scroll, cur_sel, mut expanded) = match panel.instance_states.get(widget_key) {
+                Some(crate::widgets::WidgetInstanceState::Tree {
+                    scroll_offset,
+                    selected_index,
+                    expanded_keys,
+                }) => (*scroll_offset, *selected_index, expanded_keys.clone()),
+                _ => (0u32, -1i32, std::collections::HashSet::<String>::new()),
+            };
             let next = if expanded.contains(item_key) {
                 expanded.remove(item_key);
                 false

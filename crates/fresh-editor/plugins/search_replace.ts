@@ -339,15 +339,25 @@ function buildOptionsRowSpec(): WidgetSpec {
 
   return row(
     spacer(1),
-    toggle(caseSensitive, caseLabel, { focused: oFocus && optionIndex === 0 }),
+    toggle(caseSensitive, caseLabel, {
+      focused: oFocus && optionIndex === 0,
+      key: "case",
+    }),
     spacer(2),
-    toggle(useRegex, regexLabel, { focused: oFocus && optionIndex === 1 }),
+    toggle(useRegex, regexLabel, {
+      focused: oFocus && optionIndex === 1,
+      key: "regex",
+    }),
     spacer(2),
-    toggle(wholeWords, wholeLabel, { focused: oFocus && optionIndex === 2 }),
+    toggle(wholeWords, wholeLabel, {
+      focused: oFocus && optionIndex === 2,
+      key: "whole",
+    }),
     spacer(fillCols),
     button(replLabel, {
       focused: oFocus && optionIndex === 3,
       intent: "primary",
+      key: "replaceAll",
     }),
   );
 }
@@ -1391,6 +1401,48 @@ editor.on("buffer_closed", (args) => {
   if (panel && args.buffer_id === panel.resultsBufferId) {
     panel.widgetPanel?.unmount();
     panel = null;
+  }
+});
+
+// Click → semantic event. The host hit-tests mouse clicks against the
+// mounted widget panel and fires `widget_event` for clicks that land
+// on a Toggle or Button. We dispatch on `widget_key` (set in
+// `buildOptionsRowSpec`); the existing keyboard-driven path
+// (Alt+C / Alt+R / Alt+W / Alt+Ret) still works unchanged.
+//
+// Mouse-click on a toggle should also focus it, so the user's next
+// Tab cycle starts from the clicked control. We do that by syncing
+// `focusPanel`/`optionIndex` to the clicked widget before applying
+// the state change.
+editor.on("widget_event", (args) => {
+  if (!panel || args.panel_id !== panel.widgetPanel?.id()) return;
+  switch (args.widget_key) {
+    case "case":
+      panel.focusPanel = "options";
+      panel.optionIndex = 0;
+      panel.caseSensitive = !panel.caseSensitive;
+      updatePanelContent();
+      rerunSearchDebounced();
+      break;
+    case "regex":
+      panel.focusPanel = "options";
+      panel.optionIndex = 1;
+      panel.useRegex = !panel.useRegex;
+      updatePanelContent();
+      rerunSearchDebounced();
+      break;
+    case "whole":
+      panel.focusPanel = "options";
+      panel.optionIndex = 2;
+      panel.wholeWords = !panel.wholeWords;
+      updatePanelContent();
+      rerunSearchDebounced();
+      break;
+    case "replaceAll":
+      panel.focusPanel = "options";
+      panel.optionIndex = 3;
+      doReplaceAll();
+      break;
   }
 });
 

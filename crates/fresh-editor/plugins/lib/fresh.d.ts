@@ -420,20 +420,6 @@ type BufferInfo = {
 	*/
 	splits: number[];
 };
-type WindowInfo = {
-	/**
-	* Stable session id. The base session is always `1`.
-	*/
-	id: number;
-	/**
-	* User-visible label (defaults to root basename).
-	*/
-	label: string;
-	/**
-	* Absolute project root.
-	*/
-	root: string;
-};
 type JsDiagnostic = {
 	/**
 	* Document URI
@@ -596,16 +582,6 @@ type CreateTerminalOptions = {
 	* across editor restarts.
 	*/
 	persistent?: boolean;
-	/**
-	* Optional session id to attach the new terminal buffer to.
-	* Defaults to the active session at creation time. Setting this
-	* lets Conductor and similar plugins spawn a terminal *into* an
-	* inactive session (e.g. an agent in a worktree the user hasn't
-	* dived into yet). The terminal's split is created in that
-	* session's stashed split tree; the buffer is attached to the
-	* target session's membership set rather than the active one's.
-	*/
-	windowId?: WindowId;
 };
 type CursorInfo = {
 	/**
@@ -1279,16 +1255,6 @@ interface EditorAPI {
 	*/
 	openFile(path: string, line: number | null, column: number | null): boolean;
 	/**
-	* Open a file in the background — no focus change, no
-	* active-split mutation. `windowId` defaults to the active
-	* session. Setting it to an inactive session id loads the
-	* file's buffer and adds it as a tab in that session's
-	* stashed split tree, ready to be revealed on next dive.
-	* Conductor uses this to populate worktree sessions with
-	* preselected files.
-	*/
-	openFileInBackground(path: string, windowId?: number): boolean;
-	/**
 	* Open a file in a specific split
 	*/
 	openFileInSplit(splitId: number, path: string, line: number, column: number): boolean;
@@ -1828,14 +1794,6 @@ interface EditorAPI {
 	*/
 	setPromptTitle(title: StyledText[]): boolean;
 	/**
-	* Set the footer chrome row of the floating-overlay prompt's
-	* results pane. Plugins use this for hotkey-hint banners
-	* (Conductor's `[n] new   [d] dive   [Esc] close` row).
-	* Empty array clears the footer. Has no visible effect on
-	* non-overlay prompts.
-	*/
-	setPromptFooter(footer: StyledText[]): boolean;
-	/**
 	* Define a buffer mode (takes bindings as array of [key, command] pairs)
 	*/
 	defineMode(name: string, bindingsArr: string[][], readOnly?: boolean, allowTextInput?: boolean, inheritNormalBindings?: boolean): boolean;
@@ -1859,81 +1817,6 @@ interface EditorAPI {
 	* Focus a specific split
 	*/
 	focusSplit(splitId: number): boolean;
-	/**
-	* Create a new editor session rooted at `root`. `root` must be
-	* an absolute path; relative paths are rejected by the editor
-	* (logged, no session created). The new session's id is
-	* reported via the `window_created` hook payload — plugins
-	* that need the id should listen for that event rather than
-	* polling `listWindows`.
-	* 
-	* Returns `false` only when the IPC channel to the editor is
-	* closed (editor is shutting down).
-	*/
-	createWindow(root: string, label: string): boolean;
-	/**
-	* Make the session with id `id` the active one. No-op if
-	* already active. Errors (id not found) are logged on the
-	* editor side; the JS caller can verify by reading
-	* `activeWindow()` after.
-	*/
-	setActiveWindow(id: number): boolean;
-	/**
-	* Close session `id`. Refuses to close the active session or
-	* the base session (id 1). Logs and no-ops on failure.
-	*/
-	closeWindow(id: number): boolean;
-	/**
-	* Eagerly initialise an inactive session's per-session state
-	* (file tree walk, ignore matcher, etc.) without diving.
-	* No-op for the active session or unknown id.
-	*/
-	prewarmWindow(id: number): boolean;
-	/**
-	* Register a `notify`-backed watch on `path`. Returns a
-	* promise that resolves to a numeric `handle` (also passed
-	* in subsequent `path_changed` event payloads). The promise
-	* rejects on `notify` errors (path missing, kernel limit).
-	* 
-	* `recursive` defaults to `false`. Non-recursive watches
-	* cover the path itself plus its direct children for
-	* directories — see `services/file_watcher.rs` for the
-	* rationale.
-	*/
-	watchPath(path: string, recursive?: boolean): Promise<number>;
-	/**
-	* Drop a watcher by its handle. Unknown handles are
-	* silently ignored.
-	*/
-	unwatchPath(handle: number): boolean;
-	/**
-	* Tell the editor that the floating-overlay prompt's
-	* preview pane should render the entire split tree of
-	* session `id` natively. `0` (or any unknown id) clears the
-	* override and the preview falls back to the existing
-	* path-based phantom-leaf renderer.
-	* 
-	* Conductor calls this on each prompt-selection-change so
-	* the right pane shows the highlighted session's full
-	* editor UI live — splits, terminals, syntax highlighting,
-	* decorations — at native rendering cost.
-	*/
-	previewWindowInRect(id: number): boolean;
-	/**
-	* Clear the session-preview override. Equivalent to
-	* `previewWindowInRect(0)` but reads better at call sites.
-	*/
-	clearWindowPreview(): boolean;
-	/**
-	* All editor sessions, sorted by id (creation order). Always
-	* non-empty (the base session is always present).
-	*/
-	listWindows(): WindowInfo[];
-	/**
-	* The currently active session id. Always present in
-	* `listWindows()`.
-	*/
-	activeWindow(): number;
 	/**
 	* Set scroll position of a split
 	*/
@@ -2015,22 +1898,6 @@ interface EditorAPI {
 	* TODO: Need to think about plugin isolation / namespacing strategy for these APIs.
 	*/
 	getGlobalState(key: string): unknown;
-	/**
-	* Set per-session state on the **active** session. Same
-	* shape as `setGlobalState` (write-through to snapshot +
-	* dispatched to editor; null/undefined deletes), but the
-	* underlying storage lives on `Session.plugin_state` and
-	* swaps with the rest of session state on `setActiveWindow`.
-	* Plugins that genuinely want per-project state use this;
-	* Conductor itself uses `setGlobalState` because its session
-	* list lives above session boundaries.
-	*/
-	setWindowState(key: string, value: unknown): boolean;
-	/**
-	* Get per-session state from the **active** session
-	* (snapshot read). `undefined` if missing.
-	*/
-	getWindowState(key: string): unknown;
 	/**
 	* Create a scroll sync group for anchor-based synchronized scrolling
 	*/
@@ -2520,34 +2387,26 @@ interface HookEventMap {
 			action: string;
 		}[];
 	};
-	// ── PTY terminals (see crates/fresh-core/src/hooks.rs) ───────────────────
-	terminal_output: {
-		terminal_id: number;
-		last_line: string;
-	};
-	terminal_exit: {
-		terminal_id: number;
-		exit_code: number | null;
-	};
-	// ── filesystem watching (watchPath plugin API) ────────────────────────────
-	path_changed: {
-		handle: number;
-		path: string;
-		/** "modify" | "create" | "delete" | "rename" | "other" */
-		kind: string;
-	};
-	// ── editor sessions (Conductor; see conductor-sessions-design.md) ────────
-	window_created: {
-		id: number;
-		label: string;
-		root: string;
-	};
-	window_closed: {
-		id: number;
-	};
-	active_window_changed: {
-		previous_id: number | null;
-		active_id: number;
+	// ── widget runtime ───────────────────────────────────────────────────────
+	/**
+	* A widget mounted via `editor.mountWidgetPanel` emitted a
+	* semantic event. Fired when the host's hit-test routes a mouse
+	* click to a `Toggle` / `Button` widget node within a mounted
+	* widget panel. See `docs/internal/plugin-widget-library-design.md`.
+	*
+	* Routing is by `panel_id` (matches the id the plugin allocated
+	* at mount time) plus `widget_key` (the stable `key` set on the
+	* widget spec node, or empty when the spec did not assign one).
+	*
+	* `event_type` and `payload` shapes:
+	*   * Toggle: `event_type = "toggle"`, `payload = { checked: <new> }`.
+	*   * Button: `event_type = "activate"`, `payload = {}`.
+	*/
+	widget_event: {
+		panel_id: number;
+		widget_key: string;
+		event_type: string;
+		payload: Record<string, unknown>;
 	};
 }
 /**

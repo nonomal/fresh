@@ -17,5 +17,5 @@
 mod registry;
 mod render;
 
-pub use registry::{PanelId, WidgetPanelState, WidgetRegistry};
+pub use registry::{HitArea, PanelId, WidgetPanelState, WidgetRegistry};
 pub use render::render_spec;

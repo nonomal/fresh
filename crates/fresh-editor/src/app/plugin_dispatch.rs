@@ -3120,8 +3120,8 @@ impl Editor {
         buffer_id: BufferId,
         spec: fresh_core::api::WidgetSpec,
     ) {
-        let entries = crate::widgets::render_spec(&spec);
-        self.widget_registry.mount(panel_id, buffer_id, spec);
+        let (entries, hits) = crate::widgets::render_spec(&spec);
+        self.widget_registry.mount(panel_id, buffer_id, spec, hits);
         if let Err(e) = self.set_virtual_buffer_content(buffer_id, entries) {
             tracing::error!(
                 "Failed to render mounted widget panel {} into {:?}: {}",
@@ -3139,8 +3139,8 @@ impl Editor {
     }
 
     fn handle_update_widget_panel(&mut self, panel_id: u64, spec: fresh_core::api::WidgetSpec) {
-        let entries = crate::widgets::render_spec(&spec);
-        match self.widget_registry.update(panel_id, spec) {
+        let (entries, hits) = crate::widgets::render_spec(&spec);
+        match self.widget_registry.update(panel_id, spec, hits) {
             Ok(buffer_id) => {
                 if let Err(e) = self.set_virtual_buffer_content(buffer_id, entries) {
                     tracing::error!(

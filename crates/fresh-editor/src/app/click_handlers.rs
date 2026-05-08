@@ -209,58 +209,87 @@ impl Editor {
             String::new()
         };
 
+        // Compute buffer-local row/col once. Both the widget hit-test
+        // and the mouse_click hook need them, and the cost (a single
+        // `screen_to_buffer_position` call) is non-trivial — share the
+        // result.
+        let (mc_buffer_row, mc_buffer_col) = {
+            let cached_mappings = self
+                .cached_layout
+                .view_line_mappings
+                .get(&split_id)
+                .cloned();
+            let fallback = self
+                .split_view_states
+                .get(&split_id)
+                .map(|vs| vs.viewport.top_byte)
+                .unwrap_or(0);
+            let compose_width = self
+                .split_view_states
+                .get(&split_id)
+                .and_then(|vs| vs.compose_width);
+            let gutter_width = self
+                .buffers
+                .get(&buffer_id)
+                .map(|s| s.margins.left_total_width() as u16)
+                .unwrap_or(0);
+            let target = super::click_geometry::screen_to_buffer_position(
+                col,
+                row,
+                content_rect,
+                gutter_width,
+                &cached_mappings,
+                fallback,
+                true,
+                compose_width,
+            );
+            match target {
+                Some(byte_pos) => {
+                    let state = self.buffers.get(&buffer_id);
+                    if let Some(s) = state {
+                        let (line, col_b) = s.buffer.position_to_line_col(byte_pos);
+                        (
+                            Some(line.min(u32::MAX as usize) as u32),
+                            Some(col_b.min(u32::MAX as usize) as u32),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                None => (None, None),
+            }
+        };
+
+        // Widget hit-test: if the click landed on a Toggle/Button
+        // inside a mounted widget panel, fire the semantic
+        // `widget_event` hook. We still fall through to `mouse_click`
+        // afterwards so plugins that bind both hooks get both events
+        // — needed for incremental migration of plugins that haven't
+        // moved their click handlers off the raw `mouse_click` path
+        // yet. Once a plugin's click handling is fully widget-event
+        // driven, it stops listening to `mouse_click` for its panel
+        // and the duplicate dispatch becomes a no-op.
+        if let (Some(brow), Some(bcol)) = (mc_buffer_row, mc_buffer_col) {
+            if let Some((panel_id, hit)) =
+                self.widget_registry.hit_test(buffer_id, brow, bcol)
+            {
+                if self.plugin_manager.has_hook_handlers("widget_event") {
+                    self.plugin_manager.run_hook(
+                        "widget_event",
+                        HookArgs::WidgetEvent {
+                            panel_id,
+                            widget_key: hit.widget_key.clone(),
+                            event_type: hit.event_type.to_string(),
+                            payload: hit.payload.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
         // Dispatch MouseClick hook to plugins
         // Plugins can handle clicks on their virtual buffers
         if self.plugin_manager.has_hook_handlers("mouse_click") {
-            // Compute buffer-local row/col so plugins can react to clicks
-            // on specific rows (e.g. clicking a file header, or a comment
-            // in the comments navigation panel) without redoing the math.
-            let (hook_buffer_row, hook_buffer_col) = {
-                let cached_mappings = self
-                    .cached_layout
-                    .view_line_mappings
-                    .get(&split_id)
-                    .cloned();
-                let fallback = self
-                    .split_view_states
-                    .get(&split_id)
-                    .map(|vs| vs.viewport.top_byte)
-                    .unwrap_or(0);
-                let compose_width = self
-                    .split_view_states
-                    .get(&split_id)
-                    .and_then(|vs| vs.compose_width);
-                let gutter_width = self
-                    .buffers
-                    .get(&buffer_id)
-                    .map(|s| s.margins.left_total_width() as u16)
-                    .unwrap_or(0);
-                let target = super::click_geometry::screen_to_buffer_position(
-                    col,
-                    row,
-                    content_rect,
-                    gutter_width,
-                    &cached_mappings,
-                    fallback,
-                    true,
-                    compose_width,
-                );
-                match target {
-                    Some(byte_pos) => {
-                        let state = self.buffers.get(&buffer_id);
-                        if let Some(s) = state {
-                            let (line, col_b) = s.buffer.position_to_line_col(byte_pos);
-                            (
-                                Some(line.min(u32::MAX as usize) as u32),
-                                Some(col_b.min(u32::MAX as usize) as u32),
-                            )
-                        } else {
-                            (None, None)
-                        }
-                    }
-                    None => (None, None),
-                }
-            };
             self.plugin_manager.run_hook(
                 "mouse_click",
                 HookArgs::MouseClick {
@@ -271,8 +300,8 @@ impl Editor {
                     content_x: content_rect.x,
                     content_y: content_rect.y,
                     buffer_id: Some(buffer_id.0 as u64),
-                    buffer_row: hook_buffer_row,
-                    buffer_col: hook_buffer_col,
+                    buffer_row: mc_buffer_row,
+                    buffer_col: mc_buffer_col,
                 },
             );
         }

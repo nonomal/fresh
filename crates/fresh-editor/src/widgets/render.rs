@@ -20,8 +20,10 @@
 //! `Layer`, `Transient`, `Table`) extend the dispatch without
 //! changing the public function signature.
 
+use crate::widgets::registry::HitArea;
 use fresh_core::api::{ButtonKind, HintEntry, OverlayColorSpec, OverlayOptions, WidgetSpec};
 use fresh_core::text_property::{InlineOverlay, TextPropertyEntry};
+use serde_json::json;
 
 // Theme keys used by the v1 widget renderers. Centralized so future
 // "role-based" theming (§7 of the design doc) has one place to
@@ -32,101 +34,168 @@ const KEY_FOCUSED_FG: &str = "ui.menu_active_fg";
 const KEY_FOCUSED_BG: &str = "ui.menu_active_bg";
 const KEY_DANGER_FG: &str = "ui.status_error_indicator_fg";
 
-/// Render a spec to a flat `Vec<TextPropertyEntry>` ready for
-/// `set_virtual_buffer_content`. The entries do not contain trailing
-/// newlines; the caller composes lines exactly as
-/// `setVirtualBufferContent` already expects.
-pub fn render_spec(spec: &WidgetSpec) -> Vec<TextPropertyEntry> {
-    let mut out = Vec::new();
-    render_into(spec, &mut out);
-    out
+/// Render a spec to a flat `Vec<TextPropertyEntry>` plus a flat list
+/// of click-routing `HitArea`s.
+///
+/// Entries are ready for `set_virtual_buffer_content`; hits are
+/// installed in the `WidgetRegistry` so a later `mouse_click` can
+/// dispatch a semantic `widget_event`.
+pub fn render_spec(spec: &WidgetSpec) -> (Vec<TextPropertyEntry>, Vec<HitArea>) {
+    render_collected(spec)
 }
 
-fn render_into(spec: &WidgetSpec, out: &mut Vec<TextPropertyEntry>) {
+/// Internal renderer. Returns the entries and the hit areas
+/// produced by `spec` *as if* it were rendered at row 0; callers
+/// (Col, Row block path) shift `buffer_row` upward by their own
+/// row offset before forwarding.
+fn render_collected(spec: &WidgetSpec) -> (Vec<TextPropertyEntry>, Vec<HitArea>) {
+    let mut entries: Vec<TextPropertyEntry> = Vec::new();
+    let mut hits: Vec<HitArea> = Vec::new();
     match spec {
         WidgetSpec::Row { children, .. } => {
-            // v1: rows containing only inline-stylable children
-            // collapse to one entry. Children that themselves emit
-            // multiple lines (e.g. Col, Raw) are flattened in
-            // declaration order — this matches the line-oriented
-            // layout described in §3 of the design doc.
+            // Rows collapse inline-sized children into a single
+            // `TextPropertyEntry`. Children that emit multiple lines
+            // (e.g. nested Col, Raw with several entries) flush the
+            // accumulator and pass through. Hit areas from inline
+            // children share the merged row; their byte offsets
+            // shift by the merged-text length so far. Block
+            // children's hits keep their own row index, biased by
+            // the number of entries already emitted.
             let mut acc: Option<TextPropertyEntry> = None;
             for child in children {
-                let child_entries = render_spec(child);
+                let (child_entries, child_hits) = render_collected(child);
                 if child_entries.is_empty() {
+                    debug_assert!(child_hits.is_empty(), "empty children produce no hits");
                     continue;
                 }
                 if child_entries.len() == 1 {
-                    let mut entry = child_entries.into_iter().next().unwrap();
+                    let mut child_entry = child_entries.into_iter().next().unwrap();
+                    let inline_shift = match acc.as_ref() {
+                        Some(e) => e.text.len(),
+                        None => 0,
+                    };
+                    for mut h in child_hits {
+                        // Inline child's hits all collapse onto the
+                        // accumulator's row; byte ranges shift by the
+                        // text length we've already merged.
+                        h.byte_start += inline_shift;
+                        h.byte_end += inline_shift;
+                        // buffer_row stays at 0 — caller (Col / top
+                        // level) will rebase it.
+                        hits.push(h);
+                    }
                     match acc.as_mut() {
-                        Some(merged) => merge_inline(merged, &mut entry),
-                        None => acc = Some(entry),
+                        Some(merged) => merge_inline(merged, &mut child_entry),
+                        None => acc = Some(child_entry),
                     }
                 } else {
-                    // Multi-line child inside a Row: flush whatever
-                    // we've accumulated, then emit the child's lines
-                    // straight through. Mixing inline-row + block
-                    // children in the same Row is only meaningful
-                    // when the block child is the last item; this is
-                    // good enough for v1 and avoids reflow logic.
+                    // Multi-line child: flush the accumulator and
+                    // emit the block. Hits from the block keep their
+                    // own row index relative to the block's first
+                    // line, plus the row offset of where the block
+                    // lands in `entries`.
                     if let Some(merged) = acc.take() {
-                        out.push(merged);
+                        entries.push(merged);
                     }
-                    out.extend(child_entries);
+                    let row_offset = entries.len() as u32;
+                    for mut h in child_hits {
+                        h.buffer_row += row_offset;
+                        hits.push(h);
+                    }
+                    entries.extend(child_entries);
                 }
             }
             if let Some(merged) = acc {
-                out.push(merged);
+                entries.push(merged);
             }
         }
         WidgetSpec::Col { children, .. } => {
             for child in children {
-                render_into(child, out);
+                let (child_entries, child_hits) = render_collected(child);
+                let row_offset = entries.len() as u32;
+                for mut h in child_hits {
+                    h.buffer_row += row_offset;
+                    hits.push(h);
+                }
+                entries.extend(child_entries);
             }
         }
-        WidgetSpec::HintBar { entries, .. } => {
-            out.push(render_hint_bar(entries));
+        WidgetSpec::HintBar {
+            entries: hint_entries,
+            ..
+        } => {
+            entries.push(render_hint_bar(hint_entries));
+            // No hits — HintBar is read-only in v1. (When the
+            // keymap layer arrives, individual entries become
+            // clickable command targets.)
         }
         WidgetSpec::Toggle {
             checked,
             label,
             focused,
-            ..
+            key,
         } => {
-            out.push(render_toggle(*checked, label, *focused));
+            let entry = render_toggle(*checked, label, *focused);
+            let byte_end = entry.text.len();
+            hits.push(HitArea {
+                widget_key: key.clone().unwrap_or_default(),
+                widget_kind: "toggle",
+                buffer_row: 0,
+                byte_start: 0,
+                byte_end,
+                payload: json!({ "checked": !*checked }),
+                event_type: "toggle",
+            });
+            entries.push(entry);
         }
         WidgetSpec::Button {
             label,
             focused,
             intent,
-            ..
+            key,
         } => {
-            out.push(render_button(label, *focused, *intent));
+            let entry = render_button(label, *focused, *intent);
+            let byte_end = entry.text.len();
+            hits.push(HitArea {
+                widget_key: key.clone().unwrap_or_default(),
+                widget_kind: "button",
+                buffer_row: 0,
+                byte_start: 0,
+                byte_end,
+                payload: json!({}),
+                event_type: "activate",
+            });
+            entries.push(entry);
         }
         WidgetSpec::Spacer { cols, .. } => {
             // In an inline-row context a Spacer is N spaces; in a
-            // block context (top-level / Col) it's a blank line per
-            // `cols`. The Row collapse path treats a single-line
-            // entry as inline, so emitting a single entry with N
-            // spaces does the right thing in both contexts: in a
-            // Col it becomes one short blank line; in a Row it
-            // collapses inline alongside neighbours.
+            // block context (top-level / Col) it's a short blank
+            // line. Either way: one entry, no hit areas.
             let cols = (*cols).min(4096) as usize;
             let mut text = String::with_capacity(cols);
             for _ in 0..cols {
                 text.push(' ');
             }
-            out.push(TextPropertyEntry {
+            entries.push(TextPropertyEntry {
                 text,
                 properties: Default::default(),
                 style: None,
                 inline_overlays: Vec::new(),
             });
         }
-        WidgetSpec::Raw { entries, .. } => {
-            out.extend(entries.iter().cloned());
+        WidgetSpec::Raw {
+            entries: raw_entries,
+            ..
+        } => {
+            // Raw is the migration escape hatch: the plugin's own
+            // bytes flow through unchanged. The plugin still owns
+            // mouse clicks within Raw regions (via the existing
+            // `mouse_click` hook); the widget runtime intentionally
+            // emits no hit areas here.
+            entries.extend(raw_entries.iter().cloned());
         }
     }
+    (entries, hits)
 }
 
 /// Render a HintBar into a single `TextPropertyEntry`.
@@ -369,10 +438,11 @@ mod tests {
             ],
             key: None,
         };
-        let out = render_spec(&spec);
+        let (out, hits) = render_spec(&spec);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].text, "A alpha");
         assert_eq!(out[1].text, "B beta");
+        assert!(hits.is_empty(), "HintBar emits no hit areas in v1");
     }
 
     #[test]
@@ -381,9 +451,10 @@ mod tests {
             entries: vec![TextPropertyEntry::text("hello")],
             key: None,
         };
-        let out = render_spec(&spec);
+        let (out, hits) = render_spec(&spec);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "hello");
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -471,7 +542,7 @@ mod tests {
             ],
             key: None,
         };
-        let out = render_spec(&spec);
+        let (out, _hits) = render_spec(&spec);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "[ ] A    [ Go ]");
     }
@@ -497,12 +568,143 @@ mod tests {
             ],
             key: None,
         };
-        let out = render_spec(&spec);
+        let (out, _hits) = render_spec(&spec);
         assert_eq!(out.len(), 1);
         // Two adjacent HintBars are concatenated; the second's overlay shifts.
         assert_eq!(out[0].text, "Tab xEsc y");
         assert_eq!(out[0].inline_overlays.len(), 2);
         assert_eq!(out[0].inline_overlays[1].start, 5);
         assert_eq!(out[0].inline_overlays[1].end, 8);
+    }
+
+    // -------------------------------------------------------------
+    // Hit-area tests
+    // -------------------------------------------------------------
+
+    #[test]
+    fn toggle_emits_hit_area_with_toggle_payload() {
+        let spec = WidgetSpec::Toggle {
+            checked: false,
+            label: "Case".into(),
+            focused: false,
+            key: Some("case".into()),
+        };
+        let (_entries, hits) = render_spec(&spec);
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.widget_key, "case");
+        assert_eq!(h.widget_kind, "toggle");
+        assert_eq!(h.event_type, "toggle");
+        assert_eq!(h.buffer_row, 0);
+        assert_eq!(h.byte_start, 0);
+        assert_eq!(h.byte_end, "[ ] Case".len());
+        assert_eq!(h.payload, json!({"checked": true}));
+    }
+
+    #[test]
+    fn button_emits_hit_area_with_activate_payload() {
+        let spec = WidgetSpec::Button {
+            label: "Replace All".into(),
+            focused: false,
+            intent: ButtonKind::Primary,
+            key: Some("replace".into()),
+        };
+        let (_entries, hits) = render_spec(&spec);
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.widget_key, "replace");
+        assert_eq!(h.widget_kind, "button");
+        assert_eq!(h.event_type, "activate");
+        assert_eq!(h.byte_end, "[ Replace All ]".len());
+        assert_eq!(h.payload, json!({}));
+    }
+
+    #[test]
+    fn row_inline_collapse_shifts_hit_byte_offsets() {
+        let spec = WidgetSpec::Row {
+            children: vec![
+                WidgetSpec::Toggle {
+                    checked: true,
+                    label: "A".into(),
+                    focused: false,
+                    key: Some("a".into()),
+                },
+                WidgetSpec::Spacer { cols: 2, key: None },
+                WidgetSpec::Toggle {
+                    checked: false,
+                    label: "B".into(),
+                    focused: false,
+                    key: Some("b".into()),
+                },
+            ],
+            key: None,
+        };
+        let (entries, hits) = render_spec(&spec);
+        // One merged row with text "[v] A  [ ] B"
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "[v] A  [ ] B");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].widget_key, "a");
+        assert_eq!(hits[0].buffer_row, 0);
+        assert_eq!(hits[0].byte_start, 0);
+        assert_eq!(hits[0].byte_end, 5); // "[v] A".len()
+        // Second toggle shifts past first toggle ("[v] A".len() = 5)
+        // + spacer ("  ".len() = 2) = 7.
+        assert_eq!(hits[1].widget_key, "b");
+        assert_eq!(hits[1].buffer_row, 0);
+        assert_eq!(hits[1].byte_start, 7);
+        assert_eq!(hits[1].byte_end, 12);
+    }
+
+    #[test]
+    fn col_stacks_hit_rows() {
+        let spec = WidgetSpec::Col {
+            children: vec![
+                WidgetSpec::Toggle {
+                    checked: false,
+                    label: "row0".into(),
+                    focused: false,
+                    key: Some("k0".into()),
+                },
+                WidgetSpec::Toggle {
+                    checked: true,
+                    label: "row1".into(),
+                    focused: false,
+                    key: Some("k1".into()),
+                },
+            ],
+            key: None,
+        };
+        let (_entries, hits) = render_spec(&spec);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].buffer_row, 0);
+        assert_eq!(hits[1].buffer_row, 1);
+    }
+
+    #[test]
+    fn raw_inside_col_offsets_following_hits() {
+        let spec = WidgetSpec::Col {
+            children: vec![
+                WidgetSpec::Raw {
+                    entries: vec![
+                        TextPropertyEntry::text("line0"),
+                        TextPropertyEntry::text("line1"),
+                        TextPropertyEntry::text("line2"),
+                    ],
+                    key: None,
+                },
+                WidgetSpec::Toggle {
+                    checked: false,
+                    label: "after raw".into(),
+                    focused: false,
+                    key: Some("post".into()),
+                },
+            ],
+            key: None,
+        };
+        let (entries, hits) = render_spec(&spec);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].buffer_row, 3);
     }
 }

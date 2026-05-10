@@ -3079,7 +3079,8 @@ impl Editor {
                 // content.  We want the tab to show `a.txt*` after undo.
                 event_log.mark_saved();
             }
-            self.invalidate_layouts_for_buffer(buffer_id);
+            self.active_window_mut()
+                .invalidate_layouts_for_buffer(buffer_id);
 
             // Notify LSP with full document content (bulk edits collapse
             // incremental ranges).

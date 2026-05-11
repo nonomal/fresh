@@ -39,7 +39,7 @@
 //! is a pointer write (plus first-dive seed allocation for
 //! windows that have never been activated).
 
-use crate::app::types::WindowLayoutCache;
+use crate::app::types::{ChromeLayout, WindowLayoutCache};
 use crate::app::window_resources::WindowResources;
 use crate::model::event::{Event, LeafId};
 use crate::services::lsp::manager::LspManager;
@@ -296,8 +296,15 @@ pub struct Window {
     /// frame; stale until the next render after a window switch (the
     /// post-switch render fills it in before any input handling).
     /// Editor-chrome rects (status bar, menu, popups, prompt overlay)
-    /// live on `Editor::chrome_layout` instead.
+    /// live on `Window::chrome_layout` (also per-window).
     pub(crate) layout_cache: WindowLayoutCache,
+
+    /// Per-window editor-chrome layout cache: status bar, menu,
+    /// popups, prompt overlay, full-frame cell-theme map. Each
+    /// window has its own status bar / prompt / popup state, so the
+    /// cache is per-window. Repopulated by the renderer for the
+    /// active window every frame.
+    pub(crate) chrome_layout: ChromeLayout,
 
     /// Editor-global resources shared by `Arc` clone (config, theme
     /// registry, keybindings, command registry, filesystem authority,
@@ -1484,6 +1491,7 @@ impl Window {
             composite_buffers: HashMap::new(),
             composite_view_states: HashMap::new(),
             layout_cache: WindowLayoutCache::default(),
+            chrome_layout: ChromeLayout::default(),
             preview: None,
             terminal_mode: false,
             terminal_mode_resume: std::collections::HashSet::new(),

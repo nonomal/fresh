@@ -241,7 +241,6 @@ impl Editor {
             pending_authority: None,
             remote_indicator_override: None,
             menus: crate::config::MenuConfig::translated(),
-            chrome_layout: ChromeLayout::default(),
             background_process_handles: HashMap::new(),
             host_process_handles: HashMap::new(),
             event_broadcaster: parts.event_broadcaster,

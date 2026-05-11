@@ -745,7 +745,7 @@ impl Editor {
 
     /// Check if mouse position is over a transient popup (hover, signature help)
     fn is_mouse_over_transient_popup(&self, col: u16, row: u16) -> bool {
-        let layouts = popup_areas_to_layout_info(&self.chrome_layout.popup_areas);
+        let layouts = popup_areas_to_layout_info(&self.active_chrome().popup_areas);
         let hit_tester = PopupHitTester::new(&layouts, &self.active_state().popups);
         hit_tester.is_over_transient_popup(col, row)
     }
@@ -754,7 +754,7 @@ impl Editor {
     fn is_mouse_over_any_popup(&self, col: u16, row: u16) -> bool {
         // Editor-level popup overlays absorb every click within their outer
         // rect so the buffer below doesn't receive a stray cursor placement.
-        for (_, popup_area, _, _, _) in &self.chrome_layout.global_popup_areas {
+        for (_, popup_area, _, _, _) in &self.active_chrome().global_popup_areas {
             if in_rect(col, row, *popup_area) {
                 return true;
             }
@@ -762,12 +762,12 @@ impl Editor {
         // The prompt's suggestions popup also absorbs clicks across its full
         // outer rect (border + items): clicking the chrome must not move the
         // buffer cursor below.
-        if let Some(outer) = self.chrome_layout.suggestions_outer_area {
+        if let Some(outer) = self.active_chrome().suggestions_outer_area {
             if in_rect(col, row, outer) {
                 return true;
             }
         }
-        let layouts = popup_areas_to_layout_info(&self.chrome_layout.popup_areas);
+        let layouts = popup_areas_to_layout_info(&self.active_chrome().popup_areas);
         let hit_tester = PopupHitTester::new(&layouts, &self.active_state().popups);
         hit_tester.is_over_popup(col, row)
     }
@@ -801,8 +801,8 @@ impl Editor {
     fn compute_hover_target(&self, col: u16, row: u16) -> Option<HoverTarget> {
         if let Some(ref menu) = self.active_window().file_explorer_context_menu {
             let (menu_x, menu_y) = menu.clamped_position(
-                self.chrome_layout.last_frame_width,
-                self.chrome_layout.last_frame_height,
+                self.active_chrome().last_frame_width,
+                self.active_chrome().last_frame_height,
             );
             let menu_width = super::types::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
             let menu_height = menu.height();
@@ -841,7 +841,7 @@ impl Editor {
 
         // Check suggestions area first (command palette, autocomplete)
         if let Some((inner_rect, start_idx, _visible_count, total_count)) =
-            &self.chrome_layout.suggestions_area
+            &self.active_chrome().suggestions_area
         {
             if in_rect(col, row, *inner_rect) {
                 let relative_row = (row - inner_rect.y) as usize;
@@ -856,7 +856,7 @@ impl Editor {
         // Check popups (they're rendered on top)
         // Check from top to bottom (reverse order since last popup is on top)
         for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items, _, _) in
-            self.chrome_layout.popup_areas.iter().rev()
+            self.active_chrome().popup_areas.iter().rev()
         {
             if in_rect(col, row, *inner_rect) && *num_items > 0 {
                 // Calculate which item is being hovered
@@ -879,7 +879,7 @@ impl Editor {
         // Check menu bar (row 0, only when visible)
         // Check menu bar using cached layout from previous render
         if self.active_window().menu_bar_visible {
-            if let Some(ref menu_layout) = self.chrome_layout.menu_layout {
+            if let Some(ref menu_layout) = self.active_chrome().menu_layout {
                 if let Some(menu_idx) = menu_layout.menu_at(col, row) {
                     return Some(HoverTarget::MenuBarItem(menu_idx));
                 }
@@ -1007,31 +1007,31 @@ impl Editor {
         }
 
         // Check status bar indicators
-        if let Some((status_row, _status_x, _status_width)) = self.chrome_layout.status_bar_area {
+        if let Some((status_row, _status_x, _status_width)) = self.active_chrome().status_bar_area {
             if row == status_row {
                 let indicators = [
                     (
-                        self.chrome_layout.status_bar_line_ending_area,
+                        self.active_chrome().status_bar_line_ending_area,
                         HoverTarget::StatusBarLineEndingIndicator,
                     ),
                     (
-                        self.chrome_layout.status_bar_encoding_area,
+                        self.active_chrome().status_bar_encoding_area,
                         HoverTarget::StatusBarEncodingIndicator,
                     ),
                     (
-                        self.chrome_layout.status_bar_language_area,
+                        self.active_chrome().status_bar_language_area,
                         HoverTarget::StatusBarLanguageIndicator,
                     ),
                     (
-                        self.chrome_layout.status_bar_lsp_area,
+                        self.active_chrome().status_bar_lsp_area,
                         HoverTarget::StatusBarLspIndicator,
                     ),
                     (
-                        self.chrome_layout.status_bar_remote_area,
+                        self.active_chrome().status_bar_remote_area,
                         HoverTarget::StatusBarRemoteIndicator,
                     ),
                     (
-                        self.chrome_layout.status_bar_warning_area,
+                        self.active_chrome().status_bar_warning_area,
                         HoverTarget::StatusBarWarningBadge,
                     ),
                 ];
@@ -1046,7 +1046,7 @@ impl Editor {
         }
 
         // Check search options bar checkboxes
-        if let Some(ref layout) = self.chrome_layout.search_options_layout {
+        if let Some(ref layout) = self.active_chrome().search_options_layout {
             use crate::view::ui::status_bar::SearchOptionsHover;
             if let Some(hover) = layout.checkbox_at(col, row) {
                 return Some(match hover {
@@ -1508,7 +1508,7 @@ impl Editor {
     /// the inner item area or no suggestions are visible.
     fn suggestion_at(&self, col: u16, row: u16) -> Option<usize> {
         let (inner_rect, start_idx, _visible_count, total_count) =
-            self.chrome_layout.suggestions_area?;
+            self.active_chrome().suggestions_area?;
         if col < inner_rect.x
             || col >= inner_rect.x + inner_rect.width
             || row < inner_rect.y
@@ -1566,7 +1566,7 @@ impl Editor {
     /// behaviour is consistent across the editor.
     fn handle_click_prompt_scrollbar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
         use crate::view::ui::scrollbar::ScrollbarState;
-        let sb_rect = self.chrome_layout.suggestions_scrollbar_rect?;
+        let sb_rect = self.active_chrome().suggestions_scrollbar_rect?;
         if col < sb_rect.x
             || col >= sb_rect.x + sb_rect.width
             || row < sb_rect.y
@@ -1581,7 +1581,7 @@ impl Editor {
         // prompt — `active_window_mut()` is a method call so the
         // compiler can't see that `prompt` and `chrome_layout` are
         // disjoint sub-fields.
-        let suggestions_area_visible = self.chrome_layout.suggestions_area.map(|(_, _, v, _)| v);
+        let suggestions_area_visible = self.active_chrome().suggestions_area.map(|(_, _, v, _)| v);
         let active_window_id = self.active_window;
         let prompt = self
             .windows
@@ -1604,7 +1604,7 @@ impl Editor {
     fn handle_click_popup_scrollbar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
         // Collect all needed data before mutating self.
         let scrollbar_info: Option<(usize, i32)> =
-            self.chrome_layout.popup_areas.iter().rev().find_map(
+            self.active_chrome().popup_areas.iter().rev().find_map(
                 |(popup_idx, _popup_rect, inner_rect, _scroll, _n, scrollbar_rect, total_lines)| {
                     let sb_rect = scrollbar_rect.as_ref()?;
                     if col >= sb_rect.x
@@ -1651,8 +1651,7 @@ impl Editor {
     }
 
     fn handle_click_global_popups(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
-        for (popup_idx, popup_rect, inner_rect, scroll_offset, num_items) in self
-            .chrome_layout
+        for (popup_idx, popup_rect, inner_rect, scroll_offset, num_items) in self.active_chrome()
             .global_popup_areas
             .clone()
             .into_iter()
@@ -1684,7 +1683,7 @@ impl Editor {
 
     fn handle_click_buffer_popups(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
         // Check close-button overlay ("[×]") on each popup.
-        let close_hit = self.chrome_layout.popup_areas.iter().rev().find_map(
+        let close_hit = self.active_chrome().popup_areas.iter().rev().find_map(
             |(_idx, popup_rect, _inner, _scroll, _n, _sb, _tl)| {
                 if popup_rect.width < 5 {
                     return None;
@@ -1702,7 +1701,7 @@ impl Editor {
         }
 
         // Content area clicks — clone to allow &mut self calls inside the loop.
-        let popup_areas = self.chrome_layout.popup_areas.clone();
+        let popup_areas = self.active_chrome().popup_areas.clone();
         for (popup_idx, _popup_rect, inner_rect, scroll_offset, num_items, _, _) in
             popup_areas.iter().rev()
         {
@@ -1771,12 +1770,11 @@ impl Editor {
     fn handle_click_menu_bar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
         if self.active_window_mut().menu_bar_visible {
             // Resolve the hit before any &mut operations to avoid borrow conflicts.
-            let hit = self
-                .chrome_layout
+            let hit = self.active_chrome()
                 .menu_layout
                 .as_ref()
                 .and_then(|ml| ml.menu_at(col, row));
-            let layout_exists = self.chrome_layout.menu_layout.is_some();
+            let layout_exists = self.active_chrome().menu_layout.is_some();
             if layout_exists {
                 if let Some(menu_idx) = hit {
                     if self.menu_state.active_menu == Some(menu_idx) {
@@ -1972,41 +1970,41 @@ impl Editor {
     }
 
     fn handle_click_status_bar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
-        let (status_row, _status_x, _status_width) = self.chrome_layout.status_bar_area?;
+        let (status_row, _status_x, _status_width) = self.active_chrome().status_bar_area?;
         if row != status_row {
             return None;
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_line_ending_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_line_ending_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::SetLineEnding));
             }
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_encoding_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_encoding_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::SetEncoding));
             }
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_language_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_language_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::SetLanguage));
             }
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_lsp_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_lsp_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::ShowLspStatus));
             }
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_remote_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_remote_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::ShowRemoteIndicatorMenu));
             }
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_warning_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_warning_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::ShowWarnings));
             }
         }
-        if let Some((r, s, e)) = self.chrome_layout.status_bar_message_area {
+        if let Some((r, s, e)) = self.active_chrome().status_bar_message_area {
             if row == r && col >= s && col < e {
                 return Some(self.handle_action(Action::ShowStatusLog));
             }
@@ -2016,7 +2014,7 @@ impl Editor {
 
     fn handle_click_search_options(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
         use crate::view::ui::status_bar::SearchOptionsHover;
-        let layout = self.chrome_layout.search_options_layout.clone()?;
+        let layout = self.active_chrome().search_options_layout.clone()?;
         match layout.checkbox_at(col, row)? {
             SearchOptionsHover::CaseSensitive => {
                 Some(self.handle_action(Action::ToggleSearchCaseSensitive))
@@ -2379,8 +2377,7 @@ impl Editor {
         // If selecting text in popup, extend selection
         if let Some(popup_idx) = self.active_window_mut().mouse_state.selecting_in_popup {
             // Find the popup area from cached layout
-            if let Some((_, _, inner_rect, scroll_offset, _, _, _)) = self
-                .chrome_layout
+            if let Some((_, _, inner_rect, scroll_offset, _, _, _)) = self.active_chrome()
                 .popup_areas
                 .iter()
                 .find(|(idx, _, _, _, _, _, _)| *idx == popup_idx)
@@ -2416,9 +2413,9 @@ impl Editor {
             use crate::view::ui::scrollbar::ScrollbarState;
             // Snapshot chrome rects up front so the prompt borrow on
             // active_window_mut() doesn't conflict.
-            let sb_rect = self.chrome_layout.suggestions_scrollbar_rect;
+            let sb_rect = self.active_chrome().suggestions_scrollbar_rect;
             let suggestions_area_visible =
-                self.chrome_layout.suggestions_area.map(|(_, _, v, _)| v);
+                self.active_chrome().suggestions_area.map(|(_, _, v, _)| v);
             let active_window_id = self.active_window;
             if let (Some(sb_rect), Some(prompt)) = (
                 sb_rect,
@@ -2448,8 +2445,7 @@ impl Editor {
             .dragging_popup_scrollbar
         {
             // Find the popup's scrollbar rect from cached layout
-            if let Some((_, _, inner_rect, _, _, Some(sb_rect), total_lines)) = self
-                .chrome_layout
+            if let Some((_, _, inner_rect, _, _, Some(sb_rect), total_lines)) = self.active_chrome()
                 .popup_areas
                 .iter()
                 .find(|(idx, _, _, _, _, _, _)| *idx == popup_idx)
@@ -2748,8 +2744,8 @@ impl Editor {
 
     /// Handle right-click event
     pub(super) fn handle_right_click(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
-        let frame_w = self.chrome_layout.last_frame_width;
-        let frame_h = self.chrome_layout.last_frame_height;
+        let frame_w = self.active_chrome().last_frame_width;
+        let frame_h = self.active_chrome().last_frame_height;
         if let Some(ref menu) = self.active_window().file_explorer_context_menu {
             let (menu_x, menu_y) = menu.clamped_position(frame_w, frame_h);
             let menu_width = super::types::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
@@ -2981,8 +2977,8 @@ impl Editor {
         row: u16,
     ) -> Option<AnyhowResult<()>> {
         // Extract all needed values while the immutable borrow is live, then mutate.
-        let frame_w = self.chrome_layout.last_frame_width;
-        let frame_h = self.chrome_layout.last_frame_height;
+        let frame_w = self.active_chrome().last_frame_width;
+        let frame_h = self.active_chrome().last_frame_height;
         let clicked_item: Option<super::types::FileExplorerContextMenuItem> = {
             let menu = self.active_window().file_explorer_context_menu.as_ref()?;
             let (menu_x, menu_y) = menu.clamped_position(frame_w, frame_h);

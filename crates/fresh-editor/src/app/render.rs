@@ -15,11 +15,11 @@ impl Editor {
         self.active_window_mut().animations.capture_before_all();
 
         // Save frame dimensions for recompute_layout (used by macro replay)
-        self.chrome_layout.last_frame_width = size.width;
-        self.chrome_layout.last_frame_height = size.height;
+        self.active_chrome_mut().last_frame_width = size.width;
+        self.active_chrome_mut().last_frame_height = size.height;
 
         // Reset per-cell theme key map for this frame
-        self.chrome_layout.reset_cell_theme_map();
+        self.active_chrome_mut().reset_cell_theme_map();
 
         // For scroll sync groups, we need to update the active split's viewport position BEFORE
         // calling sync_scroll_groups, so that the sync reads the correct position.
@@ -686,6 +686,7 @@ impl Editor {
         let __grouped_ref = &__win.grouped_subtrees;
         let __composite_buffers_mut = &mut __win.composite_buffers;
         let __composite_view_states_mut = &mut __win.composite_view_states;
+        let __cell_theme_map_mut = &mut __win.chrome_layout.cell_theme_map;
         let (mgr_for_split, split_view_states): (
             &crate::view::split::SplitManager,
             &mut HashMap<crate::model::event::LeafId, crate::view::split::SplitViewState>,
@@ -739,7 +740,7 @@ impl Editor {
             self.config.editor.diagnostics_inline_text,
             self.config.editor.show_tilde,
             self.config.editor.highlight_current_column,
-            &mut self.chrome_layout.cell_theme_map,
+            __cell_theme_map_mut,
             size.width,
             &mut pending_hardware_cursor,
         );
@@ -891,8 +892,8 @@ impl Editor {
         self.render_hover_highlights(frame);
 
         // Initialize popup/suggestion layout state (rendered after status bar below)
-        self.chrome_layout.suggestions_area = None;
-        self.chrome_layout.suggestions_outer_area = None;
+        self.active_chrome_mut().suggestions_area = None;
+        self.active_chrome_mut().suggestions_outer_area = None;
         self.active_window_mut().file_browser_layout = None;
 
         // Clone all immutable values before the mutable borrow
@@ -1075,16 +1076,16 @@ impl Editor {
 
             // Store status bar layout for click detection
             let status_bar_area = main_chunks[status_bar_idx];
-            self.chrome_layout.status_bar_area =
+            self.active_chrome_mut().status_bar_area =
                 Some((status_bar_area.y, status_bar_area.x, status_bar_area.width));
-            self.chrome_layout.status_bar_lsp_area = status_bar_layout.lsp_indicator;
-            self.chrome_layout.status_bar_warning_area = status_bar_layout.warning_badge;
-            self.chrome_layout.status_bar_line_ending_area =
+            self.active_chrome_mut().status_bar_lsp_area = status_bar_layout.lsp_indicator;
+            self.active_chrome_mut().status_bar_warning_area = status_bar_layout.warning_badge;
+            self.active_chrome_mut().status_bar_line_ending_area =
                 status_bar_layout.line_ending_indicator;
-            self.chrome_layout.status_bar_encoding_area = status_bar_layout.encoding_indicator;
-            self.chrome_layout.status_bar_language_area = status_bar_layout.language_indicator;
-            self.chrome_layout.status_bar_message_area = status_bar_layout.message_area;
-            self.chrome_layout.status_bar_remote_area = status_bar_layout.remote_indicator;
+            self.active_chrome_mut().status_bar_encoding_area = status_bar_layout.encoding_indicator;
+            self.active_chrome_mut().status_bar_language_area = status_bar_layout.language_indicator;
+            self.active_chrome_mut().status_bar_message_area = status_bar_layout.message_area;
+            self.active_chrome_mut().status_bar_remote_area = status_bar_layout.remote_indicator;
         }
 
         // Render search options bar when in search prompt
@@ -1125,9 +1126,9 @@ impl Editor {
                 &keybindings_cloned,
                 search_options_hover,
             );
-            self.chrome_layout.search_options_layout = Some(search_options_layout);
+            self.active_chrome_mut().search_options_layout = Some(search_options_layout);
         } else {
-            self.chrome_layout.search_options_layout = None;
+            self.active_chrome_mut().search_options_layout = None;
         }
 
         // Render prompt line if active. Overlay prompts (Live Grep)
@@ -1192,7 +1193,7 @@ impl Editor {
         let hover_target = self.active_window_mut().mouse_state.hover_target.clone();
 
         // Clear popup areas and recalculate
-        self.chrome_layout.popup_areas.clear();
+        self.active_chrome_mut().popup_areas.clear();
 
         // Collect popup information without holding a mutable borrow
         let popup_info: Vec<_> = {
@@ -1349,7 +1350,7 @@ impl Editor {
         };
 
         // Store popup areas for mouse hit testing
-        self.chrome_layout.popup_areas = popup_info.clone();
+        self.active_chrome_mut().popup_areas = popup_info.clone();
 
         // Now render popups
         let state = self.active_state_mut();
@@ -1376,7 +1377,7 @@ impl Editor {
         // but only the top one renders & receives input. Deeper popups
         // surface as the top is resolved — the alternative (drawing all at
         // the same BottomRight slot) makes them illegible.
-        self.chrome_layout.global_popup_areas.clear();
+        self.active_chrome_mut().global_popup_areas.clear();
         if let Some(popup) = self.global_popups.top() {
             let top_idx = self.global_popups.all().len() - 1;
             let popup_area = popup.calculate_area(size, None);
@@ -1400,14 +1401,15 @@ impl Editor {
                 crate::view::popup::PopupContent::List { items, .. } => items.len(),
                 _ => 0,
             };
-            self.chrome_layout.global_popup_areas.push((
+            let scroll_offset = popup.scroll_offset;
+            popup.render_with_hover(frame, popup_area, &theme_clone, hover_target.as_ref());
+            self.active_chrome_mut().global_popup_areas.push((
                 top_idx,
                 popup_area,
                 inner_area,
-                popup.scroll_offset,
+                scroll_offset,
                 num_items,
             ));
-            popup.render_with_hover(frame, popup_area, &theme_clone, hover_target.as_ref());
         }
 
         // Render menu bar last so dropdown appears on top of all other content
@@ -1434,7 +1436,7 @@ impl Editor {
                     settings_state,
                     &*self.theme.read().unwrap(),
                 );
-                self.chrome_layout.settings_layout = Some(settings_layout);
+                self.active_chrome_mut().settings_layout = Some(settings_layout);
             }
         }
 
@@ -1486,7 +1488,7 @@ impl Editor {
             let menu_bar_mnemonics = self.config.editor.menu_bar_mnemonics;
             let expanded = self.expanded_menus_cache.get().expect("just updated");
             let keybindings = self.keybindings.read().unwrap();
-            self.chrome_layout.menu_layout = Some(crate::view::ui::MenuRenderer::render(
+            let new_menu_layout = crate::view::ui::MenuRenderer::render(
                 frame,
                 menu_bar_area,
                 expanded,
@@ -1495,9 +1497,11 @@ impl Editor {
                 &*self.theme.read().unwrap(),
                 hover_target.as_ref(),
                 menu_bar_mnemonics,
-            ));
+            );
+            drop(keybindings);
+            self.active_chrome_mut().menu_layout = Some(new_menu_layout);
         } else {
-            self.chrome_layout.menu_layout = None;
+            self.active_chrome_mut().menu_layout = None;
         }
 
         // Render tab context menu if open
@@ -1700,23 +1704,21 @@ impl Editor {
                 && y < rect.y.saturating_add(rect.height)
         };
 
-        if self
-            .chrome_layout
+        if self.active_chrome()
             .popup_areas
             .iter()
             .any(|entry| inside(entry.1))
         {
             return true;
         }
-        if self
-            .chrome_layout
+        if self.active_chrome()
             .global_popup_areas
             .iter()
             .any(|entry| inside(entry.1))
         {
             return true;
         }
-        if let Some((rect, _, _, _)) = self.chrome_layout.suggestions_area {
+        if let Some((rect, _, _, _)) = self.active_chrome().suggestions_area {
             if inside(rect) {
                 return true;
             }
@@ -1847,7 +1849,7 @@ impl Editor {
             return;
         };
 
-        self.chrome_layout.suggestions_area = SuggestionsRenderer::render_with_hover(
+        let new_suggestions_area = SuggestionsRenderer::render_with_hover(
             frame,
             suggestions_area,
             prompt,
@@ -1855,8 +1857,10 @@ impl Editor {
             self.active_window().mouse_state.hover_target.as_ref(),
             true,
         );
-        if self.chrome_layout.suggestions_area.is_some() {
-            self.chrome_layout.suggestions_outer_area = Some(suggestions_area);
+        let chrome = self.active_chrome_mut();
+        chrome.suggestions_area = new_suggestions_area;
+        if chrome.suggestions_area.is_some() {
+            chrome.suggestions_outer_area = Some(suggestions_area);
         }
 
         if is_quick_open {
@@ -2639,7 +2643,7 @@ impl Editor {
                 width: results_area.width.saturating_sub(scrollbar_w),
                 height: results_area.height - chrome_above_list - footer_h,
             };
-            self.chrome_layout.suggestions_area = SuggestionsRenderer::render_with_hover(
+            self.active_chrome_mut().suggestions_area = SuggestionsRenderer::render_with_hover(
                 frame,
                 list_area,
                 &prompt,
@@ -2647,8 +2651,8 @@ impl Editor {
                 self.active_window_mut().mouse_state.hover_target.as_ref(),
                 false,
             );
-            if self.chrome_layout.suggestions_area.is_some() {
-                self.chrome_layout.suggestions_outer_area = Some(list_area);
+            if self.active_chrome_mut().suggestions_area.is_some() {
+                self.active_chrome_mut().suggestions_outer_area = Some(list_area);
             }
             // Render the scrollbar in the carved lane. Reuses the
             // shared `view::ui::scrollbar` widget so thumb sizing
@@ -2680,12 +2684,12 @@ impl Editor {
                 );
                 // Cache the rect for mouse hit testing in
                 // `mouse_input.rs::handle_click_prompt_scrollbar`.
-                self.chrome_layout.suggestions_scrollbar_rect = Some(scrollbar_rect);
+                self.active_chrome_mut().suggestions_scrollbar_rect = Some(scrollbar_rect);
             } else {
-                self.chrome_layout.suggestions_scrollbar_rect = None;
+                self.active_chrome_mut().suggestions_scrollbar_rect = None;
             }
         } else {
-            self.chrome_layout.suggestions_scrollbar_rect = None;
+            self.active_chrome_mut().suggestions_scrollbar_rect = None;
         }
 
         // Plugin-supplied footer chrome row (Primitive #2 chrome
@@ -2776,10 +2780,10 @@ impl Editor {
                     .expect("active window present");
                 let buffers = &mut __win.buffers;
                 let event_logs = &mut __win.event_logs;
+                let cell_theme_map = &mut __win.chrome_layout.cell_theme_map;
                 let Some(preview_state) = __win.overlay_preview_state.as_mut() else {
                     return;
                 };
-                let cell_theme_map = &mut self.chrome_layout.cell_theme_map;
                 preview_state
                     .view_state
                     .viewport

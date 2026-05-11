@@ -121,7 +121,7 @@ impl Editor {
     /// Resolve which theme key(s) style the character at screen position (col, row).
     /// Looks up the per-cell theme key map populated during rendering.
     fn resolve_theme_key_at(&self, col: u16, row: u16) -> Option<ThemeKeyInfo> {
-        let cell = self.chrome_layout.cell_theme_at(col, row)?;
+        let cell = self.active_chrome().cell_theme_at(col, row)?;
         let theme = &*self.theme.read().unwrap();
 
         // Resolve actual colors from theme keys
@@ -150,10 +150,10 @@ impl Editor {
     pub(super) fn record_non_editor_theme_regions(&mut self) {
         use super::types::CellThemeInfo;
 
-        let sw = self.chrome_layout.last_frame_width as usize;
+        let sw = self.active_chrome().last_frame_width as usize;
 
         // Status bar
-        if let Some((row, x, width)) = self.chrome_layout.status_bar_area {
+        if let Some((row, x, width)) = self.active_chrome().status_bar_area {
             let info = CellThemeInfo {
                 fg_key: Some("ui.status_bar_fg"),
                 bg_key: Some("ui.status_bar_bg"),
@@ -162,14 +162,14 @@ impl Editor {
             };
             for col in x..x + width {
                 let idx = row as usize * sw + col as usize;
-                if let Some(cell) = self.chrome_layout.cell_theme_map.get_mut(idx) {
+                if let Some(cell) = self.active_chrome_mut().cell_theme_map.get_mut(idx) {
                     *cell = info.clone();
                 }
             }
         }
 
         // Menu bar
-        if let Some(bar_area) = self.chrome_layout.menu_layout.as_ref().map(|m| m.bar_area) {
+        if let Some(bar_area) = self.active_chrome().menu_layout.as_ref().map(|m| m.bar_area) {
             let info = CellThemeInfo {
                 fg_key: Some("ui.menu_fg"),
                 bg_key: Some("ui.menu_bg"),
@@ -179,7 +179,7 @@ impl Editor {
             for row in bar_area.y..bar_area.y + bar_area.height {
                 for col in bar_area.x..bar_area.x + bar_area.width {
                     let idx = row as usize * sw + col as usize;
-                    if let Some(cell) = self.chrome_layout.cell_theme_map.get_mut(idx) {
+                    if let Some(cell) = self.active_chrome_mut().cell_theme_map.get_mut(idx) {
                         *cell = info.clone();
                     }
                 }
@@ -197,7 +197,7 @@ impl Editor {
             for row in area.y..area.y + area.height {
                 for col in area.x..area.x + area.width {
                     let idx = row as usize * sw + col as usize;
-                    if let Some(cell) = self.chrome_layout.cell_theme_map.get_mut(idx) {
+                    if let Some(cell) = self.active_chrome_mut().cell_theme_map.get_mut(idx) {
                         *cell = info.clone();
                     }
                 }
@@ -226,7 +226,7 @@ impl Editor {
                 };
                 for col in scrollbar_rect.x..scrollbar_rect.x + scrollbar_rect.width {
                     let idx = row as usize * sw + col as usize;
-                    if let Some(cell) = self.chrome_layout.cell_theme_map.get_mut(idx) {
+                    if let Some(cell) = self.active_chrome_mut().cell_theme_map.get_mut(idx) {
                         *cell = info.clone();
                     }
                 }
@@ -247,7 +247,7 @@ impl Editor {
                 for row in area.y..area.y + area.height {
                     for col in area.x..area.x + area.width {
                         let idx = row as usize * sw + col as usize;
-                        if let Some(cell) = self.chrome_layout.cell_theme_map.get_mut(idx) {
+                        if let Some(cell) = self.active_chrome_mut().cell_theme_map.get_mut(idx) {
                             *cell = info.clone();
                         }
                     }
@@ -363,8 +363,8 @@ impl Editor {
         let button_row_offset = line_count; // 0-indexed from popup y + 1 (top border)
 
         // Use the same screen-aware positioning as render to match the actual drawn rect
-        let screen_w = self.chrome_layout.last_frame_width;
-        let screen_h = self.chrome_layout.last_frame_height;
+        let screen_w = self.active_chrome().last_frame_width;
+        let screen_h = self.active_chrome().last_frame_height;
         let rect = compute_popup_rect(popup.position, width, height, screen_w, screen_h);
 
         Some((rect, button_row_offset))

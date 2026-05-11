@@ -741,6 +741,20 @@ impl Editor {
         &mut self.active_window_mut().layout_cache
     }
 
+    /// The active window's editor-chrome layout cache (status bar,
+    /// menu, popups, prompt overlay, full-frame cell-theme map).
+    /// Mouse hit-testing reads from here.
+    pub(crate) fn active_chrome(&self) -> &crate::app::types::ChromeLayout {
+        &self.active_window().chrome_layout
+    }
+
+    /// Mutable handle to the active window's chrome-layout cache.
+    /// Renderer writes status-bar / menu / popup / prompt-overlay
+    /// hit-test rects here at the end of each frame.
+    pub(crate) fn active_chrome_mut(&mut self) -> &mut crate::app::types::ChromeLayout {
+        &mut self.active_window_mut().chrome_layout
+    }
+
     /// Active window's utility-dock panel-id → buffer-id map.
     /// Each window owns its own dock; switching windows shows a
     /// different (possibly empty) dock.

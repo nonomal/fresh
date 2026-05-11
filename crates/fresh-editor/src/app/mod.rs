@@ -168,8 +168,8 @@ pub fn editor_tick(
 pub(crate) use path_utils::normalize_path;
 
 use self::types::{
-    ChromeLayout, FileExplorerContextMenu, InteractiveReplaceState, LspMessageEntry,
-    LspProgressInfo, MouseState, SearchState, TabContextMenu, DEFAULT_BACKGROUND_FILE,
+    FileExplorerContextMenu, InteractiveReplaceState, LspMessageEntry, LspProgressInfo, MouseState,
+    SearchState, TabContextMenu, DEFAULT_BACKGROUND_FILE,
 };
 use crate::config::Config;
 use crate::config_io::DirectoryContext;
@@ -615,12 +615,8 @@ pub struct Editor {
     // `mouse_state` moved onto `Window` — drag targets reference per-window LeafIds.
     // `tab_context_menu`, `file_explorer_context_menu`, `theme_info_popup`
     // moved onto `Window`.
-    /// Editor-chrome layout from last render (status bar, menu, prompt
-    /// overlay, popups, full-frame cell-theme map). Per-window
-    /// content-area layout (split panes, tabs, file explorer) lives on
-    /// the active window's `Window::layout_cache`; `Editor::active_layout()`
-    /// is the accessor to use for those.
-    pub(crate) chrome_layout: ChromeLayout,
+    // `chrome_layout` moved onto `Window` — each window has its own
+    // status bar, menu, prompt overlay, and popups.
 
     /// Command registry for dynamic commands
     command_registry: Arc<RwLock<CommandRegistry>>,

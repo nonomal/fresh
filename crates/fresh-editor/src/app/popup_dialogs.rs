@@ -535,8 +535,7 @@ impl Editor {
         // segment isn't visible (e.g. first render). `status_row` comes
         // from the same cached layout so the popup hugs the status bar
         // even in prompt-auto-hide mode.
-        let position = self
-            .chrome_layout
+        let position = self.active_chrome()
             .status_bar_lsp_area
             .map(
                 |(status_row, col_start, _)| crate::view::popup::PopupPosition::AboveStatusBarAt {
@@ -802,8 +801,7 @@ impl Editor {
         // right corner so the popup still appears. `status_row` comes
         // from the same cached layout so the popup hugs the status bar
         // even in prompt-auto-hide mode.
-        let position = self
-            .chrome_layout
+        let position = self.active_chrome()
             .status_bar_remote_area
             .map(
                 |(status_row, col_start, _)| crate::view::popup::PopupPosition::AboveStatusBarAt {

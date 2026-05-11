@@ -146,8 +146,7 @@ impl Editor {
         // Track hover position and compute hover hit for visual feedback
         match mouse_event.kind {
             MouseEventKind::Moved => {
-                let hover_hit = self
-                    .chrome_layout
+                let hover_hit = self.active_chrome()
                     .settings_layout
                     .as_ref()
                     .and_then(|layout: &SettingsLayout| layout.hit_test(col, row));
@@ -225,8 +224,7 @@ impl Editor {
         }
 
         // Use cached settings layout for hit testing
-        let Some(hit) = self
-            .chrome_layout
+        let Some(hit) = self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|layout: &SettingsLayout| layout.hit_test(col, row))
@@ -499,7 +497,7 @@ impl Editor {
     /// Whether the given screen coords sit inside the categories panel —
     /// used to route mouse-wheel events to the correct scroll target.
     fn over_categories_panel(&self, col: u16, row: u16) -> bool {
-        self.chrome_layout
+        self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|layout| layout.categories_panel_area)
@@ -526,8 +524,7 @@ impl Editor {
     }
 
     fn settings_scrollbar_click(&mut self, row: u16) {
-        if let Some(ref scrollbar_area) = self
-            .chrome_layout
+        if let Some(ref scrollbar_area) = self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.scrollbar_area)
@@ -543,8 +540,7 @@ impl Editor {
     }
 
     fn settings_scrollbar_drag(&mut self, col: u16, row: u16) -> bool {
-        if let Some(ref scrollbar_area) = self
-            .chrome_layout
+        if let Some(ref scrollbar_area) = self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.scrollbar_area)
@@ -563,8 +559,7 @@ impl Editor {
     }
 
     fn search_scrollbar_click(&mut self, row: u16) {
-        if let Some(ref scrollbar_area) = self
-            .chrome_layout
+        if let Some(ref scrollbar_area) = self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.search_scrollbar_area)
@@ -580,8 +575,7 @@ impl Editor {
     }
 
     fn search_scrollbar_drag(&mut self, col: u16, row: u16) -> Option<bool> {
-        if let Some(ref scrollbar_area) = self
-            .chrome_layout
+        if let Some(ref scrollbar_area) = self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.search_scrollbar_area)
@@ -600,7 +594,7 @@ impl Editor {
     }
 
     fn entry_dialog_layout(&self) -> Option<EntryDialogLayout> {
-        self.chrome_layout
+        self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| EntryDialogLayout::from_modal(l.modal_area))
@@ -840,8 +834,7 @@ impl Editor {
 
     /// Returns which confirm dialog button (0-2) is at the given position, if any
     fn get_confirm_dialog_button_at(&self, col: u16, row: u16) -> Option<usize> {
-        let modal_area = self
-            .chrome_layout
+        let modal_area = self.active_chrome()
             .settings_layout
             .as_ref()
             .map(|l| l.modal_area)?;

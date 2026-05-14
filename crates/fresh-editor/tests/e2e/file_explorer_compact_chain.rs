@@ -131,9 +131,7 @@ fn test_compact_chain_keeps_cursor_on_visible_row_after_enter() {
     let breadcrumb_row = after_enter
         .lines()
         .find(|line| line.contains("chain/a/b/c"))
-        .unwrap_or_else(|| {
-            panic!("compact breadcrumb row missing from screen:\n{after_enter}")
-        });
+        .unwrap_or_else(|| panic!("compact breadcrumb row missing from screen:\n{after_enter}"));
     assert!(
         breadcrumb_row.contains('▌'),
         "selected-row indicator `▌` should be drawn on the chain anchor row \

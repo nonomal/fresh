@@ -263,8 +263,15 @@ impl KeyContext {
     /// and naturally apply to whichever buffer is currently active, so
     /// users expect them to work even when keyboard focus is elsewhere
     /// (e.g. on the file explorer). Issue #1903.
+    ///
+    /// Also true for plugin `Mode(_)` contexts so that focus inside a
+    /// panel (search/replace, dashboard, git log, …) doesn't swallow
+    /// global navigation keys. `is_terminal_ui_action` is the curated
+    /// whitelist (split nav, palette, save, quit, help, …) — none of
+    /// which a sensible plugin mode would want to suppress. See §18 of
+    /// `docs/internal/search-replace-scope-replan-on-widgets.md`.
     pub fn allows_ui_fallthrough(&self) -> bool {
-        matches!(self, Self::FileExplorer)
+        matches!(self, Self::FileExplorer | Self::Mode(_))
     }
 
     /// Check if a context should allow input
@@ -2848,6 +2855,55 @@ mod tests {
         assert_eq!(
             resolver.resolve(&event, KeyContext::Normal),
             Action::InsertChar('a')
+        );
+    }
+
+    /// Editor-global navigation actions (split nav, save, palette, …)
+    /// must resolve when a plugin `Mode(_)` context is active, even
+    /// though the mode itself doesn't bind those keys. Without this,
+    /// focus inside a panel (search/replace, dashboard, git log, …)
+    /// swallows `Alt+]`, `Ctrl+S`, `Ctrl+P`, etc. Regression guard for
+    /// §18 of `docs/internal/search-replace-scope-replan-on-widgets.md`.
+    #[test]
+    fn test_panel_mode_passthrough_for_ui_actions() {
+        let config = Config::default();
+        let resolver = KeybindingResolver::new(&config);
+        let mode_ctx = KeyContext::Mode("search-replace-list".to_string());
+
+        // Alt+] is bound to next_split in the keymap (Normal context).
+        let alt_close = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT);
+        assert_eq!(
+            resolver.resolve(&alt_close, mode_ctx.clone()),
+            Action::NextSplit,
+            "Alt+] should fall through to next_split inside a panel mode"
+        );
+
+        // Alt+[ → prev_split.
+        let alt_open = KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT);
+        assert_eq!(
+            resolver.resolve(&alt_open, mode_ctx.clone()),
+            Action::PrevSplit,
+            "Alt+[ should fall through to prev_split inside a panel mode"
+        );
+
+        // Ctrl+S is application-wide (covered by `is_application_wide_action`),
+        // but also `is_terminal_ui_action`-true — verify the UI fallthrough
+        // path doesn't accidentally exclude it.
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            resolver.resolve(&ctrl_s, mode_ctx.clone()),
+            Action::Save,
+            "Ctrl+S should still save while a panel mode is active"
+        );
+
+        // Editing actions on the source buffer must NOT pass through.
+        // Ctrl+D (add cursor next match) is editor-only and absent from
+        // `is_terminal_ui_action`.
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_ne!(
+            resolver.resolve(&ctrl_d, mode_ctx),
+            Action::AddCursorNextMatch,
+            "Ctrl+D (add cursor next match) must not pass through to a panel mode"
         );
     }
 

@@ -86,6 +86,29 @@ pub trait ProcessSpawner: Send + Sync {
             exit_code: result.exit_code,
         })
     }
+
+    /// Spawn a process that can be cancelled mid-flight via a oneshot
+    /// receiver. When `stdout_to` is `Some`, stdout streams to the file;
+    /// when `None`, it's buffered into `SpawnResult.stdout`.
+    ///
+    /// If `kill_rx` fires before the child exits, the child is killed and
+    /// the result reflects the killed exit status.
+    ///
+    /// Default impl ignores `kill_rx` (no true cancellation for backends
+    /// that buffer in memory). Local override implements real kill.
+    async fn spawn_cancellable(
+        &self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        stdout_to: Option<std::path::PathBuf>,
+        _kill_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<SpawnResult, SpawnError> {
+        match stdout_to {
+            Some(p) => self.spawn_to_file(command, args, cwd, p).await,
+            None => self.spawn(command, args, cwd).await,
+        }
+    }
 }
 
 /// Local process spawner using tokio
@@ -118,6 +141,106 @@ impl ProcessSpawner for LocalProcessSpawner {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    /// Cancellable streaming spawn. Handles both `stdout_to = Some(path)`
+    /// (pipe stdout to file) and `stdout_to = None` (buffer in memory),
+    /// with kill support via `kill_rx`.
+    async fn spawn_cancellable(
+        &self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        stdout_to: Option<std::path::PathBuf>,
+        kill_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<SpawnResult, SpawnError> {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
+        let mut cmd = tokio::process::Command::new(&command);
+        cmd.args(&args);
+        cmd.hide_window();
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        if let Some(ref dir) = cwd {
+            cmd.current_dir(dir);
+        }
+
+        // For file-output mode, ensure parent dir exists.
+        if let Some(ref path) = stdout_to {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+            }
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SpawnError::Process(e.to_string()))?;
+
+        let mut child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| SpawnError::Process("child stdout missing".to_string()))?;
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| SpawnError::Process("child stderr missing".to_string()))?;
+
+        // Drain stdout (to file or buffer) and stderr concurrently —
+        // both must be drained or the child can stall on a full pipe.
+        let stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>> = match stdout_to {
+            Some(path) => tokio::spawn(async move {
+                let mut file = tokio::fs::File::create(&path).await?;
+                let _ = tokio::io::copy(&mut child_stdout, &mut file).await?;
+                use tokio::io::AsyncWriteExt;
+                let _ = file.flush().await;
+                let _ = file.sync_all().await;
+                Ok(Vec::new())
+            }),
+            None => tokio::spawn(async move {
+                let mut buf = Vec::new();
+                child_stdout.read_to_end(&mut buf).await?;
+                Ok(buf)
+            }),
+        };
+        let stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>> =
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                child_stderr.read_to_end(&mut buf).await?;
+                Ok(buf)
+            });
+
+        // Race child.wait() against kill_rx so the dispatcher can kill
+        // mid-stream (e.g. user scrolled past the commit before git
+        // finished).
+        let exit_code = tokio::select! {
+            status = child.wait() => status
+                .map(|s| s.code().unwrap_or(-1))
+                .unwrap_or(-1),
+            _ = kill_rx => {
+                let _ = child.start_kill();
+                child.wait().await.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
+            }
+        };
+
+        // Both drain tasks must finish; on kill they get EOF when the
+        // child's pipes close.
+        let stdout_bytes = stdout_task
+            .await
+            .map_err(|e| SpawnError::Process(format!("stdout task: {}", e)))?
+            .map_err(|e| SpawnError::Process(format!("stdout drain: {}", e)))?;
+        let stderr_bytes = stderr_task
+            .await
+            .map_err(|e| SpawnError::Process(format!("stderr task: {}", e)))?
+            .map_err(|e| SpawnError::Process(format!("stderr drain: {}", e)))?;
+
+        Ok(SpawnResult {
+            stdout: String::from_utf8_lossy(&stdout_bytes).to_string(),
+            stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
+            exit_code,
         })
     }
 
@@ -496,6 +619,66 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.trim() == "hello");
+    }
+
+    #[tokio::test]
+    async fn test_local_spawner_stdout_to_file() {
+        let spawner = LocalProcessSpawner;
+        let tmp = std::env::temp_dir().join(format!(
+            "fresh-spawner-test-{}.out",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let result = spawner
+            .spawn_to_file(
+                "echo".to_string(),
+                vec!["hello-from-disk".to_string()],
+                None,
+                tmp.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.is_empty(), "stdout should be empty when streaming");
+        let contents = std::fs::read_to_string(&tmp).expect("output file should exist");
+        assert_eq!(contents.trim(), "hello-from-disk");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_local_spawner_cancellable_kill() {
+        let spawner = LocalProcessSpawner;
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Start a sleep that would take 30s normally; fire kill after 100ms.
+        let task = tokio::spawn(async move {
+            spawner
+                .spawn_cancellable(
+                    "sleep".to_string(),
+                    vec!["30".to_string()],
+                    None,
+                    None,
+                    kill_rx,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = kill_tx.send(());
+
+        let start = std::time::Instant::now();
+        let result = task.await.unwrap().unwrap();
+        let elapsed = start.elapsed();
+
+        // SIGKILL'd sleep on Unix returns exit_code 137 or -1 (no code).
+        // The point is we returned promptly, not after 30s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "kill should be prompt, took {:?}",
+            elapsed
+        );
+        assert_ne!(result.exit_code, 0, "killed process shouldn't be exit 0");
     }
 
     #[tokio::test]

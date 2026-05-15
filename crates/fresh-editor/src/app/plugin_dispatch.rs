@@ -2926,16 +2926,24 @@ impl Editor {
             });
             let sender = bridge.sender();
             let spawner = self.authority.process_spawner.clone();
+
+            // Kill plumbing: register a oneshot keyed by process_id, same
+            // pattern as handle_spawn_host_process. JS calls
+            // `_killHostProcess(id)` → `handle_kill_host_process` fires
+            // the tx; the spawner's `spawn_cancellable` races against rx.
+            let process_id = callback_id.as_u64();
+            let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+            self.host_process_handles.insert(process_id, kill_tx);
+
             runtime.spawn(async move {
                 #[allow(clippy::let_underscore_must_use)]
-                let outcome = match stdout_to {
-                    Some(path) => spawner.spawn_to_file(command, args, effective_cwd, path).await,
-                    None => spawner.spawn(command, args, effective_cwd).await,
-                };
+                let outcome = spawner
+                    .spawn_cancellable(command, args, effective_cwd, stdout_to, kill_rx)
+                    .await;
                 match outcome {
                     Ok(result) => {
                         let _ = sender.send(AsyncMessage::PluginProcessOutput {
-                            process_id: callback_id.as_u64(),
+                            process_id,
                             stdout: result.stdout,
                             stderr: result.stderr,
                             exit_code: result.exit_code,
@@ -2943,7 +2951,7 @@ impl Editor {
                     }
                     Err(e) => {
                         let _ = sender.send(AsyncMessage::PluginProcessOutput {
-                            process_id: callback_id.as_u64(),
+                            process_id,
                             stdout: String::new(),
                             stderr: e.to_string(),
                             exit_code: -1,

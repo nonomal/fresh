@@ -5856,6 +5856,17 @@ impl QuickJsBackend {
                     });
                     return {
                         get result() { return resultPromise; },
+                        // `kill()` cancels a still-running spawn. The
+                        // dispatcher stores a oneshot keyed by callbackId;
+                        // _killHostProcess fires it and the spawner's
+                        // tokio::select! kills the child. No-op if the
+                        // child already exited (id removed from the map).
+                        kill() {
+                            if (typeof editor._killHostProcess === 'function') {
+                                return editor._killHostProcess(callbackId);
+                            }
+                            return false;
+                        },
                         then(onFulfilled, onRejected) {
                             return resultPromise.then(onFulfilled, onRejected);
                         },

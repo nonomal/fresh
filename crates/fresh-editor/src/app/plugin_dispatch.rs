@@ -1095,10 +1095,7 @@ impl Editor {
                 request_id,
             } => {
                 self.handle_set_buffer_group_panel_buffer(
-                    group_id,
-                    panel_name,
-                    buffer_id,
-                    request_id,
+                    group_id, panel_name, buffer_id, request_id,
                 );
             }
             PluginCommand::ScrollToLineCenter {
@@ -1703,7 +1700,15 @@ impl Editor {
         if !self.authority.filesystem.exists(&path) {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    let _ = std::fs::create_dir_all(parent);
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::warn!(
+                            "openFileStreaming: failed to create parent dir {:?}: {}",
+                            parent,
+                            e
+                        );
+                        self.resolve_json_callback::<Option<u64>>(request_id, None);
+                        return;
+                    }
                 }
             }
             if let Err(e) = std::fs::write(&path, b"") {
@@ -1785,11 +1790,7 @@ impl Editor {
     /// Re-stat the file backing `buffer_id` and extend the buffer if
     /// the file has grown. No-op if the buffer has no file path or the
     /// file didn't grow. Resolves with the new total byte length.
-    fn handle_refresh_buffer_from_disk(
-        &mut self,
-        buffer_id: BufferId,
-        request_id: u64,
-    ) {
+    fn handle_refresh_buffer_from_disk(&mut self, buffer_id: BufferId, request_id: u64) {
         let actual_buffer_id = self.resolve_buffer_id(buffer_id);
 
         let path = self
@@ -3112,6 +3113,7 @@ impl Editor {
                     .await;
                 match outcome {
                     Ok(result) => {
+                        #[allow(clippy::let_underscore_must_use)]
                         let _ = sender.send(AsyncMessage::PluginProcessOutput {
                             process_id,
                             stdout: result.stdout,
@@ -3120,6 +3122,7 @@ impl Editor {
                         });
                     }
                     Err(e) => {
+                        #[allow(clippy::let_underscore_must_use)]
                         let _ = sender.send(AsyncMessage::PluginProcessOutput {
                             process_id,
                             stdout: String::new(),

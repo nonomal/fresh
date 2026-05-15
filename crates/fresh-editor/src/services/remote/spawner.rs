@@ -167,11 +167,16 @@ impl ProcessSpawner for LocalProcessSpawner {
             cmd.current_dir(dir);
         }
 
-        // For file-output mode, ensure parent dir exists.
+        // For file-output mode, ensure parent dir exists. Surface the
+        // failure as a SpawnError rather than silently dropping — if we
+        // can't make the dir, the File::create below would just fail
+        // with a less informative error.
         if let Some(ref path) = stdout_to {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        SpawnError::Process(format!("create_dir_all {:?}: {}", parent, e))
+                    })?;
                 }
             }
         }
@@ -194,10 +199,18 @@ impl ProcessSpawner for LocalProcessSpawner {
         let stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>> = match stdout_to {
             Some(path) => tokio::spawn(async move {
                 let mut file = tokio::fs::File::create(&path).await?;
-                let _ = tokio::io::copy(&mut child_stdout, &mut file).await?;
+                tokio::io::copy(&mut child_stdout, &mut file).await?;
                 use tokio::io::AsyncWriteExt;
-                let _ = file.flush().await;
-                let _ = file.sync_all().await;
+                // flush + sync are best-effort durability so a reader
+                // opening the file right after spawn resolves sees all
+                // bytes. The actual write happened in `copy` above; a
+                // flush error here only loses the durability hint.
+                if let Err(e) = file.flush().await {
+                    tracing::warn!("spawn_cancellable: file flush failed: {}", e);
+                }
+                if let Err(e) = file.sync_all().await {
+                    tracing::warn!("spawn_cancellable: file sync_all failed: {}", e);
+                }
                 Ok(Vec::new())
             }),
             None => tokio::spawn(async move {
@@ -221,7 +234,13 @@ impl ProcessSpawner for LocalProcessSpawner {
                 .map(|s| s.code().unwrap_or(-1))
                 .unwrap_or(-1),
             _ = kill_rx => {
-                let _ = child.start_kill();
+                // start_kill fails only when the process has already
+                // exited — and we're about to `wait()` to reap either
+                // way, so the failure path collapses with the success
+                // path. Log at debug for diagnostic visibility.
+                if let Err(e) = child.start_kill() {
+                    tracing::debug!("spawn_cancellable: start_kill (already exited?): {}", e);
+                }
                 child.wait().await.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
             }
         };
@@ -267,9 +286,13 @@ impl ProcessSpawner for LocalProcessSpawner {
         }
 
         // Ensure the parent dir exists so the open below doesn't ENOENT.
+        // Surface failures rather than letting File::create error with a
+        // less informative message.
         if let Some(parent) = stdout_to.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    SpawnError::Process(format!("create_dir_all {:?}: {}", parent, e))
+                })?;
             }
         }
 
@@ -294,10 +317,16 @@ impl ProcessSpawner for LocalProcessSpawner {
         // must be drained or the child can stall on a full pipe.
         let stdout_task = tokio::spawn(async move {
             let res = tokio::io::copy(&mut child_stdout, &mut file).await;
-            // Best-effort flush + sync so a reader opening the file
-            // immediately after the spawn resolves sees all bytes.
-            let _ = file.flush().await;
-            let _ = file.sync_all().await;
+            // flush + sync are best-effort durability so a reader
+            // opening the file right after spawn resolves sees all
+            // bytes. The data was already written in `copy` above; a
+            // flush error here only loses the durability hint.
+            if let Err(e) = file.flush().await {
+                tracing::warn!("spawn_to_file: file flush failed: {}", e);
+            }
+            if let Err(e) = file.sync_all().await {
+                tracing::warn!("spawn_to_file: file sync_all failed: {}", e);
+            }
             res
         });
         let stderr_task = tokio::spawn(async move {
@@ -311,7 +340,10 @@ impl ProcessSpawner for LocalProcessSpawner {
             .await
             .map_err(|e| SpawnError::Process(format!("wait: {}", e)))?;
 
-        let _ = stdout_task
+        // Drop the empty Vec from the streaming task — its only signal
+        // is success/failure of the io::copy and flush, propagated via
+        // the `?` operator.
+        stdout_task
             .await
             .map_err(|e| SpawnError::Process(format!("stdout task: {}", e)))?
             .map_err(|e| SpawnError::Process(format!("stdout copy: {}", e)))?;
@@ -624,10 +656,12 @@ mod tests {
     #[tokio::test]
     async fn test_local_spawner_stdout_to_file() {
         let spawner = LocalProcessSpawner;
-        let tmp = std::env::temp_dir().join(format!(
-            "fresh-spawner-test-{}.out",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("fresh-spawner-test-{}.out", std::process::id()));
+        // Best-effort cleanup of any leftover from a previous run.
+        // Failure (e.g. NotFound) is fine — the spawn below will
+        // create the file fresh.
+        #[allow(clippy::let_underscore_must_use)]
         let _ = std::fs::remove_file(&tmp);
         let result = spawner
             .spawn_to_file(
@@ -640,9 +674,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert!(result.stdout.is_empty(), "stdout should be empty when streaming");
+        assert!(
+            result.stdout.is_empty(),
+            "stdout should be empty when streaming"
+        );
         let contents = std::fs::read_to_string(&tmp).expect("output file should exist");
         assert_eq!(contents.trim(), "hello-from-disk");
+        // Best-effort cleanup — leaving a temp file behind on
+        // failure is acceptable and the next run's pre-cleanup
+        // handles it.
+        #[allow(clippy::let_underscore_must_use)]
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -665,6 +706,12 @@ mod tests {
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Fire the kill. Err means the receiver was dropped (task
+        // already finished), which would mean the 30s sleep returned
+        // promptly on its own — impossible in this test window, but
+        // not worth a panic either way; the subsequent task.await
+        // surfaces any real problem.
+        #[allow(clippy::let_underscore_must_use)]
         let _ = kill_tx.send(());
 
         let start = std::time::Instant::now();

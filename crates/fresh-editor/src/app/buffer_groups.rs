@@ -577,30 +577,27 @@ impl super::Editor {
 
         // Look up the panel's inner leaf id, and the prior buffer id
         // we're replacing.
-        let (panel_leaf, prior_buffer_id) = match self
-            .active_window_mut()
-            .buffer_groups
-            .get_mut(&bg_id)
-        {
-            Some(group) => {
-                let Some(&leaf) = group.panel_splits.get(&panel_name) else {
-                    tracing::warn!(
-                        "setBufferGroupPanelBuffer: panel '{}' missing in group {}",
-                        panel_name,
-                        group_id
-                    );
+        let (panel_leaf, prior_buffer_id) =
+            match self.active_window_mut().buffer_groups.get_mut(&bg_id) {
+                Some(group) => {
+                    let Some(&leaf) = group.panel_splits.get(&panel_name) else {
+                        tracing::warn!(
+                            "setBufferGroupPanelBuffer: panel '{}' missing in group {}",
+                            panel_name,
+                            group_id
+                        );
+                        return false;
+                    };
+                    let prior = group
+                        .panel_buffers
+                        .insert(panel_name.clone(), new_buffer_id);
+                    (leaf, prior)
+                }
+                None => {
+                    tracing::warn!("setBufferGroupPanelBuffer: group {} not found", group_id);
                     return false;
-                };
-                let prior = group
-                    .panel_buffers
-                    .insert(panel_name.clone(), new_buffer_id);
-                (leaf, prior)
-            }
-            None => {
-                tracing::warn!("setBufferGroupPanelBuffer: group {} not found", group_id);
-                return false;
-            }
-        };
+                }
+            };
 
         // The buffer needs the same per-buffer presentation flags
         // that `build_group_layout` applies to virtual panel buffers
@@ -626,11 +623,7 @@ impl super::Editor {
         // each panel rect (see `get_leaves_with_rects`). Without
         // this, retargeting only updates focus state and the panel
         // keeps drawing the prior (now-empty) buffer.
-        for node in self
-            .active_window_mut()
-            .grouped_subtrees
-            .values_mut()
-        {
+        for node in self.active_window_mut().grouped_subtrees.values_mut() {
             if let Some(found) = node.find_mut(panel_leaf.into()) {
                 if let crate::view::split::SplitNode::Leaf { buffer_id, .. } = found {
                     *buffer_id = new_buffer_id;
@@ -643,7 +636,9 @@ impl super::Editor {
         // state entry for the new id BEFORE swapping active_buffer
         // (otherwise the next `active_state()` panics because the
         // freshly-set active_buffer has no keyed_states entry yet).
-        let line_wrap = self.active_window().resolve_line_wrap_for_buffer(new_buffer_id);
+        let line_wrap = self
+            .active_window()
+            .resolve_line_wrap_for_buffer(new_buffer_id);
         let wrap_column = self
             .active_window()
             .resolve_wrap_column_for_buffer(new_buffer_id);

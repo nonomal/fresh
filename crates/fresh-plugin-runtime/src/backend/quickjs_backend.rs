@@ -1570,11 +1570,7 @@ impl JsEditorApi {
         ts_return = "number | null"
     )]
     #[qjs(rename = "_refreshBufferFromDiskStart")]
-    pub fn refresh_buffer_from_disk_start(
-        &self,
-        _ctx: rquickjs::Ctx<'_>,
-        buffer_id: u32,
-    ) -> u64 {
+    pub fn refresh_buffer_from_disk_start(&self, _ctx: rquickjs::Ctx<'_>, buffer_id: u32) -> u64 {
         let id = self.alloc_request_id();
         let _ = self
             .command_sender

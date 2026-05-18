@@ -193,11 +193,8 @@ fn test_horizontal_scrolling() {
     };
     let mut harness = EditorTestHarness::with_config(80, 24, config).unwrap();
 
-    // Calculate visible width (80 - 7 for line number gutter = 73 chars)
-    let gutter_width = 7;
-    let _visible_width = 80 - gutter_width; // 73 characters visible
-
-    // Type characters to fill most of the visible width
+    // Type characters to fill most of the visible width.  The gutter width
+    // is queried dynamically below where needed.
     let initial_text = "a".repeat(60);
     harness.type_text(&initial_text).unwrap();
 
@@ -2074,8 +2071,8 @@ fn test_cursor_visibility_at_line_end_no_wrap() {
     config.editor.line_wrap = false;
     let mut harness = EditorTestHarness::with_config(80, 24, config).unwrap();
 
-    let gutter_width = 8; // Approximate gutter width for line numbers
-    let visible_width = 80 - gutter_width; // ~72 characters visible
+    let gutter_width = harness.editor().active_state().margins.left_total_width() as usize;
+    let visible_width = 80 - gutter_width;
 
     // Create a long line that extends well beyond visible width
     // We'll create a line that's 100 characters long
@@ -2657,6 +2654,255 @@ fn test_vertical_scroll_margin_up() {
             top_before - 1,
             "Up press {} in margin zone should scroll by exactly 1",
             i + 1
+        );
+    }
+}
+
+/// Snapshot of the editor content area as it would appear on screen, joining
+/// each visible row into a single string. Excludes status/tab/menu bars so the
+/// snapshot reflects only the scrolled view.
+fn content_area_snapshot(harness: &EditorTestHarness) -> String {
+    let (first, last) = harness.content_area_rows();
+    (first..=last)
+        .map(|r| harness.get_screen_row(r))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Generate a paged-scroll-test fixture where each logical line carries a
+/// `Line NNNN:` marker that survives wrapping — continuation rows of a wrapped
+/// line never repeat the marker, so a snapshot's marker set tells us exactly
+/// which logical lines have their head visible. Includes a heavy dose of long
+/// lines that wrap to multiple view rows so the wrap-aware scroll path is
+/// exercised on most view rows of most pages, not just occasionally.
+fn paged_fixture(lines: usize) -> String {
+    // `long` is designed to wrap in an 80-col terminal with a small gutter.
+    // Repeating padding so it reliably spans 2 view rows at 80 wide.
+    let long = ".".repeat(90);
+    let extra_long = ".".repeat(180);
+    let mut out = String::new();
+    for i in 1..=lines {
+        match i % 4 {
+            0 => out.push_str(&format!("Line {i:04}: xlong {extra_long} end\n")),
+            1 => out.push_str(&format!("Line {i:04}: short\n")),
+            _ => out.push_str(&format!("Line {i:04}: long {long} end\n")),
+        }
+    }
+    out
+}
+
+/// Assert the primary cursor appears inside the rendered content area.
+/// PageUp / PageDown must never leave the cursor off-screen — callers invoke
+/// this after every press.
+fn assert_cursor_visible(harness: &mut EditorTestHarness, context: &str) {
+    let cursors = harness.find_all_cursors();
+    assert!(
+        !cursors.is_empty(),
+        "cursor not rendered on screen ({context})"
+    );
+    let (content_first, content_last) = harness.content_area_rows();
+    let (_, cy, _, _) = cursors[0];
+    let cy = cy as usize;
+    assert!(
+        cy >= content_first && cy <= content_last,
+        "cursor row {cy} is outside content area ({content_first}..={content_last}) ({context})"
+    );
+}
+
+/// Assert consecutive pages retain at least `min_overlap` view rows of shared
+/// context: the last N rows of `prev` must appear as the first N rows of
+/// `cur`. Counts view rows (raw rendered row strings) rather than logical
+/// lines — what the user actually sees on screen — because `viewport_height
+/// - 3` scroll is defined in view rows, and with wrap a single overlapping
+/// logical line can correspond to multiple shared view rows and vice versa.
+fn assert_pages_overlap(prev: &str, cur: &str, min_overlap: usize, context: &str) {
+    let prev_rows: Vec<&str> = prev.lines().collect();
+    let cur_rows: Vec<&str> = cur.lines().collect();
+    let mut overlap = 0;
+    for k in 1..=prev_rows.len().min(cur_rows.len()) {
+        let prev_tail = &prev_rows[prev_rows.len() - k..];
+        let cur_head = &cur_rows[..k];
+        if prev_tail == cur_head {
+            overlap = k;
+        }
+    }
+    assert!(
+        overlap >= min_overlap,
+        "expected at least {min_overlap} view rows of overlap between \
+         consecutive pages ({context}); got {overlap}.\n\
+         prev last 6:\n{}\ncur first 6:\n{}",
+        prev_rows
+            .iter()
+            .rev()
+            .take(6)
+            .rev()
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+        cur_rows
+            .iter()
+            .take(6)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+/// Every PageDown must change what the content area displays until the bottom
+/// of the buffer is reached; after that, additional PageDowns are no-ops.
+/// Asserts after every press: (1) cursor stays inside the content area, and
+/// (2) consecutive pages overlap by at least 2 logical lines (the ~3-line
+/// overlap budget minus 1 line of slack for wrap-segment edges).
+#[test]
+fn test_page_down_changes_view_until_bottom() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    const TOTAL_LINES: usize = 500;
+    let content = paged_fixture(TOTAL_LINES);
+    let last_marker = format!("Line {TOTAL_LINES:04}:");
+    let first_marker = "Line 0001:";
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    let _fixture = harness.load_buffer_from_text(&content).unwrap();
+
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        content_area_snapshot(&harness).contains(first_marker),
+        "expected to start at the top showing '{first_marker}'"
+    );
+
+    let initial = content_area_snapshot(&harness);
+    let mut prev = initial.clone();
+
+    let max_pages = 1000;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= max_pages,
+            "PageDown loop did not terminate within {max_pages} iterations"
+        );
+
+        harness
+            .send_key(KeyCode::PageDown, KeyModifiers::NONE)
+            .unwrap();
+        assert_cursor_visible(&mut harness, &format!("after PageDown #{pages}"));
+        let cur = content_area_snapshot(&harness);
+        if cur == prev {
+            break;
+        }
+        assert_pages_overlap(&prev, &cur, 3, &format!("after PageDown #{pages}"));
+        prev = cur;
+    }
+
+    assert_ne!(
+        prev, initial,
+        "PageDown should have changed the displayed view at least once"
+    );
+    assert!(
+        pages >= 2,
+        "fixture too short to meaningfully exercise PageDown (stopped after {pages})"
+    );
+    assert!(
+        prev.contains(&last_marker),
+        "after hitting bottom the fixture's last line '{last_marker}' should be visible; got:\n{prev}"
+    );
+
+    for i in 0..3 {
+        harness
+            .send_key(KeyCode::PageDown, KeyModifiers::NONE)
+            .unwrap();
+        assert_cursor_visible(
+            &mut harness,
+            &format!("after bottom-pin PageDown #{}", i + 1),
+        );
+        assert_eq!(
+            content_area_snapshot(&harness),
+            prev,
+            "PageDown at bottom must not change the displayed view"
+        );
+    }
+}
+
+/// Every PageUp from the bottom must change what the content area displays
+/// until the top of the buffer is reached; after that, additional PageUps are
+/// no-ops. Asserts after every press: (1) cursor stays inside the content
+/// area, and (2) consecutive pages overlap by at least 2 logical lines.
+/// Counterpart to test_page_down_changes_view_until_bottom.
+#[test]
+fn test_page_up_changes_view_until_top() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    const TOTAL_LINES: usize = 500;
+    let content = paged_fixture(TOTAL_LINES);
+    let last_marker = format!("Line {TOTAL_LINES:04}:");
+    let first_marker = "Line 0001:";
+
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    let _fixture = harness.load_buffer_from_text(&content).unwrap();
+
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        content_area_snapshot(&harness).contains(&last_marker),
+        "expected to start at the bottom showing '{last_marker}'"
+    );
+
+    let initial = content_area_snapshot(&harness);
+    let mut prev = initial.clone();
+
+    let max_pages = 1000;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= max_pages,
+            "PageUp loop did not terminate within {max_pages} iterations"
+        );
+
+        harness
+            .send_key(KeyCode::PageUp, KeyModifiers::NONE)
+            .unwrap();
+        assert_cursor_visible(&mut harness, &format!("after PageUp #{pages}"));
+        let cur = content_area_snapshot(&harness);
+        if cur == prev {
+            break;
+        }
+        // For PageUp, cur is earlier in the file (smaller line numbers) —
+        // swap args so the helper sees old-page first.
+        assert_pages_overlap(&cur, &prev, 3, &format!("after PageUp #{pages}"));
+        prev = cur;
+    }
+
+    assert_ne!(
+        prev, initial,
+        "PageUp should have changed the displayed view at least once"
+    );
+    assert!(
+        pages >= 2,
+        "fixture too short to meaningfully exercise PageUp (stopped after {pages})"
+    );
+    assert!(
+        prev.contains(first_marker),
+        "after hitting top the fixture's first line '{first_marker}' should be visible; got:\n{prev}"
+    );
+
+    for i in 0..3 {
+        harness
+            .send_key(KeyCode::PageUp, KeyModifiers::NONE)
+            .unwrap();
+        assert_cursor_visible(&mut harness, &format!("after top-pin PageUp #{}", i + 1));
+        assert_eq!(
+            content_area_snapshot(&harness),
+            prev,
+            "PageUp at top must not change the displayed view"
         );
     }
 }

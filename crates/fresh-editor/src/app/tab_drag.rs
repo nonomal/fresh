@@ -18,7 +18,7 @@ impl Editor {
     pub(super) fn handle_tab_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
         // Update current position and check if we're dragging
         let (is_dragging, source_split_id) =
-            if let Some(ref mut drag_state) = self.mouse_state.dragging_tab {
+            if let Some(ref mut drag_state) = self.active_window_mut().mouse_state.dragging_tab {
                 drag_state.current_position = (col, row);
                 (drag_state.is_dragging(), drag_state.source_split_id)
             } else {
@@ -27,7 +27,7 @@ impl Editor {
 
         // Only compute drop zone if we've moved past threshold
         if !is_dragging {
-            if let Some(ref mut drag_state) = self.mouse_state.dragging_tab {
+            if let Some(ref mut drag_state) = self.active_window_mut().mouse_state.dragging_tab {
                 drag_state.drop_zone = None;
             }
             return Ok(());
@@ -35,7 +35,7 @@ impl Editor {
 
         // Compute the drop zone based on mouse position
         let drop_zone = self.compute_tab_drop_zone(col, row, source_split_id);
-        if let Some(ref mut drag_state) = self.mouse_state.dragging_tab {
+        if let Some(ref mut drag_state) = self.active_window_mut().mouse_state.dragging_tab {
             drag_state.drop_zone = drop_zone;
         }
 
@@ -50,7 +50,7 @@ impl Editor {
         source_split_id: LeafId,
     ) -> Option<TabDropZone> {
         // First check if we're over a tab bar (for reordering/moving to another split)
-        for (split_id, tab_layout) in &self.cached_layout.tab_layouts {
+        for (split_id, tab_layout) in &self.active_layout().tab_layouts {
             if matches!(
                 tab_layout.hit_test(col, row),
                 Some(TabHit::TabName(_) | TabHit::CloseButton(_))
@@ -63,7 +63,7 @@ impl Editor {
 
         // Check if we're in the tab row area of any split (for moving to end of tab bar)
         for (split_id, _buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
-            &self.cached_layout.split_areas
+            &self.active_layout().split_areas
         {
             // The tab row is typically at content_rect.y - 1 (assuming 1 row for tabs)
             let tab_row = content_rect.y.saturating_sub(1);
@@ -75,7 +75,7 @@ impl Editor {
 
         // Check if we're over a split content area for edge-based splitting
         for (split_id, _buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
-            &self.cached_layout.split_areas
+            &self.active_layout().split_areas
         {
             if col >= content_rect.x
                 && col < content_rect.x + content_rect.width
@@ -122,7 +122,7 @@ impl Editor {
     /// Find the index where a tab should be inserted based on mouse x position
     fn find_tab_insert_index(&self, split_id: LeafId, col: u16) -> Option<usize> {
         // Get the tab layout for this split
-        let tab_layout = self.cached_layout.tab_layouts.get(&split_id)?;
+        let tab_layout = self.active_layout().tab_layouts.get(&split_id)?;
 
         if tab_layout.tabs.is_empty() {
             return Some(0);
@@ -153,6 +153,12 @@ impl Editor {
         source_split_id: LeafId,
         drop_zone: TabDropZone,
     ) {
+        // Dropping a tab (reorder, move to another split, or create a new
+        // split from it) is an unambiguous commitment gesture — promote any
+        // preview first so a drag never leaves behind stale preview state
+        // anchored to a split that has changed underneath it.
+        self.active_window_mut().promote_current_preview();
+
         match drop_zone {
             TabDropZone::TabBar(target_split_id, insert_idx) => {
                 if target_split_id == source_split_id {
@@ -213,13 +219,17 @@ impl Editor {
         split_id: LeafId,
         insert_idx: Option<usize>,
     ) {
-        if let Some(view_state) = self.split_view_states.get_mut(&split_id) {
+        use crate::view::split::TabTarget;
+        if let Some(view_state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .get_mut(&split_id)
+        {
+            let target = TabTarget::Buffer(buffer_id);
             // Find current position of the buffer
-            if let Some(current_idx) = view_state
-                .open_buffers
-                .iter()
-                .position(|&id| id == buffer_id)
-            {
+            if let Some(current_idx) = view_state.open_buffers.iter().position(|t| *t == target) {
                 // Remove from current position
                 view_state.open_buffers.remove(current_idx);
 
@@ -232,7 +242,7 @@ impl Editor {
                     target_idx
                 };
                 let final_idx = adjusted_idx.min(view_state.open_buffers.len());
-                view_state.open_buffers.insert(final_idx, buffer_id);
+                view_state.open_buffers.insert(final_idx, target);
             }
         }
     }
@@ -245,47 +255,137 @@ impl Editor {
         target_split_id: LeafId,
         insert_idx: Option<usize>,
     ) {
+        use crate::view::split::TabTarget;
         // Check if source split will be empty after removing this buffer
         let source_becomes_empty = self
-            .split_view_states
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(_, vs)| vs)
+            .expect("active window must have a populated split layout")
             .get(&source_split_id)
-            .map(|vs| vs.open_buffers.len() == 1 && vs.open_buffers.contains(&buffer_id))
+            .map(|vs| vs.open_buffers.len() == 1 && vs.has_buffer(buffer_id))
             .unwrap_or(false);
 
-        // Remove from source split's tab bar
-        if let Some(source_view_state) = self.split_view_states.get_mut(&source_split_id) {
-            source_view_state.open_buffers.retain(|&id| id != buffer_id);
+        // If the source leaf is being absorbed (its last tab is moving
+        // out) and it carries a SplitRole, the role transfers to the
+        // target leaf so the user can physically relocate the dock by
+        // dragging out its only tab. This implements the
+        // "role follows the window" rule from
+        // docs/internal/tui-editor-layout-design.md Section 2.
+        let role_to_transfer = if source_becomes_empty {
+            self.windows
+                .get_mut(&self.active_window)
+                .and_then(|w| w.split_manager_mut())
+                .expect("active window must have a populated split layout")
+                .root()
+                .find(source_split_id.into())
+                .and_then(|n| n.role())
+        } else {
+            None
+        };
 
-            // If the source split was showing this buffer, switch to another
-            if self.split_manager.get_buffer_id(source_split_id.into()) == Some(buffer_id) {
-                if let Some(&next_buffer) = source_view_state.open_buffers.first() {
-                    self.split_manager
-                        .set_split_buffer(source_split_id, next_buffer);
+        // Compute decisions UP FRONT so we can hold a single mutable
+        // borrow on the source view state without re-borrowing windows.
+        let active_id = self.active_window;
+        let source_showed_buffer =
+            self.split_manager().get_buffer_id(source_split_id.into()) == Some(buffer_id);
+        let mut next_buffer_for_source: Option<BufferId> = None;
+        // Remove from source split's tab bar
+        if let Some((mgr, vs)) = self
+            .windows
+            .get_mut(&active_id)
+            .and_then(|w| w.buffers.splits_mut())
+        {
+            if let Some(source_view_state) = vs.get_mut(&source_split_id) {
+                source_view_state
+                    .open_buffers
+                    .retain(|t| *t != TabTarget::Buffer(buffer_id));
+
+                if source_showed_buffer {
+                    next_buffer_for_source = source_view_state.buffer_tab_ids().next();
                 }
+            }
+            if let Some(next_buffer) = next_buffer_for_source {
+                mgr.set_split_buffer(source_split_id, next_buffer);
             }
         }
 
         // Add to target split's tab bar
-        if let Some(target_view_state) = self.split_view_states.get_mut(&target_split_id) {
+        if let Some(target_view_state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .get_mut(&target_split_id)
+        {
             // Don't add duplicate
-            if !target_view_state.open_buffers.contains(&buffer_id) {
+            if !target_view_state.has_buffer(buffer_id) {
                 let idx = insert_idx.unwrap_or(target_view_state.open_buffers.len());
                 let final_idx = idx.min(target_view_state.open_buffers.len());
-                target_view_state.open_buffers.insert(final_idx, buffer_id);
+                target_view_state
+                    .open_buffers
+                    .insert(final_idx, TabTarget::Buffer(buffer_id));
             }
         }
 
-        // Focus the target split and switch to the dropped buffer
-        self.split_manager
-            .set_split_buffer(target_split_id, buffer_id);
-        self.split_manager.set_active_split(target_split_id);
+        // Focus the target split and switch to the dropped buffer.
+        //
+        // Use `set_pane_buffer` (not raw `set_split_buffer`) so the target
+        // split's `SplitViewState` gets a `keyed_states` entry for the
+        // dropped buffer. Without this, dragging a tab into a split that
+        // never hosted that buffer (e.g. a search-replace results tab
+        // dragged out of the utility dock onto another split) leaves the
+        // target SVS missing the entry. `set_active_buffer` below would
+        // then early-return because the split tree already reports
+        // `buffer_id` as active, so it never reaches `set_pane_buffer`
+        // either — and the next keystroke panics in
+        // `apply_event_to_state` on `keyed_states.get_mut(...).unwrap()`.
+        self.active_window_mut()
+            .set_pane_buffer(target_split_id, buffer_id);
+        self.windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .set_active_split(target_split_id);
         self.set_active_buffer(buffer_id);
 
         // If source split is now empty, close it
         if source_becomes_empty {
-            self.split_view_states.remove(&source_split_id);
-            if let Err(e) = self.split_manager.close_split(source_split_id) {
+            self.windows
+                .get_mut(&self.active_window)
+                .and_then(|w| w.split_view_states_mut())
+                .expect("active window must have a populated split layout")
+                .remove(&source_split_id);
+            if let Err(e) = self
+                .windows
+                .get_mut(&self.active_window)
+                .and_then(|w| w.split_manager_mut())
+                .expect("active window must have a populated split layout")
+                .close_split(source_split_id)
+            {
                 tracing::warn!("Failed to close empty split: {}", e);
+            }
+            // Transfer the absorbed leaf's role to the destination so
+            // utility-dock placement follows the window the user just
+            // moved into.
+            if let Some(role) = role_to_transfer {
+                self.windows
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.split_manager_mut())
+                    .expect("active window must have a populated split layout")
+                    .clear_role(role);
+                self.windows
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.split_manager_mut())
+                    .expect("active window must have a populated split layout")
+                    .set_leaf_role(target_split_id, Some(role));
+                tracing::info!(
+                    "Transferred role {:?} from absorbed leaf {:?} to {:?}",
+                    role,
+                    source_split_id,
+                    target_split_id
+                );
             }
             self.set_status_message(t!("status.moved_tab_split_closed").to_string());
         } else {
@@ -302,30 +402,50 @@ impl Editor {
         direction: SplitDirection,
         _new_split_first: bool, // If true, new split is placed first (left/top) - TODO: implement
     ) {
+        use crate::view::split::TabTarget;
         // Check if source split will be empty after removing this buffer
         let source_becomes_empty = self
-            .split_view_states
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(_, vs)| vs)
+            .expect("active window must have a populated split layout")
             .get(&source_split_id)
-            .map(|vs| vs.open_buffers.len() == 1 && vs.open_buffers.contains(&buffer_id))
+            .map(|vs| vs.open_buffers.len() == 1 && vs.has_buffer(buffer_id))
             .unwrap_or(false);
 
-        // Remove from source split's tab bar
-        let source_had_buffer =
-            if let Some(source_view_state) = self.split_view_states.get_mut(&source_split_id) {
-                let had = source_view_state.open_buffers.contains(&buffer_id);
-                source_view_state.open_buffers.retain(|&id| id != buffer_id);
+        // Decide buffer-switching UP FRONT under an immutable borrow,
+        // then take one mutable borrow on the active window's splits to
+        // perform the actual edits without re-borrowing windows.
+        let active_id = self.active_window;
+        let source_showed_buffer =
+            self.split_manager().get_buffer_id(source_split_id.into()) == Some(buffer_id);
+        let mut next_buffer_for_source: Option<BufferId> = None;
+        let source_had_buffer = if let Some((mgr, vs)) = self
+            .windows
+            .get_mut(&active_id)
+            .and_then(|w| w.buffers.splits_mut())
+        {
+            let had = if let Some(source_view_state) = vs.get_mut(&source_split_id) {
+                let had = source_view_state.has_buffer(buffer_id);
+                source_view_state
+                    .open_buffers
+                    .retain(|t| *t != TabTarget::Buffer(buffer_id));
 
-                // If the source split was showing this buffer, switch to another
-                if self.split_manager.get_buffer_id(source_split_id.into()) == Some(buffer_id) {
-                    if let Some(&next_buffer) = source_view_state.open_buffers.first() {
-                        self.split_manager
-                            .set_split_buffer(source_split_id, next_buffer);
-                    }
+                if source_showed_buffer {
+                    next_buffer_for_source = source_view_state.buffer_tab_ids().next();
                 }
                 had
             } else {
                 false
             };
+            if let Some(next_buffer) = next_buffer_for_source {
+                mgr.set_split_buffer(source_split_id, next_buffer);
+            }
+            had
+        } else {
+            false
+        };
 
         if !source_had_buffer {
             return;
@@ -333,14 +453,30 @@ impl Editor {
 
         // Create new split - we need to split the target split
         // First, temporarily set the target split as active
-        let original_active = self.split_manager.active_split();
-        self.split_manager.set_active_split(target_split_id);
+        let original_active = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
+        self.windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .set_active_split(target_split_id);
 
         // Determine the ratio (new split gets 50%)
         let ratio = 0.5;
 
         // Create the split
-        match self.split_manager.split_active(direction, buffer_id, ratio) {
+        match self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .split_active(direction, buffer_id, ratio)
+        {
             Ok(new_split_id) => {
                 // Initialize the new split's view state
                 let (width, height) = (self.terminal_width, self.terminal_height);
@@ -348,17 +484,31 @@ impl Editor {
                     crate::view::split::SplitViewState::with_buffer(width, height, buffer_id);
                 new_view_state.apply_config_defaults(
                     self.config.editor.line_numbers,
-                    self.config.editor.line_wrap,
+                    self.config.editor.highlight_current_line,
+                    self.active_window().resolve_line_wrap_for_buffer(buffer_id),
                     self.config.editor.wrap_indent,
+                    self.active_window()
+                        .resolve_wrap_column_for_buffer(buffer_id),
                     self.config.editor.rulers.clone(),
                 );
 
                 // Copy cursor position from source split's view state
-                if let Some(source_vs) = self.split_view_states.get(&source_split_id) {
+                if let Some(source_vs) = self
+                    .windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .map(|(_, vs)| vs)
+                    .expect("active window must have a populated split layout")
+                    .get(&source_split_id)
+                {
                     new_view_state.cursors = source_vs.cursors.clone();
                 }
 
-                self.split_view_states.insert(new_split_id, new_view_state);
+                self.windows
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.split_view_states_mut())
+                    .expect("active window must have a populated split layout")
+                    .insert(new_split_id, new_view_state);
 
                 // If new_split_first is true, we need to swap the children
                 // This requires modifying the split manager's tree structure
@@ -367,21 +517,39 @@ impl Editor {
 
                 // If source split is now empty, close it
                 if source_becomes_empty {
-                    self.split_view_states.remove(&source_split_id);
-                    if let Err(e) = self.split_manager.close_split(source_split_id) {
+                    self.windows
+                        .get_mut(&self.active_window)
+                        .and_then(|w| w.split_view_states_mut())
+                        .expect("active window must have a populated split layout")
+                        .remove(&source_split_id);
+                    if let Err(e) = self
+                        .windows
+                        .get_mut(&self.active_window)
+                        .and_then(|w| w.split_manager_mut())
+                        .expect("active window must have a populated split layout")
+                        .close_split(source_split_id)
+                    {
                         tracing::warn!("Failed to close empty split: {}", e);
                     }
                 }
 
                 // Focus the new split
-                self.split_manager.set_active_split(new_split_id);
+                self.windows
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.split_manager_mut())
+                    .expect("active window must have a populated split layout")
+                    .set_active_split(new_split_id);
                 self.set_active_buffer(buffer_id);
 
                 self.set_status_message(t!("status.created_new_split").to_string());
             }
             Err(e) => {
                 // Restore active split on error
-                self.split_manager.set_active_split(original_active);
+                self.windows
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.split_manager_mut())
+                    .expect("active window must have a populated split layout")
+                    .set_active_split(original_active);
                 self.set_status_message(
                     t!("error.split_failed", error = e.to_string()).to_string(),
                 );

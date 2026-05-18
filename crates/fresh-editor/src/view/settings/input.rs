@@ -83,6 +83,14 @@ impl SettingsState {
         event: &KeyEvent,
         ctx: &mut InputContext,
     ) -> InputResult {
+        // Ctrl+S saves entry dialog from any mode
+        if event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(event.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.save_entry_dialog();
+            return InputResult::Consumed;
+        }
+
         // Check if we're in a special editing mode
         let (editing_text, dropdown_open) = if let Some(dialog) = self.entry_dialog() {
             let dropdown_open = dialog
@@ -100,7 +108,7 @@ impl SettingsState {
         } else if dropdown_open {
             self.handle_entry_dialog_dropdown(event)
         } else {
-            self.handle_entry_dialog_navigation(event)
+            self.handle_entry_dialog_navigation(event, ctx)
         }
     }
 
@@ -208,9 +216,10 @@ impl SettingsState {
                         dialog.cursor_up();
                     }
                 } else {
-                    // Move to previous item in TextList
+                    // Auto-accept pending text in TextList before navigating
                     if let Some(item) = dialog.current_item_mut() {
                         if let SettingControl::TextList(state) = &mut item.control {
+                            state.add_item();
                             state.focus_prev();
                         }
                     }
@@ -225,9 +234,10 @@ impl SettingsState {
                         dialog.cursor_down();
                     }
                 } else {
-                    // Move to next item in TextList
+                    // Auto-accept pending text in TextList before navigating
                     if let Some(item) = dialog.current_item_mut() {
                         if let SettingControl::TextList(state) = &mut item.control {
+                            state.add_item();
                             state.focus_next();
                         }
                     }
@@ -257,6 +267,15 @@ impl SettingsState {
                         dialog.stop_editing();
                     }
                     // If not valid, Tab is ignored (user must fix or press Esc)
+                } else {
+                    // Auto-accept pending text in TextList before exiting
+                    if let Some(item) = dialog.current_item_mut() {
+                        if let SettingControl::TextList(state) = &mut item.control {
+                            state.add_item();
+                        }
+                    }
+                    // Tab exits text editing mode for non-JSON controls (TextList, Text)
+                    dialog.stop_editing();
                 }
             }
             _ => {}
@@ -289,7 +308,11 @@ impl SettingsState {
     }
 
     /// Handle navigation and activation in entry dialog (same pattern as handle_settings_input)
-    fn handle_entry_dialog_navigation(&mut self, event: &KeyEvent) -> InputResult {
+    fn handle_entry_dialog_navigation(
+        &mut self,
+        event: &KeyEvent,
+        ctx: &mut InputContext,
+    ) -> InputResult {
         match event.code {
             KeyCode::Esc => {
                 self.close_entry_dialog();
@@ -305,17 +328,18 @@ impl SettingsState {
                 }
             }
             KeyCode::Tab => {
+                // Tab cycles sequentially through all fields, sub-fields, and buttons
                 if let Some(dialog) = self.entry_dialog_mut() {
                     dialog.focus_next();
                 }
             }
             KeyCode::BackTab => {
+                // Shift+Tab cycles in reverse
                 if let Some(dialog) = self.entry_dialog_mut() {
                     dialog.focus_prev();
                 }
             }
             KeyCode::Left => {
-                // Decrement number or navigate within control
                 if let Some(dialog) = self.entry_dialog_mut() {
                     if !dialog.focus_on_buttons {
                         dialog.decrement_number();
@@ -325,7 +349,6 @@ impl SettingsState {
                 }
             }
             KeyCode::Right => {
-                // Increment number or navigate within control
                 if let Some(dialog) = self.entry_dialog_mut() {
                     if !dialog.focus_on_buttons {
                         dialog.increment_number();
@@ -334,14 +357,15 @@ impl SettingsState {
                     }
                 }
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
                 // Check button state first with immutable borrow
                 let button_action = self.entry_dialog().and_then(|dialog| {
                     if dialog.focus_on_buttons {
                         let cancel_idx = dialog.button_count() - 1;
                         if dialog.focused_button == 0 {
                             Some(ButtonAction::Save)
-                        } else if !dialog.is_new && dialog.focused_button == 1 {
+                        } else if !dialog.is_new && !dialog.no_delete && dialog.focused_button == 1
+                        {
                             Some(ButtonAction::Delete)
                         } else if dialog.focused_button == cancel_idx {
                             Some(ButtonAction::Cancel)
@@ -372,6 +396,7 @@ impl SettingsState {
                                 SettingControl::Dropdown(_) => Some(ControlAction::ToggleDropdown),
                                 SettingControl::Text(_)
                                 | SettingControl::TextList(_)
+                                | SettingControl::DualList(_)
                                 | SettingControl::Number(_)
                                 | SettingControl::Json(_) => Some(ControlAction::StartEditing),
                                 SettingControl::Map(_) | SettingControl::ObjectArray(_) => {
@@ -400,11 +425,66 @@ impl SettingsState {
                                 }
                             }
                             ControlAction::OpenNestedDialog => {
-                                // Handle nested Map or ObjectArray - open a nested dialog
                                 self.open_nested_entry_dialog();
                             }
                         }
                     }
+                }
+            }
+            KeyCode::Char(' ') => {
+                // Space toggles booleans, activates dropdowns (but doesn't submit form)
+                let control_action = self.entry_dialog().and_then(|dialog| {
+                    if dialog.focus_on_buttons {
+                        return None; // Space on buttons does nothing (Enter activates)
+                    }
+                    dialog.current_item().and_then(|item| match &item.control {
+                        SettingControl::Toggle(_) => Some(ControlAction::ToggleBool),
+                        SettingControl::Dropdown(_) => Some(ControlAction::ToggleDropdown),
+                        _ => None,
+                    })
+                });
+
+                if let Some(action) = control_action {
+                    match action {
+                        ControlAction::ToggleBool => {
+                            if let Some(dialog) = self.entry_dialog_mut() {
+                                dialog.toggle_bool();
+                            }
+                        }
+                        ControlAction::ToggleDropdown => {
+                            if let Some(dialog) = self.entry_dialog_mut() {
+                                dialog.toggle_dropdown();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                // Auto-enter edit mode when typing on a text or number field
+                let can_auto_edit = self
+                    .entry_dialog()
+                    .and_then(|dialog| {
+                        if dialog.focus_on_buttons {
+                            return None;
+                        }
+                        dialog.current_item().map(|item| match &item.control {
+                            SettingControl::Text(_) | SettingControl::TextList(_) => true,
+                            SettingControl::Number(_) => c.is_ascii_digit() || c == '-' || c == '.',
+                            _ => false,
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if can_auto_edit {
+                    if let Some(dialog) = self.entry_dialog_mut() {
+                        dialog.start_editing();
+                    }
+                    // Now forward the character to the text editing handler
+                    return self.handle_entry_dialog_text_editing(
+                        &KeyEvent::new(KeyCode::Char(c), event.modifiers),
+                        ctx,
+                    );
                 }
             }
             _ => {}
@@ -548,6 +628,34 @@ impl SettingsState {
                 self.select_next();
                 InputResult::Consumed
             }
+            KeyCode::PageUp => {
+                // Page up in the tree view scrolls by viewport height.
+                let viewport = self.categories_scroll.scroll.viewport.max(1) as i32;
+                self.tree_step(-viewport);
+                InputResult::Consumed
+            }
+            KeyCode::PageDown => {
+                let viewport = self.categories_scroll.scroll.viewport.max(1) as i32;
+                self.tree_step(viewport);
+                InputResult::Consumed
+            }
+            KeyCode::Home => {
+                let rows = self.visible_tree();
+                let cur = self.tree_cursor_index(&rows) as i32;
+                if cur > 0 {
+                    self.tree_step(-cur);
+                }
+                InputResult::Consumed
+            }
+            KeyCode::End => {
+                let rows = self.visible_tree();
+                let cur = self.tree_cursor_index(&rows) as i32;
+                let last = rows.len() as i32 - 1;
+                if last > cur {
+                    self.tree_step(last - cur);
+                }
+                InputResult::Consumed
+            }
             KeyCode::Tab => {
                 self.toggle_focus();
                 InputResult::Consumed
@@ -568,9 +676,28 @@ impl SettingsState {
                 self.request_close(ctx);
                 InputResult::Consumed
             }
-            KeyCode::Enter | KeyCode::Right => {
-                // Enter/Right on categories: move focus to settings panel
-                self.focus.set(FocusPanel::Settings);
+            KeyCode::Right => {
+                // Right ONLY expands an expandable category. Does not move
+                // focus into the body panel — that's Tab's job.
+                let cat_idx = self.selected_category;
+                if self.is_category_expandable(cat_idx)
+                    && !self.expanded_categories.contains(&cat_idx)
+                {
+                    self.expanded_categories.insert(cat_idx);
+                }
+                InputResult::Consumed
+            }
+            KeyCode::Left => {
+                // Left ONLY collapses an expanded category. No-op otherwise.
+                let cat_idx = self.selected_category;
+                if self.expanded_categories.contains(&cat_idx) {
+                    self.expanded_categories.remove(&cat_idx);
+                    // Sections aren't visible anymore — pull the cursor
+                    // back to the category row so the next Down step
+                    // walks to the *next* category, not into the
+                    // (now-hidden) sections.
+                    self.tree_cursor_section = None;
+                }
                 InputResult::Consumed
             }
             _ => InputResult::Ignored, // Let modal catch it
@@ -630,12 +757,25 @@ impl SettingsState {
                 self.handle_control_activate(ctx);
                 InputResult::Consumed
             }
+            KeyCode::PageDown => {
+                self.select_next_page();
+                InputResult::Consumed
+            }
+            KeyCode::PageUp => {
+                self.select_prev_page();
+                InputResult::Consumed
+            }
             KeyCode::Char('/') => {
                 self.start_search();
                 InputResult::Consumed
             }
             KeyCode::Char('?') => {
                 self.toggle_help();
+                InputResult::Consumed
+            }
+            KeyCode::Delete => {
+                // Delete key: set nullable setting to null (inherit)
+                self.set_current_to_null();
                 InputResult::Consumed
             }
             KeyCode::Esc => {
@@ -681,7 +821,19 @@ impl SettingsState {
             KeyCode::Enter => {
                 match self.footer_button_index {
                     0 => self.cycle_target_layer(), // Layer button
-                    1 => self.request_reset(),
+                    1 => {
+                        // Reset/Inherit button — for nullable items, set to null (inherit);
+                        // otherwise show reset-all dialog
+                        let is_nullable_set = self
+                            .current_item()
+                            .map(|item| item.nullable && !item.is_null)
+                            .unwrap_or(false);
+                        if is_nullable_set {
+                            self.set_current_to_null();
+                        } else {
+                            self.request_reset();
+                        }
+                    }
                     2 => ctx.defer(DeferredAction::CloseSettings { save: true }),
                     3 => self.request_close(ctx),
                     4 => ctx.defer(DeferredAction::OpenConfigFile {
@@ -717,6 +869,11 @@ impl SettingsState {
 
         if is_json {
             return self.handle_json_editing_input(event, ctx);
+        }
+
+        // DualList has its own keyboard handling (no text input)
+        if self.is_editing_dual_list() {
+            return self.handle_dual_list_editing_input(event);
         }
 
         match event.code {
@@ -760,8 +917,118 @@ impl SettingsState {
                 self.text_focus_next();
                 InputResult::Consumed
             }
+            KeyCode::Tab => {
+                // Tab exits text editing mode and advances focus to the next panel
+                self.stop_editing();
+                self.toggle_focus();
+                InputResult::Consumed
+            }
             _ => InputResult::Consumed, // Consume all during text edit
         }
+    }
+
+    /// Handle input when editing a DualList control
+    fn handle_dual_list_editing_input(&mut self, event: &KeyEvent) -> InputResult {
+        use crate::view::controls::DualListColumn;
+        let shift = event.modifiers.contains(KeyModifiers::SHIFT);
+        match event.code {
+            KeyCode::Esc => {
+                self.stop_editing();
+            }
+            // Tab/BackTab propagate to the settings panel (exit editing)
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.stop_editing();
+                // Return Ignored so the settings panel handles Tab/BackTab
+                return InputResult::Ignored;
+            }
+            KeyCode::Up if shift => {
+                self.with_current_dual_list_mut(|dl| dl.move_up());
+                self.on_value_changed();
+            }
+            KeyCode::Down if shift => {
+                self.with_current_dual_list_mut(|dl| dl.move_down());
+                self.on_value_changed();
+            }
+            KeyCode::Up => {
+                self.with_current_dual_list_mut(|dl| dl.cursor_up());
+            }
+            KeyCode::Down => {
+                self.with_current_dual_list_mut(|dl| dl.cursor_down());
+            }
+            KeyCode::Right if shift => {
+                // Shift+Right: add selected available item to included, follow it
+                let changed = self
+                    .with_current_dual_list_mut(|dl| {
+                        if dl.active_column == DualListColumn::Available {
+                            dl.add_selected();
+                            // Move focus to the Included column, cursor on the newly added item (last)
+                            dl.active_column = DualListColumn::Included;
+                            dl.included_cursor = dl.included.len().saturating_sub(1);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    self.on_value_changed();
+                    self.refresh_dual_list_sibling();
+                }
+            }
+            KeyCode::Left if shift => {
+                // Shift+Left: remove selected included item back to available, follow it
+                let changed = self
+                    .with_current_dual_list_mut(|dl| {
+                        if dl.active_column == DualListColumn::Included {
+                            let value = dl.included.get(dl.included_cursor).cloned();
+                            dl.remove_selected();
+                            // Move focus to Available column, find the removed item
+                            dl.active_column = DualListColumn::Available;
+                            if let Some(val) = value {
+                                let avail = dl.available_items();
+                                if let Some(pos) = avail.iter().position(|(v, _)| *v == val) {
+                                    dl.available_cursor = pos;
+                                }
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    self.on_value_changed();
+                    self.refresh_dual_list_sibling();
+                }
+            }
+            KeyCode::Right => {
+                // Plain Right: switch to Included column
+                self.with_current_dual_list_mut(|dl| {
+                    dl.active_column = DualListColumn::Included;
+                });
+            }
+            KeyCode::Left => {
+                // Plain Left: switch to Available column
+                self.with_current_dual_list_mut(|dl| {
+                    dl.active_column = DualListColumn::Available;
+                });
+            }
+            KeyCode::Enter => {
+                // Enter adds/removes based on active column
+                let changed = self
+                    .with_current_dual_list_mut(|dl| match dl.active_column {
+                        DualListColumn::Available => dl.add_selected(),
+                        DualListColumn::Included => dl.remove_selected(),
+                    })
+                    .is_some();
+                if changed {
+                    self.on_value_changed();
+                    self.refresh_dual_list_sibling();
+                }
+            }
+            _ => {}
+        }
+        InputResult::Consumed
     }
 
     /// Handle input when editing a JSON control (multiline editor)
@@ -849,6 +1116,13 @@ impl SettingsState {
                 self.number_cancel();
             }
             KeyCode::Enter => {
+                self.number_confirm();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Tab commits the pending edit and exits editing mode. We
+                // don't move panel focus here so the user can continue to
+                // tweak the same setting with Left/Right after Tab — matching
+                // the muscle memory of "Tab to leave the input box."
                 self.number_confirm();
             }
             KeyCode::Char('a') if ctrl => {
@@ -976,7 +1250,7 @@ impl SettingsState {
                 SettingControl::Text(_) => {
                     self.start_editing();
                 }
-                SettingControl::TextList(_) => {
+                SettingControl::TextList(_) | SettingControl::DualList(_) => {
                     self.start_editing();
                 }
                 SettingControl::Map(ref mut state) => {
@@ -1024,15 +1298,12 @@ impl SettingsState {
     /// Handle control increment (Right arrow on numbers/dropdowns)
     fn handle_control_increment(&mut self) {
         if let Some(item) = self.current_item_mut() {
-            match &mut item.control {
-                SettingControl::Number(ref mut state) => {
-                    state.value += 1;
-                    if let Some(max) = state.max {
-                        state.value = state.value.min(max);
-                    }
-                    self.on_value_changed();
+            if let SettingControl::Number(ref mut state) = &mut item.control {
+                state.value += 1;
+                if let Some(max) = state.max {
+                    state.value = state.value.min(max);
                 }
-                _ => {}
+                self.on_value_changed();
             }
         }
     }
@@ -1040,17 +1311,14 @@ impl SettingsState {
     /// Handle control decrement (Left arrow on numbers)
     fn handle_control_decrement(&mut self) {
         if let Some(item) = self.current_item_mut() {
-            match &mut item.control {
-                SettingControl::Number(ref mut state) => {
-                    if state.value > 0 {
-                        state.value -= 1;
-                    }
-                    if let Some(min) = state.min {
-                        state.value = state.value.max(min);
-                    }
-                    self.on_value_changed();
+            if let SettingControl::Number(ref mut state) = &mut item.control {
+                if state.value > 0 {
+                    state.value -= 1;
                 }
-                _ => {}
+                if let Some(min) = state.min {
+                    state.value = state.value.max(min);
+                }
+                self.on_value_changed();
             }
         }
     }
@@ -1084,19 +1352,29 @@ mod tests {
 
         let mut ctx = InputContext::new();
 
-        // Enter on categories should NOT affect settings items
-        // It should just move focus to settings panel
+        // Per the tree-view spec: only Tab switches panels. Enter,
+        // Left, and Right are *no longer* shortcuts to move focus
+        // out of the categories panel.
+        // * Enter falls through (Ignored) — let the modal handle it.
+        // * Right expands the focused category (no-op for non-
+        //   expandable ones); does NOT move focus to Settings.
+        // * Left collapses; same — does not switch panels.
+        // * Tab is the only key that switches panels.
         let result = state.handle_key_event(&key(KeyCode::Enter), &mut ctx);
-        assert_eq!(result, InputResult::Consumed);
-        assert_eq!(state.focus_panel(), FocusPanel::Settings);
+        assert_eq!(result, InputResult::Ignored);
+        assert_eq!(state.focus_panel(), FocusPanel::Categories);
 
-        // Go back to categories
-        state.focus.set(FocusPanel::Categories);
-
-        // Left/Right on categories should be consumed but not affect settings
         let result = state.handle_key_event(&key(KeyCode::Right), &mut ctx);
         assert_eq!(result, InputResult::Consumed);
-        // Should have moved to settings panel
+        assert_eq!(state.focus_panel(), FocusPanel::Categories);
+
+        let result = state.handle_key_event(&key(KeyCode::Left), &mut ctx);
+        assert_eq!(result, InputResult::Consumed);
+        assert_eq!(state.focus_panel(), FocusPanel::Categories);
+
+        // Tab is the panel switcher.
+        let result = state.handle_key_event(&key(KeyCode::Tab), &mut ctx);
+        assert_eq!(result, InputResult::Consumed);
         assert_eq!(state.focus_panel(), FocusPanel::Settings);
     }
 
@@ -1257,5 +1535,49 @@ mod tests {
             ctx.deferred_actions[0],
             DeferredAction::CloseSettings { save: true }
         ));
+    }
+
+    /// Reproducer for issue #1825: Tab while editing a Number control was a
+    /// no-op, leaving the user "stuck" in the input. Tab should commit the
+    /// pending edit and exit number-editing mode (matching the Text-control
+    /// behavior).
+    #[test]
+    fn test_tab_exits_number_editing() {
+        use crate::view::settings::items::SettingControl;
+
+        let schema = include_str!("../../../plugins/config-schema.json");
+        let config = crate::config::Config::default();
+        let mut state = SettingsState::new(schema, &config).unwrap();
+        state.visible = true;
+        state.focus.set(FocusPanel::Settings);
+
+        // Find a number setting (any will do)
+        let number_idx = state
+            .pages
+            .get(state.selected_category)
+            .and_then(|page| {
+                page.items
+                    .iter()
+                    .position(|item| matches!(item.control, SettingControl::Number(_)))
+            })
+            .expect("expected at least one Number control on the default page");
+        state.selected_item = number_idx;
+
+        // Enter number editing mode and type a digit so we have a pending edit
+        state.start_number_editing();
+        assert!(
+            state.is_number_editing(),
+            "precondition: should be in number-editing mode"
+        );
+        state.number_insert('7');
+
+        let mut ctx = InputContext::new();
+
+        // Tab should exit editing mode (currently fails: Tab is unhandled)
+        state.handle_key_event(&key(KeyCode::Tab), &mut ctx);
+        assert!(
+            !state.is_number_editing(),
+            "Tab while editing a Number control must exit editing mode"
+        );
     }
 }

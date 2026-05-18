@@ -15,11 +15,14 @@ rust_i18n::i18n!(
 // Core types and config are always available (needed for schema generation)
 pub mod config;
 pub mod partial_config;
+pub mod plugin_schemas;
 pub mod types;
 
 // Runtime-only modules (require the "runtime" feature)
 #[cfg(feature = "runtime")]
 pub mod config_io;
+#[cfg(feature = "runtime")]
+pub mod init_script;
 #[cfg(feature = "runtime")]
 pub mod state;
 #[cfg(feature = "runtime")]
@@ -49,6 +52,11 @@ pub mod server;
 #[cfg(any(feature = "runtime", feature = "wasm", feature = "dev-bins"))]
 pub mod view;
 
+// Plugin widget runtime — declarative widget tree mounted by plugins
+// via MountWidgetPanel/UpdateWidgetPanel/UnmountWidgetPanel. Pure Rust,
+// no UI dependencies, so always available.
+pub mod widgets;
+
 // GUI mode - native window with wgpu rendering
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -56,3 +64,10 @@ pub mod gui;
 // WASM-specific modules
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+// Test-only observation API. Compiled with the `runtime` feature so the
+// terminal binary's library form exposes it for integration tests, but
+// never reachable from production call sites — see test_api.rs and
+// docs/internal/e2e-test-migration-design.md.
+#[cfg(feature = "runtime")]
+pub mod test_api;

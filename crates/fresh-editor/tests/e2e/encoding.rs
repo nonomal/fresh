@@ -8,6 +8,8 @@
 //! - ASCII
 //! - Latin-1 (ISO-8859-1)
 //! - Windows-1252 (ANSI)
+//! - Windows-1250 (Central European)
+//! - Windows-1251 (Cyrillic)
 //! - GB18030 (Chinese)
 //! - GBK (Chinese simplified)
 
@@ -1489,6 +1491,157 @@ fn test_windows1250_czech_pangram() {
     );
 }
 
+// ============================================================================
+// Windows-1251 (Cyrillic) Encoding Tests
+// ============================================================================
+
+/// Test for Windows-1251 encoding support (issue #1453):
+/// - Load a Windows-1251 encoded Russian file from disk
+/// - Verify it is detected as Windows-1251
+/// - Verify the Cyrillic text is displayed correctly
+/// - Verify the encoding selector lists Windows-1251 with the right description
+#[test]
+fn test_windows1251_cyrillic_display_and_selector() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // "Привет мир" (Hello world) in Windows-1251:
+    // П=0xCF р=0xF0 и=0xE8 в=0xE2 е=0xE5 т=0xF2 space м=0xEC и=0xE8 р=0xF0
+    let russian_file = temp_dir.path().join("russian.txt");
+    let windows1251_bytes: &[u8] = &[
+        0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x20, // "Привет "
+        0xEC, 0xE8, 0xF0, 0x0A, // "мир\n"
+    ];
+    std::fs::write(&russian_file, windows1251_bytes).unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&russian_file).unwrap();
+    harness.render().unwrap();
+
+    // File should be detected as Windows-1251 (Russian letters form a clear
+    // 6-byte Cyrillic run that matches either chardetng or our heuristic).
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Windows-1251"),
+        "Should detect as Windows-1251. Screen:\n{}",
+        screen
+    );
+
+    // Verify Cyrillic characters are displayed (converted to UTF-8 internally)
+    assert!(screen.contains('П'), "Screen should contain 'П'");
+    assert!(screen.contains('р'), "Screen should contain 'р'");
+    assert!(screen.contains('и'), "Screen should contain 'и'");
+    assert!(screen.contains('в'), "Screen should contain 'в'");
+    assert!(screen.contains('е'), "Screen should contain 'е'");
+    assert!(screen.contains('т'), "Screen should contain 'т'");
+    assert!(screen.contains('м'), "Screen should contain 'м'");
+
+    // Verify the encoding selector lists Windows-1251 with the Cyrillic description
+    let (col, row) = harness
+        .find_text_on_screen("Windows-1251")
+        .expect("Encoding indicator should be visible");
+    harness.mouse_click(col, row).unwrap();
+    harness.assert_screen_contains("Encoding:");
+
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("1251").unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Windows-1251") && screen.contains("Cyrillic"),
+        "Selector should show Windows-1251 / CP1251 – Cyrillic. Screen:\n{}",
+        screen
+    );
+}
+
+/// Test Windows-1251 encoding conversions:
+/// - Load a UTF-8 Russian file
+/// - Switch to Windows-1251 and save
+/// - Verify bytes on disk are Windows-1251 encoded
+/// - Round-trip back to UTF-8 preserves the text
+#[test]
+fn test_windows1251_encoding_conversions() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("conversion_test.txt");
+
+    // Start with UTF-8 file containing Russian text
+    std::fs::write(&file_path, "Привет мир\n").unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    // Change encoding to Windows-1251 and save
+    let (col, row) = harness
+        .find_text_on_screen("UTF-8")
+        .expect("UTF-8 indicator should be visible");
+    harness.mouse_click(col, row).unwrap();
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("Windows-1251").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    let _ = harness.wait_until(|h| !h.editor().active_state().buffer.is_modified());
+
+    // Verify file is Windows-1251 encoded by decoding it back
+    let saved = std::fs::read(&file_path).unwrap();
+    // 'П' = 0xCF, 'р' = 0xF0 in Windows-1251 (not in the UTF-8 byte sequence 'П'
+    // which is 0xD0 0x9F)
+    assert!(
+        saved.contains(&0xCF) && saved.contains(&0xF0),
+        "File should be Windows-1251 encoded. Got: {:?}",
+        saved
+    );
+    let (decoded, _) = encoding_rs::WINDOWS_1251.decode_without_bom_handling(&saved);
+    assert!(
+        decoded.contains("Привет мир"),
+        "Should preserve Russian text. Got: {}",
+        decoded
+    );
+
+    // Part 2: Fresh load Windows-1251 from disk → UTF-8 → save
+    drop(harness);
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    let (col, row) = harness
+        .find_text_on_screen("Windows-1251")
+        .expect("Windows-1251 indicator should be visible");
+    harness.mouse_click(col, row).unwrap();
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("UTF-8").unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    let _ = harness.wait_until(|h| !h.editor().active_state().buffer.is_modified());
+
+    // Verify file is now valid UTF-8 and still contains the Russian text
+    let saved = std::fs::read(&file_path).unwrap();
+    let utf8_str = std::str::from_utf8(&saved).expect("File should be valid UTF-8");
+    assert!(
+        utf8_str.contains("Привет мир"),
+        "UTF-8 file should contain the Russian text. Got: {}",
+        utf8_str
+    );
+}
+
 /// Test loading files in various encodings from disk and saving as UTF-8
 /// This tests the full flow: create encoded file → load → save as UTF-8 → verify
 /// Covers all supported encodings with detectable content.
@@ -1543,6 +1696,12 @@ fn test_all_encodings_load_and_save_as_utf8() {
             desc: "Windows-1250",
             bytes: &[0xF3, 0xB3, 0xE6, 0x0A],
             expected_substr: "ó",
+        },
+        // Windows-1251: Russian "Привет" (П=0xCF р=0xF0 и=0xE8 в=0xE2 е=0xE5 т=0xF2)
+        TestCase {
+            desc: "Windows-1251",
+            bytes: &[0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, 0x0A],
+            expected_substr: "Привет",
         },
         // Note: CJK encodings (GB18030, GBK, Shift-JIS, EUC-KR) have ambiguous
         // detection - the same bytes can be valid in multiple encodings.
@@ -2229,6 +2388,227 @@ fn test_reload_with_encoding_menu_item() {
     harness.assert_screen_contains("Reload with Encoding...");
 }
 
+/// Helper: open the "Reload with encoding" prompt for `file_path`, with the
+/// buffer cursor parked at line 4 column 3 so we can detect any stray
+/// editor-cursor placement caused by clicks on the prompt popup.
+fn open_reload_with_encoding_prompt_at_ln4_col3(
+    harness: &mut EditorTestHarness,
+    file_path: &std::path::Path,
+) {
+    harness.open_file(file_path).unwrap();
+    harness.render().unwrap();
+
+    // Park the cursor at a known position (Ln 4, Col 3) so a stray editor
+    // click would visibly move it.
+    for _ in 0..3 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    for _ in 0..2 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.render().unwrap();
+    harness.assert_screen_contains("Ln 4, Col 3");
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Reload with").unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Reload with Encoding");
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Reload with encoding:");
+}
+
+fn double_click_at(harness: &mut EditorTestHarness, col: u16, row: u16) {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    // Mock-clock advance to ensure we're outside any previous click's
+    // double-click window before issuing two rapid clicks inside one.
+    let window = std::time::Duration::from_millis(
+        harness
+            .config()
+            .editor
+            .double_click_time_ms
+            .saturating_mul(2),
+    );
+    harness.advance_time(window);
+    let send = |h: &mut EditorTestHarness, kind: MouseEventKind| {
+        h.send_mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+        .unwrap();
+    };
+    send(harness, MouseEventKind::Down(MouseButton::Left));
+    send(harness, MouseEventKind::Up(MouseButton::Left));
+    send(harness, MouseEventKind::Down(MouseButton::Left));
+    send(harness, MouseEventKind::Up(MouseButton::Left));
+    harness.render().unwrap();
+}
+
+/// Regression for #1660: clicking an encoding in the "Reload with encoding"
+/// prompt must only update the selection, not immediately reload the file.
+/// Confirmation requires Enter (or another explicit commit) so users can
+/// preview options without committing to a destructive reload on every click.
+/// The click must also leave the buffer cursor untouched.
+#[test]
+fn test_reload_with_encoding_click_does_not_confirm() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 30).unwrap();
+    let file_path = harness.project_dir().unwrap().join("test_reload_click.txt");
+
+    // Plain ASCII with several lines so we have room to park the cursor.
+    std::fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n").unwrap();
+
+    open_reload_with_encoding_prompt_at_ln4_col3(&mut harness, &file_path);
+
+    // Find a non-default encoding row to click (Latin-1 is in the list and is
+    // not the default UTF-8 selection).
+    let (col, row) = harness
+        .find_text_on_screen("Latin-1")
+        .expect("Latin-1 suggestion should be visible in the encoding list");
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+
+    // Prompt must still be open (no reload happened on the click).
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Reload with encoding:"),
+        "Prompt should remain open after a single click. Screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Reloaded with"),
+        "Reload must not be triggered by the click. Screen:\n{screen}"
+    );
+    // Cancel the prompt so the status bar reverts to showing the buffer
+    // cursor position, then confirm the click did not move it.
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Ln 4, Col 3");
+
+    // Re-open the prompt: keyboard Enter on the (now first) selected
+    // suggestion still commits the reload.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Reload with").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    let (col, row) = harness
+        .find_text_on_screen("Latin-1")
+        .expect("Latin-1 suggestion should be visible in the encoding list");
+    harness.mouse_click(col, row).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Reloaded with");
+}
+
+/// Regression for #1660: a click on the popup chrome (border row above the
+/// items) must not fall through to the buffer underneath and move the cursor.
+#[test]
+fn test_reload_with_encoding_click_on_popup_border_keeps_cursor() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 30).unwrap();
+    let file_path = harness
+        .project_dir()
+        .unwrap()
+        .join("test_reload_border.txt");
+    std::fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n").unwrap();
+
+    open_reload_with_encoding_prompt_at_ln4_col3(&mut harness, &file_path);
+
+    // Click on the popup's top border row (the row directly above the first
+    // suggestion). This row is part of the popup chrome — clicks here must be
+    // absorbed, not forwarded to the buffer below.
+    let (_, top_row) = harness
+        .find_text_on_screen("UTF-8 (UTF-8)")
+        .expect("UTF-8 suggestion should be visible in the encoding list");
+    let border_row = top_row.saturating_sub(1);
+    harness.mouse_click(10, border_row).unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Reload with encoding:"),
+        "Prompt should still be open after clicking the popup border. Screen:\n{screen}"
+    );
+
+    // Cancel the prompt to surface the buffer cursor in the status bar,
+    // then verify the border-click did not move it.
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Ln 4, Col 3");
+}
+
+/// Regression for #1660: double-clicking a suggestion in a preview-on-click
+/// prompt commits the choice (mouse-only confirm path).
+#[test]
+fn test_reload_with_encoding_double_click_confirms() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 30).unwrap();
+    let file_path = harness.project_dir().unwrap().join("test_reload_dbl.txt");
+    std::fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n").unwrap();
+
+    open_reload_with_encoding_prompt_at_ln4_col3(&mut harness, &file_path);
+
+    let (col, row) = harness
+        .find_text_on_screen("Latin-1")
+        .expect("Latin-1 suggestion should be visible in the encoding list");
+    double_click_at(&mut harness, col, row);
+
+    // Double-click must trigger the reload, just like Enter would.
+    harness.assert_screen_contains("Reloaded with Latin-1");
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Reload with encoding:"),
+        "Prompt should be closed after double-click confirm. Screen:\n{screen}"
+    );
+}
+
+/// Regression for #1660: a mouse click on a near-bottom suggestion must not
+/// scroll the list. If the list shifted under the cursor, the second click
+/// of a double-click would land on a different item from the first.
+#[test]
+fn test_reload_with_encoding_click_does_not_scroll_list() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 30).unwrap();
+    let file_path = harness
+        .project_dir()
+        .unwrap()
+        .join("test_reload_noscroll.txt");
+    std::fs::write(&file_path, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n").unwrap();
+
+    open_reload_with_encoding_prompt_at_ln4_col3(&mut harness, &file_path);
+
+    // Pick an item near the bottom of the visible 10-row viewport. The old
+    // centering renderer would push such an item upward when it became the
+    // selection, causing the popup to scroll under the cursor.
+    let (col, row_before) = harness
+        .find_text_on_screen("GB18030")
+        .expect("GB18030 suggestion should be visible");
+
+    harness.mouse_click(col, row_before).unwrap();
+    harness.render().unwrap();
+
+    // GB18030 must still be on the same screen row after the click — i.e.
+    // the popup did not scroll under the cursor.
+    let (_, row_after) = harness
+        .find_text_on_screen("GB18030")
+        .expect("GB18030 should still be visible after click");
+    assert_eq!(
+        row_after, row_before,
+        "Clicking a suggestion must not scroll the list. GB18030 moved from row {row_before} to row {row_after}"
+    );
+}
+
 /// Regression: "Hello   é" in Latin-1 was misdetected as UTF-8 because the
 /// trailing 0xE9 byte was treated as a truncated multi-byte sequence.
 /// See proptest seed cc 4ada1874c158006a95ed15263e1dcc5aff614bd1938e47260bb970b166bcf1c4
@@ -2248,4 +2628,55 @@ fn test_latin1_trailing_accent_not_misdetected_as_utf8() {
         "Latin-1 'é' should be preserved in buffer. Buffer: {:?}",
         buffer_content
     );
+}
+
+/// Regression test for #1635: UTF-8 CJK files whose size exceeds the 8 KB
+/// encoding-detection sample must not be mis-decoded as a legacy encoding
+/// when a multi-byte sequence straddles the 8192-byte boundary.
+#[test]
+fn test_utf8_cjk_file_larger_than_8kb_displays_correctly() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("cjk_over_8kb.txt");
+
+    // Build a valid UTF-8 file whose first non-ASCII multi-byte character
+    // straddles the detector's internal 8 KB sampling boundary. Pad with
+    // ASCII 'a' until we've written exactly 8191 bytes, then emit CJK
+    // content — the second and third bytes of the first CJK codepoint
+    // sit at file offsets 8192 and 8193.
+    let mut content = Vec::with_capacity(16 * 1024);
+    content.resize(8 * 1024 - 1, b'a');
+    let cjk = "项目设置 的 CJK 内容 项目设置";
+    content.extend_from_slice(cjk.as_bytes());
+    content.push(b'\n');
+
+    assert!(content.len() > 8 * 1024);
+    assert!(std::str::from_utf8(&content).is_ok());
+    std::fs::write(&file_path, &content).unwrap();
+
+    let mut harness = EditorTestHarness::new(120, 30).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    // If detection misfires and picks a legacy encoding, the buffer will
+    // contain mojibake instead of the original CJK characters.
+    let buffer_content = harness.get_buffer_content().unwrap();
+    for ch in ['项', '目', '设', '置'] {
+        assert!(
+            buffer_content.contains(ch),
+            "CJK character {:?} should survive load. Buffer preview: {:?}",
+            ch,
+            &buffer_content[..buffer_content.len().min(200)]
+        );
+    }
+
+    // Status bar should not advertise a legacy encoding for this UTF-8 file.
+    let screen = harness.screen_to_string();
+    for legacy in ["Windows-1252", "Windows-1250", "Windows-1251"] {
+        assert!(
+            !screen.contains(legacy),
+            "UTF-8 CJK file must not be detected as {}. Screen: {:?}",
+            legacy,
+            screen
+        );
+    }
 }

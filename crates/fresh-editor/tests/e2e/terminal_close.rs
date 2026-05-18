@@ -102,7 +102,10 @@ fn test_close_terminal_as_only_tab_in_split() {
     // 2. Active buffer should NOT be a terminal
     let active_buffer = harness.editor().active_buffer_id();
     assert!(
-        !harness.editor().is_terminal_buffer(active_buffer),
+        !harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(active_buffer),
         "Active buffer should NOT be a terminal after close"
     );
 
@@ -176,7 +179,10 @@ fn test_close_buffer_in_one_split_leaves_other_split() {
 
     // The terminal buffer should still exist in the editor
     assert!(
-        harness.editor().is_terminal_buffer(terminal_buffer),
+        harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(terminal_buffer),
         "Terminal buffer should still exist after closing tab in one split"
     );
 }
@@ -213,6 +219,7 @@ fn test_closing_other_buffer_resumes_terminal_correctly() {
     // Type a command with a unique marker
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo UNIQUEMARKER_ABC_123\n");
 
     // Wait for the output to appear
@@ -275,6 +282,7 @@ fn test_closing_other_buffer_resumes_terminal_correctly() {
     // Type a second command to verify terminal is fully working
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo SECONDMARKER_XYZ_789\n");
 
     // Wait for the second output
@@ -333,7 +341,10 @@ fn test_closed_terminal_not_restored_from_session() {
 
         let terminal_buffer = harness.editor().active_buffer_id();
         assert!(
-            harness.editor().is_terminal_buffer(terminal_buffer),
+            harness
+                .editor()
+                .active_window()
+                .is_terminal_buffer(terminal_buffer),
             "Should be on terminal buffer"
         );
 
@@ -348,7 +359,10 @@ fn test_closed_terminal_not_restored_from_session() {
         harness.assert_screen_contains("test.txt");
         let active_after_close = harness.editor().active_buffer_id();
         assert!(
-            !harness.editor().is_terminal_buffer(active_after_close),
+            !harness
+                .editor()
+                .active_window()
+                .is_terminal_buffer(active_after_close),
             "Should NOT be on terminal buffer after closing it"
         );
 
@@ -385,7 +399,10 @@ fn test_closed_terminal_not_restored_from_session() {
         // NOT the old closed terminal
         let active_buffer = harness.editor().active_buffer_id();
         assert!(
-            !harness.editor().is_terminal_buffer(active_buffer),
+            !harness
+                .editor()
+                .active_window()
+                .is_terminal_buffer(active_buffer),
             "BUG: Closed terminal should NOT become focused after closing file. \
              A closed terminal from a previous session was incorrectly restored."
         );

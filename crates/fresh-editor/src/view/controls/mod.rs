@@ -20,6 +20,7 @@
 
 pub mod button;
 pub mod dropdown;
+pub mod dual_list;
 pub mod keybinding_list;
 pub mod map_input;
 pub mod number_input;
@@ -33,6 +34,10 @@ pub use button::{
 pub use dropdown::{
     render_dropdown, render_dropdown_aligned, DropdownColors, DropdownEvent, DropdownLayout,
     DropdownState,
+};
+pub use dual_list::{
+    render_dual_list_partial, DualListColors, DualListColumn, DualListHit, DualListLayout,
+    DualListState,
 };
 pub use keybinding_list::{
     render_keybinding_list, KeybindingListColors, KeybindingListEvent, KeybindingListLayout,

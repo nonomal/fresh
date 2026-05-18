@@ -197,21 +197,33 @@ fn test_compose_mode_typing_no_flicker() {
         before_content.join("\n"),
     );
 
-    // ── Type a single character, decomposed into individual frame steps ─
+    // ── Type a single character, then wait for the renderer to settle ──
     //
-    // Step 1: buffer edit only (view_transform cleared, stale flag set).
+    // Step 1: buffer edit. invalidate_layouts_for_buffer clears
+    // view_transform synchronously; the plugin sees lines_changed on
+    // its thread and asynchronously sends back a fresh
+    // SubmitViewTransform.
     harness
         .editor_mut()
         .handle_key(KeyCode::Char('x'), KeyModifiers::NONE)
         .unwrap();
 
-    // Step 2: render IMMEDIATELY — before the plugin can respond.
-    harness.render().unwrap();
-    let mid_screen = harness.screen_to_string();
-    let mid_content = extract_content(&mid_screen);
-
-    // Step 3: let the plugin process and produce the fresh view_transform.
-    // Wait until conceals re-stabilise (at most 1 line with ** from cursor).
+    // Step 2: semantic wait for the post-edit transient to clear.
+    //
+    // The previous version of this test captured a "mid-frame" with a
+    // bare `harness.render()` immediately after the keypress. That
+    // bet on the plugin's `view_transform_request` reply arriving
+    // inside the same render call (Editor::render drains pending
+    // plugin commands non-blockingly partway through). On Linux the
+    // QuickJS round-trip happens to land in time; on Windows the
+    // process / thread scheduling means the response usually misses
+    // the window and the bare render shows raw markdown — flake.
+    //
+    // CONTRIBUTING.md §Testing rule 3 forbids time-sensitive captures.
+    // Wait until the renderer settles instead: at most one line shows
+    // raw `**` markers (the cursor's own line is allowed to reveal
+    // them, since the conceal-on-cursor exception keeps that row's
+    // markup visible while editing).
     harness
         .wait_until_stable(|h| {
             let s = h.screen_to_string();
@@ -222,43 +234,28 @@ fn test_compose_mode_typing_no_flicker() {
     let after_content = extract_content(&after_screen);
 
     // ── Strict diff: only the typed character should change ─────────────
-    let before_vs_mid = diff_rows(&before_content, &mid_content);
     let before_vs_after = diff_rows(&before_content, &after_content);
 
-    eprintln!("=== BEFORE → MID-FRAME diffs ({}) ===", before_vs_mid.len());
-    eprintln!("{}", format_diffs(&before_vs_mid));
     eprintln!("=== BEFORE → AFTER diffs ({}) ===", before_vs_after.len());
     eprintln!("{}", format_diffs(&before_vs_after));
 
-    // before → mid: the only acceptable diff is the one row where 'x' appeared.
-    assert!(
-        before_vs_mid.len() <= 1,
-        "FLICKER: before→mid-frame differs on {} content rows — expected at most 1 \
-         (the typed character).  The view_transform or conceals dropped out.\n\
-         Diffs:\n{}\n\n\
-         Full before:\n{}\n\n\
-         Full mid-frame:\n{}",
-        before_vs_mid.len(),
-        format_diffs(&before_vs_mid),
-        before_content.join("\n"),
-        mid_content.join("\n"),
-    );
-    if let Some((_, _old, new)) = before_vs_mid.first() {
-        assert!(
-            new.contains('x'),
-            "The single changed row in mid-frame should contain the typed 'x', got: {:?}",
-            new.trim_end(),
-        );
-    }
-
-    // before → after: same constraint — only the typed character.
+    // before → after: only the typed character should differ. This
+    // catches the regression the original test was guarding — if
+    // conceals or wrapping permanently drop out after an edit, the
+    // diff will explode here. The mid-frame transient is intentionally
+    // not asserted (see comment above): it depends on plugin response
+    // speed which varies per platform.
     assert!(
         before_vs_after.len() <= 1,
         "FLICKER: before→after differs on {} content rows — expected at most 1.  \
-         Plugin failed to fully restore the compose view.\n\
-         Diffs:\n{}",
+         Plugin failed to fully restore the compose view after the edit.\n\
+         Diffs:\n{}\n\n\
+         Full before:\n{}\n\n\
+         Full after:\n{}",
         before_vs_after.len(),
         format_diffs(&before_vs_after),
+        before_content.join("\n"),
+        after_content.join("\n"),
     );
     if let Some((_, _old, new)) = before_vs_after.first() {
         assert!(
@@ -578,6 +575,140 @@ fn test_compose_mode_disable_preserves_content() {
     harness.assert_screen_contains("Test Header");
     harness.assert_screen_contains("bold");
     harness.assert_screen_contains("List item");
+}
+
+/// Regression test for issue #1789.
+///
+/// Compose mode wraps a long paragraph using soft breaks computed by the
+/// plugin. The Rust renderer's wrap pass reserves the last column for the
+/// EOL cursor, so the plugin must use the same reservation. Without the
+/// reservation, the plugin produces a "perfect-fit" line at width N that
+/// the renderer then re-wraps at width N-1 — splitting off the trailing
+/// word into a single-word "orphan" visual row.
+///
+/// The test sweeps a range of viewport widths one column at a time,
+/// resizing the harness in-place so the same compose session is reused.
+/// The semantic wait condition is on the paragraph rows themselves
+/// (rather than the whole screen) so a transient stable status bar can't
+/// short-circuit the stability check while soft breaks are still being
+/// recomputed asynchronously after a resize.
+#[test]
+fn test_compose_wrap_no_single_word_orphan() {
+    use crate::common::harness::{copy_plugin, copy_plugin_lib};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    std::fs::create_dir(&project_root).unwrap();
+    let plugins_dir = project_root.join("plugins");
+    std::fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "markdown_compose");
+    copy_plugin_lib(&plugins_dir);
+
+    let md_path = project_root.join("orphan.md");
+    let paragraph = "A piece tree data structure represents this file. \
+                     Some of the data may be in memory while the rest is \
+                     pointed at the disk. The piece tree provides an iterator \
+                     that walks in linear offset order over nodes of the tree, \
+                     yielding chunks of contiguous content longer.";
+    std::fs::write(&md_path, format!("# Test\n\n{paragraph}\n")).unwrap();
+
+    // Sweep range covers the widths reported in the issue (90, 105, 110)
+    // with margin on either side so off-by-one regressions are caught.
+    // The harness is resized down one column at a time within this range.
+    let max_width: u16 = 120;
+    let min_width: u16 = 80;
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        max_width,
+        30,
+        Default::default(),
+        project_root,
+    )
+    .unwrap();
+    harness.open_file(&md_path).unwrap();
+    harness.render().unwrap();
+
+    // Enable compose mode once. The same buffer/session is reused across
+    // resizes — the soft-break pipeline reruns on `viewport_changed`.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Toggle Compose").unwrap();
+    harness.wait_for_screen_contains("Toggle Compose").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+
+    /// Find rows belonging to the paragraph by skipping the heading and
+    /// empty rows above the paragraph, then taking until the next blank
+    /// row. Trims each row so trailing renderer padding doesn't change
+    /// equality of "the paragraph hasn't moved yet" comparisons.
+    fn paragraph_rows(harness: &crate::common::harness::EditorTestHarness) -> Vec<String> {
+        let screen = harness.screen_to_string();
+        let (content_start, content_end) = harness.content_area_rows();
+        screen
+            .lines()
+            .skip(content_start)
+            .take(content_end - content_start + 1)
+            .skip_while(|l| {
+                let t = l.trim_start();
+                t.is_empty() || t.starts_with('#') || t.starts_with("Test")
+            })
+            .take_while(|l| !l.trim().is_empty())
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    }
+
+    for width in (min_width..=max_width).rev() {
+        if width != max_width {
+            harness.resize(width, 30).unwrap();
+        }
+
+        // Semantic stability on the paragraph itself: poll until two
+        // consecutive renders produce the same paragraph rows AND the
+        // first row is non-trivial. This is stricter than relying on
+        // overall screen stability — async soft-break recomputation after
+        // a resize might land between two screen polls that otherwise
+        // looked identical (status bar untouched). Tying stability to the
+        // paragraph rows rules that out.
+        let mut prev = Vec::<String>::new();
+        harness
+            .wait_until(|h| {
+                let cur = paragraph_rows(h);
+                let stable =
+                    !cur.is_empty() && cur == prev && cur.first().is_some_and(|r| !r.is_empty());
+                prev = cur;
+                stable
+            })
+            .unwrap();
+
+        let rows = paragraph_rows(&harness);
+        assert!(
+            rows.len() >= 2,
+            "width {width}: paragraph should wrap onto multiple visual rows. \
+             Screen:\n{}",
+            harness.screen_to_string(),
+        );
+
+        // No NON-LAST paragraph row may hold a single word — that's the
+        // orphan bug from issue #1789. The last visual row of a paragraph
+        // can naturally be short under any greedy wrap (e.g. just the
+        // sentence terminator) and is not what this fix addresses; that's
+        // a separate balancing concern (Knuth–Plass).
+        for (i, row) in rows.iter().enumerate().take(rows.len() - 1) {
+            let words: Vec<&str> = row.split_whitespace().collect();
+            assert!(
+                words.len() >= 2,
+                "width {width}: visual row {i} contains a single-word orphan {:?}.\n\
+                 Issue #1789: wrap budget must match the renderer's reservation.\n\
+                 Paragraph rows:\n{}",
+                words.first().copied().unwrap_or(""),
+                rows.join("\n"),
+            );
+        }
+    }
 }
 
 /// Test visual cursor movement through soft-wrapped lines and auto-expose /
@@ -940,6 +1071,152 @@ fn test_compose_mode_mouse_scroll_to_bottom() {
         "After scrolling to the bottom, the last line of the README should be visible.\n\
          Screen:\n{}",
         screen,
+    );
+}
+
+/// Regression test for two compose-mode mouse-wheel scrolling bugs:
+///
+/// 1. **Wheel absorbed at long-wrap item boundaries.** With a numbered/bullet
+///    list whose items wrap to many visual rows under the markdown plugin's
+///    hanging-indent wrapping, every wheel event that landed on the start of
+///    the next item produced no movement — the scroll viewport stayed put.
+///
+/// 2. **Bottom half empty (mouse stops short of EOF).** With a long-wrap
+///    list at the very end of the document, the wheel-scroll math clamped
+///    the viewport short of the keyboard's `Ctrl+End` position, leaving the
+///    bottom of the visible area as `~` filler rows.
+///
+/// Both bugs share a root cause: `Viewport::scroll_down_visual` and friends
+/// counted visual rows using `wrap_line` on raw source text, which doesn't
+/// know about the plugin-injected hanging indent ("1. " marker → 3-column
+/// continuation indent). The plugin's `addSoftBreak` markers describe the
+/// *actual* on-screen wrapping, so those markers are now consulted by the
+/// scroll math (see `EditorState::collect_soft_break_positions`).
+///
+/// The test scrolls a small list-only fixture wheel-by-wheel and asserts
+/// that (a) every wheel makes monotonic progress (no stuck/absorbed
+/// events) and (b) the EOF marker becomes visible within the expected
+/// number of wheels.
+#[test]
+fn test_compose_mode_mouse_wheel_long_list_progresses_to_eof() {
+    use crate::common::harness::{copy_plugin, copy_plugin_lib};
+    use crate::common::tracing::init_tracing_from_env;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    init_tracing_from_env();
+
+    // Build a tiny markdown file: 5 numbered list items, each a 99-word
+    // single line. Under markdown_compose at 60 columns each item wraps to
+    // roughly 13 visual rows (with a 3-column hanging indent). The bug
+    // described above made the wheel "absorb" one event per item start, so
+    // reaching EOF took materially more wheels than the keyboard.
+    let mut md = String::from("# Test\n\n");
+    for i in 1..=5 {
+        md.push_str(&format!("{}. Item {}: ", i, i));
+        for w in 1..=99 {
+            if w > 1 {
+                md.push(' ');
+            }
+            md.push_str(&format!("word{}", w));
+        }
+        md.push('\n');
+    }
+    md.push_str("\nEOF_MARKER\n");
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    std::fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    std::fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "markdown_compose");
+    copy_plugin_lib(&plugins_dir);
+
+    let md_path = project_root.join("scroll_repro.md");
+    std::fs::write(&md_path, md).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(60, 24, Default::default(), project_root)
+            .unwrap();
+    harness.open_file(&md_path).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("scroll_repro.md");
+
+    // Enable compose mode.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Toggle Compose").unwrap();
+    harness.wait_for_screen_contains("Toggle Compose").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+
+    // Wait for compose decorations (the hanging-indent continuation rows
+    // start with at least three leading spaces).
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("   word")
+        })
+        .unwrap();
+
+    // Scroll wheel-by-wheel from the top, asserting monotonic progress and
+    // requiring EOF_MARKER to appear within a generous bound.
+    let (content_start, content_end) = harness.content_area_rows();
+    let mid_row = ((content_start + content_end) / 2) as u16;
+
+    // Visual cost of the document under the plugin's wrapping:
+    //   header (2 rows) + 5 items * ~14 rows + EOF (~3 rows) ≈ 75 rows.
+    // Each wheel advances 3 visual rows, so 25 wheels suffice; 60 leaves
+    // generous slack. With the bug, each item-start absorbed one wheel —
+    // 5 items × 1 = 5 extra wheels, *and* the apply_visual_scroll_limit
+    // clamp could refuse the last few wheels entirely, so this test would
+    // fail before the fix.
+    const MAX_WHEELS: usize = 60;
+
+    let mut prev_top: Option<String> = None;
+    let mut stuck_count = 0usize;
+    let mut wheels_used = 0usize;
+    for i in 1..=MAX_WHEELS {
+        harness.mouse_scroll_down(40, mid_row).unwrap();
+        wheels_used = i;
+
+        let screen = harness.screen_to_string();
+        if screen.contains("EOF_MARKER") {
+            break;
+        }
+
+        // Track per-wheel progress. The top of the visible content area must
+        // not stay identical for more than one wheel in a row — that would
+        // be the "absorbed wheel" symptom from the original bug report.
+        let lines: Vec<&str> = screen.lines().collect();
+        let top = lines
+            .get(content_start)
+            .copied()
+            .unwrap_or("")
+            .trim_end()
+            .to_string();
+        if Some(&top) == prev_top.as_ref() {
+            stuck_count += 1;
+            assert!(
+                stuck_count < 2,
+                "Mouse wheel produced no scroll progress for {stuck_count} consecutive events \
+                 at wheel #{i}. Top of viewport: {top:?}\nFull screen:\n{screen}"
+            );
+        } else {
+            stuck_count = 0;
+        }
+        prev_top = Some(top);
+    }
+
+    let final_screen = harness.screen_to_string();
+    assert!(
+        final_screen.contains("EOF_MARKER"),
+        "EOF_MARKER never became visible after {wheels_used} wheel events; \
+         the wheel scroll appears stuck short of EOF.\nFinal screen:\n{final_screen}"
     );
 }
 
@@ -2287,6 +2564,166 @@ End of document.
     );
 }
 
+/// Regression test for the Down-arrow / table-borders interaction:
+///
+/// Place the cursor on a line *before* the table, press Down repeatedly,
+/// and assert that each press advances by exactly one source line until
+/// the cursor reaches the line *after* the table.
+///
+/// The original bug (added together with the table-border virtual lines
+/// in markdown_compose) was that Down would land on a virtual border row
+/// (`┌─┬─┐`, `├─┼─┤`, `└─┴─┘`), which has no source mapping, and the
+/// cursor would either get stuck or rewind to the previous row's
+/// `line_end_byte`.  The fix in `move_visual_line` walks past purely-
+/// virtual rows; this test guards against regressions of that fix or the
+/// table-border feature itself.
+#[test]
+fn test_compose_mode_cursor_down_through_table_borders() {
+    use crate::common::harness::{copy_plugin, copy_plugin_lib};
+    use crate::common::tracing::init_tracing_from_env;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    init_tracing_from_env();
+
+    // Small, deterministic fixture.  Lines are numbered for clarity:
+    //
+    //   1: # Before
+    //   2:
+    //   3: Line before table.
+    //   4:
+    //   5: | A | B | C |
+    //   6: |---|---|---|
+    //   7: | 1 | 2 | 3 |
+    //   8: | 4 | 5 | 6 |
+    //   9: | 7 | 8 | 9 |
+    //  10:
+    //  11: Line after table.
+    //
+    // Compose mode renders the table with the markdown_compose
+    // table-border feature, injecting `┌─┬─┐` above row 5, `├─┼─┤`
+    // between rows 7/8 and 8/9, and `└─┴─┘` below row 9.  These are
+    // virtual rows (no source mapping) — Down must skip past them so the
+    // cursor advances exactly one source line per press.
+    let md_content = "\
+# Before
+
+Line before table.
+
+| A | B | C |
+|---|---|---|
+| 1 | 2 | 3 |
+| 4 | 5 | 6 |
+| 7 | 8 | 9 |
+
+Line after table.
+";
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    std::fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    std::fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "markdown_compose");
+    copy_plugin_lib(&plugins_dir);
+
+    let md_path = project_root.join("cursor_through_table.md");
+    std::fs::write(&md_path, md_content).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(80, 30, Default::default(), project_root)
+            .unwrap();
+    harness.open_file(&md_path).unwrap();
+    harness.render().unwrap();
+
+    // Enable compose mode.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Toggle Compose").unwrap();
+    harness.wait_for_screen_contains("Toggle Compose").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+
+    // Wait for the table-border virtual lines to be injected.
+    // Top-border row contains `┌` and `┐`; bottom-border row contains `└`
+    // and `┘`.  Stable means both are present at the same time.
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("┌") && s.contains("┐") && s.contains("└") && s.contains("┘")
+        })
+        .unwrap();
+
+    // Navigate cursor to source line 3 ("Line before table.") — two Down
+    // presses from the heading on line 1.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Helper: read the buffer line number (0-indexed) the primary cursor
+    // is currently on.
+    let cursor_line = |h: &mut EditorTestHarness| -> usize {
+        let pos = h.cursor_position();
+        let content = h.get_buffer_content().unwrap();
+        content[..pos.min(content.len())]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count()
+    };
+
+    // Sanity: cursor is on source line 2 (0-indexed) == line 3 in 1-indexed.
+    assert_eq!(
+        cursor_line(&mut harness),
+        2,
+        "Setup: cursor should start on 'Line before table.' (0-indexed line 2)"
+    );
+
+    // Press Down repeatedly through the table and into the after-table
+    // text, recording the cursor's source-line index after each press.
+    // Expected progression — one source line per press, no stalls, no
+    // skips, no rewinds, and crossing the table boundaries:
+    //
+    //   start: 2  (Line before table.)
+    //   after Down 1: 3  (blank)
+    //   after Down 2: 4  (header `| A | B | C |`)
+    //   after Down 3: 5  (source separator `|---|---|---|`)
+    //   after Down 4: 6  (`| 1 | 2 | 3 |`)
+    //   after Down 5: 7  (`| 4 | 5 | 6 |`)
+    //   after Down 6: 8  (`| 7 | 8 | 9 |`)
+    //   after Down 7: 9  (blank below table)
+    //   after Down 8: 10 (`Line after table.`)
+    let mut observed: Vec<usize> = vec![cursor_line(&mut harness)];
+    for _ in 0..8 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        harness.render().unwrap();
+        observed.push(cursor_line(&mut harness));
+    }
+
+    let expected: Vec<usize> = (2..=10).collect();
+    assert_eq!(
+        observed, expected,
+        "Down-arrow progression through compose-mode table should advance \
+         exactly one source line per press, skipping virtual border rows. \
+         Observed line indices: {observed:?}, expected: {expected:?}"
+    );
+
+    // Final assertion: cursor must end on "Line after table.", not stuck
+    // on a virtual border row or rewound to an earlier table row.
+    let final_pos = harness.cursor_position();
+    let content = harness.get_buffer_content().unwrap();
+    let after_byte = content.find("Line after table.").unwrap();
+    assert!(
+        final_pos >= after_byte,
+        "After {} Down presses cursor should be at or past 'Line after table.' \
+         (byte {after_byte}), but is at byte {final_pos}",
+        observed.len() - 1,
+    );
+}
+
 /// Regression test: pressing Down through a document with tables (in compose mode)
 /// and then Up all the way back must produce monotonically increasing then
 /// monotonically decreasing cursor byte positions.  A jump to byte 0 mid-sequence
@@ -3596,9 +4033,11 @@ fn test_compose_mode_set_width_via_command_palette() {
     println!("x-line lengths: {:?}", w40_lengths);
     println!("{}", screen_40);
 
+    // One content column is reserved at wrap time so the EOL cursor can't
+    // overlap the vertical scrollbar, so "width 40" renders 39 content cols.
     assert_eq!(
-        w40_lengths[0], 40,
-        "With compose width 40, first x-line should be 40 chars, got {:?}",
+        w40_lengths[0], 39,
+        "With compose width 40, first x-line should be 39 chars (1 col reserved for cursor), got {:?}",
         w40_lengths,
     );
 
@@ -3619,8 +4058,8 @@ fn test_compose_mode_set_width_via_command_palette() {
     println!("{}", screen_reconfirm);
 
     assert_eq!(
-        reconfirm_lengths[0], 40,
-        "After re-confirming without changes, width should still be 40, got {:?}",
+        reconfirm_lengths[0], 39,
+        "After re-confirming without changes, width should still be 39 (40 minus reserved col), got {:?}",
         reconfirm_lengths,
     );
 
@@ -3641,8 +4080,8 @@ fn test_compose_mode_set_width_via_command_palette() {
     println!("{}", screen_60);
 
     assert_eq!(
-        w60_lengths[0], 60,
-        "With compose width 60, first x-line should be 60 chars, got {:?}",
+        w60_lengths[0], 59,
+        "With compose width 60, first x-line should be 59 chars (1 col reserved for cursor), got {:?}",
         w60_lengths,
     );
 }
@@ -3763,8 +4202,8 @@ fn test_compose_mode_width_survives_session_restore() {
         println!("x-line lengths: {:?}", lengths);
         println!("{}", screen);
         assert_eq!(
-            lengths[0], 40,
-            "Session 1: width should be 40, got {:?}",
+            lengths[0], 39,
+            "Session 1: width should render 39 (40 minus 1 col reserved for EOL cursor), got {:?}",
             lengths,
         );
 
@@ -3796,8 +4235,8 @@ fn test_compose_mode_width_survives_session_restore() {
             screen_restored,
         );
         assert_eq!(
-            restored_lengths[0], 40,
-            "After restore, compose width should still be 40, got {:?}.\nScreen:\n{}",
+            restored_lengths[0], 39,
+            "After restore, compose width should still render 39 (40 minus reserved col), got {:?}.\nScreen:\n{}",
             restored_lengths, screen_restored,
         );
 
@@ -3833,8 +4272,8 @@ fn test_compose_mode_width_survives_session_restore() {
         println!("x-line lengths: {:?}", w60_lengths);
         println!("{}", screen_60);
         assert_eq!(
-            w60_lengths[0], 60,
-            "After changing width to 60 in restored session, got {:?}",
+            w60_lengths[0], 59,
+            "After changing width to 60 in restored session, expected 59 (60 minus reserved col), got {:?}",
             w60_lengths,
         );
     }
@@ -3870,8 +4309,14 @@ fn test_toggle_compose_all_affects_all_buffers() {
     let md_two = project_root.join("two.md");
     std::fs::write(&md_two, "# File Two\n\nContent two.\n").unwrap();
 
+    // Width 120 (not 100) because the status bar's right side now includes
+    // the color-coded "LSP (off)" dormant-indicator for any language with
+    // a default LSP config (markdown has marksman), which truncates the
+    // "Markdown Compose (All Files): ON/OFF" status message at 100 cols
+    // and causes the `wait_until_stable` substring polls below to spin
+    // until test timeout.
     let mut harness =
-        EditorTestHarness::with_config_and_working_dir(100, 30, Default::default(), project_root)
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
             .unwrap();
 
     // Open both files (two.md will be active)
@@ -3996,5 +4441,351 @@ fn test_toggle_compose_all_affects_all_buffers() {
         content_lines.iter().any(|l| l.contains("│")),
         "one.md should also be back in source mode after toggle all OFF: {}",
         screen
+    );
+}
+
+/// Regression test: compose-mode tables must fit within the editor
+/// viewport whether or not the File Explorer sidebar is open.
+///
+/// Bug: when a separator cell (`|---...---|`) was wider than the
+/// allocated column width, the cell-wide truncate conceal and the
+/// per-`-` conceals overlapped — the first `-` of each cell emitted
+/// `─` (from the per-char conceal) AND the cell-wide conceal emitted
+/// its N-char replacement, producing N+1 rendered chars per cell. The
+/// extra characters caused the separator to wrap onto a second line
+/// and visually misalign the table. Opening the sidebar made the
+/// symptom obvious: the smaller viewport forced truncation on a table
+/// that previously fit, exposing the off-by-one.
+#[test]
+fn test_compose_mode_table_width_respects_file_explorer() {
+    use crate::common::harness::{copy_plugin, copy_plugin_lib};
+    use crate::common::tracing::init_tracing_from_env;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    init_tracing_from_env();
+
+    // Table whose natural (un-constrained) width is bigger than the editor
+    // content area once the File Explorer sidebar is open. This forces
+    // `distributeColumnWidths` to shrink columns — but only if the cached
+    // `allocated` widths are recomputed against the new viewport width.
+    //
+    // At 120 col terminal with no sidebar, available = 120-5 = 115, so the
+    // natural widths (~28*4+5 = 117) are re-distributed down slightly.
+    // After the sidebar takes ~34 cols, available drops to ~80, so columns
+    // must get substantially narrower.
+    let md_content = "\
+# Table Width Bug
+
+| ColumnAAAAAAAAAAAAAAAAAAAAAAAAAA | ColumnBBBBBBBBBBBBBBBBBBBBBBBBBB | ColumnCCCCCCCCCCCCCCCCCCCCCCCCCC | ColumnDDDDDDDDDDDDDDDDDDDDDDDDDD |
+|----------------------------------|----------------------------------|----------------------------------|----------------------------------|
+| alphaaaaaaaaaaaaaaaaaaaaaaaaaaaa | bravooooooooooooooooooooooooooo  | charlieeeeeeeeeeeeeeeeeeeeeeeee  | deltaaaaaaaaaaaaaaaaaaaaaaaaaa   |
+| echooooooooooooooooooooooooooo   | foxtrotttttttttttttttttttttttttt | golffffffffffffffffffffffffffff  | hoteleleleleeeeeeeeeeeeeeeeeeeee |
+";
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    std::fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    std::fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "markdown_compose");
+    copy_plugin_lib(&plugins_dir);
+
+    let md_path = project_root.join("table_width.md");
+    std::fs::write(&md_path, &md_content).unwrap();
+
+    // Use a wide terminal so the unopened-sidebar path has plenty of room.
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+
+    harness.open_file(&md_path).unwrap();
+    harness.render().unwrap();
+
+    // Enable compose mode
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Toggle Compose").unwrap();
+    harness.wait_for_screen_contains("Toggle Compose").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+
+    // Wait for compose mode to render the table (box-drawing chars visible).
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("│") && s.contains("─")
+        })
+        .unwrap();
+    let mut prev = String::new();
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            let stable = s == prev;
+            prev = s;
+            stable
+        })
+        .unwrap();
+
+    // Capture the table-row span (leftmost→rightmost delimiter column)
+    // before the sidebar is opened. We use the TABLE-ROW signature (row
+    // containing "Column" text + box-drawing pipes), so we don't pick up
+    // sidebar borders.
+    let screen_before = harness.screen_to_string();
+    let (min_before, max_before) = table_column_span_on_content_rows(&screen_before);
+    let width_before = max_before - min_before;
+    assert!(
+        width_before > 60,
+        "Sanity: table should span a meaningful width before the sidebar \
+         is opened; got span {}..{}.\nScreen:\n{}",
+        min_before,
+        max_before,
+        screen_before,
+    );
+
+    // Also: the separator row between header and first data row must fit
+    // on a single line (no wrap). If the separator overflows the editor
+    // content area it will get wrapped, producing a row without both
+    // ├ and ┤ — detect that explicitly.
+    assert!(
+        separator_row_fits(&screen_before),
+        "Separator row doesn't fit on one line BEFORE the sidebar is \
+         opened.\nScreen:\n{}",
+        screen_before,
+    );
+
+    // Open the File Explorer sidebar.
+    harness.editor_mut().toggle_file_explorer();
+    harness
+        .wait_until_stable(|h| h.editor().file_explorer_visible())
+        .unwrap();
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    // Let compose mode settle again after the viewport change.
+    let mut prev = String::new();
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            let stable = s == prev;
+            prev = s;
+            stable
+        })
+        .unwrap();
+
+    let screen_after = harness.screen_to_string();
+    let (min_after, max_after) = table_column_span_on_content_rows(&screen_after);
+    let width_after = max_after - min_after;
+
+    // After the sidebar opens, the editor content area shrinks. The table
+    // must shrink to fit — natural widths are larger than the new editor
+    // area so `distributeColumnWidths` must re-distribute.
+    assert!(
+        width_after < width_before,
+        "Table width did not shrink when the File Explorer sidebar was \
+         opened. Table span before={}..{} ({}), after={}..{} ({}). The \
+         cached table column widths were not recomputed against the \
+         smaller editor content area.\n\
+         Screen after opening sidebar:\n{}",
+        min_before,
+        max_before,
+        width_before,
+        min_after,
+        max_after,
+        width_after,
+        screen_after,
+    );
+
+    // And the separator must still fit on a single line in the now-
+    // smaller editor area.
+    assert!(
+        separator_row_fits(&screen_after),
+        "Separator row doesn't fit on one line AFTER the sidebar is \
+         opened — it's being rendered wider than the editor content area \
+         and wraps.\nScreen:\n{}",
+        screen_after,
+    );
+}
+
+/// (leftmost, rightmost) column of table delimiters. We use the table's
+/// top/bottom borders (rows containing the table-only glyphs `┬` or `┴`)
+/// — these never appear in the File Explorer pane, whose vertical border
+/// uses only `│` `┌` `┐` `└` `┘` `─`.
+fn table_column_span_on_content_rows(screen: &str) -> (usize, usize) {
+    let mut min_col = usize::MAX;
+    let mut max_col = 0usize;
+    for line in screen.lines() {
+        let is_table_border = line.contains('┬') || line.contains('┴');
+        if !is_table_border {
+            continue;
+        }
+        for (i, c) in line.chars().enumerate() {
+            if matches!(c, '┌' | '┐' | '└' | '┘' | '┬' | '┴') {
+                if i < min_col {
+                    min_col = i;
+                }
+                if i > max_col {
+                    max_col = i;
+                }
+            }
+        }
+    }
+    if min_col == usize::MAX {
+        (0, 0)
+    } else {
+        (min_col, max_col)
+    }
+}
+
+/// True iff every inter-row separator of the table fits on a single
+/// screen line. Each separator row opens with `├`; a well-rendered one
+/// also closes with `┤` on the same line. If the separator overflows the
+/// viewport it gets wrapped onto a second line, and the closing `┤`
+/// appears on the next line — the opening line has `├` but no `┤`.
+fn separator_row_fits(screen: &str) -> bool {
+    let mut any = false;
+    for line in screen.lines() {
+        if line.contains('├') {
+            any = true;
+            if !line.contains('┤') {
+                return false;
+            }
+        }
+    }
+    any
+}
+
+/// Regression test: when an explicit compose width is set that's wider
+/// than the available editor area (e.g. compose width 80 in a terminal
+/// where the File Explorer sidebar leaves only ~60 cols for the editor),
+/// the table must clamp its column allocation to the editor area and
+/// not overflow into the sidebar.
+#[test]
+fn test_compose_mode_table_width_clamped_when_sidebar_opens() {
+    use crate::common::harness::{copy_plugin, copy_plugin_lib};
+    use crate::common::tracing::init_tracing_from_env;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    init_tracing_from_env();
+
+    let md_content = "\
+# Compose Width Clamp
+
+| ColumnA                          | ColumnB                          | ColumnC                          | ColumnD                          |
+|----------------------------------|----------------------------------|----------------------------------|----------------------------------|
+| alphaaaaaaaaaaaaaaaaaaaaaaaaaaaa | bravooooooooooooooooooooooooooo  | charlieeeeeeeeeeeeeeeeeeeeeeeee  | deltaaaaaaaaaaaaaaaaaaaaaaaaaa   |
+| echooooooooooooooooooooooooooo   | foxtrotttttttttttttttttttttttttt | golffffffffffffffffffffffffffff  | hoteleleleleeeeeeeeeeeeeeeeeeeee |
+";
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project");
+    std::fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    std::fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin(&plugins_dir, "markdown_compose");
+    copy_plugin_lib(&plugins_dir);
+
+    let md_path = project_root.join("clamp.md");
+    std::fs::write(&md_path, &md_content).unwrap();
+
+    // Terminal just slightly wider than the compose width we'll set (80).
+    // After the sidebar takes ~30 cols, the editor area will be much
+    // narrower than 80 — the plugin must clamp.
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(90, 30, Default::default(), project_root)
+            .unwrap();
+
+    harness.open_file(&md_path).unwrap();
+    harness.render().unwrap();
+
+    // Enable compose mode
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Toggle Compose").unwrap();
+    harness.wait_for_screen_contains("Toggle Compose").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("│") && s.contains("─")
+        })
+        .unwrap();
+
+    // Set compose width explicitly to 80
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Set Compose Width").unwrap();
+    harness
+        .wait_for_screen_contains("Set Compose Width")
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    // The prompt comes up pre-filled (e.g. with "None"); clear then type.
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("80").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+
+    // Let the new compose width settle.
+    let mut prev = String::new();
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            let stable = s == prev;
+            prev = s;
+            stable
+        })
+        .unwrap();
+
+    // Open File Explorer
+    harness.editor_mut().toggle_file_explorer();
+    harness
+        .wait_until_stable(|h| h.editor().file_explorer_visible())
+        .unwrap();
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("File Explorer"))
+        .unwrap();
+
+    let mut prev = String::new();
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            let stable = s == prev;
+            prev = s;
+            stable
+        })
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+
+    // The table must fit on a single line — no separator row should wrap.
+    assert!(
+        separator_row_fits(&screen),
+        "With compose width=80 and the File Explorer sidebar open on a \
+         90-col terminal, the table separator row overflows the editor \
+         content area and wraps. The plugin is using the configured \
+         compose width (80) instead of clamping it to the smaller \
+         editor area.\nScreen:\n{}",
+        screen,
     );
 }

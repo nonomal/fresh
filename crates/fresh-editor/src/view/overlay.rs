@@ -1,5 +1,6 @@
 use crate::model::marker::{MarkerId, MarkerList};
 use ratatui::style::{Color, Style};
+use std::collections::HashMap;
 use std::ops::Range;
 
 // Re-export types from fresh-core for shared type usage
@@ -37,6 +38,7 @@ impl OverlayFace {
     /// If the options contain theme key references, creates a ThemedStyle
     /// for runtime resolution. Otherwise creates a fully resolved Style.
     pub fn from_options(options: &fresh_core::api::OverlayOptions) -> Self {
+        use crate::view::theme::named_color_from_str;
         use ratatui::style::Modifier;
 
         let mut style = Style::default();
@@ -44,12 +46,20 @@ impl OverlayFace {
         if let Some(ref fg) = options.fg {
             if let Some((r, g, b)) = fg.as_rgb() {
                 style = style.fg(Color::Rgb(r, g, b));
+            } else if let Some(key) = fg.as_theme_key() {
+                if let Some(color) = named_color_from_str(key) {
+                    style = style.fg(color);
+                }
             }
         }
 
         if let Some(ref bg) = options.bg {
             if let Some((r, g, b)) = bg.as_rgb() {
                 style = style.bg(Color::Rgb(r, g, b));
+            } else if let Some(key) = bg.as_theme_key() {
+                if let Some(color) = named_color_from_str(key) {
+                    style = style.bg(color);
+                }
             }
         }
 
@@ -70,15 +80,19 @@ impl OverlayFace {
             style = style.add_modifier(modifiers);
         }
 
+        // Only treat as theme keys if they're NOT recognized named colors
+        // (named colors were already resolved to concrete Color values above)
         let fg_theme = options
             .fg
             .as_ref()
             .and_then(|c| c.as_theme_key())
+            .filter(|key| named_color_from_str(key).is_none())
             .map(String::from);
         let bg_theme = options
             .bg
             .as_ref()
             .and_then(|c| c.as_theme_key())
+            .filter(|key| named_color_from_str(key).is_none())
             .map(String::from);
 
         if fg_theme.is_some() || bg_theme.is_some() {
@@ -142,6 +156,11 @@ pub struct Overlay {
     /// Optional URL for OSC 8 terminal hyperlinks.
     /// When set, the rendered text in this overlay becomes a clickable hyperlink.
     pub url: Option<String>,
+
+    /// Theme key that produced this overlay's primary color (e.g. "diagnostic.warning_bg").
+    /// Recorded at creation time so the theme inspector can show the exact key
+    /// without reverse-mapping colors.
+    pub theme_key: Option<&'static str>,
 }
 
 impl Overlay {
@@ -167,6 +186,7 @@ impl Overlay {
             message: None,
             extend_to_line_end: false,
             url: None,
+            theme_key: None,
         }
     }
 
@@ -218,6 +238,12 @@ impl Overlay {
         self
     }
 
+    /// Set the theme key that produced this overlay's color
+    pub fn with_theme_key(mut self, key: &'static str) -> Self {
+        self.theme_key = Some(key);
+        self
+    }
+
     /// Get the current byte range by resolving markers
     /// This is called once per frame during rendering setup
     pub fn range(&self, marker_list: &MarkerList) -> Range<usize> {
@@ -244,6 +270,10 @@ impl Overlay {
 pub struct OverlayManager {
     /// All active overlays, indexed for O(1) lookup by handle
     overlays: Vec<Overlay>,
+    /// `MarkerId -> index into overlays` for O(log N + k) `remove_in_range`.
+    /// Both endpoints of each overlay are registered. Kept in sync with
+    /// every push / swap_remove on `overlays`, and rebuilt after any sort.
+    marker_to_idx: HashMap<MarkerId, usize>,
 }
 
 impl OverlayManager {
@@ -251,16 +281,39 @@ impl OverlayManager {
     pub fn new() -> Self {
         Self {
             overlays: Vec::new(),
+            marker_to_idx: HashMap::new(),
         }
     }
 
     /// Add an overlay and return its handle for later removal
     pub fn add(&mut self, overlay: Overlay) -> OverlayHandle {
         let handle = overlay.handle.clone();
-        self.overlays.push(overlay);
-        // Keep sorted by priority (ascending - lower priority first)
-        self.overlays.sort_by_key(|o| o.priority);
+        // Binary-search the priority-ordered insertion point and shift in
+        // place. Avoids the O(n²·log n) sort-on-every-add the prior impl
+        // had — the docstring on `extend` warned about this.
+        let priority = overlay.priority;
+        let pos = self.overlays.partition_point(|o| o.priority <= priority);
+        self.overlays.insert(pos, overlay);
+        // Every entry from `pos` onward shifted by one — re-index that tail.
+        // Tail length is small when adds are append-shaped (the common case
+        // for plugins that emit per-line clear+rebuild).
+        for (i, o) in self.overlays.iter().enumerate().skip(pos) {
+            self.marker_to_idx.insert(o.start_marker, i);
+            self.marker_to_idx.insert(o.end_marker, i);
+        }
         handle
+    }
+
+    /// Append many overlays at once, sorting a single time at the end.
+    ///
+    /// `add` re-sorts the whole vector on every insertion, which is O(n² log n)
+    /// when a caller has N overlays to add. Use this instead when rebuilding an
+    /// overlay set from scratch (e.g. `set_virtual_buffer_content`), where the
+    /// caller already owns the full list up front.
+    pub fn extend<I: IntoIterator<Item = Overlay>>(&mut self, overlays: I) {
+        self.overlays.extend(overlays);
+        self.overlays.sort_by_key(|o| o.priority);
+        self.rebuild_marker_index();
     }
 
     /// Remove an overlay by its handle
@@ -271,6 +324,13 @@ impl OverlayManager {
     ) -> bool {
         if let Some(pos) = self.overlays.iter().position(|o| &o.handle == handle) {
             let overlay = self.overlays.remove(pos);
+            self.marker_to_idx.remove(&overlay.start_marker);
+            self.marker_to_idx.remove(&overlay.end_marker);
+            // Vec::remove shifts every subsequent entry down by one — repair.
+            for (i, o) in self.overlays.iter().enumerate().skip(pos) {
+                self.marker_to_idx.insert(o.start_marker, i);
+                self.marker_to_idx.insert(o.end_marker, i);
+            }
             marker_list.delete(overlay.start_marker);
             marker_list.delete(overlay.end_marker);
             true
@@ -281,22 +341,22 @@ impl OverlayManager {
 
     /// Remove all overlays in a namespace
     pub fn clear_namespace(&mut self, namespace: &OverlayNamespace, marker_list: &mut MarkerList) {
-        // Collect markers to delete
-        let markers_to_delete: Vec<_> = self
+        let mut indices: Vec<usize> = self
             .overlays
             .iter()
-            .filter(|o| o.namespace.as_ref() == Some(namespace))
-            .flat_map(|o| vec![o.start_marker, o.end_marker])
+            .enumerate()
+            .filter_map(|(i, o)| (o.namespace.as_ref() == Some(namespace)).then_some(i))
             .collect();
-
-        // Remove overlays
-        self.overlays
-            .retain(|o| o.namespace.as_ref() != Some(namespace));
-
-        // Delete markers
-        for marker_id in markers_to_delete {
-            marker_list.delete(marker_id);
+        if indices.is_empty() {
+            return;
         }
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in indices {
+            self.swap_remove_at(idx, marker_list);
+        }
+        // Restore priority order after swap_removes.
+        self.overlays.sort_by_key(|o| o.priority);
+        self.rebuild_marker_index();
     }
 
     /// Replace overlays in a namespace that overlap a range with new overlays.
@@ -310,57 +370,119 @@ impl OverlayManager {
         mut new_overlays: Vec<Overlay>,
         marker_list: &mut MarkerList,
     ) {
-        let mut markers_to_delete = Vec::new();
-
-        self.overlays.retain(|overlay| {
-            let in_namespace = overlay.namespace.as_ref() == Some(namespace);
-            if in_namespace && overlay.overlaps(range, marker_list) {
-                markers_to_delete.push(overlay.start_marker);
-                markers_to_delete.push(overlay.end_marker);
-                false
-            } else {
-                true
+        // Find overlays in this namespace that overlap the range. Use the
+        // marker-tree to narrow candidates; verify each candidate's true
+        // range and namespace before removing.
+        if range.start < range.end {
+            let hits = marker_list.query_range(range.start, range.end);
+            let mut candidates: Vec<usize> = hits
+                .iter()
+                .filter_map(|(mid, _, _)| self.marker_to_idx.get(mid).copied())
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            let mut to_remove: Vec<usize> = candidates
+                .into_iter()
+                .filter(|&idx| {
+                    let o = &self.overlays[idx];
+                    if o.namespace.as_ref() != Some(namespace) {
+                        return false;
+                    }
+                    let start = marker_list.get_position(o.start_marker).unwrap_or(0);
+                    let end = marker_list.get_position(o.end_marker).unwrap_or(0);
+                    start < range.end && range.start < end
+                })
+                .collect();
+            to_remove.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in to_remove {
+                self.swap_remove_at(idx, marker_list);
             }
-        });
-
-        for marker_id in markers_to_delete {
-            marker_list.delete(marker_id);
         }
 
         if !new_overlays.is_empty() {
             self.overlays.append(&mut new_overlays);
-            self.overlays.sort_by_key(|o| o.priority);
         }
+        self.overlays.sort_by_key(|o| o.priority);
+        self.rebuild_marker_index();
     }
 
     /// Remove all overlays in a range and clean up their markers
     pub fn remove_in_range(&mut self, range: &Range<usize>, marker_list: &mut MarkerList) {
-        // Collect markers to delete
-        let markers_to_delete: Vec<_> = self
-            .overlays
-            .iter()
-            .filter(|o| o.overlaps(range, marker_list))
-            .flat_map(|o| vec![o.start_marker, o.end_marker])
-            .collect();
-
-        // Remove overlays
-        self.overlays.retain(|o| !o.overlaps(range, marker_list));
-
-        // Delete markers
-        for marker_id in markers_to_delete {
-            marker_list.delete(marker_id);
+        // O(log N + k) for the lookup; restoring the priority-sorted
+        // invariant after `swap_remove` is O(N) (adaptive sort on a
+        // near-sorted vec) plus O(N) marker_to_idx rebuild. For typical
+        // markdown_compose workloads where overlays in a buffer share
+        // the same priority, the adaptive sort is a no-op pass.
+        // Spanning overlays (start < range.start && end > range.end) are
+        // not detected — same precondition as ConcealManager.
+        if range.start >= range.end {
+            return;
         }
+        let hits = marker_list.query_range(range.start, range.end);
+        if hits.is_empty() {
+            return;
+        }
+        let mut candidates: Vec<usize> = hits
+            .iter()
+            .filter_map(|(mid, _, _)| self.marker_to_idx.get(mid).copied())
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        let mut to_remove: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&idx| {
+                let o = &self.overlays[idx];
+                let start = marker_list.get_position(o.start_marker).unwrap_or(0);
+                let end = marker_list.get_position(o.end_marker).unwrap_or(0);
+                start < range.end && range.start < end
+            })
+            .collect();
+        if to_remove.is_empty() {
+            return;
+        }
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            self.swap_remove_at(idx, marker_list);
+        }
+        // Restore priority order broken by swap_removes.
+        self.overlays.sort_by_key(|o| o.priority);
+        self.rebuild_marker_index();
     }
 
     /// Clear all overlays and their markers
     pub fn clear(&mut self, marker_list: &mut MarkerList) {
-        // Delete all markers
         for overlay in &self.overlays {
             marker_list.delete(overlay.start_marker);
             marker_list.delete(overlay.end_marker);
         }
-
         self.overlays.clear();
+        self.marker_to_idx.clear();
+    }
+
+    /// Swap-remove the entry at `idx`, deleting its markers and patching
+    /// `marker_to_idx` for whatever entry got swapped in. Caller is
+    /// responsible for restoring sort order if needed.
+    fn swap_remove_at(&mut self, idx: usize, marker_list: &mut MarkerList) {
+        let removed = self.overlays.swap_remove(idx);
+        self.marker_to_idx.remove(&removed.start_marker);
+        self.marker_to_idx.remove(&removed.end_marker);
+        marker_list.delete(removed.start_marker);
+        marker_list.delete(removed.end_marker);
+        if let Some(moved) = self.overlays.get(idx) {
+            self.marker_to_idx.insert(moved.start_marker, idx);
+            self.marker_to_idx.insert(moved.end_marker, idx);
+        }
+    }
+
+    /// Rebuild `marker_to_idx` from the current `overlays` order.
+    /// Called after sorts that scramble indices.
+    fn rebuild_marker_index(&mut self) {
+        self.marker_to_idx.clear();
+        for (i, o) in self.overlays.iter().enumerate() {
+            self.marker_to_idx.insert(o.start_marker, i);
+            self.marker_to_idx.insert(o.end_marker, i);
+        }
     }
 
     /// Get all overlays at a specific position, sorted by priority
@@ -408,16 +530,29 @@ impl OverlayManager {
             .map(|(id, start, _end)| (id, start))
             .collect();
 
-        // Find overlays whose markers are in the viewport
-        // Only resolve positions for overlays that are actually visible
+        // Find overlays whose markers overlap with the viewport.
+        // At least one marker must be in the viewport, but the other may be
+        // outside (e.g. a multi-line overlay partially scrolled out of view).
+        // For the out-of-viewport marker, fall back to resolving its position
+        // directly from the marker list.
         self.overlays
             .iter()
             .filter_map(|overlay| {
-                // Try to get positions from our viewport query results
-                let start_pos = marker_positions.get(&overlay.start_marker)?;
-                let end_pos = marker_positions.get(&overlay.end_marker)?;
+                let start_in_vp = marker_positions.get(&overlay.start_marker).copied();
+                let end_in_vp = marker_positions.get(&overlay.end_marker).copied();
 
-                let range = *start_pos..*end_pos;
+                // At least one marker must be in the viewport for the overlay
+                // to be visible at all
+                if start_in_vp.is_none() && end_in_vp.is_none() {
+                    return None;
+                }
+
+                // For the marker outside the viewport, resolve its position directly
+                let start_pos =
+                    start_in_vp.or_else(|| marker_list.get_position(overlay.start_marker))?;
+                let end_pos = end_in_vp.or_else(|| marker_list.get_position(overlay.end_marker))?;
+
+                let range = start_pos..end_pos;
 
                 // Only include if actually overlaps viewport.
                 // For zero-width ranges (e.g. diagnostics at a single position),
@@ -461,6 +596,50 @@ impl OverlayManager {
     /// Get all overlays (for rendering)
     pub fn all(&self) -> &[Overlay] {
         &self.overlays
+    }
+
+    /// Test-only: assert `marker_to_idx` is consistent with `overlays`,
+    /// and that priorities are non-decreasing along the vector.
+    /// Panics on any divergence. Used by property tests.
+    #[cfg(test)]
+    fn check_invariants(&self) {
+        assert_eq!(
+            self.marker_to_idx.len(),
+            self.overlays.len() * 2,
+            "marker_to_idx size != 2 * overlays.len()"
+        );
+        for (i, o) in self.overlays.iter().enumerate() {
+            assert_eq!(
+                self.marker_to_idx.get(&o.start_marker).copied(),
+                Some(i),
+                "start_marker {:?} of overlay {} mismapped",
+                o.start_marker,
+                i,
+            );
+            assert_eq!(
+                self.marker_to_idx.get(&o.end_marker).copied(),
+                Some(i),
+                "end_marker {:?} of overlay {} mismapped",
+                o.end_marker,
+                i,
+            );
+        }
+        // Priority order — only enforceable when nothing is mid-cycle.
+        // Tests check this via `assert_priority_sorted` after points
+        // where the invariant is supposed to hold (e.g. after `add`).
+    }
+
+    /// Test-only: assert overlays are non-decreasing by priority.
+    #[cfg(test)]
+    fn assert_priority_sorted(&self) {
+        for w in self.overlays.windows(2) {
+            assert!(
+                w[0].priority <= w[1].priority,
+                "priority order broken: {} after {}",
+                w[1].priority,
+                w[0].priority,
+            );
+        }
     }
 }
 
@@ -550,26 +729,30 @@ impl Overlay {
 
     /// Create a selection highlight overlay
     pub fn selection(marker_list: &mut MarkerList, range: Range<usize>) -> Self {
-        Self::with_priority(
+        let mut overlay = Self::with_priority(
             marker_list,
             range,
             OverlayFace::Background {
                 color: Color::Rgb(38, 79, 120), // VSCode-like selection color
             },
             -10, // Very low priority so it's under other overlays
-        )
+        );
+        overlay.theme_key = Some("editor.selection_bg");
+        overlay
     }
 
     /// Create a search result highlight overlay
     pub fn search_match(marker_list: &mut MarkerList, range: Range<usize>) -> Self {
-        Self::with_priority(
+        let mut overlay = Self::with_priority(
             marker_list,
             range,
             OverlayFace::Background {
                 color: Color::Rgb(72, 72, 0), // Yellow-ish highlight
             },
             -5, // Low priority
-        )
+        );
+        overlay.theme_key = Some("search.match_bg");
+        overlay
     }
 }
 
@@ -744,5 +927,296 @@ mod tests {
         assert!(overlay.overlaps(&(5..15), &marker_list));
         assert!(overlay.overlaps(&(15..25), &marker_list));
         assert!(!overlay.overlaps(&(20..30), &marker_list));
+    }
+
+    #[test]
+    fn test_overlay_remove_in_range_keeps_only_disjoint() {
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(200);
+        let mut manager = OverlayManager::new();
+
+        manager.add(Overlay::new(
+            &mut marker_list,
+            0..5,
+            OverlayFace::Background { color: Color::Red },
+        ));
+        manager.add(Overlay::new(
+            &mut marker_list,
+            10..20,
+            OverlayFace::Background { color: Color::Blue },
+        ));
+        manager.add(Overlay::new(
+            &mut marker_list,
+            30..40,
+            OverlayFace::Background {
+                color: Color::Green,
+            },
+        ));
+        manager.add(Overlay::new(
+            &mut marker_list,
+            50..60,
+            OverlayFace::Background {
+                color: Color::Yellow,
+            },
+        ));
+
+        // Range 15..35 overlaps overlays #2 (10..20) and #3 (30..40), leaves #1 and #4.
+        manager.remove_in_range(&(15..35), &mut marker_list);
+
+        let kept: Vec<_> = manager
+            .all()
+            .iter()
+            .map(|o| o.range(&marker_list))
+            .collect();
+        assert_eq!(kept, vec![0..5, 50..60]);
+    }
+
+    #[test]
+    fn test_overlay_remove_in_range_deletes_markers() {
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(100);
+        let mut manager = OverlayManager::new();
+
+        let overlay = Overlay::new(
+            &mut marker_list,
+            10..20,
+            OverlayFace::Background { color: Color::Red },
+        );
+        let start_id = overlay.start_marker;
+        let end_id = overlay.end_marker;
+        manager.add(overlay);
+
+        manager.remove_in_range(&(0..50), &mut marker_list);
+
+        assert_eq!(manager.len(), 0);
+        assert_eq!(marker_list.get_position(start_id), None);
+        assert_eq!(marker_list.get_position(end_id), None);
+    }
+
+    #[test]
+    fn test_overlay_remove_in_range_endpoint_semantics() {
+        // Touching at a single endpoint must NOT remove (start == range.end or end == range.start).
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(100);
+        let mut manager = OverlayManager::new();
+
+        manager.add(Overlay::new(
+            &mut marker_list,
+            10..20,
+            OverlayFace::Background { color: Color::Red },
+        ));
+
+        manager.remove_in_range(&(20..30), &mut marker_list);
+        assert_eq!(manager.len(), 1);
+        manager.remove_in_range(&(0..10), &mut marker_list);
+        assert_eq!(manager.len(), 1);
+        manager.remove_in_range(&(19..21), &mut marker_list);
+        assert_eq!(manager.len(), 0);
+    }
+
+    /// Mirrors the production cycle: per line in `lines_changed`, clear
+    /// overlays in the line's byte range, then re-add the line's overlays.
+    /// Steady-state count holds throughout. Same shape as the matching
+    /// conceal perf test for direct comparison.
+    ///
+    /// Run with:
+    ///   cargo nextest run -p fresh-editor --no-capture \
+    ///     view::overlay::tests::perf_full_buffer_rebuild_pass
+    #[test]
+    fn perf_full_buffer_rebuild_pass() {
+        const LINES: usize = 500;
+        const LINE_BYTES: usize = 50;
+        const OVERLAYS_PER_LINE: usize = 5;
+
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(LINES * LINE_BYTES);
+        let mut manager = OverlayManager::new();
+
+        let overlay_byte = |line: usize, k: usize| -> usize {
+            line * LINE_BYTES + k * (LINE_BYTES / OVERLAYS_PER_LINE)
+        };
+        let make_overlay = |ml: &mut MarkerList, line: usize, k: usize| {
+            let s = overlay_byte(line, k);
+            Overlay::new(
+                ml,
+                s..(s + 2),
+                OverlayFace::Background { color: Color::Red },
+            )
+        };
+
+        // Populate steady state.
+        for line in 0..LINES {
+            for k in 0..OVERLAYS_PER_LINE {
+                let o = make_overlay(&mut marker_list, line, k);
+                manager.add(o);
+            }
+        }
+        let initial = LINES * OVERLAYS_PER_LINE;
+
+        // One full-buffer `lines_changed` pass: per line, clear + re-add.
+        let start = std::time::Instant::now();
+        for line in 0..LINES {
+            let line_range = (line * LINE_BYTES)..((line + 1) * LINE_BYTES);
+            manager.remove_in_range(&line_range, &mut marker_list);
+            for k in 0..OVERLAYS_PER_LINE {
+                let o = make_overlay(&mut marker_list, line, k);
+                manager.add(o);
+            }
+        }
+        let elapsed = start.elapsed();
+
+        eprintln!(
+            "[perf] overlay full-buffer rebuild ({LINES} lines, {} entries steady): \
+             {:?} total, {:?}/line",
+            initial,
+            elapsed,
+            elapsed / LINES as u32,
+        );
+        assert_eq!(manager.len(), initial);
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Add {
+                start: usize,
+                len: usize,
+                priority: i32,
+                ns_idx: u8,
+            },
+            RemoveInRange {
+                start: usize,
+                end: usize,
+            },
+            ClearNamespace {
+                ns_idx: u8,
+            },
+            ReplaceRange {
+                start: usize,
+                end: usize,
+                ns_idx: u8,
+                /// New overlays to insert in the same range; same shape
+                /// as `Add` but len capped to satisfy precondition.
+                new_overlays: Vec<(usize, usize, i32)>,
+            },
+        }
+
+        const BUFFER_SIZE: usize = 200;
+        const MAX_OVERLAY_LEN: usize = 4;
+        const MIN_QUERY_LEN: usize = MAX_OVERLAY_LEN + 1;
+
+        fn arb_overlay_spec() -> impl Strategy<Value = (usize, usize, i32)> {
+            (
+                0..(BUFFER_SIZE - MAX_OVERLAY_LEN),
+                1..=MAX_OVERLAY_LEN,
+                -5i32..=5i32,
+            )
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                3 => arb_overlay_spec().prop_flat_map(|(start, len, priority)| {
+                    (Just(start), Just(len), Just(priority), 0u8..3u8)
+                }).prop_map(|(start, len, priority, ns_idx)| Op::Add {
+                    start, len, priority, ns_idx,
+                }),
+                2 => (0..BUFFER_SIZE, MIN_QUERY_LEN..=BUFFER_SIZE)
+                    .prop_map(|(start, qlen)| {
+                        let s = start.min(BUFFER_SIZE - 1);
+                        let e = (s + qlen).min(BUFFER_SIZE);
+                        Op::RemoveInRange { start: s, end: e }
+                    }),
+                1 => (0u8..3u8).prop_map(|ns_idx| Op::ClearNamespace { ns_idx }),
+                1 => (
+                    0..BUFFER_SIZE,
+                    MIN_QUERY_LEN..=BUFFER_SIZE,
+                    0u8..3u8,
+                    prop::collection::vec(arb_overlay_spec(), 0..4),
+                )
+                    .prop_map(|(start, qlen, ns_idx, new_overlays)| {
+                        let s = start.min(BUFFER_SIZE - 1);
+                        let e = (s + qlen).min(BUFFER_SIZE);
+                        Op::ReplaceRange { start: s, end: e, ns_idx, new_overlays }
+                    }),
+            ]
+        }
+
+        fn nsf(idx: u8) -> OverlayNamespace {
+            OverlayNamespace::from_string(format!("ns{idx}"))
+        }
+
+        proptest! {
+            /// Invariants must hold after every sequence of operations.
+            /// Plus: after `remove_in_range(r)`, no surviving overlay's
+            /// range overlaps `r`. Plus: after `add` / `extend` /
+            /// `clear_namespace` / `replace_range_in_namespace`, the
+            /// vector is sorted by priority. Note: priority order may be
+            /// transiently broken right after `remove_in_range` until the
+            /// next `add` — production callers always pair these.
+            #[test]
+            fn prop_marker_index_consistent(ops in prop::collection::vec(arb_op(), 0..30)) {
+                let mut marker_list = MarkerList::new();
+                marker_list.set_buffer_size(BUFFER_SIZE);
+                let mut manager = OverlayManager::new();
+
+                for op in ops {
+                    match op {
+                        Op::Add { start, len, priority, ns_idx } => {
+                            let o = Overlay::with_namespace(
+                                &mut marker_list,
+                                start..(start + len),
+                                OverlayFace::Background { color: Color::Red },
+                                nsf(ns_idx),
+                            );
+                            let mut o = o;
+                            o.priority = priority;
+                            manager.add(o);
+                            manager.check_invariants();
+                            manager.assert_priority_sorted();
+                        }
+                        Op::RemoveInRange { start, end } => {
+                            manager.remove_in_range(&(start..end), &mut marker_list);
+                            for (o, rng) in manager.query_viewport(start, end, &marker_list) {
+                                let overlaps = rng.start < end && start < rng.end;
+                                prop_assert!(
+                                    !overlaps,
+                                    "overlay {:?} (handle {:?}) survived remove_in_range({start}..{end})",
+                                    rng, o.handle,
+                                );
+                            }
+                            manager.check_invariants();
+                        }
+                        Op::ClearNamespace { ns_idx } => {
+                            manager.clear_namespace(&nsf(ns_idx), &mut marker_list);
+                            manager.check_invariants();
+                            manager.assert_priority_sorted();
+                        }
+                        Op::ReplaceRange { start, end, ns_idx, new_overlays } => {
+                            let new: Vec<Overlay> = new_overlays.into_iter().map(|(s, l, p)| {
+                                let mut o = Overlay::with_namespace(
+                                    &mut marker_list,
+                                    s..(s + l),
+                                    OverlayFace::Background { color: Color::Blue },
+                                    nsf(ns_idx),
+                                );
+                                o.priority = p;
+                                o
+                            }).collect();
+                            manager.replace_range_in_namespace(
+                                &nsf(ns_idx),
+                                &(start..end),
+                                new,
+                                &mut marker_list,
+                            );
+                            manager.check_invariants();
+                            manager.assert_priority_sorted();
+                        }
+                    }
+                }
+            }
+        }
     }
 }

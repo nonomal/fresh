@@ -166,6 +166,31 @@ impl IntervalTree {
         self.insert_with_type(start, end, MarkerType::Position)
     }
 
+    /// Insert a marker with a specific ID and type (for set_position).
+    /// The caller must ensure the ID is not already in use.
+    fn insert_with_id(&mut self, id: MarkerId, start: u64, end: u64, marker_type: MarkerType) {
+        debug_assert!(
+            id < self.next_id,
+            "insert_with_id: id {} must be < next_id {}",
+            id,
+            self.next_id
+        );
+        debug_assert!(
+            !self.marker_map.contains_key(&id),
+            "insert_with_id: id {} already in use",
+            id
+        );
+        let marker = Marker {
+            id,
+            interval: Interval { start, end },
+            marker_type,
+        };
+
+        let new_node = Node::new(marker.clone(), Weak::new());
+        self.root = Self::insert_recursive(self.root.take(), new_node.clone());
+        self.marker_map.insert(id, new_node);
+    }
+
     /// Insert a marker with a specific type
     pub fn insert_with_type(&mut self, start: u64, end: u64, marker_type: MarkerType) -> MarkerId {
         let id = self.next_id;
@@ -237,9 +262,30 @@ impl IntervalTree {
             return false;
         }
 
-        self.root = Self::delete_recursive(self.root.take(), start, id);
+        self.root = Self::delete_recursive(self.root.take(), start, id, &mut self.marker_map);
 
         self.marker_map.remove(&id).is_some()
+    }
+
+    /// Move a marker to a new position, preserving its ID and type.
+    /// Implemented as delete + reinsert with the same ID.
+    /// Returns false if the marker doesn't exist.
+    /// Performance: O(log n)
+    pub fn set_position(&mut self, id: MarkerId, new_start: u64, new_end: u64) -> bool {
+        // Get the marker's type before deleting
+        let marker_type = match self.get_marker(id) {
+            Some(m) => m.marker_type,
+            None => return false,
+        };
+
+        // Delete from tree
+        if !self.delete(id) {
+            return false;
+        }
+
+        // Reinsert with same ID
+        self.insert_with_id(id, new_start, new_end, marker_type);
+        true
     }
 
     /// Adjusts all markers for a text edit (insertion or deletion).
@@ -327,7 +373,12 @@ impl IntervalTree {
     }
 
     /// Recursive helper for delete
-    fn delete_recursive(root: NodePtr, start: u64, id: MarkerId) -> NodePtr {
+    fn delete_recursive(
+        root: NodePtr,
+        start: u64,
+        id: MarkerId,
+        marker_map: &mut HashMap<MarkerId, Rc<RefCell<Node>>>,
+    ) -> NodePtr {
         // Remove unnecessary 'mut'
         let root = root?;
 
@@ -338,20 +389,23 @@ impl IntervalTree {
 
         match start.cmp(&root_start) {
             Ordering::Less => {
-                root_mut.left = Self::delete_recursive(root_mut.left.take(), start, id);
+                root_mut.left = Self::delete_recursive(root_mut.left.take(), start, id, marker_map);
             }
             Ordering::Greater => {
-                root_mut.right = Self::delete_recursive(root_mut.right.take(), start, id);
+                root_mut.right =
+                    Self::delete_recursive(root_mut.right.take(), start, id, marker_map);
             }
             Ordering::Equal => match id.cmp(&root_id) {
                 Ordering::Less => {
-                    root_mut.left = Self::delete_recursive(root_mut.left.take(), start, id);
+                    root_mut.left =
+                        Self::delete_recursive(root_mut.left.take(), start, id, marker_map);
                 }
                 Ordering::Greater => {
-                    root_mut.right = Self::delete_recursive(root_mut.right.take(), start, id);
+                    root_mut.right =
+                        Self::delete_recursive(root_mut.right.take(), start, id, marker_map);
                 }
                 Ordering::Equal => {
-                    return Self::perform_node_deletion(root_mut, Rc::clone(&root));
+                    return Self::perform_node_deletion(root_mut, Rc::clone(&root), marker_map);
                 }
             },
         }
@@ -362,7 +416,11 @@ impl IntervalTree {
     }
 
     /// Handles the actual structural changes for deletion.
-    fn perform_node_deletion(mut node: RefMut<Node>, node_rc: Rc<RefCell<Node>>) -> NodePtr {
+    fn perform_node_deletion(
+        mut node: RefMut<Node>,
+        node_rc: Rc<RefCell<Node>>,
+        marker_map: &mut HashMap<MarkerId, Rc<RefCell<Node>>>,
+    ) -> NodePtr {
         if node.left.is_none() {
             let right = node.right.take();
             if let Some(ref r) = right {
@@ -378,14 +436,35 @@ impl IntervalTree {
         } else {
             let successor_rc = Self::min_node(node.right.as_ref().unwrap());
 
-            let (successor_start, successor_id) = {
+            let (_successor_start, successor_id) = {
                 let s = successor_rc.borrow();
                 (s.marker.interval.start, s.marker.id)
             };
 
+            // Capture the original node's marker identity BEFORE we swap
+            // it away. After the swap `successor_rc` carries this
+            // marker, and that's what delete_recursive must now search
+            // for in the right subtree to remove it.
+            let (orig_start, orig_id) = (node.marker.interval.start, node.marker.id);
+
             mem::swap(&mut node.marker, &mut successor_rc.borrow_mut().marker);
 
-            node.right = Self::delete_recursive(node.right.take(), successor_start, successor_id);
+            // `node_rc` now carries the successor's marker, so external
+            // references (marker_map) to `successor_id` must point here
+            // instead of at the old successor node (which is about to
+            // be removed). Without this update, `get_position(successor_id)`
+            // would keep resolving via the orphaned successor node and
+            // return stale data — the root cause of end-of-line inlay
+            // hints flipping to the start of their line after a nearby
+            // delete, because the orphan misses all subsequent
+            // adjust_for_edit calls.
+            marker_map.insert(successor_id, Rc::clone(&node_rc));
+
+            // Remove the old successor node. After the swap it holds
+            // the original marker (orig_start, orig_id), so search by
+            // THAT key — not by (successor_start, successor_id) which
+            // no longer corresponds to any node in the subtree.
+            node.right = Self::delete_recursive(node.right.take(), orig_start, orig_id, marker_map);
 
             drop(node);
             Node::update_stats(&node_rc);

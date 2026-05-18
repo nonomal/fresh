@@ -264,6 +264,22 @@ List all open buffers
 listBuffers(): BufferInfo[]
 ```
 
+### `listGrammars`
+
+List all available grammars with source information. Returns grammars from all sources: built-in, user-installed, language packs, bundles, and plugin-registered.
+
+```typescript
+listGrammars(): GrammarInfoSnapshot[]
+```
+
+**Returns:** Array of objects with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | Grammar name (use this in config `grammar` field) |
+| `source` | `string` | Where the grammar is from (e.g. "built-in", "plugin (myplugin)") |
+| `file_extensions` | `string[]` | File extensions associated with this grammar |
+
 ### `getPrimaryCursor`
 
 Get primary cursor with selection info
@@ -318,6 +334,36 @@ setPromptSuggestions(suggestions: PromptSuggestion[]): boolean
 | Name | Type | Description |
 |------|------|-------------|
 | `suggestions` | `PromptSuggestion[]` | Array of suggestions to display |
+
+### `setPromptTitle`
+
+Set the title shown in a floating-overlay prompt's frame header
+as styled segments. An empty array clears it and falls back to
+the prompt-type default.
+
+```typescript
+setPromptTitle(title: StyledText[]): boolean
+```
+
+| Name | Type | Description |
+|------|------|-------------|
+| `title` | `StyledText[]` | Styled segments rendered along the overlay's top toolbar row |
+
+### `setPromptFooter`
+
+Set the footer chrome row of the floating-overlay prompt's
+results pane. Plugins use this for hotkey-hint banners — for
+example, the Orchestrator plugin renders
+`↑↓ preview  Enter dive  Esc close`. Empty array clears the
+footer. Has no visible effect on non-overlay prompts.
+
+```typescript
+setPromptFooter(footer: StyledText[]): boolean
+```
+
+| Name | Type | Description |
+|------|------|-------------|
+| `footer` | `StyledText[]` | Styled segments rendered along the overlay's bottom row |
 
 ## Buffer Mutations
 
@@ -1093,11 +1139,164 @@ removeScrollSyncGroup(group_id: number): boolean
 |------|------|-------------|
 | `group_id` | `number` | - |
 
+## Windows / Orchestrator API
+
+A *window* (modelled on a VS Code window) is a project-rooted
+bundle of editor state — file explorer, LSP set, file watchers,
+split layout, and buffer membership — that can be swapped in
+and out as a unit. The "base" window at startup is
+`WindowId(1)`. Subsequent windows are created by plugins
+(typically the first-party Orchestrator plugin, which uses windows
+to drive parallel-agent worktrees).
+
+> **Naming note.** Internally the editor calls these "windows"
+> to disambiguate from Fresh's pre-existing workspace-recovery
+> and config-layer "session" concepts. Orchestrator's UX still
+> presents them as "agent sessions" because that's the
+> parallel-agents domain language users see. Plugin API names
+> all use `Window` / `windowId`.
+
+See `docs/internal/orchestrator-sessions-design.md` for the full
+architecture rationale.
+
+### `createWindow`
+
+Allocate a new session rooted at `root` with the given label.
+Does not switch to it — call `setActiveWindow` to dive.
+Returns the new session's id.
+
+```typescript
+createWindow(root: string, label: string): Promise<number>
+```
+
+| Name | Type | Description |
+|------|------|-------------|
+| `root` | `string` | Absolute path to the session root |
+| `label` | `string` | Display label (empty string defaults to root basename) |
+
+### `setActiveWindow`
+
+Make `id` the active session. The previous active session's
+state (file explorer, LSP set, splits, view states) is stashed
+on its `Session` and the incoming session's stash is swapped
+into the editor — O(1), no buffer recreation, no LSP restart.
+
+```typescript
+setActiveWindow(id: number): boolean
+```
+
+### `closeWindow`
+
+Close a session. Buffers attached only to this session are
+dropped; shared buffers stay open. Closing the active session
+falls back to the base session.
+
+```typescript
+closeWindow(id: number): boolean
+```
+
+### `listWindows`
+
+Snapshot of every session with its id, label, and root.
+
+```typescript
+listWindows(): WindowInfo[]
+```
+
+### `activeWindow`
+
+Return the currently active session id.
+
+```typescript
+activeWindow(): number
+```
+
+### `prewarmWindow`
+
+Spin up the session's LSP set + split layout in the
+background, without diving. The first dive into a prewarmed
+session is then instant. Useful when a plugin knows the user
+will likely visit a session soon.
+
+```typescript
+prewarmWindow(id: number): boolean
+```
+
+### `previewWindowInRect`
+
+Render the entire stashed UI of session `id` (splits,
+terminals, syntax-highlighted buffers, decorations) into the
+floating-overlay prompt's preview pane on the next frame.
+Cleared automatically when the prompt closes; call
+`clearWindowPreview` to clear earlier.
+
+This is *Primitive #1* of the Orchestrator design and is the
+mechanism the Orchestrator plugin uses to show a live preview of
+the highlighted session as the user moves the selection in
+the session list.
+
+```typescript
+previewWindowInRect(id: number): boolean
+```
+
+### `clearWindowPreview`
+
+Clear an earlier `previewWindowInRect` so the preview pane
+falls back to the prompt's default behaviour.
+
+```typescript
+clearWindowPreview(): boolean
+```
+
+### `setWindowState` / `getWindowState`
+
+Per-session, per-plugin state map. Like `setGlobalState` but
+scoped to a single session — useful for plugin state that
+should follow a session across saves/restores rather than
+applying globally. Persists to `.fresh/sessions.json`.
+
+```typescript
+setWindowState(key: string, value: unknown): boolean
+getWindowState(key: string): unknown | null
+```
+
+### `openFileInBackground`
+
+Open a file without switching to it. With `opts.windowId`,
+the buffer is attached to that session's stashed tab strip
+instead of the active session's. Pairs with `createTerminal`'s
+`windowId` for setting up an inactive session's contents
+without diving.
+
+```typescript
+openFileInBackground(path: string, opts?: { windowId?: number }): Promise<number>
+```
+
+### `watchPath` / `unwatchPath`
+
+Subscribe to filesystem changes under `path`. Returns a
+handle. Each change fires a `path_changed` hook with the
+handle id, the changed path, and the change kind. Releases via
+`unwatchPath(handle)`.
+
+```typescript
+watchPath(path: string): Promise<number>
+unwatchPath(handle: number): boolean
+```
+
 ## Terminal API
 
 ### `createTerminal`
 
-Create a new terminal in a split. Returns a `TerminalResult` with buffer, terminal, and split IDs.
+Create a new terminal in a split. Returns a `TerminalResult`
+with buffer, terminal, and split IDs.
+
+When `opts.windowId` is set the terminal attaches to that
+session's stashed split tree without diving — the user's
+current view stays put and the terminal becomes visible only
+when the user dives into the named session. This is how
+Orchestrator spawns agents into background worktrees without
+disturbing the foreground session.
 
 ```typescript
 createTerminal(opts?: CreateTerminalOptions): Promise<TerminalResult>

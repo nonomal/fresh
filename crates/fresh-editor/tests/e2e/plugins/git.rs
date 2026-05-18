@@ -18,10 +18,15 @@ fn trigger_git_grep(harness: &mut EditorTestHarness) {
         .unwrap();
     harness.wait_for_prompt().unwrap();
     harness.type_text("Git Grep").unwrap();
+    // Wait for the command to appear in the palette before pressing Enter,
+    // otherwise Enter races with async palette filtering on slow CI runners.
+    harness.wait_for_screen_contains("Git Grep").unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.render().unwrap();
+    // Wait for the grep prompt to be visible before returning so callers can
+    // type their query immediately without racing the async plugin mount.
+    harness.wait_for_screen_contains("Git grep: ").unwrap();
 }
 
 /// Helper to trigger git find file via command palette
@@ -61,9 +66,6 @@ fn test_git_grep_shows_results() {
 
     // Trigger git grep
     trigger_git_grep(&mut harness);
-
-    // Check that the prompt appeared
-    harness.assert_screen_contains("Git grep: ");
 
     // Type search query
     harness.type_text("config").unwrap();
@@ -242,11 +244,11 @@ fn test_git_grep_confirm_jumps_to_location() {
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.render().unwrap();
 
-    // Give it time to open the file
-    harness.sleep(std::time::Duration::from_millis(200));
-    harness.render().unwrap();
+    // Wait for the grep prompt to close (file open is async)
+    harness
+        .wait_until(|h| !h.screen_to_string().contains("Git grep:"))
+        .unwrap();
 
     let screen = harness.screen_to_string();
     println!("After confirming grep result:\n{screen}");
@@ -658,7 +660,9 @@ fn test_git_commands_via_command_palette() {
 
     // Type to filter to git commands (note: no colon in command name)
     harness.type_text("Git Grep").unwrap();
-    harness.render().unwrap();
+    // Wait for the filtered item before pressing Enter to avoid a race with
+    // async palette filtering on slow CI runners.
+    harness.wait_for_screen_contains("Git Grep").unwrap();
 
     // Confirm
     harness
@@ -945,12 +949,13 @@ fn trigger_git_log(harness: &mut EditorTestHarness) {
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
-    harness.render().unwrap();
+    harness.wait_for_prompt().unwrap();
     harness.type_text("Git Log").unwrap();
+    harness.wait_for_screen_contains("Git Log").unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.render().unwrap();
+    harness.wait_for_screen_contains("switch pane").unwrap();
 }
 
 /// Test git log opens and shows commits
@@ -975,19 +980,21 @@ fn test_git_log_shows_commits() {
     // Trigger git log
     trigger_git_log(&mut harness);
 
-    // Wait for git log to load
+    // Wait for git log to load (sticky toolbar + at least one commit subject)
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
-            // Should show "Commits:" header and at least one commit hash
-            screen.contains("Commits:") && screen.contains("Initial commit")
+            screen.contains("switch pane") && screen.contains("Initial commit")
         })
         .unwrap();
 
     let screen = harness.screen_to_string();
     println!("Git log screen:\n{screen}");
 
-    assert!(screen.contains("Commits:"), "Should show Commits: header");
+    assert!(
+        screen.contains("Initial commit"),
+        "Should show the seeded commit subject"
+    );
 }
 
 /// Test git log cursor navigation
@@ -1027,7 +1034,7 @@ fn test_git_log_cursor_navigation() {
 
     // Wait for git log to load
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| h.screen_to_string().contains("switch pane"))
         .unwrap();
 
     // Navigate down using j key (should work via inherited normal mode)
@@ -1050,7 +1057,7 @@ fn test_git_log_cursor_navigation() {
     println!("After navigation:\n{screen}");
 
     // Git log should still be visible
-    assert!(screen.contains("Commits:"));
+    assert!(screen.contains("switch pane"));
 }
 
 /// Test git log show commit detail with Enter
@@ -1077,7 +1084,7 @@ fn test_git_log_show_commit_detail() {
 
     // Wait for git log to load
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| h.screen_to_string().contains("switch pane"))
         .unwrap();
 
     // Move cursor to a commit line (down from header)
@@ -1102,14 +1109,15 @@ fn test_git_log_show_commit_detail() {
     println!("Commit detail screen:\n{screen}");
 }
 
-/// Test going back from commit detail to git log
+/// Pressing `q` while the detail panel has focus closes the whole git-log
+/// group. The older behaviour stepped focus back to the log panel first,
+/// making close a two-keystroke gesture that surprised users.
 #[test]
-fn test_git_log_back_from_commit_detail() {
+fn test_git_log_q_from_detail_closes_group() {
     let repo = GitTestRepo::new();
     repo.setup_typical_project();
     repo.setup_git_log_plugin();
 
-    // Change to repo directory so git commands work correctly
     let original_dir = repo.change_to_repo_dir();
     let _guard = DirGuard::new(original_dir);
 
@@ -1121,42 +1129,25 @@ fn test_git_log_back_from_commit_detail() {
     )
     .unwrap();
 
-    // Trigger git log
     trigger_git_log(&mut harness);
 
-    // Wait for git log to load
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
-        .unwrap();
-
-    // Move to commit and show detail
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness.process_async_and_render().unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
-
-    // Wait for commit detail
+    // Wait for the detail panel to populate (live-preview of HEAD).
     harness
         .wait_until(|h| h.screen_to_string().contains("Author:"))
         .unwrap();
 
-    let screen_detail = harness.screen_to_string();
-    println!("Commit detail:\n{screen_detail}");
+    // Move focus into the detail panel.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.process_async_and_render().unwrap();
 
-    // Press q to go back to git log
+    // q from the detail panel should close the entire group: the toolbar
+    // (and its "switch pane" hint) disappears along with the *Git Log* tab.
     harness
         .send_key(KeyCode::Char('q'), KeyModifiers::NONE)
         .unwrap();
-    harness.process_async_and_render().unwrap();
-
-    // Wait for git log to reappear
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| !h.screen_to_string().contains("switch pane"))
         .unwrap();
-
-    let screen_log = harness.screen_to_string();
-    println!("Back to git log:\n{screen_log}");
 }
 
 /// Test closing git log with q
@@ -1183,27 +1174,28 @@ fn test_git_log_close() {
 
     // Wait for git log to load
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| h.screen_to_string().contains("switch pane"))
         .unwrap();
 
     let screen_before = harness.screen_to_string();
-    assert!(screen_before.contains("Commits:"));
+    assert!(screen_before.contains("switch pane"));
 
     // Press q to close git log
     harness
         .send_key(KeyCode::Char('q'), KeyModifiers::NONE)
         .unwrap();
-    harness.process_async_and_render().unwrap();
 
-    // Git log should be closed
-    harness.sleep(std::time::Duration::from_millis(100));
-    harness.render().unwrap();
+    // Wait for git log to actually close (buffer group teardown is async)
+    harness
+        .wait_until(|h| !h.screen_to_string().contains("switch pane"))
+        .unwrap();
 
     let screen_after = harness.screen_to_string();
     println!("After closing:\n{screen_after}");
 
     // Should no longer show git log
-    harness.assert_screen_not_contains("Commits:");
+    // Toolbar is gone once the plugin's buffer group is closed.
+    harness.assert_screen_not_contains("switch pane");
 }
 
 /// Test diff coloring in commit detail
@@ -1231,7 +1223,7 @@ fn test_git_log_diff_coloring() {
 
     // Wait for git log to load
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| h.screen_to_string().contains("switch pane"))
         .unwrap();
 
     // Move to the commit and show detail
@@ -1297,95 +1289,265 @@ fn test_git_log_open_different_commits_sequentially() {
     // Trigger git log
     trigger_git_log(&mut harness);
 
-    // Wait for git log to load
+    // The toolbar renders before `git log` finishes; wait for the actual
+    // commit rows in the log panel before asserting on them.
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("THIRD_UNIQUE_COMMIT_CCC")
+                && s.contains("SECOND_UNIQUE_COMMIT_BBB")
+                && s.contains("FIRST_UNIQUE_COMMIT_AAA")
+        })
         .unwrap();
 
     let screen_log = harness.screen_to_string();
     println!("Git log with commits:\n{screen_log}");
 
-    // Verify all commits are visible
-    assert!(
-        screen_log.contains("THIRD_UNIQUE_COMMIT_CCC"),
-        "Should show third commit"
-    );
-    assert!(
-        screen_log.contains("SECOND_UNIQUE_COMMIT_BBB"),
-        "Should show second commit"
-    );
-    assert!(
-        screen_log.contains("FIRST_UNIQUE_COMMIT_AAA"),
-        "Should show first commit"
-    );
+    // Initial selection is HEAD (THIRD) — detail panel auto-previews its diff.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("file3.txt"))
+        .unwrap();
 
-    // Navigate down to the first commit line (header is line 1, commits start at line 2)
-    // Most recent commit (THIRD) is at the top
+    // Down → SECOND selected → detail switches to file2.txt.
     harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness.process_async_and_render().unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("file2.txt"))
+        .unwrap();
+    let screen_second = harness.screen_to_string();
+    assert!(
+        screen_second.contains("SECOND_UNIQUE_COMMIT_BBB"),
+        "Detail should reference SECOND commit subject:\n{screen_second}"
+    );
 
-    // Open the first commit (THIRD_UNIQUE_COMMIT_CCC - most recent)
+    // Down again → FIRST selected → detail switches to file1.txt.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("file1.txt"))
+        .unwrap();
+    let screen_first = harness.screen_to_string();
+    assert!(
+        screen_first.contains("FIRST_UNIQUE_COMMIT_AAA"),
+        "Detail should reference FIRST commit subject:\n{screen_first}"
+    );
+}
+
+/// Pressing Down repeatedly in the log panel should progressively deepen the
+/// selection: each press advances to the next-older commit, and the right-hand
+/// detail panel updates to show that commit's diff. Regression test for a bug
+/// where the log cursor jumped back to the top of the buffer once the detail
+/// panel re-rendered, causing subsequent Down presses to stick on commit #2.
+#[test]
+fn test_git_log_down_arrow_progresses_through_commits() {
+    init_tracing_from_env();
+    let repo = GitTestRepo::new();
+
+    // Four commits, each introduces a distinctively-named file so we can
+    // identify which commit's diff the detail panel is currently rendering.
+    repo.create_file("f1_alpha.txt", "one");
+    repo.git_add(&["f1_alpha.txt"]);
+    repo.git_commit("Alpha commit");
+
+    repo.create_file("f2_beta.txt", "two");
+    repo.git_add(&["f2_beta.txt"]);
+    repo.git_commit("Beta commit");
+
+    repo.create_file("f3_gamma.txt", "three");
+    repo.git_add(&["f3_gamma.txt"]);
+    repo.git_commit("Gamma commit");
+
+    repo.create_file("f4_delta.txt", "four");
+    repo.git_add(&["f4_delta.txt"]);
+    repo.git_commit("Delta commit");
+
+    repo.setup_git_log_plugin();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        180,
+        48,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    trigger_git_log(&mut harness);
+
+    // After open, HEAD (Delta) should be auto-selected; detail panel shows its diff.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("f4_delta.txt"))
+        .unwrap();
+
+    // Down once — detail should switch to Gamma's diff (f3_gamma.txt).
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("f3_gamma.txt"))
+        .unwrap();
+
+    // Down again — if the log cursor jumps back to row 0 after the Gamma
+    // detail render, the next Down would only re-select Gamma and we'd
+    // never reach Beta. Assert that Beta's file shows up in the detail.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("f2_beta.txt"))
+        .unwrap();
+
+    // Down once more for good measure — should reach Alpha.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("f1_alpha.txt"))
+        .unwrap();
+}
+
+/// Regression: pressing Enter on a diff line in the commit details panel
+/// opens the file at that commit. Closing the file-view and pressing Enter
+/// again on a diff line must also work — it previously failed with
+/// "Move cursor to a diff line with file context" because the panel
+/// buffer's cursor position was read from a stale mirror entry in the
+/// outer split's keyed_states.
+///
+/// FIXME(windows): test consistently times out on Windows CI at 180s.
+/// After `Tab + 10×Down`, the detail-panel cursor barely moves
+/// (status shows `Ln 2, Col 2`) and the subsequent `Enter` opens
+/// neither the file-view tab nor the "Move cursor to a diff line"
+/// error. The Downs are being absorbed somewhere — by the
+/// terminal layer, by a different mode binding, by CRLF-aware
+/// movement, by something else — but without a Windows machine
+/// to bisect we don't know which. Gated `cfg(unix)` rather than
+/// guessed at; the bug being guarded (`keyed_states` mirror
+/// staleness on `BufferGroupClosed`) is platform-agnostic, so the
+/// Linux + macOS runs are real coverage. Track + remove the
+/// gate when someone can repro on Windows.
+#[cfg(unix)]
+#[test]
+fn test_git_log_open_file_works_after_closing_previous_file_view() {
+    init_tracing_from_env();
+    fresh::services::signal_handler::install_signal_handlers();
+    let repo = GitTestRepo::new();
+
+    repo.create_file("src/main.rs", "fn main() {\n    println!(\"first\");\n}\n");
+    repo.git_add(&["src/main.rs"]);
+    repo.git_commit("first commit");
+
+    // Same file edited twice so each commit has a diff body to land on.
+    repo.create_file("src/main.rs", "fn main() {\n    println!(\"second\");\n}\n");
+    repo.git_add(&["src/main.rs"]);
+    repo.git_commit("second commit");
+
+    repo.setup_git_log_plugin();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        180,
+        48,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    trigger_git_log(&mut harness);
+    // Wait for the detail panel to render the second (HEAD) commit diff.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("+    println!(\"second\");"))
+        .unwrap();
+
+    // Focus the detail panel and land on a `file`-bearing diff line.
+    //
+    // Originally this used `Tab` (a plugin handler that calls
+    // `editor.focusBufferGroupPanel`) followed by 10× `Down` and a
+    // `wait_until("Ln 11, Col 1")`.  Two problems:
+    //
+    //   1. Under heavy CI load, `drain_async_work`'s 200 ms cap can be
+    //      exceeded by the plugin thread that handles `Tab`.  The Downs
+    //      are then dispatched while focus is still on the log panel
+    //      (which only has two commits worth of lines), the detail
+    //      cursor never reaches the target line, and the wait hangs
+    //      until the nextest 180 s timeout.
+    //
+    //   2. The detail-buffer line numbering encoded in the old comment
+    //      (Ln 11 == "diff --git", Ln 16 == " fn main() {") is fragile:
+    //      it shifts whenever the plugin's detail-header changes (e.g.
+    //      a title row is added/removed), and a hardcoded line-number
+    //      wait silently turns that drift into a timeout instead of a
+    //      clean assertion failure.
+    //
+    // Clicking directly on the rendered "diff --git" row both focuses
+    // the panel and positions the cursor on a `file`-bearing line in a
+    // single synchronous editor action — no plugin round-trip, and no
+    // dependency on the detail buffer's exact line numbering.  The
+    // detail panel is the *right* split, so the click column must be
+    // where the substring actually appears in the rendered row (past
+    // the panel divider): clicking at column 0 lands in the log panel
+    // and leaves the detail focus untouched.
+    //
+    // The `--stat --patch` output exposes several lines with `file`
+    // set (`diff --git …`, `+++ b/…`, `@@ -…`, ` fn main() {`); the
+    // assertion below only cares that Enter on such a line opens a
+    // file-view, so any one of them is a valid landing target.
+    let screen_before_click1 = harness.screen_to_string();
+    let (diff_row, diff_col) = screen_before_click1
+        .lines()
+        .enumerate()
+        .find_map(|(y, l)| l.find("diff --git").map(|x| (y as u16, x as u16)))
+        .expect("detail panel should show a diff header before the click");
+    harness.mouse_click(diff_col, diff_row).unwrap();
+    // First Enter: open file-view of src/main.rs @ HEAD.
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-
-    // Wait for commit detail
+    // Wait for the file-view virtual buffer to actually open. The
+    // `*<hash>:src/main.rs*` tab title is only produced by
+    // `createVirtualBuffer` in git_log.ts and cannot be matched by the
+    // diff, so it's the safe completion signal. The move-cursor status
+    // is also accepted so the assertion below can fail loudly if Enter
+    // somehow misses the file-bearing line despite the pre-Enter wait.
     harness
         .wait_until(|h| {
-            let screen = h.screen_to_string();
-            screen.contains("Author:") && screen.contains("THIRD_UNIQUE_COMMIT_CCC")
+            let s = h.screen_to_string();
+            s.contains(":src/main.rs*")
+                || s.contains("Move cursor to a diff line with file context")
         })
         .unwrap();
+    {
+        let s = harness.screen_to_string();
+        assert!(
+            !s.contains("Move cursor to a diff line with file context"),
+            "BUG: first Enter on the `diff --git` line fell back to move-cursor status:\n{s}",
+        );
+    }
 
-    let screen_first_detail = harness.screen_to_string();
-    println!("First commit detail (should be THIRD):\n{screen_first_detail}");
-
-    // Press q to go back to git log
+    // Close the file-view (q) and go back to the detail panel.
     harness
         .send_key(KeyCode::Char('q'), KeyModifiers::NONE)
         .unwrap();
-    harness.process_async_and_render().unwrap();
-
-    // Wait for git log to reappear
     harness
-        .wait_until(|h| h.screen_to_string().contains("Commits:"))
+        .wait_until(|h| h.screen_to_string().contains("+    println!(\"second\");"))
         .unwrap();
 
-    let screen_back_to_log = harness.screen_to_string();
-    println!("Back to git log:\n{screen_back_to_log}");
-
-    // Now navigate DOWN to a DIFFERENT commit (SECOND_UNIQUE_COMMIT_BBB)
-    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
-    harness.process_async_and_render().unwrap();
-
-    let screen_after_nav = harness.screen_to_string();
-    println!("After navigating down:\n{screen_after_nav}");
-
-    // Open the second commit - THIS IS THE BUG: it should open SECOND, not THIRD
+    // Click on the ` fn main() {` context line (also `file`-bearing) and
+    // press Enter again.  Before the fix the second Enter reported
+    // "Move cursor to a diff line with file context".  Same right-panel
+    // column dance as the first click.
+    let screen_before_click2 = harness.screen_to_string();
+    let (fn_row, fn_col) = screen_before_click2
+        .lines()
+        .enumerate()
+        .find_map(|(y, l)| l.find(" fn main() {").map(|x| (y as u16, x as u16)))
+        .expect("detail panel should show ` fn main() {` (context line) before the click");
+    harness.mouse_click(fn_col, fn_row).unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
 
-    // Wait for commit detail
+    // Same accept-and-assert pattern as the first Enter.
     harness
         .wait_until(|h| {
-            let screen = h.screen_to_string();
-            screen.contains("Author:")
+            let s = h.screen_to_string();
+            s.contains(":src/main.rs*")
+                || s.contains("Move cursor to a diff line with file context")
         })
         .unwrap();
-
-    let screen_second_detail = harness.screen_to_string();
-    println!("Second commit detail (should be SECOND):\n{screen_second_detail}");
-
-    // CRITICAL ASSERTION: The bug is that it opens the first commit again instead of the second
-    // This should show SECOND_UNIQUE_COMMIT_BBB, NOT THIRD_UNIQUE_COMMIT_CCC
+    let s = harness.screen_to_string();
     assert!(
-        screen_second_detail.contains("SECOND_UNIQUE_COMMIT_BBB"),
-        "BUG: After navigating to a different commit and pressing Enter, it should open SECOND_UNIQUE_COMMIT_BBB, but got:\n{screen_second_detail}"
-    );
-    assert!(
-        !screen_second_detail.contains("THIRD_UNIQUE_COMMIT_CCC"),
-        "BUG: Should NOT show THIRD commit when SECOND was selected:\n{screen_second_detail}"
+        !s.contains("Move cursor to a diff line with file context"),
+        "BUG: second Enter fell back to move-cursor status:\n{s}",
     );
 }
 
@@ -1398,12 +1560,13 @@ fn trigger_git_blame(harness: &mut EditorTestHarness) {
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
-    harness.render().unwrap();
+    harness.wait_for_prompt().unwrap();
     harness.type_text("Git Blame").unwrap();
+    harness.wait_for_screen_contains("Git Blame").unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.render().unwrap();
+    harness.wait_for_screen_contains("──").unwrap();
 }
 
 /// Test git blame opens and shows blame blocks with headers
@@ -2347,4 +2510,167 @@ fn test_git_blame_original_buffer_not_decorated() {
         !screen_after_close.contains("──"),
         "Original file should NOT have blame headers after closing blame"
     );
+}
+
+/// Regression test for https://github.com/sinelaw/fresh/issues/566.
+///
+/// The git-log-related read-only buffers advertise `j/k: navigate` in their
+/// footer hints. Pressing j/k used to fall through to the editing actions
+/// and trip the `Editing disabled in this buffer` status message instead of
+/// moving the cursor. The main log and detail panels already bind j/k
+/// explicitly; this test covers the file-view buffer (opened from the detail
+/// panel's `Enter on a diff line` path), which previously did not.
+#[test]
+fn test_git_log_file_view_jk_navigation() {
+    let repo = GitTestRepo::new();
+
+    // A file with several lines so j/k have somewhere to move to.
+    let multiline = "line one\nline two\nline three\nline four\nline five\n";
+    repo.create_file("notes.txt", multiline);
+    repo.git_add(&["notes.txt"]);
+    repo.git_commit("Add notes.txt");
+
+    repo.setup_git_log_plugin();
+
+    let original_dir = repo.change_to_repo_dir();
+    let _guard = DirGuard::new(original_dir);
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        40,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    trigger_git_log(&mut harness);
+
+    // Wait for git log to load and show the commit.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("switch pane") && screen.contains("Add notes.txt")
+        })
+        .unwrap();
+
+    // Tab into the detail panel so Enter-on-a-diff-line opens the file-view.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.process_async_and_render().unwrap();
+
+    // Wait for the commit diff to render in the detail panel.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("Author:") && screen.contains("+line one")
+        })
+        .unwrap();
+
+    // The file-view buffer is active when the status bar's leading "current
+    // buffer" field is `*<hash>:notes.txt* [RO]`. Matching on the status bar
+    // rather than the one-shot "(read-only) | Target: line N" ready message
+    // avoids a race: the ready message is later overwritten by any status
+    // the next key produces, but the buffer's name / [RO] indicator stays.
+    let file_view_active = |h: &EditorTestHarness| {
+        h.screen_to_string()
+            .lines()
+            .any(|l| l.contains(":notes.txt*") && l.contains("[RO]") && l.contains("Ln "))
+    };
+
+    // Walk the cursor down the detail panel, trying Enter each time until
+    // the file-view actually opens. The detail panel only accepts Enter on
+    // diff lines that have file context; other rows keep the detail panel
+    // focused and surface "Move cursor to a diff line with file context"
+    // in the status bar. Opening the file-view spawns `git show` under the
+    // hood, so we poll briefly after each Enter for the async result.
+    for _ in 0..40 {
+        harness
+            .send_key(KeyCode::Enter, KeyModifiers::NONE)
+            .unwrap();
+        for _ in 0..20 {
+            harness.process_async_and_render().unwrap();
+            if file_view_active(&harness) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        if file_view_active(&harness) {
+            break;
+        }
+        harness
+            .send_key(KeyCode::Char('j'), KeyModifiers::NONE)
+            .unwrap();
+        harness.process_async_and_render().unwrap();
+    }
+    assert!(
+        file_view_active(&harness),
+        "Did not reach a diff line that opens the file-view. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Record the file-view's starting line so we can assert that j moves
+    // the cursor forward without caring exactly which diff line the walk
+    // above landed on. The pre-fix behaviour for this buffer was: j/k ran
+    // no action, left the cursor where it was, and set the status to
+    // "Editing disabled in this buffer". The assertions below cover both
+    // halves: cursor motion AND the absence of that status message.
+    let start_line: usize = {
+        let screen = harness.screen_to_string();
+        parse_ln(&screen).unwrap_or_else(|| {
+            panic!("Could not parse 'Ln <N>' from file-view status. Screen:\n{screen}")
+        })
+    };
+    assert!(
+        !harness
+            .screen_to_string()
+            .to_lowercase()
+            .contains("editing disabled"),
+        "'Editing disabled' should not appear before pressing j. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Press j — cursor should advance and the editing-disabled message must
+    // not fire (the core #566 regression check).
+    harness
+        .send_key(KeyCode::Char('j'), KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    let after_j = {
+        let screen = harness.screen_to_string();
+        assert!(
+            !screen.to_lowercase().contains("editing disabled"),
+            "j should move the cursor in git-log-file-view, not trigger 'Editing disabled'. Screen:\n{screen}"
+        );
+        parse_ln(&screen)
+            .unwrap_or_else(|| panic!("Could not parse line after j. Screen:\n{screen}"))
+    };
+    assert!(
+        after_j > start_line,
+        "Expected cursor to advance after pressing j (start_line={start_line}, after_j={after_j})"
+    );
+
+    // Press k — the critical check is again the absence of the
+    // "Editing disabled" status. (Cursor motion on k in a virtual
+    // buffer is covered by the main git-log mode tests; the regression
+    // we're guarding here is specifically the status-message path.)
+    harness
+        .send_key(KeyCode::Char('k'), KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    {
+        let screen = harness.screen_to_string();
+        assert!(
+            !screen.to_lowercase().contains("editing disabled"),
+            "k should not trigger 'Editing disabled' in git-log-file-view. Screen:\n{screen}"
+        );
+    }
+}
+
+/// Extract the line number from a status-bar fragment of the form "Ln N, Col M".
+/// Uses `rfind` so it picks the status bar at the bottom of the screen rather
+/// than any earlier occurrence (e.g. "| Ln" in help text).
+fn parse_ln(screen: &str) -> Option<usize> {
+    let idx = screen.rfind("Ln ")?;
+    let rest = &screen[idx + 3..];
+    let end = rest.find(',')?;
+    rest[..end].trim().parse().ok()
 }

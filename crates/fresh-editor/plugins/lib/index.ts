@@ -44,3 +44,37 @@ export type {
   FinderProvider,
   LivePanelOptions,
 } from "./finder.ts";
+
+// Widget library — declarative plugin UI (see widgets.ts).
+export {
+  activate,
+  button,
+  col,
+  flexSpacer,
+  focusAdvance,
+  hintBar,
+  key,
+  list,
+  parseHintString,
+  raw,
+  row,
+  selectMove,
+  spacer,
+  text,
+  textArea,
+  textInput,
+  textInputChar,
+  textInputKey,
+  toggle,
+  tree,
+  treeNode,
+  WidgetPanel,
+} from "./widgets.ts";
+export type {
+  ButtonKind,
+  HintEntry as WidgetHintEntry,
+  TreeNode,
+  WidgetAction,
+  WidgetMutation,
+  WidgetSpec,
+} from "./widgets.ts";

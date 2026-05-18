@@ -8,6 +8,7 @@
 #[cfg(target_os = "macos")]
 pub mod macos;
 mod native_menu;
+pub mod platform;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -21,6 +22,7 @@ use crossterm::event::{
 };
 use fresh_core::menu::{Menu, MenuContext};
 use ratatui::backend::Backend;
+use ratatui::style::Color;
 use ratatui::Terminal;
 use ratatui_wgpu::{Builder, Dimensions, Font, WgpuBackend};
 use winit::application::ApplicationHandler;
@@ -35,8 +37,15 @@ use native_menu::NativeMenuBar;
 /// Embedded JetBrains Mono Regular font (SIL Open Font License 1.1).
 const FONT_DATA: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 
-/// Embedded application icon (32x32 RGBA PNG).
-const ICON_PNG_32: &[u8] = include_bytes!("../resources/icon_32x32.png");
+/// Cross-platform fallback application icon (256×256 RGBA PNG).
+///
+/// Used as the winit `Window::set_window_icon` value, which Linux WMs read
+/// as `_NET_WM_ICON` and scale down per task-bar size.  On Windows we
+/// additionally override this immediately after window creation with the
+/// multi-size HICON from the .exe's embedded `RT_GROUP_ICON` resource — see
+/// [`platform::set_window_icon`].  256 px scales down well; 32 px upscales
+/// poorly to 48/64 at 150%/200% DPI.
+const ICON_PNG: &[u8] = include_bytes!("../resources/icon_256x256.png");
 
 /// Frame duration target (60fps).
 const FRAME_DURATION: Duration = Duration::from_millis(16);
@@ -123,6 +132,17 @@ pub trait GuiApplication {
     ///
     /// Default implementation does nothing.
     fn on_menu_action(&mut self, _action: &str, _args: &HashMap<String, serde_json::Value>) {}
+
+    /// Return an updated ANSI color table if the theme changed since the
+    /// last call.
+    ///
+    /// The GUI event loop polls this every frame. Return `Some(table)` to
+    /// update the wgpu backend's color table, or `None` if unchanged.
+    ///
+    /// Default: always returns `None`.
+    fn take_color_update(&mut self) -> Option<ColorTable> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +157,14 @@ pub struct GuiConfig {
     pub width: u32,
     /// Initial window height in pixels.
     pub height: u32,
+    /// Default background color used when a cell has `Color::Reset`.
+    /// Defaults to `Color::White` (ratatui-wgpu default).
+    pub reset_bg: Color,
+    /// Default foreground color used when a cell has `Color::Reset`.
+    /// Defaults to `Color::Black` (ratatui-wgpu default).
+    pub reset_fg: Color,
+    /// ANSI base-16 color table. When `None`, uses ratatui-wgpu defaults.
+    pub color_table: Option<ColorTable>,
 }
 
 impl Default for GuiConfig {
@@ -145,7 +173,64 @@ impl Default for GuiConfig {
             title: "Fresh".into(),
             width: 1280,
             height: 800,
+            reset_bg: Color::White,
+            reset_fg: Color::Black,
+            color_table: None,
         }
+    }
+}
+
+/// ANSI color table tuned for dark backgrounds (bg ~#1e1e1e).
+///
+/// Standard colors are brightened and light variants are vivid to ensure
+/// readability against dark editor backgrounds.
+// Re-export so consumers (e.g. fresh-editor/gui) can name the type
+// returned by `GuiApplication::take_color_update`.
+pub use ratatui_wgpu::ColorTable;
+
+pub fn dark_color_table() -> ColorTable {
+    ColorTable {
+        BLACK: [0, 0, 0],
+        RED: [204, 60, 60],
+        GREEN: [80, 180, 80],
+        YELLOW: [220, 180, 60],
+        BLUE: [70, 130, 230],
+        MAGENTA: [190, 90, 220],
+        CYAN: [60, 190, 190],
+        GRAY: [160, 160, 160],
+        DARKGRAY: [100, 100, 100],
+        LIGHTRED: [240, 110, 110],
+        LIGHTGREEN: [130, 220, 130],
+        LIGHTYELLOW: [240, 220, 130],
+        LIGHTBLUE: [130, 170, 255],
+        LIGHTMAGENTA: [220, 140, 255],
+        LIGHTCYAN: [120, 230, 230],
+        WHITE: [230, 230, 230],
+    }
+}
+
+/// ANSI color table tuned for light backgrounds (bg ~#ffffff).
+///
+/// Colors are darkened / more saturated so they remain readable against
+/// white or very light editor backgrounds.
+pub fn light_color_table() -> ColorTable {
+    ColorTable {
+        BLACK: [0, 0, 0],
+        RED: [180, 0, 0],
+        GREEN: [0, 130, 0],
+        YELLOW: [150, 120, 0],
+        BLUE: [0, 50, 180],
+        MAGENTA: [140, 0, 140],
+        CYAN: [0, 130, 130],
+        GRAY: [130, 130, 130],
+        DARKGRAY: [80, 80, 80],
+        LIGHTRED: [210, 60, 60],
+        LIGHTGREEN: [40, 160, 40],
+        LIGHTYELLOW: [180, 150, 0],
+        LIGHTBLUE: [50, 90, 210],
+        LIGHTMAGENTA: [170, 50, 170],
+        LIGHTCYAN: [0, 160, 160],
+        WHITE: [255, 255, 255],
     }
 }
 
@@ -162,6 +247,10 @@ where
     F: FnOnce(u16, u16) -> AnyhowResult<A> + 'static,
     A: GuiApplication + 'static,
 {
+    // Per-platform process-level setup (e.g. Windows AppUserModelID).
+    // Must happen before the EventLoop is constructed.
+    platform::init();
+
     let event_loop = EventLoop::new().context("Failed to create winit event loop")?;
     // Use WaitUntil for frame pacing instead of Poll.  Poll causes winit to
     // schedule a CFRunLoopTimer at f64::MIN (fire immediately), which
@@ -190,11 +279,13 @@ where
 // Internal runner
 // ---------------------------------------------------------------------------
 
+type CreateAppFn<A> = Box<dyn FnOnce(u16, u16) -> AnyhowResult<A>>;
+
 /// Winit application that bridges winit/wgpu to the [`GuiApplication`] trait.
 struct WgpuRunner<A: GuiApplication> {
     config: GuiConfig,
     /// Factory called in `resumed()` once the window is ready.
-    create_app: Option<Box<dyn FnOnce(u16, u16) -> AnyhowResult<A>>>,
+    create_app: Option<CreateAppFn<A>>,
     /// Runtime state — created in `resumed()`.
     state: Option<RunnerState<A>>,
 }
@@ -455,6 +546,13 @@ impl<A: GuiApplication + 'static> ApplicationHandler for WgpuRunner<A> {
                 .update(&updated_menus, &self.config.title, &ctx);
         }
 
+        // If the app signalled a color table change (e.g. theme switch),
+        // push it to the wgpu backend so ANSI named colors match the theme.
+        if let Some(table) = state.app.take_color_update() {
+            state.terminal.backend_mut().update_color_table(table);
+            state.needs_render = true;
+        }
+
         // Sync native menu item states (enabled/disabled, checkmarks) from
         // the application's current MenuContext — cheap incremental update.
         let ctx = state.app.menu_context();
@@ -492,21 +590,30 @@ impl<A: GuiApplication> WgpuRunner<A> {
                 .context("Failed to create window")?,
         );
 
+        // On Windows, override the cross-platform PNG icon with the multi-size
+        // HICON loaded from the .exe's embedded resource so the running
+        // window's icon (small + large) is sharp at every DPI and matches
+        // what Explorer / Properties / Alt-Tab show.  No-op elsewhere.
+        platform::set_window_icon(&window);
+
         let size = window.inner_size();
 
         // Build the wgpu backend (async adapter/device request — block on it).
         let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
         let font = Font::new(FONT_DATA).context("Failed to load embedded font")?;
 
+        let mut builder = Builder::from_font(font)
+            .with_width_and_height(Dimensions {
+                width: NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap()),
+                height: NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap()),
+            })
+            .with_bg_color(self.config.reset_bg)
+            .with_fg_color(self.config.reset_fg);
+        if let Some(table) = self.config.color_table.clone() {
+            builder = builder.with_color_table(table);
+        }
         let backend = rt
-            .block_on(
-                Builder::from_font(font)
-                    .with_width_and_height(Dimensions {
-                        width: NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap()),
-                        height: NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap()),
-                    })
-                    .build_with_target(window.clone()),
-            )
+            .block_on(builder.build_with_target(window.clone()))
             .context("Failed to create wgpu backend")?;
 
         let mut terminal = Terminal::new(backend).context("Failed to create ratatui terminal")?;
@@ -866,9 +973,9 @@ pub fn cell_dimensions_to_grid(width: f64, height: f64, cell_size: (f64, f64)) -
     (cols.max(1), rows.max(1))
 }
 
-/// Decode the embedded 32x32 PNG icon into a winit `Icon`.
+/// Decode the embedded 256×256 PNG icon into a winit `Icon`.
 fn load_window_icon() -> Option<winit::window::Icon> {
-    decode_png_rgba(ICON_PNG_32)
+    decode_png_rgba(ICON_PNG)
         .and_then(|(rgba, w, h)| winit::window::Icon::from_rgba(rgba, w, h).ok())
 }
 

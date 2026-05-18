@@ -33,6 +33,7 @@ pub use fresh_gui::{
 pub fn run_gui(
     files: &[String],
     no_plugins: bool,
+    no_init: bool,
     config_path: Option<&PathBuf>,
     locale: Option<&str>,
     no_session: bool,
@@ -80,8 +81,27 @@ pub fn run_gui(
     let show_file_explorer = file_locations.is_empty();
     let no_session_flag = no_session;
 
+    // Configure wgpu reset colors and ANSI color table based on theme.
+    // Load the theme to check its editor_bg luminance rather than relying
+    // on the theme name — this works for custom themes too.
+    let is_light = crate::view::theme::Theme::load_builtin(&loaded_config.theme)
+        .map_or(false, |t| t.is_light());
+    let gui_config = {
+        let mut cfg = GuiConfig::default();
+        if is_light {
+            cfg.reset_bg = ratatui::style::Color::White;
+            cfg.reset_fg = ratatui::style::Color::Black;
+            cfg.color_table = Some(fresh_gui::light_color_table());
+        } else {
+            cfg.reset_bg = ratatui::style::Color::Black;
+            cfg.reset_fg = ratatui::style::Color::White;
+            cfg.color_table = Some(fresh_gui::dark_color_table());
+        }
+        cfg
+    };
+
     // Move all captured state into the closure that creates the editor app.
-    fresh_gui::run(GuiConfig::default(), move |cols, rows| {
+    fresh_gui::run(gui_config, move |cols, rows| {
         // For GUI, we always have true color.
         let color_capability = crate::view::color_support::ColorCapability::TrueColor;
         let filesystem: Arc<dyn FileSystem + Send + Sync> = Arc::new(StdFileSystem);
@@ -97,6 +117,10 @@ pub fn run_gui(
             filesystem,
         )
         .context("Failed to create editor instance")?;
+
+        // Auto-load ~/.config/fresh/init.ts via the plugin pipeline.
+        editor.load_init_script(!no_init);
+        editor.fire_plugins_loaded_hook();
 
         // ratatui-wgpu does not render a hardware cursor.
         editor.set_software_cursor_only(true);
@@ -123,9 +147,11 @@ pub fn run_gui(
             tracing::warn!("Failed to start recovery session: {}", e);
         }
 
+        let last_theme = editor.theme().name.clone();
         Ok(EditorApp {
             editor,
             workspace_enabled,
+            last_theme,
         })
     })
 }
@@ -137,6 +163,9 @@ pub fn run_gui(
 struct EditorApp {
     editor: Editor,
     workspace_enabled: bool,
+    /// Last theme name seen — used to detect theme switches and push
+    /// an updated ANSI color table to the wgpu backend.
+    last_theme: String,
 }
 
 impl GuiApplication for EditorApp {
@@ -148,14 +177,16 @@ impl GuiApplication for EditorApp {
         );
 
         // Event debug dialog intercepts ALL key events before normal processing.
-        if self.editor.is_event_debug_active() {
+        if self.editor.active_window().is_event_debug_active() {
             let raw_event = crossterm::event::KeyEvent {
                 code: key_event.code,
                 modifiers: key_event.modifiers,
                 kind: KeyEventKind::Press,
                 state: KeyEventState::NONE,
             };
-            self.editor.handle_event_debug_input(&raw_event);
+            self.editor
+                .active_window_mut()
+                .handle_event_debug_input(&raw_event);
             return Ok(());
         }
 
@@ -191,8 +222,8 @@ impl GuiApplication for EditorApp {
             tracing::warn!("Failed to end recovery session: {}", e);
         }
         if self.workspace_enabled {
-            if let Err(e) = self.editor.save_workspace() {
-                tracing::warn!("Failed to save workspace: {}", e);
+            if let Err(e) = self.editor.save_all_windows_workspaces() {
+                tracing::warn!("Failed to save workspaces: {}", e);
             }
         }
     }
@@ -217,6 +248,19 @@ impl GuiApplication for EditorApp {
             }
         } else {
             tracing::warn!("Unknown menu action: {}", action);
+        }
+    }
+
+    fn take_color_update(&mut self) -> Option<fresh_gui::ColorTable> {
+        let current = &self.editor.theme().name;
+        if *current == self.last_theme {
+            return None;
+        }
+        self.last_theme = current.clone();
+        if self.editor.theme().is_light() {
+            Some(fresh_gui::light_color_table())
+        } else {
+            Some(fresh_gui::dark_color_table())
         }
     }
 }

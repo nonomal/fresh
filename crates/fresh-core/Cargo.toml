@@ -15,9 +15,15 @@ schemars.workspace = true
 anyhow.workspace = true
 lsp-types.workspace = true
 ts-rs.workspace = true
-crossterm = { workspace = true, optional = true }
 rquickjs = { workspace = true, optional = true }
 rquickjs-serde = { workspace = true, optional = true }
 
+# rquickjs-sys has no pre-generated bindings for FreeBSD
+[target.'cfg(target_os = "freebsd")'.dependencies]
+rquickjs = { workspace = true, optional = true, features = ["bindgen"] }
+
+[dev-dependencies]
+proptest = "1.9"
+
 [features]
-plugins = ["dep:crossterm", "dep:rquickjs", "dep:rquickjs-serde"]
+plugins = ["dep:rquickjs", "dep:rquickjs-serde"]

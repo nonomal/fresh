@@ -1,5 +1,13 @@
 /// <reference path="./lib/fresh.d.ts" />
 
+import {
+  hintBar,
+  key,
+  list,
+  parseHintString,
+  WidgetPanel,
+} from "./lib/index.ts";
+
 /**
  * Fresh Package Manager Plugin
  *
@@ -231,14 +239,10 @@ interface ParsedPackageUrl {
 // =============================================================================
 
 /**
- * Ensure a directory exists
+ * Ensure a directory exists (cross-platform)
  */
-async function ensureDir(path: string): Promise<boolean> {
-  if (editor.fileExists(path)) {
-    return true;
-  }
-  const result = await editor.spawnProcess("mkdir", ["-p", path]);
-  return result.exit_code === 0;
+function ensureDir(path: string): boolean {
+  return editor.createDir(path);
 }
 
 /**
@@ -395,7 +399,7 @@ async function writeJsonFile(path: string, data: unknown): Promise<boolean> {
 async function syncRegistry(): Promise<void> {
   editor.setStatus("Syncing package registry...");
 
-  await ensureDir(INDEX_DIR);
+  ensureDir(INDEX_DIR);
 
   const sources = getRegistrySources();
   let synced = 0;
@@ -493,7 +497,7 @@ function loadRegistry(type: "plugins" | "themes" | "languages"): RegistryData {
  * Cache registry data locally for offline/fast access
  */
 async function cacheRegistry(): Promise<void> {
-  await ensureDir(CACHE_DIR);
+  ensureDir(CACHE_DIR);
   const sources = getRegistrySources();
 
   for (const source of sources) {
@@ -672,7 +676,7 @@ function validatePackage(packageDir: string, packageName: string): ValidationRes
 
   // For plugins, validate entry file exists
   if (manifest.type === "plugin") {
-    const entryFile = manifest.fresh?.entry || `${manifest.name}.ts`;
+    const entryFile = manifest.fresh?.entry || manifest.fresh?.main || `${manifest.name}.ts`;
     const entryPath = editor.pathJoin(packageDir, entryFile);
 
     if (!editor.fileExists(entryPath)) {
@@ -823,7 +827,7 @@ async function installFromRepo(
   version?: string
 ): Promise<boolean> {
   // Clone to temp directory first to detect package type
-  const tempDir = `/tmp/fresh-pkg-clone-${hashString(repoUrl)}-${Date.now()}`;
+  const tempDir = editor.pathJoin(editor.getTempDir(), `fresh-pkg-clone-${hashString(repoUrl)}-${Date.now()}`);
 
   const cloneArgs = ["clone"];
   if (!version || version === "latest") {
@@ -857,7 +861,7 @@ async function installFromRepo(
     editor.warn(`[pkg] Invalid package '${packageName}': ${validation.error}`);
     editor.setStatus(`Failed to install ${packageName}: ${validation.error}`);
     // Clean up
-    await editor.spawnProcess("rm", ["-rf", tempDir]);
+    editor.removePath(tempDir);
     return false;
   }
 
@@ -877,16 +881,15 @@ async function installFromRepo(
   // Check if already installed in correct location
   if (editor.fileExists(correctTargetDir)) {
     editor.setStatus(`Package '${packageName}' is already installed`);
-    await editor.spawnProcess("rm", ["-rf", tempDir]);
+    editor.removePath(tempDir);
     return false;
   }
 
   // Ensure correct directory exists and move from temp
-  await ensureDir(correctPackagesDir);
-  const moveResult = await editor.spawnProcess("mv", [tempDir, correctTargetDir]);
-  if (moveResult.exit_code !== 0) {
-    editor.setStatus(`Failed to install ${packageName}: ${moveResult.stderr}`);
-    await editor.spawnProcess("rm", ["-rf", tempDir]);
+  ensureDir(correctPackagesDir);
+  if (!editor.renamePath(tempDir, correctTargetDir)) {
+    editor.setStatus(`Failed to install ${packageName}: could not move package to target directory`);
+    editor.removePath(tempDir);
     return false;
   }
 
@@ -976,13 +979,12 @@ async function installFromLocalPath(
   }
 
   // Ensure correct directory exists
-  await ensureDir(correctPackagesDir);
+  ensureDir(correctPackagesDir);
 
   // Copy the directory to correct target
   editor.setStatus(`Copying from ${sourcePath}...`);
-  const copyResult = await editor.spawnProcess("cp", ["-r", sourcePath, correctTargetDir]);
-  if (copyResult.exit_code !== 0) {
-    editor.setStatus(`Failed to copy package: ${copyResult.stderr}`);
+  if (!editor.copyPath(sourcePath, correctTargetDir)) {
+    editor.setStatus(`Failed to copy package from ${sourcePath}`);
     return false;
   }
 
@@ -992,7 +994,7 @@ async function installFromLocalPath(
     editor.warn(`[pkg] Invalid package '${packageName}': ${validation.error}`);
     editor.setStatus(`Failed to install ${packageName}: ${validation.error}`);
     // Clean up the invalid package
-    await editor.spawnProcess("rm", ["-rf", correctTargetDir]);
+    editor.removePath(correctTargetDir);
     return false;
   }
 
@@ -1037,7 +1039,7 @@ async function installFromMonorepo(
   packageName: string,
   version?: string
 ): Promise<boolean> {
-  const tempDir = `/tmp/fresh-pkg-${hashString(parsed.repoUrl)}-${Date.now()}`;
+  const tempDir = editor.pathJoin(editor.getTempDir(), `fresh-pkg-${hashString(parsed.repoUrl)}-${Date.now()}`);
 
   try {
     // Clone the full repo to temp
@@ -1068,7 +1070,7 @@ async function installFromMonorepo(
     const subpathDir = editor.pathJoin(tempDir, parsed.subpath!);
     if (!editor.fileExists(subpathDir)) {
       editor.setStatus(`Subpath '${parsed.subpath}' not found in repository`);
-      await editor.spawnProcess("rm", ["-rf", tempDir]);
+      editor.removePath(tempDir);
       return false;
     }
 
@@ -1077,7 +1079,7 @@ async function installFromMonorepo(
     if (!validation.valid) {
       editor.warn(`[pkg] Invalid package '${packageName}': ${validation.error}`);
       editor.setStatus(`Failed to install ${packageName}: ${validation.error}`);
-      await editor.spawnProcess("rm", ["-rf", tempDir]);
+      editor.removePath(tempDir);
       return false;
     }
 
@@ -1097,19 +1099,18 @@ async function installFromMonorepo(
     // Check if already installed
     if (editor.fileExists(correctTargetDir)) {
       editor.setStatus(`Package '${packageName}' is already installed`);
-      await editor.spawnProcess("rm", ["-rf", tempDir]);
+      editor.removePath(tempDir);
       return false;
     }
 
     // Ensure correct directory exists
-    await ensureDir(correctPackagesDir);
+    ensureDir(correctPackagesDir);
 
     // Copy subdirectory to correct target
     editor.setStatus(`Installing ${packageName} from ${parsed.subpath}...`);
-    const copyResult = await editor.spawnProcess("cp", ["-r", subpathDir, correctTargetDir]);
-    if (copyResult.exit_code !== 0) {
-      editor.setStatus(`Failed to copy package: ${copyResult.stderr}`);
-      await editor.spawnProcess("rm", ["-rf", tempDir]);
+    if (!editor.copyPath(subpathDir, correctTargetDir)) {
+      editor.setStatus(`Failed to copy package from ${parsed.subpath}`);
+      editor.removePath(tempDir);
       return false;
     }
 
@@ -1143,7 +1144,7 @@ async function installFromMonorepo(
     return true;
   } finally {
     // Cleanup temp directory
-    await editor.spawnProcess("rm", ["-rf", tempDir]);
+    editor.removePath(tempDir);
   }
 }
 
@@ -1408,16 +1409,14 @@ async function reinstallPackage(pkg: InstalledPackage): Promise<boolean> {
   }
 
   // Remove old copy
-  const rmResult = await editor.spawnProcess("rm", ["-rf", pkg.path]);
-  if (rmResult.exit_code !== 0) {
-    editor.setStatus(`Failed to remove old copy: ${rmResult.stderr}`);
+  if (!editor.removePath(pkg.path)) {
+    editor.setStatus(`Failed to remove old copy of ${pkg.name}`);
     return false;
   }
 
   // Re-copy from source
-  const copyResult = await editor.spawnProcess("cp", ["-r", sourcePath, pkg.path]);
-  if (copyResult.exit_code !== 0) {
-    editor.setStatus(`Failed to copy from source: ${copyResult.stderr}`);
+  if (!editor.copyPath(sourcePath, pkg.path)) {
+    editor.setStatus(`Failed to copy from source: ${sourcePath}`);
     return false;
   }
 
@@ -1474,13 +1473,8 @@ async function removePackage(pkg: InstalledPackage): Promise<boolean> {
     }
   }
 
-  // Use trash if available, otherwise rm -rf
-  let result = await editor.spawnProcess("trash", [pkg.path]);
-  if (result.exit_code !== 0) {
-    result = await editor.spawnProcess("rm", ["-rf", pkg.path]);
-  }
-
-  if (result.exit_code === 0) {
+  // Remove package directory
+  if (editor.removePath(pkg.path)) {
     // Reload themes if we removed a theme so Select Theme list is updated
     if (pkg.type === "theme") {
       editor.reloadThemes();
@@ -1488,7 +1482,7 @@ async function removePackage(pkg: InstalledPackage): Promise<boolean> {
     editor.setStatus(`Removed ${pkg.name}`);
     return true;
   } else {
-    editor.setStatus(`Failed to remove ${pkg.name}: ${result.stderr}`);
+    editor.setStatus(`Failed to remove ${pkg.name}`);
     return false;
   }
 }
@@ -1608,7 +1602,7 @@ async function installFromLockfile(): Promise<void> {
       }
     } else {
       // Need to clone
-      await ensureDir(PACKAGES_DIR);
+      ensureDir(PACKAGES_DIR);
       const result = await gitCommand(["clone", `${entry.source}`, `${pluginPath}`]);
 
       if (result.exit_code === 0) {
@@ -1668,6 +1662,20 @@ interface PkgManagerState {
   selectedIndex: number;
   focus: FocusTarget;  // What element has Tab focus
   isLoading: boolean;
+  viewportHeight: number;
+  // Buffer group fields
+  groupId: number | null;
+  panelBuffers: Record<string, number>;
+  /** Widget panels owned by the pkg manager. The list panel hosts a
+   * `List` widget (one row per package) so the host owns selection
+   * highlight, scroll, click-to-select, mouse wheel, and PageUp/Down.
+   * The footer panel hosts a `HintBar` widget (the Navigate / Tab /
+   * Search / Esc cheat-sheet). Header and detail panels still use
+   * `setPanelContent` since their UI shape spans cross-panel focus
+   * (filter / sync / search / action buttons) which is a larger
+   * redesign. */
+  listPanel: WidgetPanel | null;
+  footerPanel: WidgetPanel | null;
 }
 
 const pkgState: PkgManagerState = {
@@ -1681,6 +1689,11 @@ const pkgState: PkgManagerState = {
   selectedIndex: 0,
   focus: { type: "list" },
   isLoading: false,
+  viewportHeight: 24,
+  groupId: null,
+  panelBuffers: {},
+  listPanel: null,
+  footerPanel: null,
 };
 
 // Theme-aware color configuration
@@ -1945,9 +1958,9 @@ function formatNumber(n: number | undefined): string {
 }
 
 // Layout constants
-const LIST_WIDTH = 36;  // Width of left panel (package list)
-const TOTAL_WIDTH = 88; // Total width of UI
-const DETAIL_WIDTH = TOTAL_WIDTH - LIST_WIDTH - 3; // Right panel width (minus divider)
+const TOTAL_WIDTH = 88;
+const LIST_WIDTH = 36;
+function DETAIL_WIDTH(): number { return TOTAL_WIDTH - LIST_WIDTH - 3; }
 
 /**
  * Helper to check if a button is focused
@@ -2001,275 +2014,6 @@ function wrapText(text: string, maxWidth: number): string[] {
 /**
  * Build virtual buffer entries for the package manager (split-view layout)
  */
-function buildListViewEntries(): TextPropertyEntry[] {
-  const entries: TextPropertyEntry[] = [];
-  const items = getFilteredItems();
-  const selectedItem = items.length > 0 && pkgState.selectedIndex < items.length
-    ? items[pkgState.selectedIndex] : null;
-  const installedItems = items.filter(i => i.installed);
-  const availableItems = items.filter(i => !i.installed);
-
-  // === HEADER ===
-  entries.push({
-    text: " Packages\n",
-    properties: { type: "header" },
-  });
-
-  // Empty line after header
-  entries.push({ text: "\n", properties: { type: "blank" } });
-
-  // === SEARCH BAR (input-style) ===
-  const searchFocused = isButtonFocused("search");
-  const searchInputWidth = 30;
-  const searchText = pkgState.searchQuery || "";
-  const searchDisplay = searchText.length > searchInputWidth - 1
-    ? searchText.slice(0, searchInputWidth - 2) + "…"
-    : searchText.padEnd(searchInputWidth);
-
-  entries.push({ text: " Search: ", properties: { type: "search-label" } });
-  entries.push({
-    text: searchFocused ? `[${searchDisplay}]` : ` ${searchDisplay} `,
-    properties: { type: "search-input", focused: searchFocused },
-  });
-  entries.push({ text: "\n", properties: { type: "newline" } });
-
-  // === FILTER BAR with focusable buttons ===
-  const filters: Array<{ id: string; label: string }> = [
-    { id: "all", label: "All" },
-    { id: "installed", label: "Installed" },
-    { id: "plugins", label: "Plugins" },
-    { id: "themes", label: "Themes" },
-    { id: "languages", label: "Languages" },
-    { id: "bundles", label: "Bundles" },
-  ];
-
-  // Build filter buttons with position tracking
-  let filterBarParts: Array<{ text: string; type: string; focused?: boolean; active?: boolean }> = [];
-  filterBarParts.push({ text: " ", type: "spacer" });
-
-  for (let i = 0; i < filters.length; i++) {
-    const f = filters[i];
-    const isActive = pkgState.filter === f.id;
-    const isFocused = isButtonFocused("filter", i);
-    // Always reserve space for brackets - show [ ] when focused, spaces when not
-    const leftBracket = isFocused ? "[" : " ";
-    const rightBracket = isFocused ? "]" : " ";
-    filterBarParts.push({
-      text: `${leftBracket} ${f.label} ${rightBracket}`,
-      type: "filter-btn",
-      focused: isFocused,
-      active: isActive,
-    });
-  }
-
-  filterBarParts.push({ text: "  ", type: "spacer" });
-
-  // Sync button - always reserve space for brackets
-  const syncFocused = isButtonFocused("sync");
-  const syncLeft = syncFocused ? "[" : " ";
-  const syncRight = syncFocused ? "]" : " ";
-  filterBarParts.push({ text: `${syncLeft} Sync ${syncRight}`, type: "sync-btn", focused: syncFocused });
-
-  // Emit each filter bar part as separate entry for individual styling
-  for (const part of filterBarParts) {
-    entries.push({
-      text: part.text,
-      properties: {
-        type: part.type,
-        focused: part.focused,
-        active: part.active,
-      },
-    });
-  }
-  entries.push({ text: "\n", properties: { type: "newline" } });
-
-  // === TOP SEPARATOR ===
-  entries.push({
-    text: " " + "─".repeat(TOTAL_WIDTH - 2) + "\n",
-    properties: { type: "separator" },
-  });
-
-  // === SPLIT VIEW: Package list on left, Details on right ===
-
-  // Build left panel lines (package list)
-  const leftLines: Array<{ text: string; type: string; selected?: boolean; installed?: boolean }> = [];
-
-  // Installed section
-  if (installedItems.length > 0) {
-    leftLines.push({ text: `INSTALLED (${installedItems.length})`, type: "section-title" });
-
-    let idx = 0;
-    for (const item of installedItems) {
-      const isSelected = idx === pkgState.selectedIndex;
-      const listFocused = pkgState.focus.type === "list";
-      const prefix = isSelected && listFocused ? "▸" : " ";
-      const status = item.updateAvailable ? "↑" : "✓";
-      const ver = item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
-      const name = item.name.length > 18 ? item.name.slice(0, 17) + "…" : item.name;
-      const line = `${prefix} ${name.padEnd(18)} ${ver.padEnd(7)} ${status}`;
-      leftLines.push({ text: line, type: "package-row", selected: isSelected, installed: true });
-      idx++;
-    }
-  }
-
-  // Available section
-  if (availableItems.length > 0) {
-    if (leftLines.length > 0) leftLines.push({ text: "", type: "blank" });
-    leftLines.push({ text: `AVAILABLE (${availableItems.length})`, type: "section-title" });
-
-    let idx = installedItems.length;
-    for (const item of availableItems) {
-      const isSelected = idx === pkgState.selectedIndex;
-      const listFocused = pkgState.focus.type === "list";
-      const prefix = isSelected && listFocused ? "▸" : " ";
-      const typeTag = item.packageType === "theme" ? "T" : item.packageType === "language" ? "L" : item.packageType === "bundle" ? "B" : "P";
-      const name = item.name.length > 22 ? item.name.slice(0, 21) + "…" : item.name;
-      const line = `${prefix} ${name.padEnd(22)} [${typeTag}]`;
-      leftLines.push({ text: line, type: "package-row", selected: isSelected, installed: false });
-      idx++;
-    }
-  }
-
-  // Empty state for left panel
-  if (items.length === 0) {
-    if (pkgState.isLoading) {
-      leftLines.push({ text: "Loading...", type: "empty-state" });
-    } else if (!isRegistrySynced()) {
-      leftLines.push({ text: "Registry not synced", type: "empty-state" });
-      leftLines.push({ text: "Tab to Sync button", type: "empty-state" });
-    } else {
-      leftLines.push({ text: "No packages found", type: "empty-state" });
-    }
-  }
-
-  // Build right panel lines (details for selected package)
-  const rightLines: Array<{ text: string; type: string; focused?: boolean; btnIndex?: number }> = [];
-
-  if (selectedItem) {
-    // Package name
-    rightLines.push({ text: selectedItem.name, type: "detail-title" });
-    rightLines.push({ text: "─".repeat(Math.min(selectedItem.name.length + 2, DETAIL_WIDTH - 2)), type: "detail-sep" });
-
-    // Version / Author / License on one line
-    let metaLine = `v${selectedItem.version}`;
-    if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
-    if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
-    if (metaLine.length > DETAIL_WIDTH - 2) metaLine = metaLine.slice(0, DETAIL_WIDTH - 5) + "...";
-    rightLines.push({ text: metaLine, type: "detail-meta" });
-
-    rightLines.push({ text: "", type: "blank" });
-
-    // Description (wrapped)
-    const descText = selectedItem.description || "No description available";
-    const descLines = wrapText(descText, DETAIL_WIDTH - 2);
-    for (const line of descLines) {
-      rightLines.push({ text: line, type: "detail-desc" });
-    }
-
-    rightLines.push({ text: "", type: "blank" });
-
-    // Keywords
-    if (selectedItem.keywords && selectedItem.keywords.length > 0) {
-      const kwText = selectedItem.keywords.slice(0, 4).join(", ");
-      rightLines.push({ text: `Tags: ${kwText}`, type: "detail-tags" });
-      rightLines.push({ text: "", type: "blank" });
-    }
-
-    // Repository URL
-    if (selectedItem.repository) {
-      // Shorten URL for display (remove protocol, truncate if needed)
-      let displayUrl = selectedItem.repository
-        .replace(/^https?:\/\//, "")
-        .replace(/\.git$/, "");
-      if (displayUrl.length > DETAIL_WIDTH - 2) {
-        displayUrl = displayUrl.slice(0, DETAIL_WIDTH - 5) + "...";
-      }
-      rightLines.push({ text: displayUrl, type: "detail-url" });
-      rightLines.push({ text: "", type: "blank" });
-    }
-
-    // Action buttons - always reserve space for brackets
-    const actions = getActionButtons();
-    for (let i = 0; i < actions.length; i++) {
-      const focused = isButtonFocused("action", i);
-      const leftBracket = focused ? "[" : " ";
-      const rightBracket = focused ? "]" : " ";
-      const btnText = `${leftBracket} ${actions[i]} ${rightBracket}`;
-      rightLines.push({ text: btnText, type: "action-btn", focused, btnIndex: i });
-    }
-  } else {
-    rightLines.push({ text: "Select a package", type: "empty-state" });
-    rightLines.push({ text: "to view details", type: "empty-state" });
-  }
-
-  // Merge left and right panels into rows
-  const maxRows = Math.max(leftLines.length, rightLines.length, 8);
-  for (let i = 0; i < maxRows; i++) {
-    const leftItem = leftLines[i];
-    const rightItem = rightLines[i];
-
-    // Left side (padded to fixed width)
-    const leftText = leftItem ? (" " + leftItem.text) : "";
-    entries.push({
-      text: leftText.padEnd(LIST_WIDTH),
-      properties: {
-        type: leftItem?.type || "blank",
-        selected: leftItem?.selected,
-        installed: leftItem?.installed,
-      },
-    });
-
-    // Divider
-    entries.push({ text: "│", properties: { type: "divider" } });
-
-    // Right side
-    const rightText = rightItem ? (" " + rightItem.text) : "";
-    entries.push({
-      text: rightText,
-      properties: {
-        type: rightItem?.type || "blank",
-        focused: rightItem?.focused,
-        btnIndex: rightItem?.btnIndex,
-      },
-    });
-
-    entries.push({ text: "\n", properties: { type: "newline" } });
-  }
-
-  // === BOTTOM SEPARATOR ===
-  entries.push({
-    text: " " + "─".repeat(TOTAL_WIDTH - 2) + "\n",
-    properties: { type: "separator" },
-  });
-
-  // === HELP LINE ===
-  let helpText = " ↑↓ Navigate  Tab Next  / Search  Enter ";
-  if (pkgState.focus.type === "action") {
-    helpText += "Activate";
-  } else if (pkgState.focus.type === "filter") {
-    helpText += "Filter";
-  } else if (pkgState.focus.type === "sync") {
-    helpText += "Sync";
-  } else if (pkgState.focus.type === "search") {
-    helpText += "Search";
-  } else {
-    helpText += "Select";
-  }
-  helpText += "  Esc Close\n";
-
-  entries.push({
-    text: helpText,
-    properties: { type: "help" },
-  });
-
-  return entries;
-}
-
-/**
- * Calculate UTF-8 byte length of a string.
- * Needed because string.length returns character count, not byte count.
- * Unicode chars like ▸ and ─ are 1 char but 3 bytes in UTF-8.
- */
 function utf8ByteLength(str: string): number {
   let bytes = 0;
   for (let i = 0; i < str.length; i++) {
@@ -2289,151 +2033,263 @@ function utf8ByteLength(str: string): number {
   return bytes;
 }
 
-/**
- * Apply theme-aware highlighting to the package manager view
- */
-function applyPkgManagerHighlighting(): void {
-  if (pkgState.bufferId === null) return;
-
-  // Clear existing overlays
-  editor.clearNamespace(pkgState.bufferId, "pkg");
-
-  const entries = buildListViewEntries();
-  let byteOffset = 0;
-
-  for (const entry of entries) {
-    const props = entry.properties as Record<string, unknown>;
-    const len = utf8ByteLength(entry.text);
-
-    // Determine theme colors based on entry type
-    let themeStyle: ThemeColor | null = null;
-
-    switch (props.type) {
-      case "header":
-        themeStyle = pkgTheme.header;
-        break;
-
-      case "section-title":
-        themeStyle = pkgTheme.sectionTitle;
-        break;
-
-      case "filter-btn":
-        if (props.focused && props.active) {
-          // Both focused and active - use focused style
-          themeStyle = pkgTheme.buttonFocused;
-        } else if (props.focused) {
-          // Only focused (not the active filter)
-          themeStyle = pkgTheme.filterFocused;
-        } else if (props.active) {
-          // Active filter but not focused
-          themeStyle = pkgTheme.filterActive;
-        } else {
-          themeStyle = pkgTheme.filterInactive;
-        }
-        break;
-
-      case "sync-btn":
-        themeStyle = props.focused ? pkgTheme.buttonFocused : pkgTheme.button;
-        break;
-
-      case "search-label":
-        themeStyle = pkgTheme.infoLabel;
-        break;
-
-      case "search-input":
-        // Search input field styling - distinct background
-        themeStyle = props.focused ? pkgTheme.searchBoxFocused : pkgTheme.searchBox;
-        break;
-
-      case "package-row":
-        if (props.selected) {
-          themeStyle = pkgTheme.selected;
-        } else if (props.installed) {
-          themeStyle = pkgTheme.installed;
-        } else {
-          themeStyle = pkgTheme.available;
-        }
-        break;
-
-      case "detail-title":
-        themeStyle = pkgTheme.header;
-        break;
-
-      case "detail-sep":
-      case "separator":
-        themeStyle = pkgTheme.separator;
-        break;
-
-      case "divider":
-        themeStyle = pkgTheme.divider;
-        break;
-
-      case "detail-meta":
-      case "detail-tags":
-      case "detail-url":
-        themeStyle = pkgTheme.infoLabel;
-        break;
-
-      case "detail-desc":
-        themeStyle = pkgTheme.description;
-        break;
-
-      case "action-btn":
-        themeStyle = props.focused ? pkgTheme.buttonFocused : pkgTheme.button;
-        break;
-
-      case "help":
-        themeStyle = pkgTheme.help;
-        break;
-
-      case "empty-state":
-        themeStyle = pkgTheme.emptyState;
-        break;
-    }
-
-    if (themeStyle) {
-      const fg = themeStyle.fg;
-      const bg = themeStyle.bg;
-
-      // Build overlay options - prefer theme keys, fallback to RGB
-      const options: Record<string, unknown> = {};
-
-      if (fg?.theme) {
-        options.fg = fg.theme;
-      } else if (fg?.rgb) {
-        options.fg = fg.rgb;
-      }
-
-      if (bg?.theme) {
-        options.bg = bg.theme;
-      } else if (bg?.rgb) {
-        options.bg = bg.rgb;
-      }
-
-      if (Object.keys(options).length > 0) {
-        editor.addOverlay(
-          pkgState.bufferId,
-          "pkg",
-          byteOffset,
-          byteOffset + len,
-          options
-        );
-      }
-    }
-
-    byteOffset += len;
+function buildPkgHeaderEntries(): TextPropertyEntry[] {
+  const entries: TextPropertyEntry[] = [];
+  entries.push({ text: " Packages\n", properties: { type: "header" } });
+  // Search bar
+  const searchFocused = pkgState.focus.type === "search";
+  const searchLeft = searchFocused ? "[" : " ";
+  const searchRight = searchFocused ? "]" : " ";
+  const searchVal = pkgState.searchQuery || "";
+  entries.push({ text: ` Search: ${searchLeft}${searchVal.padEnd(30)}${searchRight}\n`, properties: { type: "search-input", focused: searchFocused } });
+  // Filter bar
+  const filters = ["All", "Installed", "Plugins", "Themes", "Languages", "Bundles"];
+  let filterLine = " ";
+  for (let i = 0; i < filters.length; i++) {
+    const isActive = pkgState.filter === filters[i].toLowerCase();
+    const isFocused = pkgState.focus.type === "filter" && pkgState.focus.index === i;
+    const lb = isFocused ? "[" : " ";
+    const rb = isFocused ? "]" : " ";
+    filterLine += `${lb} ${filters[i]} ${rb} `;
   }
+  const syncFocused = pkgState.focus.type === "sync";
+  const sl = syncFocused ? "[" : " ";
+  const sr = syncFocused ? "]" : " ";
+  filterLine += `  ${sl} Sync ${sr}`;
+  entries.push({ text: filterLine + "\n", properties: { type: "filter-bar" } });
+  return entries;
 }
 
-/**
- * Update the package manager view
- */
-function updatePkgManagerView(): void {
-  if (pkgState.bufferId === null) return;
+/** Build the per-row item entries for the package List widget.
+ * The list iterates "installed first, then available" to match the
+ * existing buffer-render order, so the row's index in this array
+ * matches `pkgState.selectedIndex`. The leading `▸` arrow that the
+ * old hand-rolled renderer used on the focused row is gone — the
+ * List widget paints the selection highlight via `ui.menu_active_bg`
+ * which carries the same "this row is selected" signal. Section
+ * headers (`INSTALLED (n)` / `AVAILABLE (n)`) are kept as
+ * non-selectable rows; selecting them would be a no-op so the list
+ * navigation skips them implicitly via the index math. */
+interface PkgListRow {
+  entry: TextPropertyEntry;
+  /** Stable widget-key for the List item. Empty string for non-
+   * selectable header rows (the List still tracks them in
+   * itemKeys but they don't carry useful identity). */
+  key: string;
+  /** Index within `getFilteredItems()` if this row is a real
+   * package, else -1. The widget's `selectedIndex` is reported
+   * back via `widget_event "select"` and we use it to look up
+   * the matching package via this map. */
+  itemIndex: number;
+}
 
-  const entries = buildListViewEntries();
-  editor.setVirtualBufferContent(pkgState.bufferId, entries);
-  applyPkgManagerHighlighting();
+function buildPkgListRows(): PkgListRow[] {
+  const items = getFilteredItems();
+  const installedItems = items.filter((i) => i.installed);
+  const availableItems = items.filter((i) => !i.installed);
+  const rows: PkgListRow[] = [];
+
+  if (installedItems.length > 0) {
+    rows.push({
+      entry: {
+        text: `INSTALLED (${installedItems.length})`,
+        properties: { type: "section-title" },
+      },
+      key: "section.installed",
+      itemIndex: -1,
+    });
+    let idx = 0;
+    for (const item of installedItems) {
+      const status = item.updateAvailable ? "↑" : "✓";
+      const ver =
+        item.version.length > 7 ? item.version.slice(0, 6) + "…" : item.version;
+      const nameW = Math.max(8, LIST_WIDTH - 16);
+      const name =
+        item.name.length > nameW ? item.name.slice(0, nameW - 1) + "…" : item.name;
+      rows.push({
+        entry: {
+          text: `  ${name.padEnd(nameW)} ${ver.padEnd(7)} ${status}`,
+          properties: { type: "package-row", installed: true },
+        },
+        key: `pkg.${item.name}`,
+        itemIndex: idx,
+      });
+      idx++;
+    }
+  }
+
+  if (availableItems.length > 0) {
+    if (rows.length > 0) {
+      rows.push({
+        entry: { text: "", properties: { type: "blank" } },
+        key: "blank",
+        itemIndex: -1,
+      });
+    }
+    rows.push({
+      entry: {
+        text: `AVAILABLE (${availableItems.length})`,
+        properties: { type: "section-title" },
+      },
+      key: "section.available",
+      itemIndex: -1,
+    });
+    let idx = installedItems.length;
+    for (const item of availableItems) {
+      const typeTag =
+        item.packageType === "theme"
+          ? "T"
+          : item.packageType === "language"
+            ? "L"
+            : item.packageType === "bundle"
+              ? "B"
+              : "P";
+      const availNameW = Math.max(8, LIST_WIDTH - 10);
+      const name =
+        item.name.length > availNameW
+          ? item.name.slice(0, availNameW - 1) + "…"
+          : item.name;
+      rows.push({
+        entry: {
+          text: `  ${name.padEnd(availNameW)} [${typeTag}]`,
+          properties: { type: "package-row", installed: false },
+        },
+        key: `pkg.${item.name}`,
+        itemIndex: idx,
+      });
+      idx++;
+    }
+  }
+
+  if (items.length === 0) {
+    rows.push({
+      entry: {
+        text: pkgState.isLoading ? "Loading..." : "No packages found",
+        properties: { type: "empty-state" },
+      },
+      key: "empty",
+      itemIndex: -1,
+    });
+  }
+
+  return rows;
+}
+
+/** Cache the row→item-index lookup so `widget_event "select"` can
+ * map the host's reported selection index back to a real package
+ * index in O(1) without rebuilding the row array. Refreshed by
+ * `renderPkgList` every time the list is re-emitted. */
+let pkgListRowCache: PkgListRow[] = [];
+
+function selectedRowToItemIndex(rowIndex: number): number {
+  const row = pkgListRowCache[rowIndex];
+  return row ? row.itemIndex : -1;
+}
+
+function itemIndexToRow(itemIndex: number): number {
+  for (let i = 0; i < pkgListRowCache.length; i++) {
+    if (pkgListRowCache[i].itemIndex === itemIndex) return i;
+  }
+  return -1;
+}
+
+function renderPkgList(): void {
+  if (pkgState.listPanel === null) return;
+  const rows = buildPkgListRows();
+  pkgListRowCache = rows;
+  // Map the plugin's item-index selection to the row-index the List
+  // widget understands. -1 falls back to the first selectable row.
+  let rowSel = itemIndexToRow(pkgState.selectedIndex);
+  if (rowSel < 0) {
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].itemIndex >= 0) {
+        rowSel = i;
+        break;
+      }
+    }
+  }
+  pkgState.listPanel.set(
+    list({
+      items: rows.map((r) => r.entry),
+      itemKeys: rows.map((r) => r.key),
+      selectedIndex: rowSel,
+      visibleRows: Math.max(1, rows.length),
+      key: "pkg-list",
+    }),
+  );
+}
+
+function buildPkgDetailEntries(): TextPropertyEntry[] {
+  const items = getFilteredItems();
+  const selectedItem = items.length > 0 && pkgState.selectedIndex < items.length
+    ? items[pkgState.selectedIndex] : null;
+  const entries: TextPropertyEntry[] = [];
+
+  if (selectedItem) {
+    entries.push({ text: selectedItem.name + "\n", properties: { type: "detail-title" } });
+    entries.push({ text: "─".repeat(Math.min(selectedItem.name.length + 2, 50)) + "\n", properties: { type: "detail-sep" } });
+    let metaLine = `v${selectedItem.version}`;
+    if (selectedItem.author) metaLine += ` • ${selectedItem.author}`;
+    if (selectedItem.license) metaLine += ` • ${selectedItem.license}`;
+    entries.push({ text: metaLine + "\n", properties: { type: "detail-meta" } });
+    entries.push({ text: "\n", properties: { type: "blank" } });
+    const descText = selectedItem.description || "No description available";
+    const descLines = wrapText(descText, 50);
+    for (const line of descLines) {
+      entries.push({ text: line + "\n", properties: { type: "detail-desc" } });
+    }
+    entries.push({ text: "\n", properties: { type: "blank" } });
+    if (selectedItem.keywords && selectedItem.keywords.length > 0) {
+      entries.push({ text: `Tags: ${selectedItem.keywords.slice(0, 4).join(", ")}\n`, properties: { type: "detail-tags" } });
+      entries.push({ text: "\n", properties: { type: "blank" } });
+    }
+    if (selectedItem.repository) {
+      let displayUrl = selectedItem.repository.replace(/^https?:\/\//, "").replace(/\.git$/, "");
+      if (displayUrl.length > 50) displayUrl = displayUrl.slice(0, 47) + "...";
+      entries.push({ text: displayUrl + "\n", properties: { type: "detail-url" } });
+      entries.push({ text: "\n", properties: { type: "blank" } });
+    }
+    const actions = getActionButtons();
+    for (let i = 0; i < actions.length; i++) {
+      const focused = pkgState.focus.type === "action" && pkgState.focus.index === i;
+      const lb = focused ? "[" : " ";
+      const rb = focused ? "]" : " ";
+      entries.push({ text: `${lb} ${actions[i]} ${rb}\n`, properties: { type: "action-btn", focused, btnIndex: i } });
+    }
+  } else {
+    entries.push({ text: "Select a package\nto view details\n", properties: { type: "empty-state" } });
+  }
+
+  return entries;
+}
+
+function renderPkgFooter(): void {
+  if (pkgState.footerPanel === null) return;
+  let actionLabel = "Select";
+  if (pkgState.focus.type === "action") actionLabel = "Activate";
+  else if (pkgState.focus.type === "filter") actionLabel = "Filter";
+  else if (pkgState.focus.type === "sync") actionLabel = "Sync";
+  else if (pkgState.focus.type === "search") actionLabel = "Search";
+  // The hint string follows the existing `parseHintString` shape:
+  // tokens separated by two spaces, each token is `<keys>:<label>`
+  // or `<keys> <label>`. The host's HintBar styles the keys portion
+  // with `ui.help_key_fg`.
+  const hintString = `↑↓:Navigate  Tab:Next  /:Search  Enter:${actionLabel}  Esc:Close`;
+  pkgState.footerPanel.set(hintBar(parseHintString(hintString)));
+}
+
+function updatePkgManagerView(): void {
+  if (pkgState.groupId === null) return;
+  // Header + detail still flow through the legacy `setPanelContent`
+  // path — their UI shape (filter/sync/search inputs in the header,
+  // action buttons in the detail) spans cross-panel focus, which
+  // is a larger redesign best done together with the §4.1
+  // Compositor work. List and footer migrate independently because
+  // they don't participate in cross-panel focus.
+  editor.setPanelContent(pkgState.groupId, "header", buildPkgHeaderEntries());
+  renderPkgList();
+  editor.setPanelContent(pkgState.groupId, "detail", buildPkgDetailEntries());
+  renderPkgFooter();
 }
 
 /**
@@ -2459,30 +2315,50 @@ async function openPackageManager(): Promise<void> {
   pkgState.focus = { type: "list" };
 
   // Build package list immediately with installed packages and cached registry
-  // This allows viewing/managing installed packages without waiting for network
   pkgState.items = buildPackageList();
   pkgState.isLoading = false;
 
-  // Build initial entries
-  const entries = buildListViewEntries();
-
-  // Create virtual buffer
-  const result = await editor.createVirtualBufferInExistingSplit({
-    name: "*Packages*",
-    mode: "pkg-manager",
-    readOnly: true,
-    editingDisabled: true,
-    showCursors: false,
-    entries: entries,
-    splitId: pkgState.splitId!,
-    showLineNumbers: false,
+  // Create buffer group with layout:
+  // vertical: [header(fixed 4), horizontal: [list, detail], footer(fixed 1)]
+  const layout = JSON.stringify({
+    type: "split",
+    direction: "v",
+    ratio: 0.1,
+    first: { type: "fixed", id: "header", height: 3 },
+    // ^ 3 rows: title, search, filter bar
+    second: {
+      type: "split",
+      direction: "v",
+      ratio: 0.9,
+      first: {
+        type: "split",
+        direction: "h",
+        ratio: 0.4,
+        first: { type: "scrollable", id: "list" },
+        second: { type: "scrollable", id: "detail" },
+      },
+      second: { type: "fixed", id: "footer", height: 1 },
+    },
   });
 
-  pkgState.bufferId = result.bufferId;
+  const groupResult = await editor.createBufferGroup("*Packages*", "pkg-manager", layout);
+  pkgState.groupId = groupResult.groupId;
+  pkgState.panelBuffers = groupResult.panels;
   pkgState.isOpen = true;
 
-  // Apply initial highlighting
-  applyPkgManagerHighlighting();
+  // Mount widget panels for the list and footer. Header / detail
+  // still use `setPanelContent` (see `updatePkgManagerView`).
+  const listBufferId = pkgState.panelBuffers["list"];
+  if (typeof listBufferId === "number") {
+    pkgState.listPanel = new WidgetPanel(listBufferId);
+  }
+  const footerBufferId = pkgState.panelBuffers["footer"];
+  if (typeof footerBufferId === "number") {
+    pkgState.footerPanel = new WidgetPanel(footerBufferId);
+  }
+
+  // Set initial content for all panels
+  updatePkgManagerView();
 
   // Sync registry in background and update view when done
   // User can still interact with installed packages during sync
@@ -2500,8 +2376,12 @@ async function openPackageManager(): Promise<void> {
 function closePackageManager(): void {
   if (!pkgState.isOpen) return;
 
-  // Close the buffer
-  if (pkgState.bufferId !== null) {
+  // Close the buffer group if using the new system
+  if (pkgState.groupId !== null) {
+    editor.closeBufferGroup(pkgState.groupId);
+    pkgState.groupId = null;
+    pkgState.panelBuffers = {};
+  } else if (pkgState.bufferId !== null) {
     editor.closeBuffer(pkgState.bufferId);
   }
 
@@ -2510,11 +2390,17 @@ function closePackageManager(): void {
     editor.showBuffer(pkgState.sourceBufferId);
   }
 
-  // Reset state
+  // Reset state. The buffer group's close will tear down the panel
+  // buffers and (implicitly) the widget panels rendering into them;
+  // we just null the handles so any stray render call after close
+  // is a no-op.
   pkgState.isOpen = false;
   pkgState.bufferId = null;
   pkgState.splitId = null;
   pkgState.sourceBufferId = null;
+  pkgState.listPanel = null;
+  pkgState.footerPanel = null;
+  pkgListRowCache = [];
 }
 
 /**
@@ -2561,31 +2447,55 @@ function getCurrentFocusIndex(): number {
 }
 
 // Navigation commands
-function pkg_nav_up() : void {
+function pkg_nav_up(): void {
   if (!pkgState.isOpen) return;
-
-  const items = getFilteredItems();
-  if (items.length === 0) return;
-
-  // Always focus list and navigate (auto-focus behavior)
-  pkgState.selectedIndex = Math.max(0, pkgState.selectedIndex - 1);
+  // Always snap focus back to the list and let the host move the
+  // List widget's selection. The resulting `widget_event "select"`
+  // updates `pkgState.selectedIndex` and refreshes the detail
+  // panel — see the `widget_event` listener installed below.
   pkgState.focus = { type: "list" };
-  updatePkgManagerView();
+  pkgState.listPanel?.command(key("Up"));
 }
 registerHandler("pkg_nav_up", pkg_nav_up);
 
-function pkg_nav_down() : void {
+function pkg_nav_down(): void {
   if (!pkgState.isOpen) return;
-
-  const items = getFilteredItems();
-  if (items.length === 0) return;
-
-  // Always focus list and navigate (auto-focus behavior)
-  pkgState.selectedIndex = Math.min(items.length - 1, pkgState.selectedIndex + 1);
   pkgState.focus = { type: "list" };
-  updatePkgManagerView();
+  pkgState.listPanel?.command(key("Down"));
 }
 registerHandler("pkg_nav_down", pkg_nav_down);
+
+editor.on("widget_event", (data) => {
+  if (
+    pkgState.listPanel === null ||
+    data.panel_id !== pkgState.listPanel.id()
+  ) {
+    return;
+  }
+  if (data.event_type === "select") {
+    const rowIdx =
+      typeof data.payload?.index === "number" ? data.payload.index : -1;
+    if (rowIdx < 0) return;
+    const itemIdx = selectedRowToItemIndex(rowIdx);
+    if (itemIdx < 0) return; // selection landed on a section header
+    if (itemIdx === pkgState.selectedIndex) return;
+    pkgState.selectedIndex = itemIdx;
+    pkgState.focus = { type: "list" };
+    // Re-render header/detail to reflect the new selection;
+    // the list itself is already updated by the host (we don't
+    // need to call renderPkgList again).
+    if (pkgState.groupId !== null) {
+      editor.setPanelContent(pkgState.groupId, "header", buildPkgHeaderEntries());
+      editor.setPanelContent(pkgState.groupId, "detail", buildPkgDetailEntries());
+    }
+    renderPkgFooter();
+    return;
+  }
+  if (data.event_type === "activate") {
+    void pkg_activate();
+    return;
+  }
+});
 
 function pkg_next_button() : void {
   if (!pkgState.isOpen) return;
@@ -2727,11 +2637,9 @@ function pkg_search() : void {
 }
 registerHandler("pkg_search", pkg_search);
 
-function onPkgSearchConfirmed(args: {
-  prompt_type: string;
-  selected_index: number | null;
-  input: string;
-}): boolean {
+
+
+editor.on("prompt_confirmed", (args) => {
   if (args.prompt_type !== "pkg-search") return true;
 
   pkgState.searchQuery = args.input.trim();
@@ -2740,10 +2648,17 @@ function onPkgSearchConfirmed(args: {
   updatePkgManagerView();
 
   return true;
-}
-registerHandler("onPkgSearchConfirmed", onPkgSearchConfirmed);
+});
 
-editor.on("prompt_confirmed", "onPkgSearchConfirmed");
+
+editor.on("resize", () => {
+  if (!pkgState.isOpen) return;
+  const viewport = editor.getViewport();
+  if (viewport) {
+    pkgState.viewportHeight = viewport.height;
+  }
+  updatePkgManagerView();
+});
 
 // Legacy Finder-based UI (kept for backwards compatibility)
 const registryFinder = new Finder<[string, RegistryEntry]>(editor, {
@@ -2840,11 +2755,9 @@ function pkg_install_url() : void {
 }
 registerHandler("pkg_install_url", pkg_install_url);
 
-async function onPkgInstallUrlConfirmed(args: {
-  prompt_type: string;
-  selected_index: number | null;
-  input: string;
-}): Promise<boolean> {
+
+
+editor.on("prompt_confirmed", async (args) => {
   if (args.prompt_type !== "pkg-install-url") return true;
 
   const url = args.input.trim();
@@ -2855,10 +2768,7 @@ async function onPkgInstallUrlConfirmed(args: {
   }
 
   return true;
-}
-registerHandler("onPkgInstallUrlConfirmed", onPkgInstallUrlConfirmed);
-
-editor.on("prompt_confirmed", "onPkgInstallUrlConfirmed");
+});
 
 /**
  * Open the package manager UI
@@ -3049,34 +2959,9 @@ editor.registerCommand("%cmd.install_url", "%cmd.install_url_desc", "pkg_install
 // Note: Other commands (install_plugin, install_theme, update, remove, sync, etc.)
 // are available via the package manager UI and don't need global command palette entries.
 
-// =============================================================================
-// Startup: Load installed language packs and bundles
-// =============================================================================
-
-(async function loadInstalledPackages() {
-  // Load language packs
-  const languages = getInstalledPackages("language");
-  for (const pkg of languages) {
-    if (pkg.manifest) {
-      editor.debug(`[pkg] Loading language pack: ${pkg.name}`);
-      await loadLanguagePack(pkg.path, pkg.manifest);
-    }
-  }
-  if (languages.length > 0) {
-    editor.debug(`[pkg] Loaded ${languages.length} language pack(s)`);
-  }
-
-  // Load bundles
-  const bundles = getInstalledPackages("bundle");
-  for (const pkg of bundles) {
-    if (pkg.manifest) {
-      editor.debug(`[pkg] Loading bundle: ${pkg.name}`);
-      await loadBundle(pkg.path, pkg.manifest);
-    }
-  }
-  if (bundles.length > 0) {
-    editor.debug(`[pkg] Loaded ${bundles.length} bundle(s)`);
-  }
-})();
+// Note: Startup loading of installed language packs and bundles is now handled
+// by Rust (services::packages::scan_installed_packages) during editor init.
+// The loadLanguagePack() and loadBundle() functions above are still used for
+// runtime installs via the package manager UI.
 
 editor.debug("Package Manager plugin loaded");

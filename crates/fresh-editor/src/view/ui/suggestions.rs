@@ -31,10 +31,14 @@ impl SuggestionsRenderer {
         prompt: &Prompt,
         theme: &crate::view::theme::Theme,
     ) -> Option<(Rect, usize, usize, usize)> {
-        Self::render_with_hover(frame, area, prompt, theme, None)
+        Self::render_with_hover(frame, area, prompt, theme, None, true)
     }
 
-    /// Render the suggestions popup with hover highlighting
+    /// Render the suggestions popup with hover highlighting.
+    /// `with_border` controls whether the popup draws its own
+    /// frame; the floating-overlay prompt passes `false` because
+    /// the overlay's outer frame already provides one and a
+    /// nested border would create a visible double frame.
     ///
     /// # Returns
     /// * Optional tuple of (inner_rect, scroll_start_idx, visible_count, total_count) for mouse hit testing
@@ -44,14 +48,18 @@ impl SuggestionsRenderer {
         prompt: &Prompt,
         theme: &crate::view::theme::Theme,
         hover_target: Option<&crate::app::HoverTarget>,
+        with_border: bool,
     ) -> Option<(Rect, usize, usize, usize)> {
         if prompt.suggestions.is_empty() {
             return None;
         }
 
-        // Create a block with a border and background
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(if with_border {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            })
             .border_style(Style::default().fg(theme.popup_border_fg))
             .style(Style::default().bg(theme.suggestion_bg));
 
@@ -60,23 +68,13 @@ impl SuggestionsRenderer {
         let mut lines = Vec::new();
         let visible_count = inner_area.height as usize;
 
-        // Calculate scroll position to keep selected item visible
-        let start_idx = if let Some(selected) = prompt.selected_suggestion {
-            // Try to center the selected item, or at least keep it visible
-            if selected < visible_count / 2 {
-                // Near the top, start from beginning
-                0
-            } else if selected >= prompt.suggestions.len() - visible_count / 2 {
-                // Near the bottom, show last page
-                prompt.suggestions.len().saturating_sub(visible_count)
-            } else {
-                // In the middle, center the selected item
-                selected.saturating_sub(visible_count / 2)
-            }
-        } else {
-            0
-        };
-
+        // The scroll position is owned by the Prompt itself and only adjusted
+        // when the selection moves out of the viewport (see
+        // `Prompt::ensure_selected_visible`, called once before render). This
+        // keeps a stable list under the cursor so a click near the bottom
+        // doesn't trigger a recenter that shifts items mid-double-click.
+        let max_offset = prompt.suggestions.len().saturating_sub(visible_count);
+        let start_idx = prompt.scroll_offset.min(max_offset);
         let end_idx = (start_idx + visible_count).min(prompt.suggestions.len());
 
         let visible_suggestions = &prompt.suggestions[start_idx..end_idx];
@@ -107,10 +105,20 @@ impl SuggestionsRenderer {
         // Give name column a reasonable portion of remaining space
         // Scale with terminal width so wide screens aren't wasted on descriptions
         let base_name_width = 30;
+        // Compute actual max name width from visible suggestions
+        let actual_max_name_width = visible_suggestions
+            .iter()
+            .map(|s| str_width(&s.text))
+            .max()
+            .unwrap_or(0);
         let name_column_width = if !has_keybinding && !has_source {
-            // For file finders etc., use up to 60% of available width for name
+            // For file finders etc., use up to 60% of available width for name,
+            // but also cap to actual content width so descriptions get more room
             let max_name_width = (available_width * 60 / 100).max(base_name_width);
-            max_name_width.min(available_width.saturating_sub(reserved_for_other_columns))
+            let content_based = actual_max_name_width.max(base_name_width);
+            max_name_width
+                .min(content_based)
+                .min(available_width.saturating_sub(reserved_for_other_columns))
         } else {
             // Use ~30% of available width for the name, minimum 30
             let dynamic_width = available_width * 30 / 100;
@@ -141,7 +149,7 @@ impl SuggestionsRenderer {
             } else if is_selected {
                 // Highlight selected suggestion with theme colors
                 Style::default()
-                    .fg(theme.popup_text_fg)
+                    .fg(theme.popup_selection_fg)
                     .bg(theme.suggestion_selected_bg)
             } else if is_hovered {
                 // Hover highlight
@@ -479,7 +487,7 @@ mod tests {
         // Create a prompt with this suggestion
         let mut prompt = Prompt::new(
             "Test: ".to_string(),
-            crate::view::prompt::PromptType::Command,
+            crate::view::prompt::PromptType::QuickOpen,
         );
         prompt.suggestions = vec![suggestion];
 
@@ -528,7 +536,7 @@ mod tests {
 
             let mut prompt = Prompt::new(
                 "Test: ".to_string(),
-                crate::view::prompt::PromptType::Command,
+                crate::view::prompt::PromptType::QuickOpen,
             );
             prompt.suggestions = vec![suggestion];
 

@@ -93,6 +93,147 @@ impl ScrollbarState {
         let (thumb_start, thumb_size) = self.thumb_geometry(track_height);
         row >= thumb_start && row < thumb_start + thumb_size
     }
+
+    /// Inverse of [`thumb_geometry`]: compute the scroll offset that
+    /// places the thumb's top at (or as close as possible to)
+    /// `target_thumb_top`. Use this — not `click_to_offset` — when a
+    /// caller needs the thumb to land at a specific row on the track
+    /// (e.g. press on the track to recentre the thumb under the cursor):
+    /// `click_to_offset` divides by `track_height` rather than the actual
+    /// `max_thumb_top`, so its result drifts above the intended row by a
+    /// factor of `thumb_size / track_height`.
+    pub fn offset_for_thumb_top(&self, track_height: usize, target_thumb_top: usize) -> usize {
+        let max_scroll = self.total_items.saturating_sub(self.visible_items);
+        if track_height == 0 || max_scroll == 0 {
+            return 0;
+        }
+        let (_, thumb_size) = self.thumb_geometry(track_height);
+        let max_thumb_top = track_height.saturating_sub(thumb_size);
+        if max_thumb_top == 0 {
+            return 0;
+        }
+        let clamped = target_thumb_top.min(max_thumb_top);
+        let ratio = clamped as f64 / max_thumb_top as f64;
+        ((ratio * max_scroll as f64).round() as usize).min(max_scroll)
+    }
+
+    /// Compute the scroll offset for a drag that preserves the cursor's
+    /// position within the thumb.
+    ///
+    /// When the user presses on the thumb itself, the thumb shouldn't jump
+    /// so its top aligns with the cursor — the cursor should stay pinned to
+    /// the same spot on the thumb. Callers capture the press position
+    /// (`drag_start_row`) and the scroll offset at that moment
+    /// (`drag_start_offset`), then call this on every subsequent drag event.
+    ///
+    /// # Arguments
+    /// * `track_height` — height of the scrollbar track in rows
+    /// * `drag_start_row` — track-relative row where the drag started
+    /// * `drag_start_offset` — scroll offset at the time of the press
+    /// * `current_row` — track-relative row of the cursor now
+    pub fn drag_to_offset(
+        &self,
+        track_height: usize,
+        drag_start_row: usize,
+        drag_start_offset: usize,
+        current_row: usize,
+    ) -> usize {
+        let max_scroll = self.total_items.saturating_sub(self.visible_items);
+        if track_height == 0 || max_scroll == 0 {
+            return drag_start_offset.min(max_scroll);
+        }
+
+        // Compute by cursor delta so the round-trip through thumb_geometry
+        // can't drift the offset on a zero-movement drag — pressing on the
+        // thumb without moving must leave the viewport untouched.
+        let delta_rows = current_row as i64 - drag_start_row as i64;
+        if delta_rows == 0 {
+            return drag_start_offset.min(max_scroll);
+        }
+
+        // Thumb geometry the thumb had at drag start. `max_thumb_top` is
+        // the denominator that maps thumb rows to scroll offsets.
+        let start = Self::new(self.total_items, self.visible_items, drag_start_offset);
+        let (_, thumb_size) = start.thumb_geometry(track_height);
+        let max_thumb_top = track_height.saturating_sub(thumb_size);
+        if max_thumb_top == 0 {
+            return drag_start_offset.min(max_scroll);
+        }
+
+        // delta_rows on the track ↦ delta_rows × (max_scroll / max_thumb_top).
+        let offset_delta = delta_rows as f64 * (max_scroll as f64 / max_thumb_top as f64);
+        let new_offset = (drag_start_offset as f64 + offset_delta).round();
+        new_offset.clamp(0.0, max_scroll as f64) as usize
+    }
+}
+
+/// In-flight scrollbar drag state captured on press. `start_row` is in
+/// track coordinates (0 = top of the track).
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollbarDrag {
+    pub start_row: usize,
+    pub start_offset: usize,
+}
+
+/// Shared press/drag/release state for a modal scrollbar. Owners hold one
+/// of these alongside their scroll state and forward mouse events to it
+/// via [`press`](Self::press), [`drag`](Self::drag), [`release`](Self::release).
+///
+/// All three methods return `Some(new_offset)` when the caller should
+/// update its scroll position, or `None` when the event isn't ours to
+/// handle (press outside the track, drag without a prior press, etc.).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollbarMouse {
+    pub drag: Option<ScrollbarDrag>,
+}
+
+impl ScrollbarMouse {
+    /// Handle a left-button press. Returns `Some(new_offset)` when the
+    /// press lands inside `track`. A press on the thumb captures the
+    /// anchor without moving the viewport; a press on the track outside
+    /// the thumb recentres the thumb on the cursor before capturing.
+    pub fn press(
+        &mut self,
+        state: ScrollbarState,
+        track: Rect,
+        col: u16,
+        row: u16,
+    ) -> Option<usize> {
+        if !super::point_in_rect(track, col, row) {
+            return None;
+        }
+        let track_height = track.height as usize;
+        let click_row = (row.saturating_sub(track.y) as usize).min(track_height);
+
+        let new_offset = if state.is_thumb_row(track_height, click_row) {
+            state.scroll_offset
+        } else {
+            let (_, thumb_size) = state.thumb_geometry(track_height);
+            let aim_top = click_row.saturating_sub(thumb_size / 2);
+            state.offset_for_thumb_top(track_height, aim_top)
+        };
+
+        self.drag = Some(ScrollbarDrag {
+            start_row: click_row,
+            start_offset: new_offset,
+        });
+        Some(new_offset)
+    }
+
+    /// Handle a left-button drag. Returns `Some(new_offset)` if a drag is
+    /// active (i.e. there was a prior `press`), preserving the cursor's
+    /// position within the thumb.
+    pub fn drag(&mut self, state: ScrollbarState, track: Rect, row: u16) -> Option<usize> {
+        let drag = self.drag?;
+        let track_height = track.height as usize;
+        let current_row = (row.saturating_sub(track.y) as usize).min(track_height);
+        Some(state.drag_to_offset(track_height, drag.start_row, drag.start_offset, current_row))
+    }
+
+    /// Handle a left-button release. Ends any active drag.
+    pub fn release(&mut self) {
+        self.drag = None;
+    }
 }
 
 /// Colors for the scrollbar
@@ -298,5 +439,185 @@ mod tests {
         if start > 0 {
             assert!(!state.is_thumb_row(10, 0));
         }
+    }
+
+    #[test]
+    fn test_drag_to_offset_no_movement_keeps_offset() {
+        // Press on the thumb and don't move — offset must stay put.
+        let state = ScrollbarState::new(100, 20, 40);
+        let track = 20;
+        let (thumb_top, _) = state.thumb_geometry(track);
+        // Click in the middle of the thumb.
+        let click_row = thumb_top + 1;
+        let new_offset = state.drag_to_offset(track, click_row, 40, click_row);
+        assert_eq!(new_offset, 40);
+    }
+
+    #[test]
+    fn test_drag_to_offset_press_anywhere_on_thumb_no_jump() {
+        // Pressing on a non-top row of the thumb must not jump the
+        // viewport — the cursor stays pinned to that thumb position.
+        let state = ScrollbarState::new(200, 50, 75);
+        let track = 20;
+        let (thumb_top, thumb_size) = state.thumb_geometry(track);
+        assert!(thumb_size >= 2, "test needs thumb at least 2 rows tall");
+        for row_in_thumb in thumb_top..(thumb_top + thumb_size) {
+            let new_offset = state.drag_to_offset(track, row_in_thumb, 75, row_in_thumb);
+            assert_eq!(
+                new_offset, 75,
+                "press at thumb row {row_in_thumb} should not move the viewport"
+            );
+        }
+    }
+
+    #[test]
+    fn test_drag_to_offset_follows_cursor_down() {
+        // Press at the top of the thumb when scrolled to the start, then
+        // drag the cursor down — the offset must move down accordingly.
+        let state = ScrollbarState::new(100, 20, 0);
+        let track = 20;
+        let (thumb_top, _) = state.thumb_geometry(track);
+        let start_row = thumb_top;
+        let down_row = start_row + 5;
+        let dragged = state.drag_to_offset(track, start_row, 0, down_row);
+        assert!(
+            dragged > 0,
+            "drag down should increase offset, got {dragged}"
+        );
+    }
+
+    #[test]
+    fn test_drag_to_offset_clamps_at_bottom() {
+        let state = ScrollbarState::new(100, 20, 0);
+        let track = 20;
+        let dragged = state.drag_to_offset(track, 0, 0, 1000);
+        let max_scroll = 100 - 20;
+        assert_eq!(dragged, max_scroll);
+    }
+
+    #[test]
+    fn test_drag_to_offset_no_overflow_when_fits() {
+        // Content shorter than viewport — drag is a no-op.
+        let state = ScrollbarState::new(10, 20, 0);
+        assert_eq!(state.drag_to_offset(20, 0, 0, 5), 0);
+    }
+
+    #[test]
+    fn test_offset_for_thumb_top_round_trip() {
+        // For every reachable thumb row, `offset_for_thumb_top` must
+        // produce an offset whose rendered thumb top matches that row —
+        // i.e. it really is the inverse of `thumb_geometry`.
+        let cases = [
+            (200_usize, 50_usize, 20_usize),
+            (1000, 30, 25),
+            (50, 10, 15),
+        ];
+        for (total, visible, track) in cases {
+            let probe = ScrollbarState::new(total, visible, 0);
+            let (_, thumb_size) = probe.thumb_geometry(track);
+            let max_thumb_top = track.saturating_sub(thumb_size);
+            for target in 0..=max_thumb_top {
+                let offset = probe.offset_for_thumb_top(track, target);
+                let placed = ScrollbarState::new(total, visible, offset);
+                let (got_top, _) = placed.thumb_geometry(track);
+                assert!(
+                    got_top.abs_diff(target) <= 1,
+                    "thumb landed at {got_top}, expected {target} (total={total} visible={visible} track={track})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_offset_for_thumb_top_clamps_to_max() {
+        let state = ScrollbarState::new(200, 50, 0);
+        let track = 20;
+        let (_, thumb_size) = state.thumb_geometry(track);
+        let max_thumb_top = track - thumb_size;
+        // Asking for a row past the bottom must clamp to max_scroll, not
+        // wrap or overshoot.
+        assert_eq!(
+            state.offset_for_thumb_top(track, max_thumb_top + 100),
+            200 - 50
+        );
+    }
+
+    fn track_rect(height: u16) -> Rect {
+        Rect::new(50, 10, 1, height)
+    }
+
+    #[test]
+    fn test_mouse_press_outside_track_returns_none() {
+        let mut mouse = ScrollbarMouse::default();
+        let state = ScrollbarState::new(200, 50, 75);
+        let track = track_rect(20);
+        // x outside
+        assert_eq!(mouse.press(state, track, 0, 15), None);
+        // y above
+        assert_eq!(mouse.press(state, track, 50, 0), None);
+        // y below (track is rows 10..30)
+        assert_eq!(mouse.press(state, track, 50, 30), None);
+        assert!(mouse.drag.is_none());
+    }
+
+    #[test]
+    fn test_mouse_press_on_thumb_does_not_jump() {
+        let mut mouse = ScrollbarMouse::default();
+        let state = ScrollbarState::new(200, 50, 75);
+        let track = track_rect(20);
+        let (thumb_top, _) = state.thumb_geometry(track.height as usize);
+        let press_screen_row = track.y + thumb_top as u16 + 1;
+        let returned = mouse.press(state, track, track.x, press_screen_row);
+        assert_eq!(returned, Some(75), "press on thumb must not move offset");
+        let drag = mouse.drag.expect("anchor captured");
+        assert_eq!(drag.start_offset, 75);
+    }
+
+    #[test]
+    fn test_mouse_press_on_track_recenters_thumb() {
+        let mut mouse = ScrollbarMouse::default();
+        let state = ScrollbarState::new(200, 50, 0); // thumb at top
+        let track = track_rect(20);
+        // Click way down the track (outside the thumb).
+        let returned = mouse.press(state, track, track.x, track.y + 18).unwrap();
+        // The new offset should place the thumb so its centre is near
+        // row 18: that means the new thumb_top is at 18 - thumb_size/2.
+        let placed = ScrollbarState::new(200, 50, returned);
+        let (got_top, thumb_size) = placed.thumb_geometry(track.height as usize);
+        let want_top = (18_usize).saturating_sub(thumb_size / 2);
+        assert!(
+            got_top.abs_diff(want_top) <= 1,
+            "thumb landed at {got_top}, expected ~{want_top}"
+        );
+    }
+
+    #[test]
+    fn test_mouse_drag_without_press_returns_none() {
+        let mut mouse = ScrollbarMouse::default();
+        let state = ScrollbarState::new(200, 50, 0);
+        assert_eq!(mouse.drag(state, track_rect(20), 15), None);
+    }
+
+    #[test]
+    fn test_mouse_drag_after_press_follows_cursor() {
+        let mut mouse = ScrollbarMouse::default();
+        let state = ScrollbarState::new(200, 50, 0);
+        let track = track_rect(20);
+        // Press at the thumb top.
+        let _ = mouse.press(state, track, track.x, track.y);
+        // Drag down a few rows.
+        let new_offset = mouse.drag(state, track, track.y + 5).unwrap();
+        assert!(new_offset > 0, "drag down should increase offset");
+    }
+
+    #[test]
+    fn test_mouse_release_clears_drag() {
+        let mut mouse = ScrollbarMouse::default();
+        let state = ScrollbarState::new(200, 50, 0);
+        let track = track_rect(20);
+        let _ = mouse.press(state, track, track.x, track.y);
+        assert!(mouse.drag.is_some());
+        mouse.release();
+        assert!(mouse.drag.is_none());
     }
 }

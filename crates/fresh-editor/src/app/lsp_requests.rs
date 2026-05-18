@@ -15,13 +15,14 @@ use rust_i18n::t;
 use std::io;
 use std::time::{Duration, Instant};
 
-use lsp_types::TextDocumentContentChangeEvent;
-
 use crate::model::event::{BufferId, Event};
 use crate::primitives::word_navigation::{find_word_end, find_word_start};
 use crate::view::prompt::{Prompt, PromptType};
 
-use super::{uri_to_path, Editor, SemanticTokenRangeRequest};
+use crate::services::lsp::async_handler::LspHandle;
+use crate::types::LspFeature;
+
+use super::{Editor, SemanticTokenRangeRequest};
 
 /// Ensure every line in a docstring is separated by a blank line.
 ///
@@ -30,25 +31,49 @@ use super::{uri_to_path, Editor, SemanticTokenRangeRequest};
 /// doubles all single newlines so each line becomes its own paragraph with
 /// spacing between them.
 fn space_doc_paragraphs(text: &str) -> String {
-    text.replace("\n\n", "\x00")
-        .replace('\n', "\n\n")
-        .replace('\x00', "\n\n")
+    text.replace("\n\n", "\x00").replace(['\n', '\x00'], "\n\n")
 }
 
-const SEMANTIC_TOKENS_FULL_DEBOUNCE_MS: u64 = 500;
+/// Whether an LSP range (half-open end, like `[start, end)`) contains the given
+/// `(line, character)` LSP position. Zero-length ranges (start == end) are
+/// treated as containing their single anchor point so point-style diagnostics
+/// still match a hover that lands exactly on them.
+fn lsp_range_contains(range: &lsp_types::Range, line: u32, character: u32) -> bool {
+    let start = range.start;
+    let end = range.end;
+    // Before start?
+    if line < start.line || (line == start.line && character < start.character) {
+        return false;
+    }
+    // Zero-length range: accept exact anchor match.
+    if start.line == end.line && start.character == end.character {
+        return line == start.line && character == start.character;
+    }
+    // After end? (half-open)
+    if line > end.line || (line == end.line && character >= end.character) {
+        return false;
+    }
+    true
+}
+
 const SEMANTIC_TOKENS_RANGE_DEBOUNCE_MS: u64 = 50;
 const SEMANTIC_TOKENS_RANGE_PADDING_LINES: usize = 10;
-const FOLDING_RANGES_DEBOUNCE_MS: u64 = 300;
 
 impl Editor {
-    /// Handle LSP completion response
+    /// Handle LSP completion response.
+    /// Supports merging from multiple servers: first response creates the menu,
+    /// subsequent responses extend it.
     pub(crate) fn handle_completion_response(
         &mut self,
         request_id: u64,
         items: Vec<lsp_types::CompletionItem>,
     ) -> AnyhowResult<()> {
-        // Check if this is the pending completion request
-        if self.pending_completion_request != Some(request_id) {
+        // Check if this is one of the pending completion requests
+        if !self
+            .active_window_mut()
+            .pending_completion_requests
+            .remove(&request_id)
+        {
             tracing::debug!(
                 "Ignoring completion response for outdated request {}",
                 request_id
@@ -56,11 +81,15 @@ impl Editor {
             return Ok(());
         }
 
-        self.pending_completion_request = None;
-        self.update_lsp_status_from_server_statuses();
-
         if items.is_empty() {
             tracing::debug!("No completion items received");
+            if self.active_window().pending_completion_requests.is_empty()
+                && self.active_window().completion_items.is_none()
+            {
+                // All servers responded with nothing — fall back to buffer-word completions,
+                // matching the behaviour when no LSP servers are available at all.
+                self.show_buffer_word_completion_popup();
+            }
             return Ok(());
         }
 
@@ -80,49 +109,90 @@ impl Editor {
             String::new()
         };
 
-        // Filter completions to match the typed prefix
-        let filtered_items: Vec<&lsp_types::CompletionItem> = if prefix.is_empty() {
-            // No prefix - show all completions
-            items.iter().collect()
-        } else {
-            // Filter to items that start with the prefix (case-insensitive)
-            items
-                .iter()
-                .filter(|item| {
-                    item.label.to_lowercase().starts_with(&prefix)
-                        || item
-                            .filter_text
-                            .as_ref()
-                            .map(|ft| ft.to_lowercase().starts_with(&prefix))
-                            .unwrap_or(false)
-                })
-                .collect()
+        let matches_prefix = |item: &lsp_types::CompletionItem| -> bool {
+            prefix.is_empty()
+                || item.label.to_lowercase().starts_with(&prefix)
+                || item
+                    .filter_text
+                    .as_ref()
+                    .map(|ft| ft.to_lowercase().starts_with(&prefix))
+                    .unwrap_or(false)
         };
 
-        if filtered_items.is_empty() {
+        let filtered_items: Vec<&lsp_types::CompletionItem> =
+            items.iter().filter(|item| matches_prefix(item)).collect();
+
+        if filtered_items.is_empty() && self.active_window().completion_items.is_none() {
             tracing::debug!("No completion items match prefix '{}'", prefix);
             return Ok(());
         }
 
-        let popup_data = crate::app::popup_actions::build_completion_popup(&filtered_items, 0);
+        // Store/extend original items for type-to-filter (merge from multiple servers)
+        match &mut self.active_window_mut().completion_items {
+            Some(existing) => {
+                existing.extend(items);
+                tracing::debug!("Extended completion items, now {} total", existing.len());
+            }
+            None => {
+                self.active_window_mut().completion_items = Some(items);
+            }
+        }
 
-        // Store original items for type-to-filter
-        self.completion_items = Some(items);
+        // Rebuild popup from ALL merged items (not just the new batch)
+        let all_items = self.active_window_mut().completion_items.as_ref().unwrap();
+        let all_filtered: Vec<&lsp_types::CompletionItem> = all_items
+            .iter()
+            .filter(|item| matches_prefix(item))
+            .collect();
+
+        if all_filtered.is_empty() {
+            tracing::debug!("No completion items match prefix '{}'", prefix);
+            return Ok(());
+        }
+
+        // Build LSP popup items, then append buffer-word items below.
+        let mut all_popup_items =
+            crate::app::popup_actions::lsp_items_to_popup_items(&all_filtered);
+        let buffer_word_items = self.get_buffer_completion_popup_items();
+        // Deduplicate: skip buffer-word items whose label already appears in LSP results.
+        let lsp_labels: std::collections::HashSet<String> = all_popup_items
+            .iter()
+            .map(|i| i.text.to_lowercase())
+            .collect();
+        all_popup_items.extend(
+            buffer_word_items
+                .into_iter()
+                .filter(|item| !lsp_labels.contains(&item.text.to_lowercase())),
+        );
+
+        let popup_data =
+            crate::app::popup_actions::build_completion_popup_from_items(all_popup_items, 0);
+        let accept_hint = self.completion_accept_key_hint();
+        let focus_hint = self.popup_focus_key_hint();
 
         {
             let buffer_id = self.active_buffer();
-            let split_id = self.split_manager.active_split();
-            let state = self.buffers.get_mut(&buffer_id).unwrap();
-            let cursors = &mut self.split_view_states.get_mut(&split_id).unwrap().cursors;
-            state.apply(
-                cursors,
-                &crate::model::event::Event::ShowPopup { popup: popup_data },
-            );
+            let state = self
+                .windows
+                .get_mut(&self.active_window)
+                .map(|w| &mut w.buffers)
+                .expect("active window present")
+                .get_mut(&buffer_id)
+                .unwrap();
+            // Convert PopupData to Popup and use show_or_replace to avoid stacking
+            let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
+            popup_obj.accept_key_hint = accept_hint;
+            popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
+            popup_obj.focus_key_hint = focus_hint;
+            state.popups.show_or_replace(popup_obj);
         }
 
         tracing::info!(
             "Showing completion popup with {} items",
-            self.completion_items.as_ref().map_or(0, |i| i.len())
+            self.active_window_mut()
+                .completion_items
+                .as_ref()
+                .map_or(0, |i| i.len())
         );
 
         Ok(())
@@ -135,7 +205,7 @@ impl Editor {
         locations: Vec<lsp_types::Location>,
     ) -> AnyhowResult<()> {
         // Check if this is the pending request
-        if self.pending_goto_definition_request != Some(request_id) {
+        if self.active_window_mut().pending_goto_definition_request != Some(request_id) {
             tracing::debug!(
                 "Ignoring go-to-definition response for outdated request {}",
                 request_id
@@ -143,214 +213,367 @@ impl Editor {
             return Ok(());
         }
 
-        self.pending_goto_definition_request = None;
+        self.active_window_mut().pending_goto_definition_request = None;
 
         if locations.is_empty() {
-            self.status_message = Some(t!("lsp.no_definition").to_string());
+            self.active_window_mut().status_message = Some(t!("lsp.no_definition").to_string());
             return Ok(());
         }
 
         // For now, just jump to the first location
         let location = &locations[0];
 
-        // Convert URI to file path
-        if let Ok(path) = uri_to_path(&location.uri) {
-            // Open the file
-            let buffer_id = match self.open_file(&path) {
-                Ok(id) => id,
-                Err(e) => {
-                    // Check if this is a large file encoding confirmation error
-                    if let Some(confirmation) =
-                        e.downcast_ref::<crate::model::buffer::LargeFileEncodingConfirmation>()
-                    {
-                        self.start_large_file_encoding_confirmation(confirmation);
-                    } else {
-                        self.set_status_message(
-                            t!("file.error_opening", error = e.to_string()).to_string(),
-                        );
-                    }
-                    return Ok(());
+        // Resolve the URI to a buffer. `open_lsp_uri_target` handles
+        // all three cases: host file under the workspace mount,
+        // container-only file fetched via `docker exec cat`, and
+        // unreachable (no file at the host path AND container fetch
+        // failed). The last case becomes a user-visible status
+        // message instead of a phantom empty buffer.
+        let wire = crate::app::types::LspUri::from_wire(location.uri.clone());
+        let buffer_id = match self.open_lsp_uri_target(&wire) {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(confirmation) =
+                    e.downcast_ref::<crate::model::buffer::LargeFileEncodingConfirmation>()
+                {
+                    self.start_large_file_encoding_confirmation(confirmation);
+                } else {
+                    self.set_status_message(
+                        t!("file.error_opening", error = e.to_string()).to_string(),
+                    );
                 }
+                return Ok(());
+            }
+        };
+
+        // Move cursor to the definition position. The buffer's
+        // `file_path` is the *destination* path — the host path on a
+        // bind-mounted file, the container path on a fetched one —
+        // so we read it back for the status message rather than
+        // formatting the original wire URI.
+        let line = location.range.start.line as usize;
+        let character = location.range.start.character as usize;
+        let position = self
+            .buffers()
+            .get(&buffer_id)
+            .map(|state| state.buffer.line_col_to_position(line, character));
+
+        if let Some(position) = position {
+            let (cursor_id, old_position, old_anchor, old_sticky_column) = {
+                let cursors = self.active_cursors();
+                let primary = cursors.primary();
+                (
+                    cursors.primary_id(),
+                    primary.position,
+                    primary.anchor,
+                    primary.sticky_column,
+                )
+            };
+            let event = crate::model::event::Event::MoveCursor {
+                cursor_id,
+                old_position,
+                new_position: position,
+                old_anchor,
+                new_anchor: None,
+                old_sticky_column,
+                new_sticky_column: 0,
             };
 
-            // Move cursor to the definition position
-            let line = location.range.start.line as usize;
-            let character = location.range.start.character as usize;
-
-            // Calculate byte position from line and character
-            let position = self
-                .buffers
-                .get(&buffer_id)
-                .map(|state| state.buffer.line_col_to_position(line, character));
-
-            if let Some(position) = position {
-                // Move cursor - read cursor info from split view state
-                let (cursor_id, old_position, old_anchor, old_sticky_column) = {
-                    let cursors = self.active_cursors();
-                    let primary = cursors.primary();
-                    (
-                        cursors.primary_id(),
-                        primary.position,
-                        primary.anchor,
-                        primary.sticky_column,
-                    )
-                };
-                let event = crate::model::event::Event::MoveCursor {
-                    cursor_id,
-                    old_position,
-                    new_position: position,
-                    old_anchor,
-                    new_anchor: None,
-                    old_sticky_column,
-                    new_sticky_column: 0, // Reset sticky column for goto definition
-                };
-
-                let split_id = self.split_manager.active_split();
-                if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                    let cursors = &mut self.split_view_states.get_mut(&split_id).unwrap().cursors;
-                    state.apply(cursors, &event);
-                }
-            }
-
-            self.status_message = Some(
-                t!(
-                    "lsp.jumped_to_definition",
-                    path = path.display().to_string(),
-                    line = line + 1
-                )
-                .to_string(),
-            );
-        } else {
-            self.status_message = Some(t!("lsp.cannot_open_definition").to_string());
+            let split_id = self
+                .windows
+                .get(&self.active_window)
+                .and_then(|w| w.buffers.splits())
+                .map(|(mgr, _)| mgr)
+                .expect("active window must have a populated split layout")
+                .active_split();
+            self.active_window_mut()
+                .apply_event_to_buffer(buffer_id, split_id, &event);
+            // Without this the cursor lands at the definition but the
+            // viewport never scrolls when the target file is already
+            // open (#1689).
+            self.active_window_mut()
+                .ensure_active_cursor_visible_for_navigation(true);
         }
+
+        let display_path = self
+            .buffers()
+            .get(&buffer_id)
+            .and_then(|s| s.buffer.file_path().map(|p| p.display().to_string()))
+            .unwrap_or_default();
+        self.active_window_mut().status_message = Some(
+            t!(
+                "lsp.jumped_to_definition",
+                path = display_path,
+                line = line + 1
+            )
+            .to_string(),
+        );
 
         Ok(())
     }
 
-    /// Check if there are any pending LSP requests
-    pub fn has_pending_lsp_requests(&self) -> bool {
-        self.pending_completion_request.is_some() || self.pending_goto_definition_request.is_some()
-    }
-
-    /// Cancel any pending LSP requests
-    /// This should be called when the user performs an action that would make
-    /// the pending request's results stale (e.g., cursor movement, text editing)
-    pub(crate) fn cancel_pending_lsp_requests(&mut self) {
-        // Cancel scheduled (not yet sent) completion trigger
-        self.scheduled_completion_trigger = None;
-        if let Some(request_id) = self.pending_completion_request.take() {
-            tracing::debug!("Canceling pending LSP completion request {}", request_id);
-            // Send cancellation to the LSP server
-            self.send_lsp_cancel_request(request_id);
-            self.update_lsp_status_from_server_statuses();
-        }
-        if let Some(request_id) = self.pending_goto_definition_request.take() {
-            tracing::debug!(
-                "Canceling pending LSP goto-definition request {}",
-                request_id
-            );
-            // Send cancellation to the LSP server
-            self.send_lsp_cancel_request(request_id);
-            self.update_lsp_status_from_server_statuses();
-        }
-    }
-
-    /// Send a cancel request to the LSP server for a specific request ID
-    fn send_lsp_cancel_request(&mut self, request_id: u64) {
-        // Get language from buffer state
-        let buffer_id = self.active_buffer();
-        let Some(language) = self.buffers.get(&buffer_id).map(|s| s.language.clone()) else {
-            return;
-        };
-
-        if let Some(lsp) = self.lsp.as_mut() {
-            // Only send cancel if LSP is already running (no need to spawn just to cancel)
-            if let Some(handle) = lsp.get_handle_mut(&language) {
-                if let Err(e) = handle.cancel_request(request_id) {
-                    tracing::warn!("Failed to send LSP cancel request: {}", e);
-                } else {
-                    tracing::debug!("Sent $/cancelRequest for request_id={}", request_id);
-                }
-            }
-        }
-    }
-
-    /// Execute a closure with LSP handle, ensuring didOpen was sent first.
+    /// Dispatch an exclusive LSP feature request to the first handle that allows the feature.
     ///
-    /// This helper centralizes the logic for:
-    /// 1. Getting buffer metadata, URI, and language
-    /// 2. Checking if LSP can be spawned (respects auto_start setting)
-    /// 3. Ensuring didOpen was sent to this server instance (lazy - only gets text if needed)
-    /// 4. Calling the provided closure with the handle
-    ///
-    /// Returns None if any step fails (no file, no language, LSP disabled, auto_start=false, etc.)
-    /// Note: This respects the auto_start setting. If auto_start is false and the server
-    /// hasn't been manually started, this will return None without spawning the server.
-    pub(crate) fn with_lsp_for_buffer<F, R>(&mut self, buffer_id: BufferId, f: F) -> Option<R>
+    /// Ensures all handles receive didOpen first, then calls the closure with the first
+    /// handle matching the feature filter. For features like hover, definition, rename, etc.
+    pub(crate) fn with_lsp_for_buffer<F, R>(
+        &mut self,
+        buffer_id: BufferId,
+        feature: LspFeature,
+        f: F,
+    ) -> Option<R>
     where
-        F: FnOnce(&crate::services::lsp::async_handler::LspHandle, &lsp_types::Uri, &str) -> R,
+        F: FnOnce(&LspHandle, &crate::app::types::LspUri, &str) -> R,
     {
         use crate::services::lsp::manager::LspSpawnResult;
 
-        // Get metadata and language from buffer state
-        let (uri, language) = {
-            let metadata = self.buffer_metadata.get(&buffer_id)?;
+        let (uri, language, file_path) = {
+            let metadata = self.active_window().buffer_metadata.get(&buffer_id)?;
             if !metadata.lsp_enabled {
                 return None;
             }
             let uri = metadata.file_uri()?.clone();
-            let language = self.buffers.get(&buffer_id)?.language.clone();
-            (uri, language)
+            let file_path = metadata.file_path().cloned();
+            let language = self
+                .windows
+                .get(&self.active_window)
+                .map(|w| &w.buffers)
+                .expect("active window present")
+                .get(&buffer_id)?
+                .language
+                .clone();
+            (uri, language, file_path)
         };
 
-        // Try to spawn LSP (respects auto_start setting)
-        // This will only spawn if auto_start=true or the language was manually allowed
-        let lsp = self.lsp.as_mut()?;
-        if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
+        let lsp = self.lsp_mut()?;
+        if lsp.try_spawn(&language, file_path.as_deref()) != LspSpawnResult::Spawned {
             return None;
         }
 
-        // Get handle ID (handle exists since try_spawn succeeded)
-        let handle_id = lsp.get_handle_mut(&language)?.id();
+        // Ensure didOpen is sent to all handles
+        self.ensure_did_open_all(buffer_id, &uri, &language)?;
 
-        // Check if didOpen is needed
-        let needs_open = {
-            let metadata = self.buffer_metadata.get(&buffer_id)?;
-            !metadata.lsp_opened_with.contains(&handle_id)
-        };
-
-        if needs_open {
-            // Only now get the text (can be expensive for large buffers)
-            let text = self.buffers.get(&buffer_id)?.buffer.to_string()?;
-
-            // Send didOpen
-            let lsp = self.lsp.as_mut()?;
-            let handle = lsp.get_handle_mut(&language)?;
-            if let Err(e) = handle.did_open(uri.clone(), text, language.clone()) {
-                tracing::warn!("Failed to send didOpen: {}", e);
-                return None;
-            }
-
-            // Mark as opened with this server instance
-            let metadata = self.buffer_metadata.get_mut(&buffer_id)?;
-            metadata.lsp_opened_with.insert(handle_id);
-
-            tracing::debug!(
-                "Sent didOpen for {} to LSP handle {} (language: {})",
-                uri.as_str(),
-                handle_id,
-                language
-            );
-        }
-
-        // Call the closure with the handle
-        let lsp = self.lsp.as_mut()?;
-        let handle = lsp.get_handle_mut(&language)?;
-        Some(f(handle, &uri, &language))
+        // Dispatch to the first handle that allows this feature
+        let lsp = self.lsp_mut()?;
+        let sh = lsp.handle_for_feature_mut(&language, feature)?;
+        Some(f(&sh.handle, &uri, &language))
     }
 
-    /// Request LSP completion at current cursor position
+    /// Dispatch a merged LSP feature request to all handles that allow the feature.
+    ///
+    /// Ensures all handles receive didOpen first, then calls the closure for each
+    /// handle matching the feature filter, collecting all results. For features like
+    /// completion, code actions, diagnostics, etc.
+    pub(crate) fn with_all_lsp_for_buffer_feature<F, R>(
+        &mut self,
+        buffer_id: BufferId,
+        feature: LspFeature,
+        f: F,
+    ) -> Vec<R>
+    where
+        F: Fn(&LspHandle, &crate::app::types::LspUri, &str) -> R,
+    {
+        use crate::services::lsp::manager::LspSpawnResult;
+
+        let (uri, language, file_path) = match (|| {
+            let metadata = self.active_window().buffer_metadata.get(&buffer_id)?;
+            if !metadata.lsp_enabled {
+                return None;
+            }
+            let uri = metadata.file_uri()?.clone();
+            let file_path = metadata.file_path().cloned();
+            let language = self
+                .windows
+                .get(&self.active_window)
+                .map(|w| &w.buffers)
+                .expect("active window present")
+                .get(&buffer_id)?
+                .language
+                .clone();
+            Some((uri, language, file_path))
+        })() {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+
+        let lsp = match self.lsp_mut() {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        if lsp.try_spawn(&language, file_path.as_deref()) != LspSpawnResult::Spawned {
+            return Vec::new();
+        }
+
+        // Ensure didOpen is sent to all handles
+        if self
+            .ensure_did_open_all(buffer_id, &uri, &language)
+            .is_none()
+        {
+            return Vec::new();
+        }
+
+        // Dispatch to all handles that allow this feature
+        let lsp = match self.lsp_mut() {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        lsp.handles_for_feature_mut(&language, feature)
+            .into_iter()
+            .map(|sh| f(&sh.handle, &uri, &language))
+            .collect()
+    }
+
+    /// Like `with_all_lsp_for_buffer_feature`, but also passes the server name
+    /// to the closure for attribution purposes.
+    pub(crate) fn with_all_lsp_for_buffer_feature_named<F, R>(
+        &mut self,
+        buffer_id: BufferId,
+        feature: LspFeature,
+        f: F,
+    ) -> Vec<R>
+    where
+        F: Fn(&LspHandle, &crate::app::types::LspUri, &str, &str) -> R,
+    {
+        use crate::services::lsp::manager::LspSpawnResult;
+
+        let (uri, language, file_path) = match (|| {
+            let metadata = self.active_window().buffer_metadata.get(&buffer_id)?;
+            if !metadata.lsp_enabled {
+                return None;
+            }
+            let uri = metadata.file_uri()?.clone();
+            let file_path = metadata.file_path().cloned();
+            let language = self
+                .windows
+                .get(&self.active_window)
+                .map(|w| &w.buffers)
+                .expect("active window present")
+                .get(&buffer_id)?
+                .language
+                .clone();
+            Some((uri, language, file_path))
+        })() {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+
+        let lsp = match self.lsp_mut() {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        if lsp.try_spawn(&language, file_path.as_deref()) != LspSpawnResult::Spawned {
+            return Vec::new();
+        }
+
+        if self
+            .ensure_did_open_all(buffer_id, &uri, &language)
+            .is_none()
+        {
+            return Vec::new();
+        }
+
+        let lsp = match self.lsp_mut() {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        lsp.handles_for_feature_mut(&language, feature)
+            .into_iter()
+            .map(|sh| f(&sh.handle, &uri, &language, &sh.name))
+            .collect()
+    }
+
+    /// Ensure didOpen has been sent to all handles for the given buffer's language.
+    /// Returns Some(()) on success, None if we can't access required state.
+    fn ensure_did_open_all(
+        &mut self,
+        buffer_id: BufferId,
+        uri: &crate::app::types::LspUri,
+        language: &str,
+    ) -> Option<()> {
+        let lsp = self.lsp_mut()?;
+        let handle_ids: Vec<u64> = lsp
+            .get_handles(language)
+            .iter()
+            .map(|sh| sh.handle.id())
+            .collect();
+
+        let needs_open: Vec<u64> = {
+            let metadata = self.active_window().buffer_metadata.get(&buffer_id)?;
+            handle_ids
+                .iter()
+                .filter(|id| !metadata.lsp_opened_with.contains(id))
+                .copied()
+                .collect()
+        };
+
+        if !needs_open.is_empty() {
+            let text = self
+                .windows
+                .get(&self.active_window)
+                .map(|w| &w.buffers)
+                .expect("active window present")
+                .get(&buffer_id)?
+                .buffer
+                .to_string()?;
+            let active_id = self.active_window;
+            let __win = self.windows.get_mut(&active_id)?;
+            let lsp = __win.lsp.as_mut()?;
+            for sh in lsp.get_handles_mut(language) {
+                if needs_open.contains(&sh.handle.id()) {
+                    if let Err(e) =
+                        sh.handle
+                            .did_open(uri.as_uri().clone(), text.clone(), language.to_string())
+                    {
+                        tracing::warn!("Failed to send didOpen to '{}': {}", sh.name, e);
+                        continue;
+                    }
+                    let metadata = __win.buffer_metadata.get_mut(&buffer_id)?;
+                    metadata.lsp_opened_with.insert(sh.handle.id());
+                    tracing::debug!(
+                        "Sent didOpen for {} to LSP handle '{}' (language: {})",
+                        uri.as_str(),
+                        sh.name,
+                        language
+                    );
+                }
+            }
+        }
+
+        Some(())
+    }
+
+    /// Request LSP completion at current cursor position.
+    /// Sends completion requests to all eligible servers for merged results.
     pub(crate) fn request_completion(&mut self) {
+        // A new completion request starts a fresh batch. Cancel any
+        // previous in-flight completion requests so their late responses
+        // are ignored (handle_completion_response drops responses whose
+        // request_id isn't in pending_completion_requests), and drop any
+        // leftover items from a previous popup that was closed via the
+        // "pass-through" path (hide_popup() without handle_popup_cancel,
+        // e.g. Enter or a non-word character while the popup was open).
+        // Without this, the new response would be merged into the stale
+        // items by `handle_completion_response`'s extend branch, leading
+        // to duplicate / stale entries in the rendered popup — see the
+        // regression test in
+        // crates/fresh-editor/tests/e2e/lsp_completion_duplicate_entries_1514.rs
+        // and sinelaw/fresh#1514.
+        if !self.active_window().pending_completion_requests.is_empty() {
+            let ids: Vec<u64> = self
+                .active_window_mut()
+                .pending_completion_requests
+                .drain()
+                .collect();
+            for request_id in ids {
+                tracing::debug!(
+                    "Canceling previous pending LSP completion request {}",
+                    request_id
+                );
+                self.active_window_mut().send_lsp_cancel_request(request_id);
+            }
+        }
+        self.active_window_mut().completion_items = None;
+
         // Get the current buffer and cursor position
         let cursor_pos = self.active_cursors().primary().position;
         let state = self.active_state();
@@ -358,48 +581,105 @@ impl Editor {
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
 
-        // Use helper to ensure didOpen is sent before the request
-        let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result =
-                    handle.completion(request_id, uri.clone(), line as u32, character as u32);
+        // Pre-allocate request IDs for all eligible servers
+        let base_request_id = self.active_window_mut().next_lsp_request_id;
+        // Use an atomic counter in the closure
+        let counter = std::sync::atomic::AtomicU64::new(0);
+
+        let results = self.with_all_lsp_for_buffer_feature(
+            buffer_id,
+            LspFeature::Completion,
+            |handle, uri, _language| {
+                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let request_id = base_request_id + idx;
+                let result = handle.completion(
+                    request_id,
+                    uri.as_uri().clone(),
+                    line as u32,
+                    character as u32,
+                );
                 if result.is_ok() {
                     tracing::info!(
-                        "Requested completion at {}:{}:{}",
+                        "Requested completion at {}:{}:{} (request_id={})",
                         uri.as_str(),
                         line,
-                        character
+                        character,
+                        request_id
                     );
                 }
-                result.is_ok()
-            })
-            .unwrap_or(false);
+                (request_id, result.is_ok())
+            },
+        );
 
-        if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_completion_request = Some(request_id);
-            self.lsp_status = "LSP: completion...".to_string();
+        let mut sent_ids = Vec::new();
+        for (request_id, ok) in &results {
+            if *ok {
+                sent_ids.push(*request_id);
+            }
         }
+        // Advance the ID counter past all allocated IDs
+        self.active_window_mut().next_lsp_request_id = base_request_id + results.len() as u64;
+
+        if !sent_ids.is_empty() {
+            self.active_window_mut()
+                .pending_completion_requests
+                .extend(sent_ids);
+        } else {
+            // No LSP servers available — show buffer-word completions as popup.
+            self.show_buffer_word_completion_popup();
+        }
+    }
+
+    /// Show a completion popup with buffer-word results only (no LSP).
+    ///
+    /// Called when no LSP servers are available for the current buffer.
+    fn show_buffer_word_completion_popup(&mut self) {
+        let items = self.get_buffer_completion_popup_items();
+        if items.is_empty() {
+            return;
+        }
+
+        let popup_data = crate::app::popup_actions::build_completion_popup_from_items(items, 0);
+        let accept_hint = self.completion_accept_key_hint();
+        let focus_hint = self.popup_focus_key_hint();
+
+        let buffer_id = self.active_buffer();
+        let state = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&buffer_id)
+            .unwrap();
+        let mut popup_obj = crate::state::convert_popup_data_to_popup(&popup_data);
+        popup_obj.accept_key_hint = accept_hint;
+        popup_obj.resolver = crate::view::popup::PopupResolver::Completion;
+        popup_obj.focus_key_hint = focus_hint;
+        state.popups.show_or_replace(popup_obj);
     }
 
     /// Check if the inserted character should trigger completion
     /// and if so, request completion automatically (possibly after a delay).
     ///
-    /// Triggers completion in two cases:
+    /// Only triggers when `completion_popup_auto_show` is enabled. Then:
     /// 1. Trigger characters (like `.`, `::`, etc.): immediate if suggest_on_trigger_characters is enabled
     /// 2. Word characters: delayed by quick_suggestions_delay_ms if quick_suggestions is enabled
     ///
     /// This provides VS Code-like behavior where suggestions appear while typing,
     /// with debouncing to avoid spamming the LSP server.
     pub(crate) fn maybe_trigger_completion(&mut self, c: char) {
+        // Auto-show must be enabled for any automatic triggering
+        if !self.config.editor.completion_popup_auto_show {
+            return;
+        }
+
         // Get the active buffer's language
         let language = self.active_state().language.clone();
 
         // Check if this character is a trigger character for this language
         let is_lsp_trigger = self
-            .lsp
+            .lsp()
             .as_ref()
             .map(|lsp| lsp.is_completion_trigger_char(c, &language))
             .unwrap_or(false);
@@ -417,7 +697,7 @@ impl Editor {
                 language
             );
             // Cancel any pending scheduled trigger
-            self.scheduled_completion_trigger = None;
+            self.active_window_mut().scheduled_completion_trigger = None;
             self.request_completion();
             return;
         }
@@ -436,12 +716,12 @@ impl Editor {
 
             // Schedule (or reschedule) the completion trigger
             // This effectively debounces - each keystroke resets the timer
-            self.scheduled_completion_trigger = Some(trigger_time);
+            self.active_window_mut().scheduled_completion_trigger = Some(trigger_time);
         } else {
             // Non-word, non-trigger character (space, punctuation, etc.) —
             // cancel any pending scheduled trigger so a stale timer from the
             // previous word doesn't fire at the wrong cursor position.
-            self.scheduled_completion_trigger = None;
+            self.active_window_mut().scheduled_completion_trigger = None;
         }
     }
 
@@ -454,35 +734,43 @@ impl Editor {
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result =
-                    handle.goto_definition(request_id, uri.clone(), line as u32, character as u32);
-                if result.is_ok() {
-                    tracing::info!(
-                        "Requested go-to-definition at {}:{}:{}",
-                        uri.as_str(),
-                        line,
-                        character
+            .with_lsp_for_buffer(
+                buffer_id,
+                LspFeature::Definition,
+                |handle, uri, _language| {
+                    let result = handle.goto_definition(
+                        request_id,
+                        uri.as_uri().clone(),
+                        line as u32,
+                        character as u32,
                     );
-                }
-                result.is_ok()
-            })
+                    if result.is_ok() {
+                        tracing::info!(
+                            "Requested go-to-definition at {}:{}:{}",
+                            uri.as_str(),
+                            line,
+                            character
+                        );
+                    }
+                    result.is_ok()
+                },
+            )
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_goto_definition_request = Some(request_id);
+            self.active_window_mut().next_lsp_request_id += 1;
+            self.active_window_mut().pending_goto_definition_request = Some(request_id);
         }
 
         Ok(())
     }
 
     /// Request LSP hover documentation at current cursor position
-    pub(crate) fn request_hover(&mut self) -> AnyhowResult<()> {
+    pub fn request_hover(&mut self) -> AnyhowResult<()> {
         // Get the current buffer and cursor position
         let cursor_pos = self.active_cursors().primary().position;
         let state = self.active_state();
@@ -502,12 +790,17 @@ impl Editor {
         }
 
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result = handle.hover(request_id, uri.clone(), line as u32, character as u32);
+            .with_lsp_for_buffer(buffer_id, LspFeature::Hover, |handle, uri, _language| {
+                let result = handle.hover(
+                    request_id,
+                    uri.as_uri().clone(),
+                    line as u32,
+                    character as u32,
+                );
                 if result.is_ok() {
                     tracing::info!(
                         "Requested hover at {}:{}:{} (byte_pos={})",
@@ -522,9 +815,12 @@ impl Editor {
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_hover_request = Some(request_id);
-            self.lsp_status = "LSP: hover...".to_string();
+            self.active_window_mut().next_lsp_request_id += 1;
+            self.active_window_mut().hover.record_request(
+                request_id,
+                line as u32,
+                character as u32,
+            );
         }
 
         Ok(())
@@ -532,7 +828,9 @@ impl Editor {
 
     /// Request LSP hover documentation at a specific byte position
     /// Used for mouse-triggered hover
-    pub(crate) fn request_hover_at_position(&mut self, byte_pos: usize) -> AnyhowResult<()> {
+    /// Returns `Ok(true)` if the request was dispatched, `Ok(false)` if no
+    /// eligible server was available (e.g. not yet initialized).
+    pub(crate) fn request_hover_at_position(&mut self, byte_pos: usize) -> AnyhowResult<bool> {
         // Get the current buffer
         let state = self.active_state();
 
@@ -551,12 +849,17 @@ impl Editor {
         }
 
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result = handle.hover(request_id, uri.clone(), line as u32, character as u32);
+            .with_lsp_for_buffer(buffer_id, LspFeature::Hover, |handle, uri, _language| {
+                let result = handle.hover(
+                    request_id,
+                    uri.as_uri().clone(),
+                    line as u32,
+                    character as u32,
+                );
                 if result.is_ok() {
                     tracing::trace!(
                         "Mouse hover requested at {}:{}:{} (byte_pos={})",
@@ -571,12 +874,15 @@ impl Editor {
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_hover_request = Some(request_id);
-            self.lsp_status = "LSP: hover...".to_string();
+            self.active_window_mut().next_lsp_request_id += 1;
+            self.active_window_mut().hover.record_request(
+                request_id,
+                line as u32,
+                character as u32,
+            );
         }
 
-        Ok(())
+        Ok(sent)
     }
 
     /// Handle hover response from LSP
@@ -587,18 +893,26 @@ impl Editor {
         is_markdown: bool,
         range: Option<((u32, u32), (u32, u32))>,
     ) {
-        // Check if this response is for the current pending request
-        if self.pending_hover_request != Some(request_id) {
+        // Check if this response is for the current pending request.
+        // `claim_pending` also drains the stored LSP position, which we keep
+        // around for diagnostic correlation below.
+        let Some(position) = self.active_window_mut().hover.claim_pending(request_id) else {
             tracing::debug!("Ignoring stale hover response: {}", request_id);
             return;
-        }
+        };
+        let hover_lsp_position = Some(position);
 
-        self.pending_hover_request = None;
-        self.update_lsp_status_from_server_statuses();
+        // Gather any diagnostics whose range overlaps the hover position so
+        // they can be fused into the top of the hover card. Without this the
+        // user has to leave hover and go chase the error elsewhere in the UI
+        // even though the cursor is already on the offending symbol.
+        let diagnostic_lines = hover_lsp_position
+            .map(|pos| self.compose_hover_diagnostic_lines(pos))
+            .unwrap_or_default();
 
-        if contents.is_empty() {
+        if contents.is_empty() && diagnostic_lines.is_empty() {
             self.set_status_message(t!("lsp.no_hover").to_string());
-            self.hover_symbol_range = None;
+            self.active_window_mut().hover.set_symbol_range(None);
             return;
         }
 
@@ -618,7 +932,9 @@ impl Editor {
             let end_byte = state
                 .buffer
                 .lsp_position_to_byte(end_line as usize, end_char as usize);
-            self.hover_symbol_range = Some((start_byte, end_byte));
+            self.active_window_mut()
+                .hover
+                .set_symbol_range(Some((start_byte, end_byte)));
             tracing::debug!(
                 "Hover symbol range: {}..{} (LSP {}:{}..{}:{})",
                 start_byte,
@@ -630,7 +946,7 @@ impl Editor {
             );
 
             // Remove previous hover overlay if any
-            if let Some(old_handle) = self.hover_symbol_overlay.take() {
+            if let Some(old_handle) = self.active_window_mut().hover.take_symbol_overlay() {
                 let remove_event = crate::model::event::Event::RemoveOverlay { handle: old_handle };
                 self.apply_event_to_active_buffer(&remove_event);
             }
@@ -649,75 +965,261 @@ impl Editor {
             };
             self.apply_event_to_active_buffer(&event);
             // Store the handle for later removal
-            if let Some(state) = self.buffers.get(&self.active_buffer()) {
-                self.hover_symbol_overlay = state.overlays.all().last().map(|o| o.handle.clone());
+            if let Some(state) = self
+                .windows
+                .get(&self.active_window)
+                .map(|w| &w.buffers)
+                .expect("active window present")
+                .get(&self.active_buffer())
+            {
+                if let Some(handle) = state.overlays.all().last().map(|o| o.handle.clone()) {
+                    self.active_window_mut().hover.set_symbol_overlay(handle);
+                }
             }
         } else {
             // No range provided by LSP - compute word boundaries at hover position
             // This prevents the popup from following the mouse within the same word
-            if let Some((hover_byte_pos, _, _, _)) = self.mouse_state.lsp_hover_state {
+            let computed_range = if let Some((hover_byte_pos, _, _, _)) =
+                self.active_window_mut().mouse_state.lsp_hover_state
+            {
                 let state = self.active_state();
                 let start_byte = find_word_start(&state.buffer, hover_byte_pos);
                 let end_byte = find_word_end(&state.buffer, hover_byte_pos);
                 if start_byte < end_byte {
-                    self.hover_symbol_range = Some((start_byte, end_byte));
                     tracing::debug!(
                         "Hover symbol range (computed from word boundaries): {}..{}",
                         start_byte,
                         end_byte
                     );
+                    Some((start_byte, end_byte))
                 } else {
-                    self.hover_symbol_range = None;
+                    None
                 }
             } else {
-                self.hover_symbol_range = None;
-            }
+                None
+            };
+            self.active_window_mut()
+                .hover
+                .set_symbol_range(computed_range);
         }
 
-        // Create a popup with the hover contents
-        use crate::view::popup::{Popup, PopupPosition};
+        // Create a popup with the hover contents.
+        //
+        // When a diagnostic overlaps the hover position, we pre-style its
+        // lines (severity-colored header + plain message) and concatenate
+        // with the parsed hover body into a single `PopupContent::Markdown`
+        // vector. This avoids the previous approach of injecting a
+        // `**bold**` heading and a `---` horizontal rule into the markdown
+        // input — which rendered as uncolored bold text + a thick 40-cell
+        // divider with blank-line padding, wasting vertical space and
+        // losing the "this is an error" visual signal.
+        use crate::view::markdown::{parse_markdown, StyledLine};
+        use crate::view::popup::{Popup, PopupContent, PopupPosition};
         use ratatui::style::Style;
+        use unicode_width::UnicodeWidthStr;
 
-        // Use markdown rendering if the content is markdown
-        let mut popup = if is_markdown {
-            Popup::markdown(&contents, &self.theme, Some(&self.grammar_registry))
+        let hover_lines: Vec<StyledLine> = if contents.is_empty() {
+            Vec::new()
+        } else if is_markdown {
+            parse_markdown(
+                &contents,
+                &*self.theme.read().unwrap(),
+                Some(&self.grammar_registry),
+            )
         } else {
-            // Plain text - split by lines
-            let lines: Vec<String> = contents.lines().map(|s| s.to_string()).collect();
-            Popup::text(lines, &self.theme)
+            contents
+                .lines()
+                .map(|s| {
+                    let mut sl = StyledLine::new();
+                    sl.push(
+                        s.to_string(),
+                        Style::default().fg(self.theme.read().unwrap().popup_text_fg),
+                    );
+                    sl
+                })
+                .collect()
         };
 
-        // Configure popup properties
+        let has_diagnostic = !diagnostic_lines.is_empty();
+        let mut all_lines: Vec<StyledLine> = Vec::new();
+        all_lines.extend(diagnostic_lines);
+        if has_diagnostic && !hover_lines.is_empty() {
+            // Compact single-line separator — no blank padding, no 40-cell
+            // dash run. One row of dashes the width of the content, in the
+            // popup border color so it reads as "same card, new section."
+            let mut sep = StyledLine::new();
+            sep.push(
+                "─".repeat(12),
+                Style::default().fg(self.theme.read().unwrap().popup_border_fg),
+            );
+            all_lines.push(sep);
+        }
+        all_lines.extend(hover_lines);
+
+        // Drop trailing empty lines that some markdown payloads carry.
+        while all_lines
+            .last()
+            .map(|l| l.spans.iter().all(|s| s.text.trim().is_empty()))
+            .unwrap_or(false)
+        {
+            all_lines.pop();
+        }
+
+        // Fit width to content so short hovers stop rendering in an 80-col
+        // card with half the width empty. Measured as the widest styled
+        // line (display cells, not bytes), plus 4 for borders + padding,
+        // clamped to [30, 80]. Height stays dynamic on terminal size.
+        let content_width: usize = all_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+        let popup_width = (content_width as u16 + 4).clamp(30, 80);
+        let dynamic_height = (self.terminal_height * 60 / 100).clamp(15, 40);
+
+        // Construct the popup with the fused content.
+        let mut popup = Popup::text(Vec::new(), &*self.theme.read().unwrap());
+        popup.content = PopupContent::Markdown(all_lines);
         popup.title = Some(t!("lsp.popup_hover").to_string());
         popup.transient = true;
-        // Use mouse position if this was a mouse-triggered hover, otherwise use cursor position
-        popup.position = if let Some((x, y)) = self.mouse_hover_screen_position.take() {
-            // Position below the mouse, offset by 1 row
+        popup.position = if let Some((x, y)) = self.active_window_mut().hover.take_screen_position()
+        {
             PopupPosition::Fixed { x, y: y + 1 }
         } else {
             PopupPosition::BelowCursor
         };
-        popup.width = 80;
-        // Use dynamic max_height based on terminal size (60% of height, min 15, max 40)
-        // This allows hover popups to show more documentation on larger terminals
-        let dynamic_height = (self.terminal_height * 60 / 100).clamp(15, 40);
+        popup.width = popup_width;
         popup.max_height = dynamic_height;
-        popup.border_style = Style::default().fg(self.theme.popup_border_fg);
-        popup.background_style = Style::default().bg(self.theme.popup_bg);
+        popup.border_style = Style::default().fg(self.theme.read().unwrap().popup_border_fg);
+        popup.background_style = Style::default().bg(self.theme.read().unwrap().popup_bg);
+        popup.focus_key_hint = self.popup_focus_key_hint();
 
-        // Show the popup
-        if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
+        // Show the popup. Replace any existing transient (hover/signature)
+        // popup so successive hovers don't pile up on the popup stack —
+        // the user expects exactly one hover card on screen at a time.
+        let __buffer_id = self.active_buffer();
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&__buffer_id)
+        {
+            while state.popups.top().is_some_and(|p| p.transient) {
+                state.popups.hide();
+            }
             state.popups.show(popup);
             tracing::info!("Showing hover popup (markdown={})", is_markdown);
         }
 
         // Mark hover request as sent to prevent duplicate popups during race conditions
         // (e.g., when mouse moves while a hover response is pending)
-        self.mouse_state.lsp_hover_request_sent = true;
+        self.active_window_mut().mouse_state.lsp_hover_request_sent = true;
+    }
+
+    /// Pre-style any diagnostics overlapping the hover position into lines
+    /// ready to stack into the hover popup. Each diagnostic yields two or
+    /// more styled lines:
+    ///   1. severity marker + label in `diagnostic_*_fg`, followed by
+    ///      `  (source)` dimmed — italic on theme-default foreground,
+    ///   2. one styled line per message line, in `popup_text_fg`.
+    ///
+    /// Multiple overlapping diagnostics are separated by a blank line.
+    /// Returns an empty vec when there are no overlapping diagnostics,
+    /// or no buffer/URI resolves.
+    fn compose_hover_diagnostic_lines(
+        &self,
+        lsp_pos: (u32, u32),
+    ) -> Vec<crate::view::markdown::StyledLine> {
+        use crate::view::markdown::StyledLine;
+        use lsp_types::DiagnosticSeverity;
+        use ratatui::style::{Modifier, Style};
+
+        let buffer_id = self.active_buffer();
+        let Some(metadata) = self.active_window().buffer_metadata.get(&buffer_id) else {
+            return Vec::new();
+        };
+        let Some(uri) = metadata.file_uri() else {
+            return Vec::new();
+        };
+        let Some(diagnostics) = self.get_stored_diagnostics().get(uri.as_str()) else {
+            return Vec::new();
+        };
+
+        let (hover_line, hover_char) = lsp_pos;
+        let overlapping: Vec<&lsp_types::Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| lsp_range_contains(&d.range, hover_line, hover_char))
+            .collect();
+
+        if overlapping.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out: Vec<StyledLine> = Vec::new();
+        for (idx, diag) in overlapping.iter().enumerate() {
+            if idx > 0 {
+                out.push(StyledLine::new());
+            }
+
+            let (label, marker, severity_color) = match diag.severity {
+                Some(DiagnosticSeverity::ERROR) => {
+                    ("Error", "✖", self.theme.read().unwrap().diagnostic_error_fg)
+                }
+                Some(DiagnosticSeverity::WARNING) => (
+                    "Warning",
+                    "⚠",
+                    self.theme.read().unwrap().diagnostic_warning_fg,
+                ),
+                Some(DiagnosticSeverity::INFORMATION) => {
+                    ("Info", "ℹ", self.theme.read().unwrap().diagnostic_info_fg)
+                }
+                Some(DiagnosticSeverity::HINT) => {
+                    ("Hint", "ℹ", self.theme.read().unwrap().diagnostic_hint_fg)
+                }
+                _ => ("Diagnostic", "•", self.theme.read().unwrap().popup_text_fg),
+            };
+
+            let header_style = Style::default()
+                .fg(severity_color)
+                .add_modifier(Modifier::BOLD);
+            let mut header = StyledLine::new();
+            header.push(format!("{} {}", marker, label), header_style);
+            if let Some(source) = diag.source.as_deref().filter(|s| !s.is_empty()) {
+                // Dim italic source tag — reads as metadata, not as part
+                // of the diagnostic text.
+                header.push(
+                    format!("  ({})", source),
+                    Style::default()
+                        .fg(self.theme.read().unwrap().tab_inactive_fg)
+                        .add_modifier(Modifier::ITALIC),
+                );
+            }
+            out.push(header);
+
+            // Message verbatim: one styled line per message line. Using
+            // `popup_text_fg` lets themes override the body color; the
+            // severity information is already conveyed by the header.
+            for message_line in diag.message.lines() {
+                let mut line = StyledLine::new();
+                line.push(
+                    message_line.to_string(),
+                    Style::default().fg(self.theme.read().unwrap().popup_text_fg),
+                );
+                out.push(line);
+            }
+        }
+        out
     }
 
     /// Apply inlay hints to editor state as virtual text
-    pub(crate) fn apply_inlay_hints_to_state(
+    #[doc(hidden)]
+    pub fn apply_inlay_hints_to_state(
         state: &mut crate::state::EditorState,
         hints: &[lsp_types::InlayHint],
     ) {
@@ -731,8 +1233,13 @@ impl Editor {
             return;
         }
 
-        // Style for inlay hints - dimmed to not distract from actual code
+        // Fallback style for inlay hints - dimmed to not distract from actual
+        // code. The actual on-screen color is resolved from the theme key
+        // below (`editor.line_number_fg`) so the hints follow the active
+        // theme. This fallback only applies when the theme doesn't define
+        // the key.
         let hint_style = Style::default().fg(Color::Rgb(128, 128, 128));
+        let hint_fg_theme_key = Some("editor.line_number_fg".to_string());
 
         for hint in hints {
             // Convert LSP position to byte offset
@@ -758,12 +1265,35 @@ impl Editor {
                 continue;
             }
 
-            let (byte_offset, position) = if byte_offset >= state.buffer.len() {
-                // If hint is at EOF, anchor to last character and render after it.
-                (
-                    state.buffer.len().saturating_sub(1),
-                    VirtualTextPosition::AfterChar,
-                )
+            // Pick the anchor character for this hint. If the LSP-computed
+            // byte lies on a line terminator (\n or the \r of a CRLF), the
+            // "following character" is the first byte of the next line.
+            // Anchoring to it would make the hint drift one line down on
+            // any whitespace edit adjacent to the brace (issue #1572), so
+            // instead anchor to the *preceding* non-newline character with
+            // `AfterChar`. That keeps the hint stuck to the glyph the LSP
+            // intended to annotate even as edits shift bytes around it.
+            let buf_len = state.buffer.len();
+            let byte_here = if byte_offset < buf_len {
+                state
+                    .buffer
+                    .slice_bytes(byte_offset..byte_offset + 1)
+                    .first()
+                    .copied()
+            } else {
+                None
+            };
+            let at_line_break = matches!(byte_here, Some(b'\n' | b'\r'));
+
+            let (byte_offset, position) = if byte_offset >= buf_len {
+                // Hint is at EOF: anchor to last character and render
+                // after it.
+                (buf_len.saturating_sub(1), VirtualTextPosition::AfterChar)
+            } else if at_line_break && byte_offset > 0 {
+                // Hint points past the last glyph on a line: anchor to
+                // that glyph with AfterChar so the marker cannot drift
+                // onto a subsequent line when whitespace is edited.
+                (byte_offset - 1, VirtualTextPosition::AfterChar)
             } else {
                 (byte_offset, VirtualTextPosition::BeforeChar)
             };
@@ -771,11 +1301,13 @@ impl Editor {
             // Use the hint text as-is - spacing is handled during rendering
             let display_text = text;
 
-            state.virtual_texts.add(
+            state.virtual_texts.add_with_theme_keys(
                 &mut state.marker_list,
                 byte_offset,
                 display_text,
                 hint_style,
+                hint_fg_theme_key.clone(),
+                None,
                 position,
                 0, // Default priority
             );
@@ -786,98 +1318,52 @@ impl Editor {
 
     /// Request LSP find references at current cursor position
     pub(crate) fn request_references(&mut self) -> AnyhowResult<()> {
-        // Get the current buffer and cursor position
+        use crate::primitives::word_navigation::{find_word_end, find_word_start};
+
         let cursor_pos = self.active_cursors().primary().position;
-        let state = self.active_state();
-
-        // Extract the word under cursor for display
-        let symbol = {
-            let text = match state.buffer.to_string() {
-                Some(t) => t,
-                None => {
-                    self.set_status_message(t!("error.buffer_not_loaded").to_string());
-                    return Ok(());
-                }
-            };
-            let bytes = text.as_bytes();
-            let buf_len = bytes.len();
-
-            if cursor_pos <= buf_len {
-                // Find word boundaries
-                let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
-
-                // Find start of word
-                let mut start = cursor_pos;
-                while start > 0 {
-                    // Move to previous byte
-                    start -= 1;
-                    // Skip continuation bytes (UTF-8)
-                    while start > 0 && (bytes[start] & 0xC0) == 0x80 {
-                        start -= 1;
-                    }
-                    // Get the character at this position
-                    if let Some(ch) = text[start..].chars().next() {
-                        if !is_word_char(ch) {
-                            start += ch.len_utf8();
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                // Find end of word
-                let mut end = cursor_pos;
-                while end < buf_len {
-                    if let Some(ch) = text[end..].chars().next() {
-                        if is_word_char(ch) {
-                            end += ch.len_utf8();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if start < end {
-                    text[start..end].to_string()
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            }
+        let (line, character, symbol) = {
+            let state = self.active_state();
+            let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
+            let word_start = find_word_start(&state.buffer, cursor_pos);
+            let word_end = find_word_end(&state.buffer, cursor_pos);
+            let symbol = String::from_utf8_lossy(&state.buffer.slice_bytes(word_start..word_end))
+                .into_owned();
+            (line, character, symbol)
         };
 
-        // Convert byte position to LSP position (line, UTF-16 code units)
-        let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result =
-                    handle.references(request_id, uri.clone(), line as u32, character as u32);
-                if result.is_ok() {
-                    tracing::info!(
-                        "Requested find references at {}:{}:{} (byte_pos={})",
-                        uri.as_str(),
-                        line,
-                        character,
-                        cursor_pos
+            .with_lsp_for_buffer(
+                buffer_id,
+                LspFeature::References,
+                |handle, uri, _language| {
+                    let result = handle.references(
+                        request_id,
+                        uri.as_uri().clone(),
+                        line as u32,
+                        character as u32,
                     );
-                }
-                result.is_ok()
-            })
+                    if result.is_ok() {
+                        tracing::info!(
+                            "Requested find references at {}:{}:{} (byte_pos={})",
+                            uri.as_str(),
+                            line,
+                            character,
+                            cursor_pos
+                        );
+                    }
+                    result.is_ok()
+                },
+            )
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_references_request = Some(request_id);
-            self.pending_references_symbol = symbol;
-            self.lsp_status = "LSP: finding references...".to_string();
+            self.active_window_mut().next_lsp_request_id += 1;
+            self.active_window_mut().pending_references_request = Some(request_id);
+            self.active_window_mut().pending_references_symbol = symbol;
         }
 
         Ok(())
@@ -892,30 +1378,37 @@ impl Editor {
         // Convert byte position to LSP position (line, UTF-16 code units)
         let (line, character) = state.buffer.position_to_lsp_position(cursor_pos);
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result =
-                    handle.signature_help(request_id, uri.clone(), line as u32, character as u32);
-                if result.is_ok() {
-                    tracing::info!(
-                        "Requested signature help at {}:{}:{} (byte_pos={})",
-                        uri.as_str(),
-                        line,
-                        character,
-                        cursor_pos
+            .with_lsp_for_buffer(
+                buffer_id,
+                LspFeature::SignatureHelp,
+                |handle, uri, _language| {
+                    let result = handle.signature_help(
+                        request_id,
+                        uri.as_uri().clone(),
+                        line as u32,
+                        character as u32,
                     );
-                }
-                result.is_ok()
-            })
+                    if result.is_ok() {
+                        tracing::info!(
+                            "Requested signature help at {}:{}:{} (byte_pos={})",
+                            uri.as_str(),
+                            line,
+                            character,
+                            cursor_pos
+                        );
+                    }
+                    result.is_ok()
+                },
+            )
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_signature_help_request = Some(request_id);
-            self.lsp_status = "LSP: signature help...".to_string();
+            self.active_window_mut().next_lsp_request_id += 1;
+            self.active_window_mut().pending_signature_help_request = Some(request_id);
         }
     }
 
@@ -926,14 +1419,12 @@ impl Editor {
         signature_help: Option<lsp_types::SignatureHelp>,
     ) {
         // Check if this response is for the current pending request
-        if self.pending_signature_help_request != Some(request_id) {
+        if self.active_window_mut().pending_signature_help_request != Some(request_id) {
             tracing::debug!("Ignoring stale signature help response: {}", request_id);
             return;
         }
 
-        self.pending_signature_help_request = None;
-        self.update_lsp_status_from_server_statuses();
-
+        self.active_window_mut().pending_signature_help_request = None;
         let signature_help = match signature_help {
             Some(help) if !help.signatures.is_empty() => help,
             _ => {
@@ -1015,17 +1506,29 @@ impl Editor {
         use crate::view::popup::{Popup, PopupPosition};
         use ratatui::style::Style;
 
-        let mut popup = Popup::markdown(&content, &self.theme, Some(&self.grammar_registry));
+        let mut popup = Popup::markdown(
+            &content,
+            &*self.theme.read().unwrap(),
+            Some(&self.grammar_registry),
+        );
         popup.title = Some(t!("lsp.popup_signature").to_string());
         popup.transient = true;
         popup.position = PopupPosition::BelowCursor;
         popup.width = 60;
         popup.max_height = 20;
-        popup.border_style = Style::default().fg(self.theme.popup_border_fg);
-        popup.background_style = Style::default().bg(self.theme.popup_bg);
+        popup.border_style = Style::default().fg(self.theme.read().unwrap().popup_border_fg);
+        popup.background_style = Style::default().bg(self.theme.read().unwrap().popup_bg);
+        popup.focus_key_hint = self.popup_focus_key_hint();
 
         // Show the popup
-        if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
+        let __buffer_id = self.active_buffer();
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&__buffer_id)
+        {
             state.popups.show(popup);
             tracing::info!(
                 "Showing signature help popup for {} signatures",
@@ -1034,8 +1537,40 @@ impl Editor {
         }
     }
 
-    /// Request LSP code actions at current cursor position
+    /// Request LSP code actions at current cursor position.
+    /// Sends code action requests to all eligible servers for merged results.
     pub(crate) fn request_code_actions(&mut self) -> AnyhowResult<()> {
+        // A new invocation starts a fresh batch. Cancel any previous
+        // in-flight code-action requests so their late responses are
+        // ignored (handle_code_actions_response drops responses whose
+        // request_id isn't in pending_code_actions_requests). Without
+        // this, actions from a prior cursor position would be merged
+        // into the new popup — same bug class we already avoid for
+        // completion (sinelaw/fresh#1514) and inlay hints (multi-buffer
+        // quiescent).
+        if !self
+            .active_window()
+            .pending_code_actions_requests
+            .is_empty()
+        {
+            let ids: Vec<u64> = self
+                .active_window_mut()
+                .pending_code_actions_requests
+                .drain()
+                .collect();
+            for request_id in ids {
+                tracing::debug!(
+                    "Canceling previous pending LSP code actions request {}",
+                    request_id
+                );
+                self.active_window_mut().send_lsp_cancel_request(request_id);
+            }
+        }
+        self.active_window_mut()
+            .pending_code_actions_server_names
+            .clear();
+        self.active_window_mut().pending_code_actions = None;
+
         // Get the current buffer and cursor position
         let cursor_pos = self.active_cursors().primary().position;
         let selection_range = self.active_cursors().primary().selection_range();
@@ -1057,103 +1592,432 @@ impl Editor {
         // TODO: Implement diagnostic retrieval when needed
         let diagnostics: Vec<lsp_types::Diagnostic> = Vec::new();
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
 
-        // Use helper to ensure didOpen is sent before the request
-        let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+        // Pre-allocate request IDs for all eligible servers
+        let base_request_id = self.active_window_mut().next_lsp_request_id;
+        let counter = std::sync::atomic::AtomicU64::new(0);
+
+        let results = self.with_all_lsp_for_buffer_feature_named(
+            buffer_id,
+            LspFeature::CodeAction,
+            |handle, uri, _language, server_name| {
+                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let request_id = base_request_id + idx;
                 let result = handle.code_actions(
                     request_id,
-                    uri.clone(),
+                    uri.as_uri().clone(),
                     start_line,
                     start_char,
                     end_line,
                     end_char,
-                    diagnostics,
+                    diagnostics.clone(),
                 );
                 if result.is_ok() {
                     tracing::info!(
-                        "Requested code actions at {}:{}:{}-{}:{} (byte_pos={})",
+                        "Requested code actions at {}:{}:{}-{}:{} (byte_pos={}, request_id={}, server={})",
                         uri.as_str(),
                         start_line,
                         start_char,
                         end_line,
                         end_char,
-                        cursor_pos
+                        cursor_pos,
+                        request_id,
+                        server_name
                     );
                 }
-                result.is_ok()
-            })
-            .unwrap_or(false);
+                (request_id, result.is_ok(), server_name.to_string())
+            },
+        );
 
-        if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_code_actions_request = Some(request_id);
-            self.lsp_status = "LSP: code actions...".to_string();
+        let mut sent_ids = Vec::new();
+        for (request_id, ok, server_name) in &results {
+            if *ok {
+                sent_ids.push(*request_id);
+                self.active_window_mut()
+                    .pending_code_actions_server_names
+                    .insert(*request_id, server_name.clone());
+            }
+        }
+        // Advance the ID counter past all allocated IDs
+        self.active_window_mut().next_lsp_request_id = base_request_id + results.len() as u64;
+
+        if !sent_ids.is_empty() {
+            // pending_code_actions was already cleared above alongside the
+            // cancel-previous-requests logic.
+            self.active_window_mut()
+                .pending_code_actions_requests
+                .extend(sent_ids);
         }
 
         Ok(())
     }
 
-    /// Handle code actions response from LSP
+    /// Handle code actions response from LSP.
+    /// Supports merging from multiple servers: each response extends the action
+    /// list, and the popup is shown/updated with each arriving response.
     pub(crate) fn handle_code_actions_response(
         &mut self,
         request_id: u64,
         actions: Vec<lsp_types::CodeActionOrCommand>,
     ) {
-        // Check if this response is for the current pending request
-        if self.pending_code_actions_request != Some(request_id) {
+        // Check if this response is for one of the pending requests
+        if !self
+            .active_window_mut()
+            .pending_code_actions_requests
+            .remove(&request_id)
+        {
             tracing::debug!("Ignoring stale code actions response: {}", request_id);
             return;
         }
 
-        self.pending_code_actions_request = None;
-        self.update_lsp_status_from_server_statuses();
+        // Look up the server name for this request
+        let server_name = self
+            .active_window_mut()
+            .pending_code_actions_server_names
+            .remove(&request_id)
+            .unwrap_or_default();
 
         if actions.is_empty() {
-            self.set_status_message(t!("lsp.no_code_actions").to_string());
+            // Only show "no code actions" if all responses are in and we have nothing
+            if self
+                .active_window()
+                .pending_code_actions_requests
+                .is_empty()
+                && self
+                    .active_window_mut()
+                    .pending_code_actions
+                    .as_ref()
+                    .is_none_or(|a| a.is_empty())
+            {
+                self.set_status_message(t!("lsp.no_code_actions").to_string());
+            }
             return;
         }
 
-        // Build the display content
-        let mut lines: Vec<String> = Vec::new();
-        lines.push(format!("Code Actions ({}):", actions.len()));
-        lines.push(String::new());
+        // Tag each action with its server name and store/extend for merging
+        let tagged_actions: Vec<(String, lsp_types::CodeActionOrCommand)> = actions
+            .into_iter()
+            .map(|a| (server_name.clone(), a))
+            .collect();
 
-        for (i, action) in actions.iter().enumerate() {
-            let title = match action {
-                lsp_types::CodeActionOrCommand::Command(cmd) => &cmd.title,
-                lsp_types::CodeActionOrCommand::CodeAction(ca) => &ca.title,
-            };
-            lines.push(format!("  {}. {}", i + 1, title));
+        match &mut self.active_window_mut().pending_code_actions {
+            Some(existing) => {
+                existing.extend(tagged_actions);
+                tracing::debug!("Extended code actions, now {} total", existing.len());
+            }
+            None => {
+                self.active_window_mut().pending_code_actions = Some(tagged_actions);
+            }
         }
 
-        lines.push(String::new());
-        lines.push(t!("lsp.code_action_hint").to_string());
-
-        // Create a popup with the code actions
-        use crate::view::popup::{Popup, PopupPosition};
+        // Build list items from all accumulated code actions
+        use crate::view::popup::{Popup, PopupListItem, PopupPosition};
         use ratatui::style::Style;
 
-        let mut popup = Popup::text(lines, &self.theme);
+        let items: Vec<PopupListItem> = {
+            let all_actions = self.active_window().pending_code_actions.as_ref().unwrap();
+            let multiple_servers = {
+                let mut names = std::collections::HashSet::new();
+                for (name, _) in all_actions {
+                    names.insert(name.as_str());
+                }
+                names.len() > 1
+            };
+            all_actions
+                .iter()
+                .enumerate()
+                .map(|(i, (srv_name, action))| {
+                    let title = match action {
+                        lsp_types::CodeActionOrCommand::Command(cmd) => &cmd.title,
+                        lsp_types::CodeActionOrCommand::CodeAction(ca) => &ca.title,
+                    };
+                    let kind = match action {
+                        lsp_types::CodeActionOrCommand::CodeAction(ca) => {
+                            ca.kind.as_ref().map(|k| k.as_str().to_string())
+                        }
+                        _ => None,
+                    };
+                    let detail = if multiple_servers && !srv_name.is_empty() {
+                        match kind {
+                            Some(k) => Some(format!("[{}] {}", srv_name, k)),
+                            None => Some(format!("[{}]", srv_name)),
+                        }
+                    } else {
+                        kind
+                    };
+                    PopupListItem {
+                        text: format!("{}. {}", i + 1, title),
+                        detail,
+                        icon: None,
+                        data: Some(i.to_string()),
+                        disabled: false,
+                    }
+                })
+                .collect()
+        };
+
+        let mut popup = Popup::list(items, &*self.theme.read().unwrap());
+        popup.kind = crate::view::popup::PopupKind::Action;
         popup.title = Some(t!("lsp.popup_code_actions").to_string());
         popup.position = PopupPosition::BelowCursor;
         popup.width = 60;
         popup.max_height = 15;
-        popup.border_style = Style::default().fg(self.theme.popup_border_fg);
-        popup.background_style = Style::default().bg(self.theme.popup_bg);
+        popup.border_style = Style::default().fg(self.theme.read().unwrap().popup_border_fg);
+        popup.background_style = Style::default().bg(self.theme.read().unwrap().popup_bg);
+        // Confirm reads the selected row's `data` as an index into
+        // `self.active_window_mut().pending_code_actions` — the heavy lsp_types payload
+        // stays on the Editor to keep the view crate LSP-free.
+        popup.resolver = crate::view::popup::PopupResolver::CodeAction;
+        // Code actions are an explicit user invocation (`lsp_code_actions`
+        // command); the user expects to choose immediately, so the popup
+        // grabs focus on creation. Unfocused-by-default behavior applies
+        // only to popups that *appear under the cursor* (completion,
+        // hover, signature help, the LSP-server auto-prompt).
+        popup.focused = true;
 
-        // Show the popup
-        if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
-            state.popups.show(popup);
-            tracing::info!("Showing code actions popup with {} actions", actions.len());
+        // Show the popup, replacing any existing action popup to avoid stacking
+        let __buffer_id = self.active_buffer();
+        let action_count = self
+            .active_window()
+            .pending_code_actions
+            .as_ref()
+            .map_or(0, |v| v.len());
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&__buffer_id)
+        {
+            state.popups.show_or_replace(popup);
+            tracing::info!("Showing code actions popup with {} actions", action_count);
+        }
+    }
+
+    /// Execute a code action by index from the stored pending_code_actions.
+    pub(crate) fn execute_code_action(&mut self, index: usize) {
+        let action = match &self.active_window_mut().pending_code_actions {
+            Some(actions) => actions.get(index).map(|(_, a)| a.clone()),
+            None => None,
+        };
+
+        let Some(action) = action else {
+            tracing::warn!("Code action index {} out of range", index);
+            return;
+        };
+
+        match action {
+            lsp_types::CodeActionOrCommand::CodeAction(ca) => {
+                // If the action has no edit and no command, it may need resolve first.
+                // Only resolve if the action has `data` and the server supports resolveProvider.
+                if ca.edit.is_none()
+                    && ca.command.is_none()
+                    && ca.data.is_some()
+                    && self.active_window().server_supports_code_action_resolve()
+                {
+                    tracing::info!(
+                        "Code action '{}' needs resolve, sending codeAction/resolve",
+                        ca.title
+                    );
+                    self.send_code_action_resolve(ca);
+                    return;
+                }
+                self.execute_resolved_code_action(ca);
+            }
+            lsp_types::CodeActionOrCommand::Command(cmd) => {
+                self.send_execute_command(cmd);
+            }
+        }
+    }
+
+    /// Execute a code action that has been fully resolved (has edit and/or command).
+    pub(crate) fn execute_resolved_code_action(&mut self, ca: lsp_types::CodeAction) {
+        let title = ca.title.clone();
+
+        // Apply workspace edit if present
+        if let Some(edit) = ca.edit {
+            match self.apply_workspace_edit(edit) {
+                Ok(n) => {
+                    self.set_status_message(
+                        t!("lsp.code_action_applied", title = &title, count = n).to_string(),
+                    );
+                }
+                Err(e) => {
+                    self.set_status_message(format!("Code action failed: {e}"));
+                    return;
+                }
+            }
         }
 
-        // Note: Executing code actions would require storing the actions and handling
-        // key presses to select and apply them. This is left for future enhancement.
+        // Execute command if present (may trigger workspace/applyEdit from server)
+        if let Some(cmd) = ca.command {
+            self.send_execute_command(cmd);
+        }
+    }
+
+    /// Send workspace/executeCommand to the LSP server
+    fn send_execute_command(&mut self, cmd: lsp_types::Command) {
+        tracing::info!("Executing LSP command: {} ({})", cmd.title, cmd.command);
         self.set_status_message(
-            t!("lsp.code_actions_not_implemented", count = actions.len()).to_string(),
+            t!(
+                "lsp.code_action_applied",
+                title = &cmd.title,
+                count = 0_usize
+            )
+            .to_string(),
         );
+
+        // Get the language for this buffer to find the right LSP handle
+        let language = match self
+            .buffers()
+            .get(&self.active_buffer())
+            .map(|s| s.language.clone())
+        {
+            Some(l) => l,
+            None => return,
+        };
+
+        let __active_id = self.active_window;
+
+        if let Some(lsp) = self
+            .windows
+            .get_mut(&__active_id)
+            .and_then(|w| w.lsp.as_mut())
+        {
+            for sh in lsp.get_handles_mut(&language) {
+                if let Err(e) = sh
+                    .handle
+                    .execute_command(cmd.command.clone(), cmd.arguments.clone())
+                {
+                    tracing::warn!("Failed to send executeCommand to '{}': {}", sh.name, e);
+                }
+            }
+        }
+    }
+
+    /// Send codeAction/resolve to the LSP server
+    fn send_code_action_resolve(&mut self, action: lsp_types::CodeAction) {
+        let language = match self
+            .buffers()
+            .get(&self.active_buffer())
+            .map(|s| s.language.clone())
+        {
+            Some(l) => l,
+            None => return,
+        };
+
+        self.active_window_mut().next_lsp_request_id += 1;
+        let request_id = self.active_window_mut().next_lsp_request_id;
+
+        let __active_id = self.active_window;
+
+        if let Some(lsp) = self
+            .windows
+            .get_mut(&__active_id)
+            .and_then(|w| w.lsp.as_mut())
+        {
+            for sh in lsp.get_handles_mut(&language) {
+                if let Err(e) = sh.handle.code_action_resolve(request_id, action.clone()) {
+                    tracing::warn!("Failed to send codeAction/resolve to '{}': {}", sh.name, e);
+                }
+            }
+        }
+    }
+
+    /// Handle a resolved completion item — apply additional_text_edits (e.g. auto-imports).
+    pub(crate) fn handle_completion_resolved(&mut self, item: lsp_types::CompletionItem) {
+        if let Some(additional_edits) = item.additional_text_edits {
+            if !additional_edits.is_empty() {
+                tracing::info!(
+                    "Applying {} additional text edits from completion resolve",
+                    additional_edits.len()
+                );
+                let buffer_id = self.active_buffer();
+                if let Err(e) = self.apply_lsp_text_edits(buffer_id, additional_edits) {
+                    tracing::error!("Failed to apply completion additional_text_edits: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Apply formatting edits from textDocument/formatting response.
+    pub(crate) fn apply_formatting_edits(
+        &mut self,
+        uri: &str,
+        edits: Vec<lsp_types::TextEdit>,
+    ) -> AnyhowResult<usize> {
+        // Find the buffer for this URI
+        let buffer_id = self
+            .active_window()
+            .buffer_metadata
+            .iter()
+            .find(|(_, meta)| meta.file_uri().map(|u| u.as_str() == uri).unwrap_or(false))
+            .map(|(id, _)| *id);
+
+        if let Some(buffer_id) = buffer_id {
+            let count = self.apply_lsp_text_edits(buffer_id, edits)?;
+            self.set_status_message(format!("Formatted ({} edits)", count));
+            Ok(count)
+        } else {
+            tracing::warn!("Cannot apply formatting: no buffer for URI {}", uri);
+            Ok(0)
+        }
+    }
+
+    /// Request document formatting from LSP.
+    pub(crate) fn request_formatting(&mut self) {
+        let buffer_id = self.active_buffer();
+        let metadata = match self.active_window().buffer_metadata.get(&buffer_id) {
+            Some(m) if m.lsp_enabled => m,
+            _ => {
+                self.set_status_message("LSP not available for this buffer".to_string());
+                return;
+            }
+        };
+
+        let uri = match metadata.file_uri() {
+            Some(u) => u.clone(),
+            None => return,
+        };
+
+        let language = match self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+            .map(|s| s.language.clone())
+        {
+            Some(l) => l,
+            None => return,
+        };
+
+        let tab_size = self.config.editor.tab_size as u32;
+        let insert_spaces = !self.config.editor.use_tabs;
+
+        self.active_window_mut().next_lsp_request_id += 1;
+        let request_id = self.active_window_mut().next_lsp_request_id;
+
+        let __active_id = self.active_window;
+
+        if let Some(lsp) = self
+            .windows
+            .get_mut(&__active_id)
+            .and_then(|w| w.lsp.as_mut())
+        {
+            if let Some(sh) = lsp.handle_for_feature_mut(&language, LspFeature::Format) {
+                if let Err(e) = sh.handle.document_formatting(
+                    request_id,
+                    uri.as_uri().clone(),
+                    tab_size,
+                    insert_spaces,
+                ) {
+                    tracing::warn!("Failed to request formatting: {}", e);
+                }
+            } else {
+                self.set_status_message("Formatting not supported by LSP server".to_string());
+            }
+        }
     }
 
     /// Handle find references response from LSP
@@ -1169,27 +2033,36 @@ impl Editor {
         );
 
         // Check if this response is for the current pending request
-        if self.pending_references_request != Some(request_id) {
+        if self.active_window_mut().pending_references_request != Some(request_id) {
             tracing::debug!("Ignoring stale references response: {}", request_id);
             return Ok(());
         }
 
-        self.pending_references_request = None;
-        self.update_lsp_status_from_server_statuses();
-
+        self.active_window_mut().pending_references_request = None;
         if locations.is_empty() {
             self.set_status_message(t!("lsp.no_references").to_string());
             return Ok(());
         }
 
-        // Convert locations to hook args format
+        // Convert locations to hook args format. Each `loc.uri` is a
+        // wire-side URI from the LSP, so wrap it in [`LspUri`] and run
+        // it through the active authority's translation before
+        // handing a host-path string to the references hook —
+        // otherwise plugins (notably `find_references`) try to open
+        // an in-container path on the host and fail.
+        let translation = self.authority.path_translation.clone();
         let lsp_locations: Vec<crate::services::plugins::hooks::LspLocation> = locations
             .iter()
             .map(|loc| {
-                // Convert URI to file path
+                let wire = crate::app::types::LspUri::from_wire(loc.uri.clone());
+                // Prefer the host-side path (after translation) so
+                // plugin-side file ops resolve. Fall back to the raw
+                // string for non-`file://` URIs so callers can still
+                // see *something*.
                 let file = if loc.uri.scheme().map(|s| s.as_str()) == Some("file") {
-                    // Extract path from file:// URI
-                    loc.uri.path().as_str().to_string()
+                    wire.to_host_path(translation.as_ref())
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| loc.uri.path().as_str().to_string())
                 } else {
                     loc.uri.as_str().to_string()
                 };
@@ -1203,13 +2076,13 @@ impl Editor {
             .collect();
 
         let count = lsp_locations.len();
-        let symbol = std::mem::take(&mut self.pending_references_symbol);
+        let symbol = std::mem::take(&mut self.active_window_mut().pending_references_symbol);
         self.set_status_message(
             t!("lsp.found_references", count = count, symbol = &symbol).to_string(),
         );
 
         // Fire the lsp_references hook so plugins can display the results
-        self.plugin_manager.run_hook(
+        self.plugin_manager.read().unwrap().run_hook(
             "lsp_references",
             crate::services::plugins::hooks::HookArgs::LspReferences {
                 symbol: symbol.clone(),
@@ -1253,12 +2126,23 @@ impl Editor {
         // Get cursor_id for this buffer from split view state
         let cursor_id = {
             let split_id = self
-                .split_manager
+                .split_manager_mut()
                 .splits_for_buffer(buffer_id)
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| self.split_manager.active_split());
-            self.split_view_states
+                .unwrap_or_else(|| {
+                    self.windows
+                        .get(&self.active_window)
+                        .and_then(|w| w.buffers.splits())
+                        .map(|(mgr, _)| mgr)
+                        .expect("active window must have a populated split layout")
+                        .active_split()
+                });
+            self.windows
+                .get(&self.active_window)
+                .and_then(|w| w.buffers.splits())
+                .map(|(_, vs)| vs)
+                .expect("active window must have a populated split layout")
                 .get(&split_id)
                 .map(|vs| vs.cursors.primary_id())
                 .unwrap_or_else(|| self.active_cursors().primary_id())
@@ -1267,7 +2151,7 @@ impl Editor {
         // Create events for all edits
         for edit in edits {
             let state = self
-                .buffers
+                .buffers_mut()
                 .get_mut(&buffer_id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Buffer not found"))?;
 
@@ -1332,147 +2216,314 @@ impl Editor {
         Ok(changes)
     }
 
+    /// Apply a single TextDocumentEdit from a workspace edit.
+    ///
+    /// Per LSP spec: if `text_document.version` is non-null, it must match the
+    /// version we last sent via didOpen/didChange. On mismatch the edit is stale
+    /// and we skip it to avoid corrupting the buffer.
+    fn apply_text_document_edit(
+        &mut self,
+        text_doc_edit: lsp_types::TextDocumentEdit,
+    ) -> AnyhowResult<usize> {
+        // Wrap the incoming wire URI once; both the version-check
+        // lookup and the file-open below need the host-path form.
+        let uri = crate::app::types::LspUri::from_wire(text_doc_edit.text_document.uri);
+
+        // Version check: if the server specifies a version, verify it matches
+        // what we sent. A mismatch means the edit was computed against stale content.
+        if let Some(expected_version) = text_doc_edit.text_document.version {
+            if let Ok(path) =
+                super::lsp_uri_to_host_path(&uri, self.authority.path_translation.as_ref())
+            {
+                if let Some(lsp) = self.lsp() {
+                    let language = self
+                        .buffers()
+                        .get(&self.active_buffer())
+                        .map(|s| s.language.clone())
+                        .unwrap_or_default();
+                    for sh in lsp.get_handles(&language) {
+                        if let Some(current_version) = sh.handle.document_version(&path) {
+                            if (expected_version as i64) != current_version {
+                                tracing::warn!(
+                                    "Rejecting stale TextDocumentEdit for {:?}: \
+                                     server version {} != our version {}",
+                                    path,
+                                    expected_version,
+                                    current_version,
+                                );
+                                return Ok(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(path) =
+            super::lsp_uri_to_host_path(&uri, self.authority.path_translation.as_ref())
+        {
+            let buffer_id = match self.open_file(&path) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Some(confirmation) =
+                        e.downcast_ref::<crate::model::buffer::LargeFileEncodingConfirmation>()
+                    {
+                        self.start_large_file_encoding_confirmation(confirmation);
+                    } else {
+                        self.set_status_message(
+                            t!("file.error_opening", error = e.to_string()).to_string(),
+                        );
+                    }
+                    return Ok(0);
+                }
+            };
+
+            let edits: Vec<lsp_types::TextEdit> = text_doc_edit
+                .edits
+                .into_iter()
+                .map(|one_of| match one_of {
+                    lsp_types::OneOf::Left(text_edit) => text_edit,
+                    lsp_types::OneOf::Right(annotated) => annotated.text_edit,
+                })
+                .collect();
+
+            tracing::info!("Applying {} edits for {:?}:", edits.len(), path);
+            for (i, edit) in edits.iter().enumerate() {
+                tracing::info!(
+                    "  Edit {}: line {}:{}-{}:{} -> {:?}",
+                    i,
+                    edit.range.start.line,
+                    edit.range.start.character,
+                    edit.range.end.line,
+                    edit.range.end.character,
+                    edit.new_text
+                );
+            }
+
+            self.apply_lsp_text_edits(buffer_id, edits)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Apply a resource operation (CreateFile, RenameFile, DeleteFile) from a workspace edit.
+    fn apply_resource_operation(&mut self, op: lsp_types::ResourceOp) -> AnyhowResult<()> {
+        // Each URI in a resource operation is wire-side and must be
+        // translated back to the host before we touch the host
+        // filesystem. Wrapping in [`LspUri`] and calling
+        // `to_host_path` is the type-checked path.
+        let translation = self.authority.path_translation.clone();
+        let to_host = |uri: &lsp_types::Uri| -> std::path::PathBuf {
+            crate::app::types::LspUri::from_wire(uri.clone())
+                .to_host_path(translation.as_ref())
+                .unwrap_or_else(|| std::path::PathBuf::from(uri.path().as_str()))
+        };
+        match op {
+            lsp_types::ResourceOp::Create(create) => {
+                let path = to_host(&create.uri);
+                let overwrite = create
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.overwrite)
+                    .unwrap_or(false);
+                let ignore_if_exists = create
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.ignore_if_exists)
+                    .unwrap_or(false);
+
+                if path.exists() {
+                    if ignore_if_exists {
+                        tracing::debug!("CreateFile: {:?} already exists, ignoring", path);
+                        return Ok(());
+                    }
+                    if !overwrite {
+                        tracing::warn!("CreateFile: {:?} already exists and overwrite=false", path);
+                        return Ok(());
+                    }
+                }
+
+                // Create parent directories if needed
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, "")?;
+                tracing::info!("CreateFile: created {:?}", path);
+
+                // Open the new file as a buffer
+                if let Err(e) = self.open_file(&path) {
+                    tracing::warn!("CreateFile: failed to open created file {:?}: {}", path, e);
+                }
+            }
+            lsp_types::ResourceOp::Rename(rename) => {
+                let old_path = to_host(&rename.old_uri);
+                let new_path = to_host(&rename.new_uri);
+                let overwrite = rename
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.overwrite)
+                    .unwrap_or(false);
+                let ignore_if_exists = rename
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.ignore_if_exists)
+                    .unwrap_or(false);
+
+                if new_path.exists() {
+                    if ignore_if_exists {
+                        tracing::debug!("RenameFile: {:?} already exists, ignoring", new_path);
+                        return Ok(());
+                    }
+                    if !overwrite {
+                        tracing::warn!(
+                            "RenameFile: {:?} already exists and overwrite=false",
+                            new_path
+                        );
+                        return Ok(());
+                    }
+                }
+
+                // Create parent directories if needed
+                if let Some(parent) = new_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&old_path, &new_path)?;
+                tracing::info!("RenameFile: {:?} -> {:?}", old_path, new_path);
+            }
+            lsp_types::ResourceOp::Delete(delete) => {
+                let path = to_host(&delete.uri);
+                let recursive = delete
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.recursive)
+                    .unwrap_or(false);
+                let ignore_if_not_exists = delete
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.ignore_if_not_exists)
+                    .unwrap_or(false);
+
+                if !path.exists() {
+                    if ignore_if_not_exists {
+                        tracing::debug!("DeleteFile: {:?} does not exist, ignoring", path);
+                        return Ok(());
+                    }
+                    tracing::warn!("DeleteFile: {:?} does not exist", path);
+                    return Ok(());
+                }
+
+                if path.is_dir() && recursive {
+                    std::fs::remove_dir_all(&path)?;
+                } else if path.is_file() {
+                    std::fs::remove_file(&path)?;
+                }
+                tracing::info!("DeleteFile: deleted {:?}", path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply an LSP WorkspaceEdit (used by rename, code actions, etc.).
+    ///
+    /// Returns the total number of text changes applied.
+    pub(crate) fn apply_workspace_edit(
+        &mut self,
+        workspace_edit: lsp_types::WorkspaceEdit,
+    ) -> AnyhowResult<usize> {
+        tracing::debug!(
+            "Applying WorkspaceEdit: changes={:?}, document_changes={:?}",
+            workspace_edit.changes.as_ref().map(|c| c.len()),
+            workspace_edit.document_changes.as_ref().map(|dc| match dc {
+                lsp_types::DocumentChanges::Edits(e) => format!("{} edits", e.len()),
+                lsp_types::DocumentChanges::Operations(o) => format!("{} operations", o.len()),
+            })
+        );
+
+        let mut total_changes = 0;
+
+        // Handle changes (map of URI -> Vec<TextEdit>)
+        if let Some(changes) = workspace_edit.changes {
+            for (uri, edits) in changes {
+                let uri = crate::app::types::LspUri::from_wire(uri);
+                if let Ok(path) =
+                    super::lsp_uri_to_host_path(&uri, self.authority.path_translation.as_ref())
+                {
+                    let buffer_id = match self.open_file(&path) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            if let Some(confirmation) = e.downcast_ref::<
+                                crate::model::buffer::LargeFileEncodingConfirmation,
+                            >() {
+                                self.start_large_file_encoding_confirmation(confirmation);
+                            } else {
+                                self.set_status_message(
+                                    t!("file.error_opening", error = e.to_string())
+                                        .to_string(),
+                                );
+                            }
+                            return Ok(0);
+                        }
+                    };
+                    total_changes += self.apply_lsp_text_edits(buffer_id, edits)?;
+                }
+            }
+        }
+
+        // Handle document_changes (TextDocumentEdit[] or DocumentChangeOperation[])
+        if let Some(document_changes) = workspace_edit.document_changes {
+            use lsp_types::DocumentChanges;
+
+            match document_changes {
+                DocumentChanges::Edits(edits) => {
+                    for text_doc_edit in edits {
+                        total_changes += self.apply_text_document_edit(text_doc_edit)?;
+                    }
+                }
+                DocumentChanges::Operations(ops) => {
+                    // Process operations in order — resource ops (create/rename/delete)
+                    // must be applied before text edits on the created/renamed files.
+                    for op in ops {
+                        match op {
+                            lsp_types::DocumentChangeOperation::Edit(text_doc_edit) => {
+                                total_changes += self.apply_text_document_edit(text_doc_edit)?;
+                            }
+                            lsp_types::DocumentChangeOperation::Op(resource_op) => {
+                                self.apply_resource_operation(resource_op)?;
+                                total_changes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(total_changes)
+    }
+
     /// Handle rename response from LSP
     pub fn handle_rename_response(
         &mut self,
         _request_id: u64,
         result: Result<lsp_types::WorkspaceEdit, String>,
     ) -> AnyhowResult<()> {
-        self.update_lsp_status_from_server_statuses();
-
         match result {
             Ok(workspace_edit) => {
-                // Log the full workspace edit for debugging
-                tracing::debug!(
-                    "Received WorkspaceEdit: changes={:?}, document_changes={:?}",
-                    workspace_edit.changes.as_ref().map(|c| c.len()),
-                    workspace_edit.document_changes.as_ref().map(|dc| match dc {
-                        lsp_types::DocumentChanges::Edits(e) => format!("{} edits", e.len()),
-                        lsp_types::DocumentChanges::Operations(o) =>
-                            format!("{} operations", o.len()),
-                    })
-                );
-
-                // Apply the workspace edit
-                let mut total_changes = 0;
-
-                // Handle changes (map of URI -> Vec<TextEdit>)
-                if let Some(changes) = workspace_edit.changes {
-                    for (uri, edits) in changes {
-                        if let Ok(path) = uri_to_path(&uri) {
-                            let buffer_id = match self.open_file(&path) {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    // Check if this is a large file encoding confirmation error
-                                    if let Some(confirmation) = e.downcast_ref::<
-                                        crate::model::buffer::LargeFileEncodingConfirmation,
-                                    >() {
-                                        self.start_large_file_encoding_confirmation(confirmation);
-                                    } else {
-                                        self.set_status_message(
-                                            t!("file.error_opening", error = e.to_string())
-                                                .to_string(),
-                                        );
-                                    }
-                                    return Ok(());
-                                }
-                            };
-                            total_changes += self.apply_lsp_text_edits(buffer_id, edits)?;
-                        }
-                    }
-                }
-
-                // Handle document_changes (TextDocumentEdit[])
-                // This is what rust-analyzer sends instead of changes
-                if let Some(document_changes) = workspace_edit.document_changes {
-                    use lsp_types::DocumentChanges;
-
-                    let text_edits = match document_changes {
-                        DocumentChanges::Edits(edits) => edits,
-                        DocumentChanges::Operations(ops) => {
-                            // Extract TextDocumentEdit from operations
-                            ops.into_iter()
-                                .filter_map(|op| {
-                                    if let lsp_types::DocumentChangeOperation::Edit(edit) = op {
-                                        Some(edit)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        }
-                    };
-
-                    for text_doc_edit in text_edits {
-                        let uri = text_doc_edit.text_document.uri;
-
-                        if let Ok(path) = uri_to_path(&uri) {
-                            let buffer_id = match self.open_file(&path) {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    // Check if this is a large file encoding confirmation error
-                                    if let Some(confirmation) = e.downcast_ref::<
-                                        crate::model::buffer::LargeFileEncodingConfirmation,
-                                    >() {
-                                        self.start_large_file_encoding_confirmation(confirmation);
-                                    } else {
-                                        self.set_status_message(
-                                            t!("file.error_opening", error = e.to_string())
-                                                .to_string(),
-                                        );
-                                    }
-                                    return Ok(());
-                                }
-                            };
-
-                            // Extract TextEdit from OneOf<TextEdit, AnnotatedTextEdit>
-                            let edits: Vec<lsp_types::TextEdit> = text_doc_edit
-                                .edits
-                                .into_iter()
-                                .map(|one_of| match one_of {
-                                    lsp_types::OneOf::Left(text_edit) => text_edit,
-                                    lsp_types::OneOf::Right(annotated) => annotated.text_edit,
-                                })
-                                .collect();
-
-                            // Log the edits for debugging
-                            tracing::info!(
-                                "Applying {} edits from rust-analyzer for {:?}:",
-                                edits.len(),
-                                path
-                            );
-                            for (i, edit) in edits.iter().enumerate() {
-                                tracing::info!(
-                                    "  Edit {}: line {}:{}-{}:{} -> {:?}",
-                                    i,
-                                    edit.range.start.line,
-                                    edit.range.start.character,
-                                    edit.range.end.line,
-                                    edit.range.end.character,
-                                    edit.new_text
-                                );
-                            }
-
-                            total_changes += self.apply_lsp_text_edits(buffer_id, edits)?;
-                        }
-                    }
-                }
-
-                self.status_message = Some(t!("lsp.renamed", count = total_changes).to_string());
+                let total_changes = self.apply_workspace_edit(workspace_edit)?;
+                self.active_window_mut().status_message =
+                    Some(t!("lsp.renamed", count = total_changes).to_string());
             }
             Err(error) => {
                 // Per LSP spec: ContentModified errors (-32801) should NOT be shown to user
-                // These are expected when document changes during LSP operations
-                // Reference: https://github.com/neovim/neovim/issues/16900
                 if error.contains("content modified") || error.contains("-32801") {
                     tracing::debug!(
                         "LSP rename: ContentModified error (expected, ignoring): {}",
                         error
                     );
-                    self.status_message = Some(t!("lsp.rename_cancelled").to_string());
+                    self.active_window_mut().status_message =
+                        Some(t!("lsp.rename_cancelled").to_string());
                 } else {
-                    // Show other errors to user
-                    self.status_message = Some(t!("lsp.rename_failed", error = &error).to_string());
+                    self.active_window_mut().status_message =
+                        Some(t!("lsp.rename_failed", error = &error).to_string());
                 }
             }
         }
@@ -1504,21 +2555,49 @@ impl Editor {
 
         // IMPORTANT: Calculate LSP changes BEFORE applying to buffer!
         // The byte positions in the events are relative to the ORIGINAL buffer.
+        //
+        // The tree-only swap below violates the pane-buffer invariant
+        // transiently (see active_focus.rs for the invariant's contract)
+        // but `collect_lsp_changes` does not route any input, call
+        // `apply_event_to_active_buffer`, or otherwise read
+        // `active_buffer()` while the invariant is broken, so the drift
+        // is contained within this synchronous section. If that changes,
+        // switch to a read-only accessor that takes `buffer_id` directly
+        // rather than mutating tree state.
         let original_active = self.active_buffer();
-        self.split_manager.set_active_buffer_id(buffer_id);
-        let lsp_changes = self.collect_lsp_changes(&batch_for_lsp);
-        self.split_manager.set_active_buffer_id(original_active);
+        self.windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .set_active_buffer_id(buffer_id);
+        let lsp_changes = self.active_window().collect_lsp_changes(&batch_for_lsp);
+        self.windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .set_active_buffer_id(original_active);
 
         // Capture old cursor states from split view state
         // Find a split that has this buffer in its keyed_states
         let split_id_for_cursors = self
-            .split_manager
+            .split_manager_mut()
             .splits_for_buffer(buffer_id)
             .into_iter()
             .next()
-            .unwrap_or_else(|| self.split_manager.active_split());
+            .unwrap_or_else(|| {
+                self.windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .map(|(mgr, _)| mgr)
+                    .expect("active window must have a populated split layout")
+                    .active_split()
+            });
         let old_cursors: Vec<(CursorId, usize, Option<usize>)> = self
-            .split_view_states
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(_, vs)| vs)
+            .expect("active window must have a populated split layout")
             .get(&split_id_for_cursors)
             .and_then(|vs| vs.keyed_states.get(&buffer_id))
             .map(|bvs| {
@@ -1529,268 +2608,197 @@ impl Editor {
             })
             .unwrap_or_default();
 
-        let state = self
+        // TODO: move this whole bulk-edit method to impl Window — the
+        // body is window-scoped except for `send_lsp_changes_for_buffer`
+        // at the tail which is LSP coordination on Editor. The block
+        // below uses a single-window split borrow because the bulk edit
+        // needs `&mut state` (buffer) and `&mut __vs_map` (split view
+        // states) live together for the cursor-positioning loop.
+        let __win = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window must exist");
+        let bulk_edit = __win
             .buffers
-            .get_mut(&buffer_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Buffer not found"))?;
+            .with_buffer_and_view_states(buffer_id, |state, vs_map| -> AnyhowResult<Event> {
+                // Snapshot buffer state for undo (piece tree + buffers)
+                let old_snapshot = state.buffer.snapshot_buffer_state();
 
-        // Snapshot buffer state for undo (piece tree + buffers)
-        let old_snapshot = state.buffer.snapshot_buffer_state();
-
-        // Convert events to edit tuples: (position, delete_len, insert_text)
-        let mut edits: Vec<(usize, usize, String)> = Vec::new();
-        for event in &events {
-            match event {
-                Event::Insert { position, text, .. } => {
-                    edits.push((*position, 0, text.clone()));
-                }
-                Event::Delete { range, .. } => {
-                    edits.push((range.start, range.len(), String::new()));
-                }
-                _ => {}
-            }
-        }
-
-        // Sort edits by position descending (required by apply_bulk_edits)
-        edits.sort_by(|a, b| b.0.cmp(&a.0));
-
-        // Convert to references for apply_bulk_edits
-        let edit_refs: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .map(|(pos, del, text)| (*pos, *del, text.as_str()))
-            .collect();
-
-        // Apply bulk edits - O(n) instead of O(n²)
-        let _delta = state.buffer.apply_bulk_edits(&edit_refs);
-
-        // Calculate new cursor positions based on edits
-        let mut position_deltas: Vec<(usize, isize)> = Vec::new();
-        for (pos, del_len, text) in &edits {
-            let delta = text.len() as isize - *del_len as isize;
-            position_deltas.push((*pos, delta));
-        }
-        position_deltas.sort_by_key(|(pos, _)| *pos);
-
-        let calc_shift = |original_pos: usize| -> isize {
-            let mut shift: isize = 0;
-            for (edit_pos, delta) in &position_deltas {
-                if *edit_pos < original_pos {
-                    shift += delta;
-                }
-            }
-            shift
-        };
-
-        // Calculate new cursor positions
-        let buffer_len = state.buffer.len();
-        let new_cursors: Vec<(CursorId, usize, Option<usize>)> = old_cursors
-            .iter()
-            .map(|(id, pos, anchor)| {
-                let shift = calc_shift(*pos);
-                let new_pos = ((*pos as isize + shift).max(0) as usize).min(buffer_len);
-                let new_anchor = anchor.map(|a| {
-                    let anchor_shift = calc_shift(a);
-                    ((a as isize + anchor_shift).max(0) as usize).min(buffer_len)
-                });
-                (*id, new_pos, new_anchor)
-            })
-            .collect();
-
-        // Snapshot buffer state after edits (for redo)
-        let new_snapshot = state.buffer.snapshot_buffer_state();
-
-        // Invalidate syntax highlighting
-        state.highlighter.invalidate_all();
-
-        // Apply new cursor positions to split view state
-        if let Some(vs) = self.split_view_states.get_mut(&split_id_for_cursors) {
-            if let Some(bvs) = vs.keyed_states.get_mut(&buffer_id) {
-                for (cursor_id, new_pos, new_anchor) in &new_cursors {
-                    if let Some(cursor) = bvs.cursors.get_mut(*cursor_id) {
-                        cursor.position = *new_pos;
-                        cursor.anchor = *new_anchor;
+                // Convert events to edit tuples: (position, delete_len, insert_text)
+                let mut edits: Vec<(usize, usize, String)> = Vec::new();
+                for event in &events {
+                    match event {
+                        Event::Insert { position, text, .. } => {
+                            edits.push((*position, 0, text.clone()));
+                        }
+                        Event::Delete { range, .. } => {
+                            edits.push((range.start, range.len(), String::new()));
+                        }
+                        _ => {}
                     }
                 }
-            }
-        }
 
-        // Create BulkEdit event for undo log
-        let bulk_edit = Event::BulkEdit {
-            old_snapshot: Some(old_snapshot),
-            new_snapshot: Some(new_snapshot),
-            old_cursors,
-            new_cursors,
-            description,
-        };
+                // Sort edits by position descending (required by apply_bulk_edits)
+                edits.sort_by(|a, b| b.0.cmp(&a.0));
+
+                // Convert to references for apply_bulk_edits
+                let edit_refs: Vec<(usize, usize, &str)> = edits
+                    .iter()
+                    .map(|(pos, del, text)| (*pos, *del, text.as_str()))
+                    .collect();
+
+                // Snapshot displaced markers before edits so undo can restore them exactly.
+                let displaced_markers = state.capture_displaced_markers_bulk(&edits);
+
+                // Apply bulk edits - O(n) instead of O(n²)
+                let _delta = state.buffer.apply_bulk_edits(&edit_refs);
+
+                // Calculate new cursor positions based on edits
+                let mut position_deltas: Vec<(usize, isize)> = Vec::new();
+                for (pos, del_len, text) in &edits {
+                    let delta = text.len() as isize - *del_len as isize;
+                    position_deltas.push((*pos, delta));
+                }
+                position_deltas.sort_by_key(|(pos, _)| *pos);
+
+                let calc_shift = |original_pos: usize| -> isize {
+                    let mut shift: isize = 0;
+                    for (edit_pos, delta) in &position_deltas {
+                        if *edit_pos < original_pos {
+                            shift += delta;
+                        }
+                    }
+                    shift
+                };
+
+                // Calculate new cursor positions
+                let buffer_len = state.buffer.len();
+                let new_cursors: Vec<(CursorId, usize, Option<usize>)> = old_cursors
+                    .iter()
+                    .map(|(id, pos, anchor)| {
+                        let shift = calc_shift(*pos);
+                        let new_pos = ((*pos as isize + shift).max(0) as usize).min(buffer_len);
+                        let new_anchor = anchor.map(|a| {
+                            let anchor_shift = calc_shift(a);
+                            ((a as isize + anchor_shift).max(0) as usize).min(buffer_len)
+                        });
+                        (*id, new_pos, new_anchor)
+                    })
+                    .collect();
+
+                // Snapshot buffer state after edits (for redo)
+                let new_snapshot = state.buffer.snapshot_buffer_state();
+
+                // Invalidate syntax highlighting
+                state.highlighter.invalidate_all();
+
+                // Apply new cursor positions to split view state
+                if let Some(vs) = vs_map.get_mut(&split_id_for_cursors) {
+                    if let Some(bvs) = vs.keyed_states.get_mut(&buffer_id) {
+                        for (cursor_id, new_pos, new_anchor) in &new_cursors {
+                            if let Some(cursor) = bvs.cursors.get_mut(*cursor_id) {
+                                cursor.position = *new_pos;
+                                cursor.anchor = *new_anchor;
+                            }
+                        }
+                    }
+                }
+
+                // Convert edit list to lengths-only for undo/redo marker replay.
+                // Merge edits at the same position into a single replacement.
+                let edit_lengths: Vec<(usize, usize, usize)> = {
+                    let mut lengths: Vec<(usize, usize, usize)> = Vec::new();
+                    for (pos, del_len, text) in &edits {
+                        if let Some(last) = lengths.last_mut() {
+                            if last.0 == *pos {
+                                last.1 += del_len;
+                                last.2 += text.len();
+                                continue;
+                            }
+                        }
+                        lengths.push((*pos, *del_len, text.len()));
+                    }
+                    lengths
+                };
+
+                // Adjust markers using merged net-delta
+                for &(pos, del_len, ins_len) in &edit_lengths {
+                    if del_len > 0 && ins_len > 0 {
+                        if ins_len > del_len {
+                            state.marker_list.adjust_for_insert(pos, ins_len - del_len);
+                            state.margins.adjust_for_insert(pos, ins_len - del_len);
+                        } else if del_len > ins_len {
+                            state.marker_list.adjust_for_delete(pos, del_len - ins_len);
+                            state.margins.adjust_for_delete(pos, del_len - ins_len);
+                        }
+                    } else if del_len > 0 {
+                        state.marker_list.adjust_for_delete(pos, del_len);
+                        state.margins.adjust_for_delete(pos, del_len);
+                    } else if ins_len > 0 {
+                        state.marker_list.adjust_for_insert(pos, ins_len);
+                        state.margins.adjust_for_insert(pos, ins_len);
+                    }
+                }
+
+                Ok(Event::BulkEdit {
+                    old_snapshot: Some(old_snapshot),
+                    new_snapshot: Some(new_snapshot),
+                    old_cursors,
+                    new_cursors,
+                    description,
+                    edits: edit_lengths,
+                    displaced_markers,
+                })
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Buffer not found"))??;
 
         // Add to event log
-        if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
+        if let Some(event_log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
             event_log.append(bulk_edit);
         }
 
         // Notify LSP about the changes using pre-calculated positions
-        self.send_lsp_changes_for_buffer(buffer_id, lsp_changes);
+        self.active_window_mut()
+            .send_lsp_changes_for_buffer(buffer_id, lsp_changes);
 
         Ok(())
     }
 
-    /// Send pre-calculated LSP changes for a specific buffer
-    pub(crate) fn send_lsp_changes_for_buffer(
+    /// Start rename mode - select the symbol at cursor and allow inline editing
+    pub(crate) fn start_rename(&mut self) -> AnyhowResult<()> {
+        // If server supports prepareRename, validate first
+        if self.active_window().server_supports_prepare_rename() {
+            self.active_window_mut().send_prepare_rename();
+            return Ok(());
+        }
+
+        self.show_rename_prompt()
+    }
+
+    /// Handle prepareRename response — if valid, show rename prompt; if error, show message.
+    pub(crate) fn handle_prepare_rename_response(
         &mut self,
-        buffer_id: BufferId,
-        changes: Vec<TextDocumentContentChangeEvent>,
+        result: Result<serde_json::Value, String>,
     ) {
-        if changes.is_empty() {
-            return;
-        }
-
-        // Check if LSP is enabled for this buffer
-        let metadata = match self.buffer_metadata.get(&buffer_id) {
-            Some(m) => m,
-            None => {
-                tracing::debug!(
-                    "send_lsp_changes_for_buffer: no metadata for buffer {:?}",
-                    buffer_id
-                );
-                return;
-            }
-        };
-
-        if !metadata.lsp_enabled {
-            tracing::debug!("send_lsp_changes_for_buffer: LSP disabled for this buffer");
-            return;
-        }
-
-        // Get the URI
-        let uri = match metadata.file_uri() {
-            Some(u) => u.clone(),
-            None => {
-                tracing::debug!(
-                    "send_lsp_changes_for_buffer: no URI for buffer (not a file or URI creation failed)"
-                );
-                return;
-            }
-        };
-
-        // Get language from buffer state
-        let language = match self.buffers.get(&buffer_id).map(|s| s.language.clone()) {
-            Some(l) => l,
-            None => {
-                tracing::debug!(
-                    "send_lsp_changes_for_buffer: no buffer state for {:?}",
-                    buffer_id
-                );
-                return;
-            }
-        };
-
-        tracing::trace!(
-            "send_lsp_changes_for_buffer: sending {} changes to {} in single didChange notification",
-            changes.len(),
-            uri.as_str()
-        );
-
-        // Check if we can use LSP (respects auto_start setting)
-        use crate::services::lsp::manager::LspSpawnResult;
-        let Some(lsp) = self.lsp.as_mut() else {
-            tracing::debug!("send_lsp_changes_for_buffer: no LSP manager available");
-            return;
-        };
-
-        if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
-            tracing::debug!(
-                "send_lsp_changes_for_buffer: LSP not running for {} (auto_start disabled)",
-                language
-            );
-            return;
-        }
-
-        // Get handle ID (handle exists since try_spawn succeeded)
-        let Some(handle) = lsp.get_handle_mut(&language) else {
-            return;
-        };
-        let handle_id = handle.id();
-
-        // Check if didOpen needs to be sent first
-        let needs_open = {
-            let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
-                return;
-            };
-            !metadata.lsp_opened_with.contains(&handle_id)
-        };
-
-        if needs_open {
-            // Get text for didOpen
-            let text = match self
-                .buffers
-                .get(&buffer_id)
-                .and_then(|s| s.buffer.to_string())
-            {
-                Some(t) => t,
-                None => {
-                    tracing::debug!(
-                        "send_lsp_changes_for_buffer: buffer text not available for didOpen"
-                    );
-                    return;
-                }
-            };
-
-            // Send didOpen first
-            let Some(lsp) = self.lsp.as_mut() else { return };
-            let Some(handle) = lsp.get_handle_mut(&language) else {
-                return;
-            };
-            if let Err(e) = handle.did_open(uri.clone(), text, language.clone()) {
-                tracing::warn!("Failed to send didOpen before didChange: {}", e);
-                return;
-            }
-            tracing::debug!(
-                "Sent didOpen for {} to LSP handle {} before didChange",
-                uri.as_str(),
-                handle_id
-            );
-
-            // Mark as opened
-            if let Some(metadata) = self.buffer_metadata.get_mut(&buffer_id) {
-                metadata.lsp_opened_with.insert(handle_id);
-            }
-
-            // didOpen already contains the full current buffer content, so we must
-            // NOT also send didChange (which carries pre-edit incremental changes).
-            // Sending both would corrupt the server's view of the document.
-            return;
-        }
-
-        // Now send didChange
-        let Some(lsp) = self.lsp.as_mut() else { return };
-        let Some(client) = lsp.get_handle_mut(&language) else {
-            return;
-        };
-        if let Err(e) = client.did_change(uri, changes) {
-            tracing::warn!("Failed to send didChange to LSP: {}", e);
-        } else {
-            tracing::trace!("Successfully sent batched didChange to LSP");
-
-            // Invalidate diagnostic cache so the next diagnostic apply recomputes
-            // overlay positions from fresh byte offsets (the buffer content changed)
-            if let Some(state) = self.buffers.get(&buffer_id) {
-                if let Some(path) = state.buffer.file_path() {
-                    crate::services::lsp::diagnostics::invalidate_cache_for_file(
-                        &path.to_string_lossy(),
-                    );
+        match result {
+            Ok(value) if !value.is_null() => {
+                // prepareRename succeeded — show the rename prompt
+                if let Err(e) = self.show_rename_prompt() {
+                    self.set_status_message(format!("Rename failed: {e}"));
                 }
             }
-
-            // Schedule debounced diagnostic re-pull (1000ms after last edit)
-            self.scheduled_diagnostic_pull = Some((
-                buffer_id,
-                std::time::Instant::now() + std::time::Duration::from_millis(1000),
-            ));
+            Ok(_) => {
+                self.set_status_message("Cannot rename at this position".to_string());
+            }
+            Err(e) => {
+                self.set_status_message(format!("Cannot rename: {e}"));
+            }
         }
     }
 
-    /// Start rename mode - select the symbol at cursor and allow inline editing
-    pub(crate) fn start_rename(&mut self) -> AnyhowResult<()> {
+    /// Send textDocument/prepareRename to the LSP server
+    /// Show the rename prompt (called directly or after prepareRename succeeds).
+    fn show_rename_prompt(&mut self) -> AnyhowResult<()> {
         use crate::primitives::word_navigation::{find_word_end, find_word_start};
 
         // Get the current buffer and cursor position
@@ -1804,7 +2812,8 @@ impl Editor {
 
             // Check if we're on a word
             if word_start >= word_end {
-                self.status_message = Some(t!("lsp.no_symbol_at_cursor").to_string());
+                self.active_window_mut().status_message =
+                    Some(t!("lsp.no_symbol_at_cursor").to_string());
                 return Ok(());
             }
 
@@ -1839,7 +2848,7 @@ impl Editor {
         // Pre-fill the input with the current name and position cursor at the end
         prompt.set_input(word_text);
 
-        self.prompt = Some(prompt);
+        self.active_window_mut().prompt = Some(prompt);
         Ok(())
     }
 
@@ -1861,7 +2870,7 @@ impl Editor {
 
         // Check if the name actually changed
         if new_name == original_text {
-            self.status_message = Some(t!("lsp.name_unchanged").to_string());
+            self.active_window_mut().status_message = Some(t!("lsp.name_unchanged").to_string());
             return;
         }
 
@@ -1874,14 +2883,14 @@ impl Editor {
         let state = self.active_state();
         let (line, character) = state.buffer.position_to_lsp_position(rename_pos);
         let buffer_id = self.active_buffer();
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
+            .with_lsp_for_buffer(buffer_id, LspFeature::Rename, |handle, uri, _language| {
                 let result = handle.rename(
                     request_id,
-                    uri.clone(),
+                    uri.as_uri().clone(),
                     line as u32,
                     character as u32,
                     new_name.clone(),
@@ -1900,84 +2909,118 @@ impl Editor {
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.lsp_status = "LSP: rename...".to_string();
+            self.active_window_mut().next_lsp_request_id += 1;
         } else if self
+            .active_window()
             .buffer_metadata
             .get(&buffer_id)
             .and_then(|m| m.file_path())
             .is_none()
         {
-            self.status_message = Some(t!("lsp.cannot_rename_unsaved").to_string());
+            self.active_window_mut().status_message =
+                Some(t!("lsp.cannot_rename_unsaved").to_string());
         }
     }
 
     /// Request inlay hints for the active buffer (if enabled and LSP available)
     pub(crate) fn request_inlay_hints_for_active_buffer(&mut self) {
+        let buffer_id = self.active_buffer();
+        self.request_inlay_hints_for_buffer(buffer_id);
+    }
+
+    /// Request inlay hints for a specific buffer (if enabled and LSP available)
+    pub(crate) fn request_inlay_hints_for_buffer(&mut self, buffer_id: BufferId) {
         if !self.config.editor.enable_inlay_hints {
             return;
         }
 
-        let buffer_id = self.active_buffer();
-
-        // Get line count from buffer state
-        let line_count = if let Some(state) = self.buffers.get(&buffer_id) {
-            state.buffer.line_count().unwrap_or(1000)
+        // Get line count and version from buffer state — both are needed so
+        // the response handler can drop stale data if the buffer has moved
+        // on by the time hints arrive.
+        let (line_count, version) = if let Some(state) = self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+        {
+            (
+                state.buffer.line_count().unwrap_or(1000),
+                state.buffer.version(),
+            )
         } else {
             return;
         };
         let last_line = line_count.saturating_sub(1) as u32;
-        let request_id = self.next_lsp_request_id;
+        let request_id = self.active_window_mut().next_lsp_request_id;
 
         // Use helper to ensure didOpen is sent before the request
         let sent = self
-            .with_lsp_for_buffer(buffer_id, |handle, uri, _language| {
-                let result = handle.inlay_hints(request_id, uri.clone(), 0, 0, last_line, 10000);
-                if result.is_ok() {
-                    tracing::info!(
-                        "Requested inlay hints for {} (request_id={})",
-                        uri.as_str(),
-                        request_id
+            .with_lsp_for_buffer(
+                buffer_id,
+                LspFeature::InlayHints,
+                |handle, uri, _language| {
+                    let result = handle.inlay_hints(
+                        request_id,
+                        uri.as_uri().clone(),
+                        0,
+                        0,
+                        last_line,
+                        10000,
                     );
-                } else if let Err(e) = &result {
-                    tracing::debug!("Failed to request inlay hints: {}", e);
-                }
-                result.is_ok()
-            })
+                    if result.is_ok() {
+                        tracing::info!(
+                            "Requested inlay hints for {} (request_id={})",
+                            uri.as_str(),
+                            request_id
+                        );
+                    } else if let Err(e) = &result {
+                        tracing::debug!("Failed to request inlay hints: {}", e);
+                    }
+                    result.is_ok()
+                },
+            )
             .unwrap_or(false);
 
         if sent {
-            self.next_lsp_request_id += 1;
-            self.pending_inlay_hints_request = Some(request_id);
+            self.active_window_mut().next_lsp_request_id += 1;
+            self.active_window_mut()
+                .pending_inlay_hints_requests
+                .insert(request_id, super::InlayHintsRequest { buffer_id, version });
         }
-    }
-
-    /// Schedule a folding range refresh for a buffer (debounced).
-    pub(crate) fn schedule_folding_ranges_refresh(&mut self, buffer_id: BufferId) {
-        let next_time = Instant::now() + Duration::from_millis(FOLDING_RANGES_DEBOUNCE_MS);
-        self.folding_ranges_debounce.insert(buffer_id, next_time);
     }
 
     /// Issue a debounced folding range request if the timer has elapsed.
     pub(crate) fn maybe_request_folding_ranges_debounced(&mut self, buffer_id: BufferId) {
-        let Some(ready_at) = self.folding_ranges_debounce.get(&buffer_id).copied() else {
+        let Some(ready_at) = self
+            .active_window()
+            .folding_ranges_debounce
+            .get(&buffer_id)
+            .copied()
+        else {
             return;
         };
         if Instant::now() < ready_at {
             return;
         }
 
-        self.folding_ranges_debounce.remove(&buffer_id);
+        self.active_window_mut()
+            .folding_ranges_debounce
+            .remove(&buffer_id);
         self.request_folding_ranges_for_buffer(buffer_id);
     }
 
     /// Request folding ranges for a buffer if supported and needed.
     pub(crate) fn request_folding_ranges_for_buffer(&mut self, buffer_id: BufferId) {
-        if self.folding_ranges_in_flight.contains_key(&buffer_id) {
+        if self
+            .active_window_mut()
+            .folding_ranges_in_flight
+            .contains_key(&buffer_id)
+        {
             return;
         }
 
-        let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
+        let Some(metadata) = self.active_window().buffer_metadata.get(&buffer_id) else {
             return;
         };
         if !metadata.lsp_enabled {
@@ -1986,12 +3029,36 @@ impl Editor {
         let Some(uri) = metadata.file_uri().cloned() else {
             return;
         };
+        let file_path = metadata.file_path().cloned();
 
-        let Some(language) = self.buffers.get(&buffer_id).map(|s| s.language.clone()) else {
+        let Some(language) = self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+            .map(|s| s.language.clone())
+        else {
             return;
         };
 
-        let Some(lsp) = self.lsp.as_mut() else {
+        let __active_id = self.active_window;
+        // Pre-collect buffer version so we don't re-read self.buffers
+        // while the &mut lsp borrow is alive.
+        let __buffer_version_for_request = self
+            .windows
+            .get(&__active_id)
+            .and_then(|w| w.buffers.get(&buffer_id))
+            .map(|s| s.buffer.version())
+            .unwrap_or(0);
+
+        let Some(__win) = self.windows.get_mut(&__active_id) else {
+            return;
+        };
+        let __next_id = &mut __win.next_lsp_request_id;
+        let __pending_folding = &mut __win.pending_folding_range_requests;
+        let __folding_in_flight = &mut __win.folding_ranges_in_flight;
+        let Some(lsp) = __win.lsp.as_mut() else {
             return;
         };
 
@@ -2001,33 +3068,33 @@ impl Editor {
 
         // Ensure there is a running server
         use crate::services::lsp::manager::LspSpawnResult;
-        if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
+        if lsp.try_spawn(&language, file_path.as_deref()) != LspSpawnResult::Spawned {
             return;
         }
 
-        let Some(handle) = lsp.get_handle_mut(&language) else {
+        let Some(sh) = lsp.handle_for_feature_mut(&language, LspFeature::FoldingRange) else {
             return;
         };
+        let handle = &mut sh.handle;
 
-        let request_id = self.next_lsp_request_id;
-        self.next_lsp_request_id += 1;
-        let buffer_version = self
-            .buffers
-            .get(&buffer_id)
-            .map(|s| s.buffer.version())
-            .unwrap_or(0);
+        let request_id = {
+            let id = *__next_id;
+            *__next_id += 1;
+            id
+        };
+        let buffer_version = __buffer_version_for_request;
+        let _ = __folding_in_flight;
 
-        match handle.folding_ranges(request_id, uri) {
+        match handle.folding_ranges(request_id, uri.as_uri().clone()) {
             Ok(()) => {
-                self.pending_folding_range_requests.insert(
+                __pending_folding.insert(
                     request_id,
                     super::FoldingRangeRequest {
                         buffer_id,
                         version: buffer_version,
                     },
                 );
-                self.folding_ranges_in_flight
-                    .insert(buffer_id, (request_id, buffer_version));
+                __folding_in_flight.insert(buffer_id, (request_id, buffer_version));
             }
             Err(e) => {
                 tracing::debug!("Failed to request folding ranges: {}", e);
@@ -2042,11 +3109,15 @@ impl Editor {
         }
 
         // Avoid duplicate in-flight requests per buffer
-        if self.semantic_tokens_in_flight.contains_key(&buffer_id) {
+        if self
+            .active_window_mut()
+            .semantic_tokens_in_flight
+            .contains_key(&buffer_id)
+        {
             return;
         }
 
-        let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
+        let Some(metadata) = self.active_window().buffer_metadata.get(&buffer_id) else {
             return;
         };
         if !metadata.lsp_enabled {
@@ -2055,15 +3126,60 @@ impl Editor {
         let Some(uri) = metadata.file_uri().cloned() else {
             return;
         };
+        let file_path_for_spawn = metadata.file_path().cloned();
         // Get language from buffer state
-        let Some(language) = self.buffers.get(&buffer_id).map(|s| s.language.clone()) else {
+        let Some(language) = self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+            .map(|s| s.language.clone())
+        else {
             return;
         };
 
-        let Some(lsp) = self.lsp.as_mut() else {
+        let __active_id = self.active_window;
+        // Pre-extract buffer state info so we don't re-borrow self
+        // while the &mut lsp borrow is alive.
+        let Some((buffer_version, existing_version, previous_result_id)) = self
+            .windows
+            .get(&__active_id)
+            .and_then(|w| w.buffers.get(&buffer_id))
+            .map(|state| {
+                (
+                    state.buffer.version(),
+                    state.semantic_tokens.as_ref().map(|s| s.version),
+                    state
+                        .semantic_tokens
+                        .as_ref()
+                        .and_then(|s| s.result_id.clone()),
+                )
+            })
+        else {
+            return;
+        };
+        if Some(buffer_version) == existing_version {
+            return; // Already up to date
+        }
+
+        let Some(__win) = self.windows.get_mut(&__active_id) else {
+            return;
+        };
+        let __next_id = &mut __win.next_lsp_request_id;
+        let __pending_st = &mut __win.pending_semantic_token_requests;
+        let __st_in_flight = &mut __win.semantic_tokens_in_flight;
+        let Some(lsp) = __win.lsp.as_mut() else {
             return;
         };
 
+        // Ensure there is a running server
+        use crate::services::lsp::manager::LspSpawnResult;
+        if lsp.try_spawn(&language, file_path_for_spawn.as_deref()) != LspSpawnResult::Spawned {
+            return;
+        }
+
+        // Check that a server actually supports full semantic tokens
         if !lsp.semantic_tokens_full_supported(&language) {
             return;
         }
@@ -2071,35 +3187,19 @@ impl Editor {
             return;
         }
 
-        // Ensure there is a running server
-        use crate::services::lsp::manager::LspSpawnResult;
-        if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
-            return;
-        }
-
-        let Some(state) = self.buffers.get(&buffer_id) else {
+        let Some(sh) = lsp.handle_for_feature_mut(&language, LspFeature::SemanticTokens) else {
             return;
         };
-        let buffer_version = state.buffer.version();
-        if let Some(store) = state.semantic_tokens.as_ref() {
-            if store.version == buffer_version {
-                return; // Already up to date
-            }
-        }
-
-        let previous_result_id = state
-            .semantic_tokens
-            .as_ref()
-            .and_then(|store| store.result_id.clone());
-        let supports_delta = lsp.semantic_tokens_full_delta_supported(&language);
+        // Check capabilities on the specific server we'll send to
+        let supports_delta = sh.capabilities.semantic_tokens_full_delta;
         let use_delta = previous_result_id.is_some() && supports_delta;
+        let handle = &mut sh.handle;
 
-        let Some(handle) = lsp.get_handle_mut(&language) else {
-            return;
+        let request_id = {
+            let id = *__next_id;
+            *__next_id += 1;
+            id
         };
-
-        let request_id = self.next_lsp_request_id;
-        self.next_lsp_request_id += 1;
 
         let request_kind = if use_delta {
             super::SemanticTokensFullRequestKind::FullDelta
@@ -2108,14 +3208,18 @@ impl Editor {
         };
 
         let request_result = if use_delta {
-            handle.semantic_tokens_full_delta(request_id, uri, previous_result_id.unwrap())
+            handle.semantic_tokens_full_delta(
+                request_id,
+                uri.as_uri().clone(),
+                previous_result_id.unwrap(),
+            )
         } else {
-            handle.semantic_tokens_full(request_id, uri)
+            handle.semantic_tokens_full(request_id, uri.as_uri().clone())
         };
 
         match request_result {
             Ok(_) => {
-                self.pending_semantic_token_requests.insert(
+                __pending_st.insert(
                     request_id,
                     super::SemanticTokenFullRequest {
                         buffer_id,
@@ -2123,8 +3227,7 @@ impl Editor {
                         kind: request_kind,
                     },
                 );
-                self.semantic_tokens_in_flight
-                    .insert(buffer_id, (request_id, buffer_version, request_kind));
+                __st_in_flight.insert(buffer_id, (request_id, buffer_version, request_kind));
             }
             Err(e) => {
                 tracing::debug!("Failed to request semantic tokens: {}", e);
@@ -2132,32 +3235,30 @@ impl Editor {
         }
     }
 
-    /// Schedule a full semantic token refresh for a buffer (debounced).
-    pub(crate) fn schedule_semantic_tokens_full_refresh(&mut self, buffer_id: BufferId) {
-        if !self.config.editor.enable_semantic_tokens_full {
-            return;
-        }
-
-        let next_time = Instant::now() + Duration::from_millis(SEMANTIC_TOKENS_FULL_DEBOUNCE_MS);
-        self.semantic_tokens_full_debounce
-            .insert(buffer_id, next_time);
-    }
-
     /// Issue a debounced full semantic token request if the timer has elapsed.
     pub(crate) fn maybe_request_semantic_tokens_full_debounced(&mut self, buffer_id: BufferId) {
         if !self.config.editor.enable_semantic_tokens_full {
-            self.semantic_tokens_full_debounce.remove(&buffer_id);
+            self.active_window_mut()
+                .semantic_tokens_full_debounce
+                .remove(&buffer_id);
             return;
         }
 
-        let Some(ready_at) = self.semantic_tokens_full_debounce.get(&buffer_id).copied() else {
+        let Some(ready_at) = self
+            .active_window()
+            .semantic_tokens_full_debounce
+            .get(&buffer_id)
+            .copied()
+        else {
             return;
         };
         if Instant::now() < ready_at {
             return;
         }
 
-        self.semantic_tokens_full_debounce.remove(&buffer_id);
+        self.active_window_mut()
+            .semantic_tokens_full_debounce
+            .remove(&buffer_id);
         self.maybe_request_semantic_tokens(buffer_id);
     }
 
@@ -2168,7 +3269,7 @@ impl Editor {
         start_line: usize,
         end_line: usize,
     ) {
-        let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
+        let Some(metadata) = self.active_window().buffer_metadata.get(&buffer_id) else {
             return;
         };
         if !metadata.lsp_enabled {
@@ -2177,17 +3278,44 @@ impl Editor {
         let Some(uri) = metadata.file_uri().cloned() else {
             return;
         };
+        let file_path = metadata.file_path().cloned();
         // Get language from buffer state
-        let Some(language) = self.buffers.get(&buffer_id).map(|s| s.language.clone()) else {
+        let Some(language) = self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+            .map(|s| s.language.clone())
+        else {
             return;
         };
 
-        let Some(lsp) = self.lsp.as_mut() else {
+        let __active_id = self.active_window;
+        // Single &mut on the active window — split-borrow into &mut lsp
+        // and &buffers so we can use both concurrently.
+        let __win = self
+            .windows
+            .get_mut(&__active_id)
+            .expect("active window must exist");
+        let __next_id = &mut __win.next_lsp_request_id;
+        let __pending_st_range = &mut __win.pending_semantic_token_range_requests;
+        let __st_range_in_flight = &mut __win.semantic_tokens_range_in_flight;
+        let __st_range_last = &mut __win.semantic_tokens_range_last_request;
+        let __st_range_applied = &__win.semantic_tokens_range_applied;
+        let Some(lsp) = __win.lsp.as_mut() else {
             return;
         };
+        let __buffers_ref: &crate::app::window::WindowBuffers = &__win.buffers;
+
+        // Ensure there is a running server
+        use crate::services::lsp::manager::LspSpawnResult;
+        if lsp.try_spawn(&language, file_path.as_deref()) != LspSpawnResult::Spawned {
+            return;
+        }
 
         if !lsp.semantic_tokens_range_supported(&language) {
-            // Fall back to full document tokens if range not supported.
+            // Fall back to full document tokens if no server supports range.
             self.maybe_request_semantic_tokens(buffer_id);
             return;
         }
@@ -2195,16 +3323,16 @@ impl Editor {
             return;
         }
 
-        // Ensure there is a running server
-        use crate::services::lsp::manager::LspSpawnResult;
-        if lsp.try_spawn(&language) != LspSpawnResult::Spawned {
-            return;
-        }
-
-        let Some(handle) = lsp.get_handle_mut(&language) else {
+        let Some(sh) = lsp.handle_for_feature_mut(&language, LspFeature::SemanticTokens) else {
             return;
         };
-        let Some(state) = self.buffers.get(&buffer_id) else {
+        // The handle_for_feature_mut check ensures has_capability(SemanticTokens) which is
+        // full || range. Double-check this specific server supports range.
+        if !sh.capabilities.semantic_tokens_range {
+            return;
+        }
+        let handle = &mut sh.handle;
+        let Some(state) = __buffers_ref.get(&buffer_id) else {
             return;
         };
 
@@ -2239,28 +3367,27 @@ impl Editor {
 
         let range = start_byte..end_byte;
         if let Some((in_flight_id, in_flight_start, in_flight_end, in_flight_version)) =
-            self.semantic_tokens_range_in_flight.get(&buffer_id)
+            __st_range_in_flight.get(&buffer_id).copied()
         {
-            if *in_flight_start == padded_start
-                && *in_flight_end == padded_end
-                && *in_flight_version == buffer_version
+            if in_flight_start == padded_start
+                && in_flight_end == padded_end
+                && in_flight_version == buffer_version
             {
                 return;
             }
-            if let Err(e) = handle.cancel_request(*in_flight_id) {
+            if let Err(e) = handle.cancel_request(in_flight_id) {
                 tracing::debug!("Failed to cancel semantic token range request: {}", e);
             }
-            self.pending_semantic_token_range_requests
-                .remove(in_flight_id);
-            self.semantic_tokens_range_in_flight.remove(&buffer_id);
+            __pending_st_range.remove(&in_flight_id);
+            __st_range_in_flight.remove(&buffer_id);
         }
 
         if let Some((applied_start, applied_end, applied_version)) =
-            self.semantic_tokens_range_applied.get(&buffer_id)
+            __st_range_applied.get(&buffer_id).copied()
         {
-            if *applied_start == padded_start
-                && *applied_end == padded_end
-                && *applied_version == buffer_version
+            if applied_start == padded_start
+                && applied_end == padded_end
+                && applied_version == buffer_version
             {
                 return;
             }
@@ -2268,12 +3395,12 @@ impl Editor {
 
         let now = Instant::now();
         if let Some((last_start, last_end, last_version, last_time)) =
-            self.semantic_tokens_range_last_request.get(&buffer_id)
+            __st_range_last.get(&buffer_id).copied()
         {
-            if *last_start == padded_start
-                && *last_end == padded_end
-                && *last_version == buffer_version
-                && now.duration_since(*last_time)
+            if last_start == padded_start
+                && last_end == padded_end
+                && last_version == buffer_version
+                && now.duration_since(last_time)
                     < Duration::from_millis(SEMANTIC_TOKENS_RANGE_DEBOUNCE_MS)
             {
                 return;
@@ -2291,12 +3418,16 @@ impl Editor {
             },
         };
 
-        let request_id = self.next_lsp_request_id;
-        self.next_lsp_request_id += 1;
+        let request_id = {
+            let id = *__next_id;
+            *__next_id += 1;
+            id
+        };
+        let _ = __st_range_applied;
 
-        match handle.semantic_tokens_range(request_id, uri, lsp_range) {
+        match handle.semantic_tokens_range(request_id, uri.as_uri().clone(), lsp_range) {
             Ok(_) => {
-                self.pending_semantic_token_range_requests.insert(
+                __pending_st_range.insert(
                     request_id,
                     SemanticTokenRangeRequest {
                         buffer_id,
@@ -2306,12 +3437,11 @@ impl Editor {
                         end_line: padded_end,
                     },
                 );
-                self.semantic_tokens_range_in_flight.insert(
+                __st_range_in_flight.insert(
                     buffer_id,
                     (request_id, padded_start, padded_end, buffer_version),
                 );
-                self.semantic_tokens_range_last_request
-                    .insert(buffer_id, (padded_start, padded_end, buffer_version, now));
+                __st_range_last.insert(buffer_id, (padded_start, padded_end, buffer_version, now));
             }
             Err(e) => {
                 tracing::debug!("Failed to request semantic token range: {}", e);
@@ -2328,7 +3458,70 @@ mod tests {
     fn test_fs() -> Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> {
         Arc::new(StdFileSystem)
     }
-    use super::Editor;
+    use super::{lsp_range_contains, Editor};
+
+    fn range(sl: u32, sc: u32, el: u32, ec: u32) -> lsp_types::Range {
+        lsp_types::Range {
+            start: lsp_types::Position {
+                line: sl,
+                character: sc,
+            },
+            end: lsp_types::Position {
+                line: el,
+                character: ec,
+            },
+        }
+    }
+
+    #[test]
+    fn test_lsp_range_contains_inclusive_start_exclusive_end() {
+        let r = range(3, 10, 3, 20);
+        // Before start
+        assert!(!lsp_range_contains(&r, 3, 9));
+        assert!(!lsp_range_contains(&r, 2, 50));
+        // At start (inclusive)
+        assert!(lsp_range_contains(&r, 3, 10));
+        // Inside
+        assert!(lsp_range_contains(&r, 3, 15));
+        // Just before end (inclusive)
+        assert!(lsp_range_contains(&r, 3, 19));
+        // At end (exclusive)
+        assert!(!lsp_range_contains(&r, 3, 20));
+        // After end
+        assert!(!lsp_range_contains(&r, 3, 21));
+        assert!(!lsp_range_contains(&r, 4, 0));
+    }
+
+    #[test]
+    fn test_lsp_range_contains_multiline() {
+        let r = range(2, 5, 4, 3);
+        // Line before start
+        assert!(!lsp_range_contains(&r, 1, 100));
+        // On start line, before start character
+        assert!(!lsp_range_contains(&r, 2, 4));
+        // On start line, at start character (inclusive)
+        assert!(lsp_range_contains(&r, 2, 5));
+        // Interior line — any character is inside.
+        assert!(lsp_range_contains(&r, 3, 0));
+        assert!(lsp_range_contains(&r, 3, 9999));
+        // End line, before end character (inclusive)
+        assert!(lsp_range_contains(&r, 4, 2));
+        // End line, at end character (exclusive)
+        assert!(!lsp_range_contains(&r, 4, 3));
+        // Line after end
+        assert!(!lsp_range_contains(&r, 5, 0));
+    }
+
+    #[test]
+    fn test_lsp_range_contains_zero_length_matches_anchor_only() {
+        // Point diagnostic: start == end.
+        let r = range(7, 4, 7, 4);
+        assert!(lsp_range_contains(&r, 7, 4));
+        assert!(!lsp_range_contains(&r, 7, 3));
+        assert!(!lsp_range_contains(&r, 7, 5));
+        assert!(!lsp_range_contains(&r, 6, 4));
+        assert!(!lsp_range_contains(&r, 8, 4));
+    }
     use crate::model::buffer::Buffer;
     use crate::state::EditorState;
     use crate::view::virtual_text::VirtualTextPosition;
@@ -2413,6 +3606,198 @@ mod tests {
         Editor::apply_inlay_hints_to_state(&mut state, &hints);
 
         assert!(state.virtual_texts.is_empty());
+    }
+
+    #[test]
+    fn test_inlay_hint_uses_theme_key_for_foreground() {
+        // Verify that apply_inlay_hints_to_state stores the theme key so
+        // hints follow the active theme rather than a hardcoded color.
+        let mut state = EditorState::new(
+            80,
+            24,
+            crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+            test_fs(),
+        );
+        state.buffer = Buffer::from_str_test("ab");
+
+        if !state.buffer.is_empty() {
+            state.marker_list.adjust_for_insert(0, state.buffer.len());
+        }
+
+        let hints = vec![make_hint(0, 1, ": i32", Some(InlayHintKind::TYPE))];
+        Editor::apply_inlay_hints_to_state(&mut state, &hints);
+
+        let lookup = state
+            .virtual_texts
+            .build_lookup(&state.marker_list, 0, state.buffer.len());
+        let vtexts = lookup.get(&1).expect("expected hint at byte offset 1");
+        assert_eq!(
+            vtexts[0].fg_theme_key.as_deref(),
+            Some("editor.line_number_fg")
+        );
+        assert_eq!(vtexts[0].bg_theme_key, None);
+    }
+
+    #[test]
+    fn test_inlay_hint_removed_when_its_range_is_deleted() {
+        // Regression: deleting a range that covers the anchor byte of an
+        // inlay hint used to leave the hint visible (the marker snapped to
+        // the deletion start). apply_delete now calls
+        // virtual_texts.remove_in_range before adjusting markers, so the
+        // hint vanishes immediately. A future LSP refresh can repopulate
+        // hints elsewhere.
+        let mut state = EditorState::new(
+            80,
+            24,
+            crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+            test_fs(),
+        );
+        state.buffer = Buffer::from_str_test("let x = 42;");
+        state.marker_list.adjust_for_insert(0, state.buffer.len());
+
+        // Hint anchored at byte 5 (after "let x" -> rendered before '=').
+        let hints = vec![make_hint(0, 5, ": i32", Some(InlayHintKind::TYPE))];
+        Editor::apply_inlay_hints_to_state(&mut state, &hints);
+        assert_eq!(state.virtual_texts.len(), 1);
+
+        // Simulate user deleting "x = 42" (bytes 4..10, half-open) — the
+        // hint anchor at byte 5 is inside this range.
+        let removed = state
+            .virtual_texts
+            .remove_in_range(&mut state.marker_list, 4, 10);
+        assert_eq!(removed, 1, "hint inside deleted range must be removed");
+        assert!(state.virtual_texts.is_empty());
+    }
+
+    #[test]
+    fn test_marker_delete_after_repeat_clear_recreate() {
+        // Regression: simulates what apply_inlay_hints_to_state does on
+        // every LSP refresh — clear every virtual_text's marker then
+        // recreate markers at fresh positions. After a few rounds,
+        // delete one marker and adjust for a deletion and check the
+        // remaining markers' positions.
+        use crate::model::marker::MarkerList;
+        use crate::view::virtual_text::{VirtualTextManager, VirtualTextPosition};
+        use ratatui::style::Style;
+
+        let mut markers = MarkerList::new();
+        let mut vtexts = VirtualTextManager::new();
+
+        // Initial marker layout at six positions (same as the e2e test).
+        let positions = [200usize, 401, 602, 803, 1205, 1406];
+        for &p in &positions {
+            vtexts.add(
+                &mut markers,
+                p,
+                format!("hint-at-{p}"),
+                Style::default(),
+                VirtualTextPosition::BeforeChar,
+                0,
+            );
+        }
+
+        // Simulate a couple of clear/recreate cycles (each LSP refresh
+        // goes through this exact path via apply_inlay_hints_to_state).
+        for _ in 0..3 {
+            vtexts.clear(&mut markers);
+            for &p in &positions {
+                vtexts.add(
+                    &mut markers,
+                    p,
+                    format!("hint-at-{p}"),
+                    Style::default(),
+                    VirtualTextPosition::BeforeChar,
+                    0,
+                );
+            }
+        }
+
+        // remove_in_range + adjust_for_delete equivalent to apply_delete.
+        let removed = vtexts.remove_in_range(&mut markers, 1005, 1206);
+        assert_eq!(
+            removed, 1,
+            "exactly one marker inside [1005, 1206) should be removed"
+        );
+        markers.adjust_for_delete(1005, 201);
+
+        let lookup = vtexts.build_lookup(&markers, 0, 10_000);
+        let mut positions: Vec<usize> = lookup.keys().copied().collect();
+        positions.sort();
+        assert_eq!(
+            positions,
+            vec![200, 401, 602, 803, 1205],
+            "after delete+adjust, expected marker byte positions {:?}, got {:?}",
+            vec![200, 401, 602, 803, 1205],
+            positions
+        );
+    }
+
+    #[test]
+    fn test_marker_delete_then_adjust_preserves_last_marker_position() {
+        // Regression for the user-observed flip of an end-of-line inlay
+        // hint to the start of its line after a nearby line is deleted.
+        //
+        // Scenario (real numbers from the failing e2e test): six markers
+        // at byte offsets that correspond to the `\n` of each line,
+        // then delete-one-marker (simulating remove_in_range on the
+        // line being deleted) followed by adjust_for_delete on the
+        // remaining markers.
+        //
+        // The last marker (at byte 1406) should end up at byte 1205
+        // after subtracting the 201-byte deleted range. Observed bug:
+        // it ends up at byte 1005 (the deletion start) — exactly as
+        // though the delta were applied twice.
+        use crate::model::marker::MarkerList;
+
+        let mut markers = MarkerList::new();
+        let m0 = markers.create(200, false);
+        let m1 = markers.create(401, false);
+        let m2 = markers.create(602, false);
+        let m3 = markers.create(803, false);
+        let m5 = markers.create(1205, false);
+        let m6 = markers.create(1406, false);
+
+        // Simulate remove_in_range removing marker m5 inside [1005, 1206).
+        markers.delete(m5);
+
+        // Now simulate adjust_for_delete over that range.
+        markers.adjust_for_delete(1005, 201);
+
+        assert_eq!(markers.get_position(m0), Some(200), "m0 unchanged");
+        assert_eq!(markers.get_position(m1), Some(401), "m1 unchanged");
+        assert_eq!(markers.get_position(m2), Some(602), "m2 unchanged");
+        assert_eq!(markers.get_position(m3), Some(803), "m3 unchanged");
+        assert_eq!(
+            markers.get_position(m6),
+            Some(1205),
+            "m6 must shift from 1406 to 1205 (1406 - 201), not be clamped to delete-start 1005"
+        );
+    }
+
+    #[test]
+    fn test_inlay_hint_outside_deletion_survives() {
+        // Anchors outside the deleted range must not be collateral damage.
+        let mut state = EditorState::new(
+            80,
+            24,
+            crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+            test_fs(),
+        );
+        state.buffer = Buffer::from_str_test("let x = 42; let y = 0;");
+        state.marker_list.adjust_for_insert(0, state.buffer.len());
+
+        let hints = vec![
+            make_hint(0, 5, ": i32", Some(InlayHintKind::TYPE)), // byte 5 - inside deletion
+            make_hint(0, 17, ": i32", Some(InlayHintKind::TYPE)), // byte 17 - outside
+        ];
+        Editor::apply_inlay_hints_to_state(&mut state, &hints);
+        assert_eq!(state.virtual_texts.len(), 2);
+
+        let removed = state
+            .virtual_texts
+            .remove_in_range(&mut state.marker_list, 4, 10);
+        assert_eq!(removed, 1);
+        assert_eq!(state.virtual_texts.len(), 1);
     }
 
     #[test]

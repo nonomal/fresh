@@ -24,11 +24,11 @@ use std::fs;
 fn test_diagnostics_panel_enter_does_not_jump() {
     init_tracing_from_env();
 
+    let temp_dir = tempfile::TempDir::new().unwrap();
+
     // Create fake LSP that sends diagnostics on didOpen/didChange
     // This server sends diagnostics at lines 0, 0, 1 (2 per line, 3 total)
-    let _fake_server = FakeLspServer::spawn_many_diagnostics(3).unwrap();
-
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let _fake_server = FakeLspServer::spawn_many_diagnostics(temp_dir.path(), 3).unwrap();
     let project_root = temp_dir.path().to_path_buf();
 
     // Set up plugins
@@ -49,8 +49,8 @@ fn test_diagnostics_panel_enter_does_not_jump() {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::many_diagnostics_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::many_diagnostics_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -60,7 +60,11 @@ fn test_diagnostics_panel_enter_does_not_jump() {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness =
@@ -175,9 +179,9 @@ fn test_diagnostics_panel_enter_does_not_jump() {
 fn test_diagnostics_panel_cursor_move_scrolls_editor() {
     init_tracing_from_env();
 
-    let _fake_server = FakeLspServer::spawn_many_diagnostics(3).unwrap();
-
     let temp_dir = tempfile::TempDir::new().unwrap();
+    let _fake_server = FakeLspServer::spawn_many_diagnostics(temp_dir.path(), 3).unwrap();
+
     let project_root = temp_dir.path().to_path_buf();
 
     let plugins_dir = project_root.join("plugins");
@@ -197,8 +201,8 @@ fn test_diagnostics_panel_cursor_move_scrolls_editor() {
     let mut config = fresh::config::Config::default();
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::many_diagnostics_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::many_diagnostics_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -208,7 +212,11 @@ fn test_diagnostics_panel_cursor_move_scrolls_editor() {
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness =

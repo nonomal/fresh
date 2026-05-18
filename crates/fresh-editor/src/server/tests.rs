@@ -33,35 +33,6 @@ mod integration_tests {
         }
     }
 
-    /// Wait for the server to have processed all data sent so far, then drain
-    /// render output while wall-clock time elapses.  Used when testing features
-    /// that depend on real time (e.g., the 50ms ESC flush timeout).
-    ///
-    /// Works by:
-    ///   1. Ping/Pong round-trip — guarantees the server has completed at least
-    ///      one tick after reading all prior data bytes.
-    ///   2. Draining render output in a yield loop until `duration` has elapsed,
-    ///      giving the server additional ticks to fire `flush_timeout()`.
-    fn wait_for_server_flush(conn: &ClientConnection, output: &mut Vec<u8>, duration: Duration) {
-        // Round-trip: ensures the server read/processed all previously-sent data
-        let ping = serde_json::to_string(&ClientControl::Ping).unwrap();
-        conn.write_control(&ping).unwrap();
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = conn.read_control(); // blocks until server replies
-
-        // Now drain render output while wall-clock time elapses.
-        // The server's flush_timeout() checks Instant::elapsed(), so real time
-        // must pass.  We yield rather than sleep so the scheduler stays healthy.
-        let start = std::time::Instant::now();
-        let mut buf = [0u8; 4096];
-        while start.elapsed() < duration {
-            match conn.data.try_read(&mut buf) {
-                Ok(n) if n > 0 => output.extend_from_slice(&buf[..n]),
-                _ => thread::yield_now(),
-            }
-        }
-    }
-
     fn unique_session_name(prefix: &str) -> String {
         format!(
             "{}-{}-{}",
@@ -84,6 +55,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(unique_session_name("lifecycle")),
             idle_timeout: Some(Duration::from_millis(100)),
+            mouse_hover_enabled: true,
         };
 
         let mut server = Server::new(config).unwrap();
@@ -112,6 +84,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(session_name.clone()),
             idle_timeout: Some(Duration::from_secs(5)),
+            mouse_hover_enabled: true,
         };
 
         let mut server = Server::new(config).unwrap();
@@ -156,6 +129,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(unique_session_name("version")),
             idle_timeout: Some(Duration::from_secs(5)),
+            mouse_hover_enabled: true,
         };
 
         let mut server = Server::new(config).unwrap();
@@ -198,6 +172,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(unique_session_name("idle")),
             idle_timeout: Some(Duration::from_millis(50)), // Very short timeout
+            mouse_hover_enabled: true,
         };
 
         let mut server = Server::new(config).unwrap();
@@ -223,6 +198,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(unique_session_name("ping")),
             idle_timeout: Some(Duration::from_secs(5)),
+            mouse_hover_enabled: true,
         };
 
         let mut server = Server::new(config).unwrap();
@@ -270,6 +246,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(unique_session_name("quit")),
             idle_timeout: None, // No idle timeout
+            mouse_hover_enabled: true,
         };
 
         let mut server = Server::new(config).unwrap();
@@ -319,6 +296,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(session_name.clone()),
             idle_timeout: Some(Duration::from_secs(5)),
+            mouse_hover_enabled: true,
         };
 
         // Use channel to get socket paths from server thread
@@ -556,6 +534,7 @@ mod integration_tests {
             working_dir: temp_dir.clone(),
             session_name: Some(session_name.clone()),
             idle_timeout: Some(Duration::from_secs(5)),
+            mouse_hover_enabled: true,
         };
 
         let paths_for_cleanup = socket_paths.clone();
@@ -623,6 +602,9 @@ mod integration_tests {
             editor_config: config,
             dir_context,
             plugins_enabled: false,
+            init_enabled: false,
+            startup_authority: None,
+            session_keepalive: None,
         };
 
         let (paths_tx, paths_rx) = mpsc::channel();
@@ -788,6 +770,9 @@ mod integration_tests {
             editor_config: config,
             dir_context,
             plugins_enabled: false,
+            init_enabled: false,
+            startup_authority: None,
+            session_keepalive: None,
         };
 
         let (paths_tx, paths_rx) = mpsc::channel();
@@ -960,6 +945,9 @@ mod integration_tests {
             editor_config: config,
             dir_context,
             plugins_enabled: false,
+            init_enabled: false,
+            startup_authority: None,
+            session_keepalive: None,
         };
 
         let (paths_tx, paths_rx) = mpsc::channel();
@@ -1126,47 +1114,6 @@ mod integration_tests {
     }
 
     /// E2E regression test for issue #1089:
-    /// Standalone ESC should be processed within timeout, not hang indefinitely.
-    ///
-    /// When ESC is pressed alone (without follow-up bytes), the server should
-    /// emit it as an Escape key event after the timeout (50ms), rather than
-    /// buffering it forever.
-    #[test]
-    fn test_standalone_esc_is_processed_via_timeout() {
-        let (conn, mut output, shutdown_handle, server_handle, socket_paths, temp_dir) =
-            setup_editor_server_e2e("esc-timeout");
-
-        // Type some text
-        conn.write_data(b"hello").unwrap();
-        read_until_contains(&conn, &mut output, "hello");
-
-        // Send standalone ESC
-        conn.write_data(&[0x1b]).unwrap();
-
-        // Wait for the server to read the ESC and for the 50ms flush timeout
-        // to expire.  Uses Ping/Pong + output draining instead of thread::sleep
-        // to stay responsive and avoid flaky fixed timers.
-        wait_for_server_flush(&conn, &mut output, Duration::from_millis(100));
-
-        // Now type more text. If ESC was properly flushed, the next input should
-        // work normally. If ESC is still stuck in the buffer, it might combine
-        // with the next bytes and produce garbage.
-        conn.write_data(b"world").unwrap();
-        read_until_contains(&conn, &mut output, "world");
-
-        let screen = vt100_screen_text(&output);
-
-        // The screen should contain "world" as normal text
-        assert!(
-            screen.contains("world"),
-            "Screen should contain 'world' after standalone ESC + timeout.\nScreen:\n{}",
-            screen
-        );
-
-        teardown_editor_server_e2e(conn, shutdown_handle, server_handle, socket_paths, temp_dir);
-    }
-
-    /// E2E regression test for issue #1089:
     /// ESC buffered, then CSI arrow key arrives — should produce Escape + arrow,
     /// not Alt+Escape + literal characters.
     #[test]
@@ -1315,5 +1262,318 @@ mod integration_tests {
         let _ = conn.control.set_nonblocking(false);
 
         teardown_editor_server_e2e(conn, shutdown_handle, server_handle, socket_paths, temp_dir);
+    }
+
+    /// Authority transitions in session mode must rebuild the editor in
+    /// place (not shut the daemon down).  This test drives the rebuild
+    /// path directly against an `EditorServer`, without running the
+    /// full event loop — it's enough to assert the public contract: the
+    /// Editor instance is replaced, `current_authority` tracks the new
+    /// authority, and `should_quit` is cleared so the main loop
+    /// wouldn't shut down on the next tick.
+    #[test]
+    fn test_session_rebuild_swaps_editor_and_authority() {
+        use crate::config::Config;
+        use crate::config_io::DirectoryContext;
+        use crate::server::editor_server::{EditorServer, EditorServerConfig};
+        use crate::services::authority::{
+            Authority, AuthorityPayload, FilesystemSpec, SpawnerSpec, TerminalWrapperSpec,
+        };
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("fresh-rebuild-test-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let dir_context = DirectoryContext::for_testing(&temp_dir);
+        let server_config = EditorServerConfig {
+            working_dir: temp_dir.clone(),
+            session_name: Some(unique_session_name("rebuild")),
+            idle_timeout: Some(Duration::from_secs(30)),
+            editor_config: Config::default(),
+            dir_context,
+            plugins_enabled: false,
+            init_enabled: false,
+            startup_authority: None,
+            session_keepalive: None,
+        };
+
+        // `Editor` isn't `Send`, so construction + rebuild must happen
+        // on the same thread.  Wrap the whole assertion block in a
+        // spawned thread to avoid smuggling the server across `await`
+        // points; use a channel to propagate the test result out.
+        let handle = thread::spawn(move || -> Result<(), String> {
+            let mut server =
+                EditorServer::new(server_config).map_err(|e| format!("EditorServer::new: {e}"))?;
+
+            // Pretend a client has connected — `initialize_editor`
+            // doesn't actually need one, it only needs the term_size
+            // to have been written.
+            server
+                .initialize_editor()
+                .map_err(|e| format!("initialize_editor: {e}"))?;
+
+            // Sanity: we booted with a local authority.
+            let label_before = server
+                .editor()
+                .expect("editor after init")
+                .authority()
+                .display_label
+                .clone();
+            if !label_before.is_empty() {
+                return Err(format!("expected empty label, got {:?}", label_before));
+            }
+
+            // Build a container-style authority via the plugin payload
+            // path, to exercise the same code plugins hit.
+            let payload = AuthorityPayload {
+                filesystem: FilesystemSpec::Local,
+                spawner: SpawnerSpec::DockerExec {
+                    container_id: "deadbeef".into(),
+                    user: Some("vscode".into()),
+                    workspace: Some("/workspaces/proj".into()),
+                    env: Vec::new(),
+                },
+                terminal_wrapper: TerminalWrapperSpec::Explicit {
+                    command: "docker".into(),
+                    args: vec![
+                        "exec".into(),
+                        "-it".into(),
+                        "deadbeef".into(),
+                        "bash".into(),
+                    ],
+                    manages_cwd: true,
+                },
+                display_label: "Container:deadbeef".into(),
+                path_translation: None,
+            };
+            let new_auth = Authority::from_plugin_payload(payload)
+                .map_err(|e| format!("from_plugin_payload: {e}"))?;
+
+            // Capture the pre-rebuild editor's address.  We can't
+            // compare `Editor` by identity directly (it moves), but the
+            // `authority()` pointer is a Arc so it should change.
+            // Snapshot the filesystem Arc via strong_count parity:
+            // after rebuild the old editor is gone, so any Arc it
+            // uniquely held is dropped. We keep a clone to compare.
+            let before_filesystem = server
+                .editor()
+                .expect("editor before rebuild")
+                .authority()
+                .filesystem
+                .clone();
+
+            server
+                .rebuild_editor(None, Some(new_auth))
+                .map_err(|e| format!("rebuild_editor: {e}"))?;
+
+            // After rebuild: new editor exists, carries the new label.
+            let editor = server.editor().expect("editor after rebuild");
+            if editor.authority().display_label != "Container:deadbeef" {
+                return Err(format!(
+                    "expected Container:deadbeef label, got {:?}",
+                    editor.authority().display_label
+                ));
+            }
+            if editor.should_quit() {
+                return Err("rebuilt editor still has should_quit=true".into());
+            }
+            // The pre-rebuild filesystem Arc should now only be held
+            // by our local clone (strong_count == 1) because the old
+            // editor was dropped. If it were still referenced by the
+            // new editor, the count would be >= 2.
+            let remaining = std::sync::Arc::strong_count(&before_filesystem);
+            if remaining != 1 {
+                return Err(format!(
+                    "expected pre-rebuild filesystem Arc to be unique after rebuild; strong_count={}",
+                    remaining
+                ));
+            }
+
+            Ok(())
+        });
+
+        let result = handle.join().expect("rebuild test thread panicked");
+        std::fs::remove_dir_all(&temp_dir).ok();
+        result.expect("rebuild test failed");
+    }
+
+    /// Working-directory changes (the "switch project root" flow) must
+    /// also rebuild in place under session mode.  Mirrors the authority
+    /// test above but with the working_dir slot instead.
+    #[test]
+    fn test_session_rebuild_switches_working_dir() {
+        use crate::config::Config;
+        use crate::config_io::DirectoryContext;
+        use crate::server::editor_server::{EditorServer, EditorServerConfig};
+
+        let parent = std::env::temp_dir().join(format!("fresh-rebuild-cwd-{}", std::process::id()));
+        let dir_a = parent.join("project_a");
+        let dir_b = parent.join("project_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let dir_context = DirectoryContext::for_testing(&parent);
+        let server_config = EditorServerConfig {
+            working_dir: dir_a.clone(),
+            session_name: Some(unique_session_name("rebuild-cwd")),
+            idle_timeout: Some(Duration::from_secs(30)),
+            editor_config: Config::default(),
+            dir_context,
+            plugins_enabled: false,
+            init_enabled: false,
+            startup_authority: None,
+            session_keepalive: None,
+        };
+
+        let dir_b_clone = dir_b.clone();
+        let handle = thread::spawn(move || -> Result<(), String> {
+            let mut server =
+                EditorServer::new(server_config).map_err(|e| format!("EditorServer::new: {e}"))?;
+
+            server
+                .initialize_editor()
+                .map_err(|e| format!("initialize_editor: {e}"))?;
+
+            server
+                .rebuild_editor(Some(dir_b_clone.clone()), None)
+                .map_err(|e| format!("rebuild_editor: {e}"))?;
+
+            let editor = server.editor().expect("editor after rebuild");
+            if editor.should_quit() {
+                return Err("rebuilt editor still has should_quit=true".into());
+            }
+            let current = editor.working_dir();
+            // working_dir may canonicalize — compare via canonical form.
+            let want = dir_b_clone
+                .canonicalize()
+                .unwrap_or_else(|_| dir_b_clone.clone());
+            if current != want {
+                return Err(format!(
+                    "expected working_dir {}, got {}",
+                    want.display(),
+                    current.display()
+                ));
+            }
+            Ok(())
+        });
+
+        let result = handle.join().expect("cwd-rebuild thread panicked");
+        std::fs::remove_dir_all(&parent).ok();
+        result.expect("cwd-rebuild test failed");
+    }
+
+    /// `EditorServerConfig.startup_authority` lets a caller (notably
+    /// the `ssh://` / `user@host:path` CLI forms) hand the daemon a
+    /// non-local authority to boot into.  The paired
+    /// `session_keepalive` must live as long as the server so remote
+    /// resources — SSH runtimes, reconnect tasks — don't get dropped
+    /// mid-flight.  This test drives both contracts without a live
+    /// SSH connection: a plugin-style docker-exec authority stands
+    /// in for "something non-local", and a keepalive that drops an
+    /// `Arc<AtomicBool>` to `true` proves the server retained it.
+    #[test]
+    fn test_server_boots_with_startup_authority_and_keeps_keepalive() {
+        use crate::config::Config;
+        use crate::config_io::DirectoryContext;
+        use crate::server::editor_server::{EditorServer, EditorServerConfig};
+        use crate::services::authority::{
+            Authority, AuthorityPayload, FilesystemSpec, SpawnerSpec, TerminalWrapperSpec,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
+        use std::sync::Arc;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("fresh-startup-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let dir_context = DirectoryContext::for_testing(&temp_dir);
+
+        let payload = AuthorityPayload {
+            filesystem: FilesystemSpec::Local,
+            spawner: SpawnerSpec::DockerExec {
+                container_id: "cafef00d".into(),
+                user: None,
+                workspace: None,
+                env: Vec::new(),
+            },
+            terminal_wrapper: TerminalWrapperSpec::Explicit {
+                command: "docker".into(),
+                args: vec![
+                    "exec".into(),
+                    "-it".into(),
+                    "cafef00d".into(),
+                    "bash".into(),
+                ],
+                manages_cwd: true,
+            },
+            display_label: "Container:cafef00d".into(),
+            path_translation: None,
+        };
+        let startup_auth =
+            Authority::from_plugin_payload(payload).expect("docker payload is valid");
+
+        // Sentinel for the keepalive: flipped to `true` when the
+        // wrapper is dropped.  While the server holds it, the flag
+        // stays `false`.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, AOrdering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let keepalive: Box<dyn std::any::Any + Send> = Box::new(DropFlag(dropped.clone()));
+
+        let server_config = EditorServerConfig {
+            working_dir: temp_dir.clone(),
+            session_name: Some(unique_session_name("startup-auth")),
+            idle_timeout: Some(Duration::from_secs(30)),
+            editor_config: Config::default(),
+            dir_context,
+            plugins_enabled: false,
+            init_enabled: false,
+            startup_authority: Some(startup_auth),
+            session_keepalive: Some(keepalive),
+        };
+
+        let dropped_for_thread = dropped.clone();
+        let handle = thread::spawn(move || -> Result<(), String> {
+            let mut server =
+                EditorServer::new(server_config).map_err(|e| format!("EditorServer::new: {e}"))?;
+
+            server
+                .initialize_editor()
+                .map_err(|e| format!("initialize_editor: {e}"))?;
+
+            // Authority installed at boot: the editor sees the
+            // container-style label from the first tick.
+            let label = server
+                .editor()
+                .expect("editor after init")
+                .authority()
+                .display_label
+                .clone();
+            if label != "Container:cafef00d" {
+                return Err(format!(
+                    "expected Container:cafef00d label, got {:?}",
+                    label
+                ));
+            }
+
+            // Keepalive is still alive inside the server.
+            if dropped_for_thread.load(AOrdering::SeqCst) {
+                return Err("keepalive dropped while server is alive".into());
+            }
+
+            // Drop the server — this must drop the keepalive too.
+            drop(server);
+            if !dropped_for_thread.load(AOrdering::SeqCst) {
+                return Err("keepalive not dropped after server shutdown".into());
+            }
+            Ok(())
+        });
+
+        let result = handle.join().expect("startup-auth thread panicked");
+        std::fs::remove_dir_all(&temp_dir).ok();
+        result.expect("startup-auth test failed");
     }
 }

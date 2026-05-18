@@ -17,10 +17,17 @@ pub mod focus;
 pub mod layout;
 pub mod scroll_panel;
 pub mod scrollbar;
-pub mod text_edit;
 pub mod view_pipeline;
 
+/// `TextEdit` lives in `crate::primitives::text_edit` now (shared
+/// between the legacy Settings UI and the plugin widget framework).
+/// Re-exported here under the historical `crate::view::ui::text_edit`
+/// path so existing call sites keep compiling unchanged.
+pub use crate::primitives::text_edit;
+
 // Runtime-only modules (depend on state, services, input, etc.)
+#[cfg(feature = "runtime")]
+pub mod expanded_menus_cache;
 #[cfg(feature = "runtime")]
 pub mod file_browser;
 #[cfg(feature = "runtime")]
@@ -39,6 +46,9 @@ pub mod suggestions;
 pub mod tabs;
 
 // Re-export main types for convenience
+pub use crate::primitives::text_edit::TextEdit;
+#[cfg(feature = "runtime")]
+pub use expanded_menus_cache::ExpandedMenusCache;
 #[cfg(feature = "runtime")]
 pub use file_browser::{FileBrowserLayout, FileBrowserRenderer};
 #[cfg(feature = "runtime")]
@@ -61,4 +71,3 @@ pub use status_bar::{truncate_path, StatusBarLayout, StatusBarRenderer, Truncate
 pub use suggestions::SuggestionsRenderer;
 #[cfg(feature = "runtime")]
 pub use tabs::{TabHit, TabHitArea, TabLayout, TabsRenderer};
-pub use text_edit::TextEdit;

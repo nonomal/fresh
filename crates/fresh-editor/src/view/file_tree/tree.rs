@@ -227,6 +227,61 @@ impl FileTree {
         self.expand_node(id).await
     }
 
+    /// Re-read this directory from disk, preserving the expansion state of
+    /// every descendant that is still present afterwards.
+    ///
+    /// Implementation is deliberately simple: snapshot the paths of all
+    /// currently-expanded descendants, run a normal `refresh_node` (which
+    /// rebuilds child ids via the well-tested `expand_node` path), then
+    /// re-walk each previously-expanded path so its subtree loads again.
+    /// Descendants whose path no longer exists on disk are silently
+    /// dropped — `expand_to_path` returns None for them.
+    ///
+    /// Callers should not rely on NodeIds under `id` surviving the call:
+    /// refresh_node recycles every descendant id. Cursor / multi-selection
+    /// state should be re-resolved by path afterwards.
+    pub async fn reload_expanded_node(&mut self, id: NodeId) -> io::Result<()> {
+        let expanded_paths = self.collect_expanded_descendant_paths(id);
+        self.refresh_node(id).await?;
+        // Re-expand each previously-expanded descendant in tree order —
+        // i.e. shallowest first, so `expand_to_path` can walk through them.
+        // `expand_to_path` only expands intermediate ancestors along the
+        // way, so also call `expand_node` on the resolved target so the
+        // directory's own children load.
+        for path in expanded_paths {
+            if let Some(target_id) = self.expand_to_path(&path).await {
+                if let Err(e) = self.expand_node(target_id).await {
+                    tracing::warn!("Failed to re-expand {:?} after tree reload: {}", path, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect the on-disk paths of every descendant of `id` that is in
+    /// `Expanded` state. Excludes `id` itself — the caller is about to
+    /// refresh that node, which handles its own expansion.
+    fn collect_expanded_descendant_paths(&self, id: NodeId) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Some(node) = self.get_node(id) {
+            for &child in &node.children {
+                self.collect_expanded_recursive(child, &mut out);
+            }
+        }
+        out
+    }
+
+    fn collect_expanded_recursive(&self, id: NodeId, out: &mut Vec<PathBuf>) {
+        if let Some(node) = self.get_node(id) {
+            if node.is_expanded() {
+                out.push(node.entry.path.clone());
+                for &child in &node.children {
+                    self.collect_expanded_recursive(child, out);
+                }
+            }
+        }
+    }
+
     /// Get all visible nodes in tree order
     ///
     /// Returns a flat list of nodes that should be visible, respecting
@@ -723,4 +778,10 @@ mod tests {
 
         assert!(result.is_none(), "Should return None for nonexistent paths");
     }
+
+    // End-to-end observable behavior for `reload_expanded_node` —
+    // preserved expansion state, visibility of newly-appeared files,
+    // freshness of rendered metadata — is exercised at the e2e harness
+    // level in `tests/e2e/explorer_bugs.rs`. No unit tests here poke at
+    // `self.nodes` / `self.path_to_node` directly.
 }

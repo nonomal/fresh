@@ -578,7 +578,11 @@ fn test_undo_beyond_cursor_add() {
 #[test]
 fn test_multi_cursor_status_bar_indicator() {
     use crossterm::event::{KeyCode, KeyModifiers};
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    // 120×24 instead of 80×24: with the {{remote}} indicator on the
+    // default status bar, the trailing Messages element is
+    // ellipsis-truncated at 80 cols. The widening keeps the
+    // assertions below readable.
+    let mut harness = EditorTestHarness::new(120, 24).unwrap();
 
     // Create three lines
     harness.type_text("Line 1\nLine 2\nLine 3").unwrap();
@@ -2064,4 +2068,146 @@ fn test_multi_cursor_enter_markdown_bullet_list() {
         "Typing after Enter in markdown bullet list should insert at ALL cursors, found {} X's in: {:?}",
         x_count, content_after
     );
+}
+
+/// Issue #1870: "Add Cursors to Line Ends" (VSCode Shift+Alt+I).
+///
+/// Selecting across multiple lines and invoking the command should place a
+/// cursor at the end of each covered line; typing then appends to every line.
+#[test]
+fn test_add_cursors_to_line_ends_appends_to_each_line() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+
+    harness.type_text("one").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("two").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("three").unwrap();
+    harness.assert_buffer_content("one\ntwo\nthree");
+
+    // Select from the very start of the buffer through to the end ("one\ntwo\nthree").
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        .unwrap();
+
+    harness.editor_mut().add_cursors_to_line_ends();
+    harness.render().unwrap();
+
+    // Exactly one cursor per line, each collapsed.
+    let cursors = harness.editor().active_cursors();
+    assert_eq!(
+        cursors.iter().count(),
+        3,
+        "expected 3 cursors (one per line) after add_cursors_to_line_ends"
+    );
+    for (_id, c) in cursors.iter() {
+        assert!(
+            c.collapsed(),
+            "cursors should be collapsed (no selection) after add_cursors_to_line_ends, got cursor with anchor {:?}",
+            c.anchor
+        );
+    }
+
+    // Typing should append to every line because each cursor sits at end-of-line.
+    harness.type_text("!").unwrap();
+    harness.render().unwrap();
+    harness.assert_buffer_content("one!\ntwo!\nthree!");
+}
+
+/// Single-line selection collapses to one cursor at the end of that line.
+#[test]
+fn test_add_cursors_to_line_ends_single_line() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+
+    harness.type_text("alpha").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("beta").unwrap();
+    harness.assert_buffer_content("alpha\nbeta");
+
+    // Position cursor in the middle of "beta" (after 'b').
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+
+    harness.editor_mut().add_cursors_to_line_ends();
+    harness.render().unwrap();
+
+    let cursors = harness.editor().active_cursors();
+    assert_eq!(cursors.iter().count(), 1);
+    // Cursor should now be at end of "beta" (position 10: "alpha\nbeta".len()).
+    assert_eq!(cursors.primary().position, 10);
+    assert!(cursors.primary().collapsed());
+}
+
+/// Regression: when the user already has multiple collapsed cursors on
+/// different lines, invoking the command must keep every cursor and move each
+/// to the end of its own line — not wipe everything down to a single cursor.
+///
+/// This matches VSCode's "Add Cursor to Line Ends" semantics: every existing
+/// cursor contributes, no cursor is silently dropped.
+#[test]
+fn test_add_cursors_to_line_ends_keeps_existing_multi_cursors() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+
+    harness.type_text("alpha").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("beta").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("gamma").unwrap();
+    harness.assert_buffer_content("alpha\nbeta\ngamma");
+
+    // Place the primary cursor at the start of line 1 ("alpha"), then add
+    // collapsed cursors on lines 2 and 3 via "add cursor below".
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.editor_mut().add_cursor_below();
+    harness.editor_mut().add_cursor_below();
+
+    let before = harness.editor().active_cursors().iter().count();
+    assert_eq!(
+        before, 3,
+        "test setup: expected 3 collapsed cursors before invoking command"
+    );
+
+    harness.editor_mut().add_cursors_to_line_ends();
+    harness.render().unwrap();
+
+    let cursors = harness.editor().active_cursors();
+    assert_eq!(
+        cursors.iter().count(),
+        3,
+        "expected all 3 cursors to survive; pre-fix behaviour collapsed to 1"
+    );
+
+    // Every cursor should be collapsed and at end of its respective line:
+    // "alpha" ends at 5, "alpha\nbeta" ends at 10, "alpha\nbeta\ngamma" ends at 16.
+    let mut positions: Vec<usize> = cursors.iter().map(|(_, c)| c.position).collect();
+    positions.sort_unstable();
+    assert_eq!(positions, vec![5, 10, 16]);
+    for (_id, c) in cursors.iter() {
+        assert!(c.collapsed(), "all cursors must be collapsed");
+    }
+
+    // Typing appends to every line.
+    harness.type_text("!").unwrap();
+    harness.render().unwrap();
+    harness.assert_buffer_content("alpha!\nbeta!\ngamma!");
 }

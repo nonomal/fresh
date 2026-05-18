@@ -24,6 +24,11 @@ pub trait PluginServiceBridge: Send + Sync + 'static {
     /// Get a list of builtin theme names
     fn get_builtin_themes(&self) -> serde_json::Value;
 
+    /// Full theme registry (builtins + user + packages + bundles) as a JSON
+    /// object keyed by canonical registry key. Each value is the parsed theme
+    /// with `_key` / `_pack` metadata fields (see `ThemeRegistry::to_json_map`).
+    fn get_all_themes(&self) -> serde_json::Value;
+
     /// Register custom i18n strings for a plugin
     fn register_plugin_strings(
         &self,
@@ -52,6 +57,10 @@ pub trait PluginServiceBridge: Send + Sync + 'static {
 
     /// Get the config directory path
     fn config_dir(&self) -> std::path::PathBuf;
+
+    /// Get the persistent data directory path (DirectoryContext::data_dir).
+    /// Used for long-lived plugin state such as review-diff comment history.
+    fn data_dir(&self) -> std::path::PathBuf;
 
     /// Get theme data (JSON) by name from the in-memory cache.
     fn get_theme_data(&self, _name: &str) -> Option<serde_json::Value> {
@@ -91,6 +100,9 @@ impl PluginServiceBridge for NoopServiceBridge {
     fn get_builtin_themes(&self) -> serde_json::Value {
         serde_json::Value::Null
     }
+    fn get_all_themes(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
     fn register_plugin_strings(
         &self,
         _plugin_name: &str,
@@ -107,5 +119,8 @@ impl PluginServiceBridge for NoopServiceBridge {
     }
     fn config_dir(&self) -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp/config")
+    }
+    fn data_dir(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/data")
     }
 }

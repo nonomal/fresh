@@ -46,6 +46,11 @@ jobs:
           sed -i "s/<release version=\"[^\"]*\"/<release version=\"$VERSION\"/" crates/fresh-editor/flatpak/io.github.sinelaw.fresh.metainfo.xml
           sed -i "s/date=\"[^\"]*\"/date=\"$DATE\"/" crates/fresh-editor/flatpak/io.github.sinelaw.fresh.metainfo.xml
 
+      - name: Copy icons into Flatpak source tree
+        run: |
+          mkdir -p crates/fresh-editor/docs/icons/linux
+          cp -r docs/icons/linux/hicolor crates/fresh-editor/docs/icons/linux/
+
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:

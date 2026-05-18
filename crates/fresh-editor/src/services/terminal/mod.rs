@@ -47,7 +47,7 @@
 //! - `../app/terminal.rs`: Mode switching logic
 //! - `../app/session.rs`: Session save/restore integration
 
-mod manager;
+pub mod manager;
 pub mod pty;
 pub mod term;
 

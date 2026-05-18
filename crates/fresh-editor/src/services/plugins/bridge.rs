@@ -44,6 +44,13 @@ impl PluginServiceBridge for EditorServiceBridge {
         theme::get_builtin_themes()
     }
 
+    fn get_all_themes(&self) -> serde_json::Value {
+        let cache = self.theme_cache.read().unwrap();
+        let map: serde_json::Map<String, serde_json::Value> =
+            cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        serde_json::Value::Object(map)
+    }
+
     fn register_plugin_strings(
         &self,
         plugin_name: &str,
@@ -68,6 +75,7 @@ impl PluginServiceBridge for EditorServiceBridge {
             contexts: vec![KeyContext::Global],
             custom_contexts: command.custom_contexts,
             source: CommandSource::Plugin(command.plugin_name),
+            terminal_bypass: command.terminal_bypass,
         };
         self.command_registry
             .read()
@@ -101,9 +109,26 @@ impl PluginServiceBridge for EditorServiceBridge {
         self.dir_context.config_dir.clone()
     }
 
-    fn get_theme_data(&self, name: &str) -> Option<serde_json::Value> {
+    fn data_dir(&self) -> PathBuf {
+        self.dir_context.data_dir.clone()
+    }
+
+    fn get_theme_data(&self, key_or_name: &str) -> Option<serde_json::Value> {
         let cache = self.theme_cache.read().unwrap();
-        cache.get(name).cloned()
+        // Exact key match
+        if let Some(v) = cache.get(key_or_name) {
+            return Some(v.clone());
+        }
+        // Fallback: match by theme name inside the cached values
+        let normalized = key_or_name.to_lowercase().replace(['_', ' '], "-");
+        cache
+            .values()
+            .find(|v| {
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.to_lowercase().replace(['_', ' '], "-") == normalized)
+            })
+            .cloned()
     }
 
     fn save_theme_file(&self, name: &str, content: &str) -> Result<String, String> {

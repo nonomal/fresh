@@ -20,7 +20,9 @@
 
 use super::term::TerminalState;
 use crate::services::async_bridge::AsyncBridge;
+use crate::services::authority::TerminalWrapper;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
@@ -55,6 +57,12 @@ pub struct TerminalHandle {
     cwd: Option<std::path::PathBuf>,
     /// Shell executable used to spawn the terminal
     shell: String,
+    /// PID of the shell child process at the head of the pty's
+    /// session. `kill(-pid, signal)` (note the negation) signals
+    /// the entire process group, which catches subprocesses the
+    /// shell or agent forked. `None` on Windows or when
+    /// portable_pty couldn't report the pid.
+    pid: Option<u32>,
 }
 
 impl TerminalHandle {
@@ -90,6 +98,69 @@ impl TerminalHandle {
         // Receiver may be dropped if terminal already exited; nothing to do in that case.
         #[allow(clippy::let_underscore_must_use)]
         let _ = self.command_tx.send(TerminalCommand::Shutdown);
+    }
+
+    /// Pid of the shell at the head of the pty session, when
+    /// portable_pty was able to report it. Returns `None` on
+    /// platforms / configurations that don't expose a pid.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Send `signal` to the terminal's process group. Returns
+    /// `Ok(false)` when the terminal has no recorded pid
+    /// (Windows, or platforms where portable_pty didn't report
+    /// one) — caller can fall back to `shutdown()` (SIGKILL via
+    /// child_killer). The shell is always its own session
+    /// leader inside a pty, so `kill(-pid, …)` reaches the
+    /// shell *and* any subprocesses it forked.
+    ///
+    /// Recognised signal names: `"SIGTERM"`, `"SIGKILL"`,
+    /// `"SIGINT"`, `"SIGHUP"`. Unknown names return an Err
+    /// instead of dropping silently.
+    #[cfg(unix)]
+    pub fn signal(&self, signal_name: &str) -> Result<bool, String> {
+        let Some(pid) = self.pid else {
+            return Ok(false);
+        };
+        let sig = match signal_name {
+            "SIGTERM" => libc::SIGTERM,
+            "SIGKILL" => libc::SIGKILL,
+            "SIGINT" => libc::SIGINT,
+            "SIGHUP" => libc::SIGHUP,
+            other => return Err(format!("unsupported signal: {}", other)),
+        };
+        // `kill(-pid, sig)` targets the process group whose
+        // leader is `pid`. The pty puts the spawned shell at
+        // the head of its own session, so this catches
+        // sub-processes the shell or agent forked.
+        let rc = unsafe { libc::kill(-(pid as i32), sig) };
+        if rc == 0 {
+            Ok(true)
+        } else {
+            let err = std::io::Error::last_os_error();
+            // ESRCH = no such process group. Treat as
+            // "nothing to signal" rather than an error so the
+            // caller's stop flow stays idempotent.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                Ok(false)
+            } else {
+                Err(format!("kill(-{}, {}): {}", pid, signal_name, err))
+            }
+        }
+    }
+
+    /// Windows fallback: no real signal semantics. SIGKILL is
+    /// modelled as the existing `shutdown()` (which calls the
+    /// pty child killer); other signals are unsupported and
+    /// return Ok(false).
+    #[cfg(windows)]
+    pub fn signal(&self, signal_name: &str) -> Result<bool, String> {
+        if signal_name == "SIGKILL" {
+            self.shutdown();
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Get current dimensions
@@ -156,6 +227,7 @@ impl TerminalManager {
         cwd: Option<std::path::PathBuf>,
         log_path: Option<std::path::PathBuf>,
         backing_path: Option<std::path::PathBuf>,
+        terminal_wrapper: crate::services::authority::TerminalWrapper,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.next_id);
         self.next_id += 1;
@@ -185,21 +257,42 @@ impl TerminalManager {
                     }
                 })?;
 
-            // Detect shell
-            let shell = detect_shell();
+            // The active authority's terminal wrapper drives the shell
+            // command unconditionally — local wraps `detect_shell()` with
+            // no args; container/remote authorities re-parent into
+            // `docker exec -w …`, `ssh …`, etc. `manages_cwd` says
+            // whether the wrapper's args already establish cwd (in which
+            // case `CommandBuilder::cwd()` is skipped).
+            let TerminalWrapper {
+                command: shell,
+                args: cmd_args,
+                manages_cwd: skip_cwd,
+            } = terminal_wrapper;
             tracing::info!("Spawning terminal with shell: {}", shell);
 
-            // Build command
             let mut cmd = CommandBuilder::new(&shell);
-            if let Some(ref dir) = cwd {
-                cmd.cwd(dir);
+            for arg in &cmd_args {
+                cmd.arg(arg);
+            }
+            if !skip_cwd {
+                if let Some(ref dir) = cwd {
+                    // Hand the shell a non-verbatim path. Fresh canonicalizes
+                    // working_dir at startup, which on Windows yields
+                    // `\\?\C:\…`. PowerShell can't infer a drive from a
+                    // verbatim path and falls back to the fully-qualified
+                    // provider form, producing prompts like
+                    // `PS Microsoft.PowerShell.Core\FileSystem::\\?\C:\…>`.
+                    cmd.cwd(strip_verbatim_prefix(dir).as_ref());
+                }
             }
 
-            // On Windows, set environment variables that help with ConPTY
+            // Set TERM so programs like less know the terminal capabilities.
+            // The built-in emulator is alacritty-based so xterm-256color is appropriate.
+            cmd.env("TERM", "xterm-256color");
+
+            // On Windows, set additional environment variables that help with ConPTY
             #[cfg(windows)]
             {
-                // Set TERM to help shells understand they're in a terminal
-                cmd.env("TERM", "xterm-256color");
                 // Ensure PROMPT is set for cmd.exe
                 if shell.to_lowercase().contains("cmd") {
                     cmd.env("PROMPT", "$P$G");
@@ -213,6 +306,19 @@ impl TerminalManager {
                 .map_err(|e| format!("Failed to spawn shell '{}': {}", shell, e))?;
 
             tracing::debug!("Shell process spawned successfully");
+
+            // Capture the child's pid before it moves into the
+            // wait-thread. The pty puts the shell at the head of
+            // its own session, so `kill(-pid, signal)` signals
+            // every process the shell has spawned.
+            let child_pid = child.process_id();
+
+            // Pull a separate killer handle so the writer thread
+            // can request termination on `Shutdown` without owning
+            // `child` itself. `child` moves into the dedicated
+            // wait-thread below, where its exit status is captured
+            // and propagated through `AsyncMessage::TerminalExited`.
+            let mut child_killer = child.clone_killer();
 
             // Create terminal state
             let state = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
@@ -402,11 +508,37 @@ impl TerminalManager {
                     #[allow(clippy::let_underscore_must_use)]
                     let _ = w.flush();
                 }
-                // Notify that terminal exited (receiver may be dropped during shutdown).
-                if let Some(ref bridge) = async_bridge {
+                // The wait-thread (spawned below) owns `child` and
+                // is the single source of `TerminalExited`, so the
+                // reader intentionally does not fire it here. Firing
+                // from both threads would race and sometimes produce
+                // `exit_code: None` despite a clean exit.
+            });
+
+            // Wait-thread: blocks on `child.wait()`, captures the
+            // exit status, and fires `TerminalExited` exactly once
+            // with the real code. The reader thread above has
+            // already dropped `alive_clone` to false on PTY EOF, so
+            // by the time we get here the child is either gone or
+            // about to be (the writer thread's killer.kill()
+            // accelerates the latter case for user-initiated
+            // shutdown).
+            let async_bridge_for_wait = self.async_bridge.clone();
+            thread::spawn(move || {
+                let exit_code = match child.wait() {
+                    Ok(status) => Some(status.exit_code() as i32),
+                    Err(e) => {
+                        tracing::warn!("child.wait() failed for {:?}: {}", terminal_id, e);
+                        None
+                    }
+                };
+                if let Some(ref bridge) = async_bridge_for_wait {
                     #[allow(clippy::let_underscore_must_use)]
                     let _ = bridge.sender().send(
-                        crate::services::async_bridge::AsyncMessage::TerminalExited { terminal_id },
+                        crate::services::async_bridge::AsyncMessage::TerminalExited {
+                            terminal_id,
+                            exit_code,
+                        },
                     );
                 }
             });
@@ -440,11 +572,13 @@ impl TerminalManager {
                         }
                     }
                 }
-                // Best-effort child process cleanup during teardown.
+                // User-initiated shutdown: ask the OS to terminate
+                // the child via the cloned killer. The wait-thread
+                // (above) owns `child` and will reap the exit status
+                // for us; we don't call `wait` here because that
+                // would race the wait-thread for the exit status.
                 #[allow(clippy::let_underscore_must_use)]
-                let _ = child.kill();
-                #[allow(clippy::let_underscore_must_use)]
-                let _ = child.wait();
+                let _ = child_killer.kill();
             });
 
             // Create handle
@@ -456,6 +590,7 @@ impl TerminalManager {
                 rows,
                 cwd: cwd.clone(),
                 shell,
+                pid: child_pid,
             })
         })();
 
@@ -533,6 +668,52 @@ impl Drop for TerminalManager {
     }
 }
 
+/// Convert a Windows verbatim path (`\\?\C:\…` or `\\?\UNC\server\share\…`)
+/// into its non-verbatim equivalent (`C:\…` or `\\server\share\…`).
+///
+/// Returns the input unchanged on non-Windows platforms or for paths that
+/// have no verbatim prefix.
+pub(crate) fn strip_verbatim_prefix(path: &std::path::Path) -> Cow<'_, std::path::Path> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(p)) => p,
+            _ => return Cow::Borrowed(path),
+        };
+
+        let mut rebuilt = std::path::PathBuf::new();
+        match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                rebuilt.push(format!("{}:\\", drive as char));
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                rebuilt.push(format!(
+                    r"\\{}\{}\",
+                    server.to_string_lossy(),
+                    share.to_string_lossy()
+                ));
+            }
+            _ => return Cow::Borrowed(path),
+        }
+        // Skip the original RootDir (which the rebuilt prefix already includes)
+        // and append the rest of the components.
+        for component in components {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            rebuilt.push(component.as_os_str());
+        }
+        Cow::Owned(rebuilt)
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
+    }
+}
+
 /// Detect the user's shell
 pub fn detect_shell() -> String {
     // Try $SHELL environment variable first
@@ -596,5 +777,48 @@ mod tests {
     fn test_detect_shell() {
         let shell = detect_shell();
         assert!(!shell.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn strip_verbatim_prefix_is_noop_on_unix() {
+        use std::path::Path;
+        let p = Path::new("/home/user/project");
+        assert_eq!(strip_verbatim_prefix(p).as_ref(), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_removes_verbatim_disk() {
+        use std::path::{Path, PathBuf};
+        let verbatim = PathBuf::from(r"\\?\C:\Users\HP\OneDrive\Desktop\PY'PGMS");
+        let stripped = strip_verbatim_prefix(&verbatim);
+        assert_eq!(
+            stripped.as_ref(),
+            Path::new(r"C:\Users\HP\OneDrive\Desktop\PY'PGMS"),
+            "verbatim disk prefix should be replaced with plain drive form"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_removes_verbatim_unc() {
+        use std::path::{Path, PathBuf};
+        let verbatim = PathBuf::from(r"\\?\UNC\server\share\dir\file");
+        let stripped = strip_verbatim_prefix(&verbatim);
+        assert_eq!(
+            stripped.as_ref(),
+            Path::new(r"\\server\share\dir\file"),
+            "verbatim UNC prefix should be replaced with plain UNC form"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_passes_plain_paths_through() {
+        use std::path::{Path, PathBuf};
+        let plain = PathBuf::from(r"C:\Users\HP\project");
+        let result = strip_verbatim_prefix(&plain);
+        assert_eq!(result.as_ref(), Path::new(r"C:\Users\HP\project"));
     }
 }

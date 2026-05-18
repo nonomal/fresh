@@ -14,7 +14,8 @@ use rust_i18n::t;
 impl Editor {
     /// Check if the file open dialog is active (for OpenFile, SwitchProject, or SaveFileAs)
     pub fn is_file_open_active(&self) -> bool {
-        self.prompt
+        self.active_window()
+            .prompt
             .as_ref()
             .map(|p| {
                 matches!(
@@ -23,12 +24,13 @@ impl Editor {
                 )
             })
             .unwrap_or(false)
-            && self.file_open_state.is_some()
+            && self.active_window().file_open_state.is_some()
     }
 
     /// Check if we're in folder-only selection mode (Switch Project)
     fn is_folder_open_mode(&self) -> bool {
-        self.prompt
+        self.active_window()
+            .prompt
             .as_ref()
             .map(|p| p.prompt_type == PromptType::SwitchProject)
             .unwrap_or(false)
@@ -36,7 +38,8 @@ impl Editor {
 
     /// Check if we're in save mode (Save As)
     fn is_save_mode(&self) -> bool {
-        self.prompt
+        self.active_window()
+            .prompt
             .as_ref()
             .map(|p| p.prompt_type == PromptType::SaveFileAs)
             .unwrap_or(false)
@@ -52,25 +55,25 @@ impl Editor {
         match action {
             // Navigation actions - Up/Down in file list
             Action::PromptSelectPrev => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.select_prev();
                 }
                 true
             }
             Action::PromptSelectNext => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.select_next();
                 }
                 true
             }
             Action::PromptPageUp => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.page_up(10);
                 }
                 true
             }
             Action::PromptPageDown => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.page_down(10);
                 }
                 true
@@ -87,17 +90,21 @@ impl Editor {
             // Tab to autocomplete to selected item (and navigate into dir if it's a directory)
             Action::PromptAcceptSuggestion => {
                 // Get the selected entry info
-                let selected_info = self.file_open_state.as_ref().and_then(|s| {
-                    s.selected_index
-                        .and_then(|idx| s.entries.get(idx))
-                        .map(|e| {
-                            (
-                                e.fs_entry.name.clone(),
-                                e.fs_entry.is_dir(),
-                                e.fs_entry.path.clone(),
-                            )
-                        })
-                });
+                let selected_info =
+                    self.active_window_mut()
+                        .file_open_state
+                        .as_ref()
+                        .and_then(|s| {
+                            s.selected_index
+                                .and_then(|idx| s.entries.get(idx))
+                                .map(|e| {
+                                    (
+                                        e.fs_entry.name.clone(),
+                                        e.fs_entry.is_dir(),
+                                        e.fs_entry.path.clone(),
+                                    )
+                                })
+                        });
 
                 if let Some((name, is_dir, path)) = selected_info {
                     if is_dir {
@@ -105,7 +112,7 @@ impl Editor {
                         self.file_open_navigate_to(path);
                     } else {
                         // Just autocomplete the filename
-                        if let Some(prompt) = &mut self.prompt {
+                        if let Some(prompt) = &mut self.active_window_mut().prompt {
                             prompt.input = name;
                             prompt.cursor_pos = prompt.input.len();
                         }
@@ -119,11 +126,13 @@ impl Editor {
             // Backspace when filter is empty goes to parent
             Action::PromptBackspace => {
                 let filter_empty = self
+                    .active_window_mut()
                     .file_open_state
                     .as_ref()
                     .map(|s| s.filter.is_empty())
                     .unwrap_or(true);
                 let prompt_empty = self
+                    .active_window()
                     .prompt
                     .as_ref()
                     .map(|p| p.input.is_empty())
@@ -141,7 +150,7 @@ impl Editor {
             // Escape cancels
             Action::PromptCancel => {
                 self.cancel_prompt();
-                self.file_open_state = None;
+                self.active_window_mut().file_open_state = None;
                 true
             }
 
@@ -167,6 +176,7 @@ impl Editor {
         let is_folder_mode = self.is_folder_open_mode();
         let is_save_mode = self.is_save_mode();
         let prompt_input = self
+            .active_window()
             .prompt
             .as_ref()
             .map(|p| p.input.clone())
@@ -175,6 +185,7 @@ impl Editor {
 
         // Get the current directory from file open state
         let current_dir = self
+            .active_window_mut()
             .file_open_state
             .as_ref()
             .map(|s| s.current_dir.clone())
@@ -221,7 +232,7 @@ impl Editor {
 
         // Use the selected entry from the file list
         let (path, is_dir) = {
-            let state = match &self.file_open_state {
+            let state = match &self.active_window_mut().file_open_state {
                 Some(s) => s,
                 None => {
                     // If no file is selected but we're in folder mode, use the current directory
@@ -272,8 +283,8 @@ impl Editor {
     /// Select a folder as the new project root (for SwitchProject mode)
     fn file_open_select_folder(&mut self, path: std::path::PathBuf) {
         // Close the file browser
-        self.file_open_state = None;
-        self.prompt = None;
+        self.active_window_mut().file_open_state = None;
+        self.active_window_mut().prompt = None;
 
         // Change the working directory
         self.change_working_dir(path);
@@ -282,7 +293,7 @@ impl Editor {
     /// Navigate to a directory in the file browser
     fn file_open_navigate_to(&mut self, path: std::path::PathBuf) {
         // Clear prompt input
-        if let Some(prompt) = self.prompt.as_mut() {
+        if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             prompt.input.clear();
             prompt.cursor_pos = 0;
         }
@@ -305,14 +316,15 @@ impl Editor {
     ) {
         // Check if encoding detection is disabled - if so, prompt for encoding first
         let detect_encoding = self
+            .active_window_mut()
             .file_open_state
             .as_ref()
             .map(|s| s.detect_encoding)
             .unwrap_or(true);
 
         // Close the file browser
-        self.file_open_state = None;
-        self.prompt = None;
+        self.active_window_mut().file_open_state = None;
+        self.active_window_mut().prompt = None;
 
         if !detect_encoding {
             // Start encoding selection prompt, then open with selected encoding
@@ -322,7 +334,7 @@ impl Editor {
 
         // Reset key context to Normal so editor gets focus
         // This is important when the file explorer was focused before opening the file browser
-        self.key_context = crate::input::keybindings::KeyContext::Normal;
+        self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Normal;
 
         // Open the file with auto-detected encoding
         tracing::info!("[SYNTAX DEBUG] file_open_dialog opening file: {:?}", path);
@@ -421,14 +433,14 @@ impl Editor {
             })
             .collect();
 
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
             "Select encoding: ".to_string(),
             PromptType::OpenFileWithEncoding { path },
             suggestions,
         ));
 
         // Pre-select UTF-8
-        if let Some(prompt) = self.prompt.as_mut() {
+        if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
                 prompt.selected_suggestion = Some(0); // UTF-8 is first
                 let enc = Encoding::Utf8;
@@ -441,12 +453,12 @@ impl Editor {
     /// Create a new file (opens an unsaved buffer that will create the file on save)
     fn file_open_create_new_file(&mut self, path: std::path::PathBuf) {
         // Close the file browser
-        self.file_open_state = None;
-        self.prompt = None;
+        self.active_window_mut().file_open_state = None;
+        self.active_window_mut().prompt = None;
 
         // Reset key context to Normal so editor gets focus
         // This is important when the file explorer was focused before opening the file browser
-        self.key_context = crate::input::keybindings::KeyContext::Normal;
+        self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Normal;
 
         // Open the file - this will create an unsaved buffer with the path set
         if let Err(e) = self.open_file(&path) {
@@ -460,35 +472,11 @@ impl Editor {
 
     /// Save the current buffer to a file (for SaveFileAs mode)
     fn file_open_save_file(&mut self, path: std::path::PathBuf) {
-        use crate::view::prompt::PromptType as PT;
-
         // Close the file browser
-        self.file_open_state = None;
-        self.prompt = None;
+        self.active_window_mut().file_open_state = None;
+        self.active_window_mut().prompt = None;
 
-        // Check if file exists and is different from current file
-        let current_file_path = self
-            .active_state()
-            .buffer
-            .file_path()
-            .map(|p| p.to_path_buf());
-        let is_different_file = current_file_path.as_ref() != Some(&path);
-
-        if is_different_file && path.is_file() {
-            // File exists and is different from current - ask for confirmation
-            let filename = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            self.start_prompt(
-                t!("buffer.overwrite_confirm", name = &filename).to_string(),
-                PT::ConfirmOverwriteFile { path },
-            );
-            return;
-        }
-
-        // Proceed with save
-        self.perform_save_file_as(path);
+        self.save_file_as_with_checks(path);
     }
 
     /// Check if the input looks like a filename that should be created
@@ -510,6 +498,7 @@ impl Editor {
     /// Navigate to parent directory
     fn file_open_go_parent(&mut self) {
         let parent = self
+            .active_window_mut()
             .file_open_state
             .as_ref()
             .and_then(|s| s.current_dir.parent())
@@ -527,6 +516,7 @@ impl Editor {
         }
 
         let filter = self
+            .active_window()
             .prompt
             .as_ref()
             .map(|p| p.input.clone())
@@ -536,6 +526,7 @@ impl Editor {
         // Navigate to the parent directory of the path (so the file appears in the list)
         if filter.contains('/') {
             let current_dir = self
+                .active_window_mut()
                 .file_open_state
                 .as_ref()
                 .map(|s| s.current_dir.clone())
@@ -570,35 +561,35 @@ impl Editor {
             // Navigate to target directory if it exists and is different from current
             if target_dir.is_dir() && target_dir != current_dir {
                 // Update prompt to only show the filename (directory is shown separately)
-                if let Some(prompt) = &mut self.prompt {
+                if let Some(prompt) = &mut self.active_window_mut().prompt {
                     prompt.input = filename.clone();
                     prompt.cursor_pos = prompt.input.len();
                 }
                 self.load_file_open_directory(target_dir);
 
                 // Apply filter with the filename only
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.apply_filter(&filename);
                 }
                 return;
             }
         }
 
-        if let Some(state) = &mut self.file_open_state {
+        if let Some(state) = &mut self.active_window_mut().file_open_state {
             state.apply_filter(&filter);
         }
     }
 
     /// Handle sorting toggle (called from keybinding)
     pub fn file_open_toggle_sort(&mut self, mode: SortMode) {
-        if let Some(state) = &mut self.file_open_state {
+        if let Some(state) = &mut self.active_window_mut().file_open_state {
             state.set_sort_mode(mode);
         }
     }
 
     /// Handle hidden files toggle
     pub fn file_open_toggle_hidden(&mut self) {
-        if let Some(state) = &mut self.file_open_state {
+        if let Some(state) = &mut self.active_window_mut().file_open_state {
             let show_hidden = state.show_hidden;
             state.show_hidden = !show_hidden;
             let new_state = state.show_hidden;
@@ -619,7 +610,7 @@ impl Editor {
 
     /// Handle encoding detection toggle
     pub fn file_open_toggle_detect_encoding(&mut self) {
-        if let Some(state) = &mut self.file_open_state {
+        if let Some(state) = &mut self.active_window_mut().file_open_state {
             state.toggle_detect_encoding();
             let new_state = state.detect_encoding;
 
@@ -641,12 +632,13 @@ impl Editor {
         }
 
         let visible_rows = self
+            .active_window_mut()
             .file_browser_layout
             .as_ref()
             .map(|l| l.visible_rows)
             .unwrap_or(10);
 
-        if let Some(state) = &mut self.file_open_state {
+        if let Some(state) = &mut self.active_window_mut().file_open_state {
             let total_entries = state.entries.len();
             if total_entries <= visible_rows {
                 // No scrolling needed if all entries fit
@@ -676,7 +668,7 @@ impl Editor {
             return false;
         }
 
-        let layout = match &self.file_browser_layout {
+        let layout = match &self.active_window_mut().file_browser_layout {
             Some(l) => l.clone(),
             None => return false,
         };
@@ -684,6 +676,7 @@ impl Editor {
         // Check if click is in the file list
         if layout.is_in_list(x, y) {
             let scroll_offset = self
+                .active_window_mut()
                 .file_open_state
                 .as_ref()
                 .map(|s| s.scroll_offset)
@@ -692,12 +685,13 @@ impl Editor {
             if let Some(index) = layout.click_to_index(y, scroll_offset) {
                 // Get the entry name before mutating state
                 let entry_name = self
+                    .active_window_mut()
                     .file_open_state
                     .as_ref()
                     .and_then(|s| s.entries.get(index))
                     .map(|e| e.fs_entry.name.clone());
 
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.active_section = FileOpenSection::Files;
                     if index < state.entries.len() {
                         state.selected_index = Some(index);
@@ -706,7 +700,7 @@ impl Editor {
 
                 // Update prompt text to show the selected entry name
                 if let Some(name) = entry_name {
-                    if let Some(prompt) = &mut self.prompt {
+                    if let Some(prompt) = &mut self.active_window_mut().prompt {
                         prompt.input = name;
                         prompt.cursor_pos = prompt.input.len();
                     }
@@ -731,6 +725,7 @@ impl Editor {
         if layout.is_in_nav(x, y) {
             // Get shortcut labels for hit testing
             let shortcut_labels: Vec<&str> = self
+                .active_window_mut()
                 .file_open_state
                 .as_ref()
                 .map(|s| s.shortcuts.iter().map(|sc| sc.label.as_str()).collect())
@@ -739,13 +734,14 @@ impl Editor {
             if let Some(shortcut_idx) = layout.nav_shortcut_at(x, y, &shortcut_labels) {
                 // Get the path from the shortcut and navigate there
                 let target_path = self
+                    .active_window_mut()
                     .file_open_state
                     .as_ref()
                     .and_then(|s| s.shortcuts.get(shortcut_idx))
                     .map(|sc| sc.path.clone());
 
                 if let Some(path) = target_path {
-                    if let Some(state) = &mut self.file_open_state {
+                    if let Some(state) = &mut self.active_window_mut().file_open_state {
                         state.active_section = FileOpenSection::Navigation;
                         state.selected_shortcut = shortcut_idx;
                     }
@@ -753,7 +749,7 @@ impl Editor {
                 }
             } else {
                 // Clicked in nav area but not on a shortcut
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.active_section = FileOpenSection::Navigation;
                 }
             }
@@ -774,7 +770,7 @@ impl Editor {
             let rel_y = y.saturating_sub(layout.scrollbar_area.y) as usize;
             let track_height = layout.scrollbar_area.height as usize;
 
-            if let Some(state) = &mut self.file_open_state {
+            if let Some(state) = &mut self.active_window_mut().file_open_state {
                 let total_items = state.entries.len();
                 let visible_items = layout.visible_rows;
 
@@ -797,13 +793,30 @@ impl Editor {
             return false;
         }
 
-        let layout = match &self.file_browser_layout {
+        let layout = match &self.active_window_mut().file_browser_layout {
             Some(l) => l.clone(),
             None => return false,
         };
 
         // Double-click in file list opens/navigates
         if layout.is_in_list(x, y) {
+            // In Switch Project (folder-only) mode, double-clicking a directory
+            // entry should navigate INTO it like a file manager would, rather
+            // than immediately selecting it as the new project root. Selecting
+            // a project root remains available via Enter (or by typing a path)
+            // so keyboard users keep one-keypress confirmation.
+            if self.is_folder_open_mode() {
+                let selected_dir = self.active_window().file_open_state.as_ref().and_then(|s| {
+                    s.selected_index
+                        .and_then(|idx| s.entries.get(idx))
+                        .filter(|e| e.fs_entry.is_dir())
+                        .map(|e| e.fs_entry.path.clone())
+                });
+                if let Some(path) = selected_dir {
+                    self.file_open_navigate_to(path);
+                    return true;
+                }
+            }
             self.file_open_confirm();
             return true;
         }
@@ -815,7 +828,7 @@ impl Editor {
     pub fn compute_file_browser_hover(&self, x: u16, y: u16) -> Option<super::types::HoverTarget> {
         use super::types::HoverTarget;
 
-        let layout = self.file_browser_layout.as_ref()?;
+        let layout = self.active_window().file_browser_layout.as_ref()?;
 
         // Check "Show Hidden" checkbox first (priority over navigation shortcuts)
         if layout.is_on_show_hidden_checkbox(x, y) {
@@ -830,6 +843,7 @@ impl Editor {
         // Check navigation shortcuts
         if layout.is_in_nav(x, y) {
             let shortcut_labels: Vec<&str> = self
+                .active_window()
                 .file_open_state
                 .as_ref()
                 .map(|s| s.shortcuts.iter().map(|sc| sc.label.as_str()).collect())
@@ -850,6 +864,7 @@ impl Editor {
         // Check file list entries
         if layout.is_in_list(x, y) {
             let scroll_offset = self
+                .active_window()
                 .file_open_state
                 .as_ref()
                 .map(|s| s.scroll_offset)
@@ -857,6 +872,7 @@ impl Editor {
 
             if let Some(idx) = layout.click_to_index(y, scroll_offset) {
                 let total_entries = self
+                    .active_window()
                     .file_open_state
                     .as_ref()
                     .map(|s| s.entries.len())

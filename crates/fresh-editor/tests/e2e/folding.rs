@@ -7,7 +7,7 @@ use lsp_types::FoldingRange;
 
 fn set_fold_range(harness: &mut EditorTestHarness, start_line: usize, end_line: usize) {
     let state = harness.editor_mut().active_state_mut();
-    state.folding_ranges = vec![FoldingRange {
+    let ranges = vec![FoldingRange {
         start_line: start_line as u32,
         end_line: end_line as u32,
         start_character: None,
@@ -15,6 +15,9 @@ fn set_fold_range(harness: &mut EditorTestHarness, start_line: usize, end_line: 
         kind: None,
         collapsed_text: None,
     }];
+    state
+        .folding_ranges
+        .set_from_lsp(&state.buffer, &mut state.marker_list, ranges);
 }
 
 fn set_top_line(harness: &mut EditorTestHarness, line: usize) {
@@ -189,6 +192,7 @@ fn test_cursor_down_skips_folded_lines() {
     let buffer_id = harness.editor().active_buffer();
     harness
         .editor_mut()
+        .active_window_mut()
         .toggle_fold_at_line(buffer_id, header_line);
     harness.render().unwrap();
 
@@ -297,6 +301,7 @@ fn test_cursor_down_up_keeps_fold_collapsed() {
     let buffer_id = harness.editor().active_buffer();
     harness
         .editor_mut()
+        .active_window_mut()
         .toggle_fold_at_line(buffer_id, header_line);
     harness.render().unwrap();
 
@@ -464,10 +469,10 @@ fn test_folded_gutter_line_numbers_match_content_during_scroll() -> anyhow::Resu
 
     // 1. Spawn fake LSP that advertises foldingRangeProvider and returns
     //    a single range covering lines 10..30.
-    let _fake_server = FakeLspServer::spawn_with_folding_ranges()?;
-
     // 2. Create a 60-line file where every line is "line N\n".
     let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_with_folding_ranges(temp_dir.path())?;
     let content: String = (0..60).map(|i| format!("line {i}\n")).collect();
     let test_file = temp_dir.path().join("test.rs");
     std::fs::write(&test_file, &content)?;
@@ -480,8 +485,8 @@ fn test_folded_gutter_line_numbers_match_content_during_scroll() -> anyhow::Resu
     config.editor.enable_semantic_tokens_full = true;
     config.lsp.insert(
         "rust".to_string(),
-        fresh::services::lsp::LspServerConfig {
-            command: FakeLspServer::folding_ranges_script_path()
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::folding_ranges_script_path(temp_dir.path())
                 .to_string_lossy()
                 .to_string(),
             args: vec![],
@@ -491,7 +496,11 @@ fn test_folded_gutter_line_numbers_match_content_during_scroll() -> anyhow::Resu
             initialization_options: None,
             env: Default::default(),
             language_id_overrides: Default::default(),
-        },
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
     );
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -557,7 +566,10 @@ fn test_unfold_works_after_folding_ranges_cleared() {
     harness.render().unwrap();
 
     let buffer_id = harness.editor().active_buffer();
-    harness.editor_mut().toggle_fold_at_line(buffer_id, 5);
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_line(buffer_id, 5);
     harness.render().unwrap();
 
     // Verify lines 6-10 are hidden.
@@ -565,15 +577,17 @@ fn test_unfold_works_after_folding_ranges_cleared() {
     harness.assert_screen_not_contains("line 9");
 
     // Simulate LSP disconnect: clear folding_ranges.
-    harness
-        .editor_mut()
-        .active_state_mut()
-        .folding_ranges
-        .clear();
+    {
+        let state = harness.editor_mut().active_state_mut();
+        state.folding_ranges.clear(&mut state.marker_list);
+    }
 
     // Attempt to unfold — the fold markers still exist in the FoldManager.
     let buffer_id = harness.editor().active_buffer();
-    harness.editor_mut().toggle_fold_at_line(buffer_id, 5);
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_line(buffer_id, 5);
     harness.render().unwrap();
 
     // The fold should have been expanded: hidden lines should be visible again.
@@ -679,6 +693,7 @@ fn test_scroll_margin_identical_with_and_without_fold() {
     let buffer_id = harness_folded.editor().active_buffer();
     harness_folded
         .editor_mut()
+        .active_window_mut()
         .toggle_fold_at_line(buffer_id, fold_header);
     harness_folded.render().unwrap();
 
@@ -794,7 +809,10 @@ fn gamma() {
     harness.render().unwrap();
 
     // Fold the block at the cursor using the Toggle Fold command path.
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
 
     // Beta block body should be hidden, with placeholder shown on header.
@@ -808,7 +826,10 @@ fn gamma() {
     harness.assert_screen_contains("gamma_body_1");
 
     // Expand the fold again via the same command.
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
 
     // All body lines should be visible again.
@@ -1262,7 +1283,10 @@ fn test_fold_unfold_at_end_of_large_file_cursor() {
     cursors.primary_mut().position = block_a_header;
     cursors.primary_mut().anchor = None;
     harness.render().unwrap();
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
 
     // block_a body hidden, header shows placeholder, block_b untouched.
@@ -1276,7 +1300,10 @@ fn test_fold_unfold_at_end_of_large_file_cursor() {
     harness.assert_screen_contains("THE_END");
 
     // --- Unfold block_a ---
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
     harness.assert_screen_contains("a_body_1");
     harness.assert_screen_contains("a_body_3");
@@ -1286,7 +1313,10 @@ fn test_fold_unfold_at_end_of_large_file_cursor() {
     cursors.primary_mut().position = block_b_header;
     cursors.primary_mut().anchor = None;
     harness.render().unwrap();
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
 
     // block_b body hidden, block_a untouched.
@@ -1299,7 +1329,10 @@ fn test_fold_unfold_at_end_of_large_file_cursor() {
     harness.assert_screen_contains("THE_END");
 
     // --- Unfold block_b ---
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
     harness.assert_screen_contains("b_body_1");
     harness.assert_screen_contains("b_body_3");
@@ -1365,7 +1398,10 @@ fn test_fold_unfold_function_body_at_end_of_large_file() {
     harness.render().unwrap();
 
     // Toggle fold at cursor — should hide the function body.
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
 
     // The body should be hidden; header, args, and AFTER must remain.
@@ -1391,7 +1427,10 @@ fn test_fold_unfold_function_body_at_end_of_large_file() {
     );
 
     // Toggle fold again to unfold.
-    harness.editor_mut().toggle_fold_at_cursor();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .toggle_fold_at_cursor();
     harness.render().unwrap();
 
     // Everything should be visible again.

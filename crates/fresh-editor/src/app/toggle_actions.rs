@@ -6,6 +6,7 @@
 //! - Reset buffer settings
 //! - Config dump, save, and reload
 
+use crate::types::LspServerConfig;
 use rust_i18n::t;
 
 use crate::config::Config;
@@ -20,19 +21,21 @@ impl Editor {
     /// Line number visibility is stored per-split in `BufferViewState` so that
     /// different splits of the same buffer can independently show/hide line numbers
     /// (e.g., source mode shows them, compose mode hides them).
-    /// Toggle scroll sync for same-buffer splits.
-    pub fn toggle_scroll_sync(&mut self) {
-        self.same_buffer_scroll_sync = !self.same_buffer_scroll_sync;
-        if self.same_buffer_scroll_sync {
-            self.set_status_message(t!("toggle.scroll_sync_enabled").to_string());
-        } else {
-            self.set_status_message(t!("toggle.scroll_sync_disabled").to_string());
-        }
-    }
-
     pub fn toggle_line_numbers(&mut self) {
-        let active_split = self.split_manager.active_split();
-        if let Some(vs) = self.split_view_states.get_mut(&active_split) {
+        let active_split = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
+        if let Some(vs) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .get_mut(&active_split)
+        {
             let currently_shown = vs.show_line_numbers;
             vs.show_line_numbers = !currently_shown;
             if currently_shown {
@@ -43,29 +46,23 @@ impl Editor {
         }
     }
 
-    /// Toggle debug highlight mode for the active buffer
-    /// When enabled, shows byte positions and highlight span info for debugging
-    pub fn toggle_debug_highlights(&mut self) {
-        if let Some(state) = self.buffers.get_mut(&self.active_buffer()) {
-            state.debug_highlight_mode = !state.debug_highlight_mode;
-            if state.debug_highlight_mode {
-                self.set_status_message(t!("toggle.debug_mode_on").to_string());
-            } else {
-                self.set_status_message(t!("toggle.debug_mode_off").to_string());
-            }
-        }
-    }
-
-    /// Toggle menu bar visibility
+    /// Toggle menu bar visibility.
+    ///
+    /// `editor.show_menu_bar` is a global preference, so the toggle updates the
+    /// runtime config and persists the change to the user config layer (same
+    /// pattern as the file-explorer toggles). See issue #1156.
     pub fn toggle_menu_bar(&mut self) {
-        self.menu_bar_visible = !self.menu_bar_visible;
+        let new_value = !self.active_window_mut().menu_bar_visible;
+        self.config_mut().editor.show_menu_bar = new_value;
+        self.active_window_mut().menu_bar_visible = new_value;
         // When explicitly toggling, clear auto-show state
-        self.menu_bar_auto_shown = false;
+        self.active_window_mut().menu_bar_auto_shown = false;
         // Close any open menu when hiding the menu bar
-        if !self.menu_bar_visible {
+        if !self.active_window_mut().menu_bar_visible {
             self.menu_state.close_menu();
         }
-        let status = if self.menu_bar_visible {
+        self.persist_config_change("/editor/show_menu_bar", serde_json::Value::Bool(new_value));
+        let status = if self.active_window_mut().menu_bar_visible {
             t!("toggle.menu_bar_shown")
         } else {
             t!("toggle.menu_bar_hidden")
@@ -73,41 +70,15 @@ impl Editor {
         self.set_status_message(status.to_string());
     }
 
-    /// Toggle tab bar visibility
-    pub fn toggle_tab_bar(&mut self) {
-        self.tab_bar_visible = !self.tab_bar_visible;
-        let status = if self.tab_bar_visible {
-            t!("toggle.tab_bar_shown")
-        } else {
-            t!("toggle.tab_bar_hidden")
-        };
-        self.set_status_message(status.to_string());
-    }
-
-    /// Get tab bar visibility
-    pub fn tab_bar_visible(&self) -> bool {
-        self.tab_bar_visible
-    }
-
-    /// Toggle status bar visibility
-    pub fn toggle_status_bar(&mut self) {
-        self.status_bar_visible = !self.status_bar_visible;
-        let status = if self.status_bar_visible {
-            t!("toggle.status_bar_shown")
-        } else {
-            t!("toggle.status_bar_hidden")
-        };
-        self.set_status_message(status.to_string());
-    }
-
-    /// Get status bar visibility
-    pub fn status_bar_visible(&self) -> bool {
-        self.status_bar_visible
-    }
+    // `toggle_tab_bar` / `toggle_status_bar` / `toggle_prompt_line` and
+    // their `*_visible` getters live on `impl Window` — call them via
+    // `self.active_window_mut().toggle_tab_bar()` etc. (or read
+    // `active_window().tab_bar_visible` for the flag directly).
 
     /// Toggle vertical scrollbar visibility
     pub fn toggle_vertical_scrollbar(&mut self) {
-        self.config.editor.show_vertical_scrollbar = !self.config.editor.show_vertical_scrollbar;
+        let new_value = !self.config.editor.show_vertical_scrollbar;
+        self.config_mut().editor.show_vertical_scrollbar = new_value;
         let status = if self.config.editor.show_vertical_scrollbar {
             t!("toggle.vertical_scrollbar_shown")
         } else {
@@ -118,8 +89,8 @@ impl Editor {
 
     /// Toggle horizontal scrollbar visibility
     pub fn toggle_horizontal_scrollbar(&mut self) {
-        self.config.editor.show_horizontal_scrollbar =
-            !self.config.editor.show_horizontal_scrollbar;
+        let new_value = !self.config.editor.show_horizontal_scrollbar;
+        self.config_mut().editor.show_horizontal_scrollbar = new_value;
         let status = if self.config.editor.show_horizontal_scrollbar {
             t!("toggle.horizontal_scrollbar_shown")
         } else {
@@ -136,7 +107,14 @@ impl Editor {
         // Determine settings from config using buffer's stored language
         let mut whitespace = WhitespaceVisibility::from_editor_config(&self.config.editor);
         let mut auto_close = self.config.editor.auto_close;
-        let (tab_size, use_tabs) = if let Some(state) = self.buffers.get(&buffer_id) {
+        let mut word_characters = String::new();
+        let (tab_size, use_tabs) = if let Some(state) = self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+        {
             let language = &state.language;
             if let Some(lang_config) = self.config.languages.get(language) {
                 whitespace =
@@ -147,23 +125,33 @@ impl Editor {
                         auto_close = lang_auto_close;
                     }
                 }
+                if let Some(ref wc) = lang_config.word_characters {
+                    word_characters = wc.clone();
+                }
                 (
                     lang_config.tab_size.unwrap_or(self.config.editor.tab_size),
-                    lang_config.use_tabs,
+                    lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs),
                 )
             } else {
-                (self.config.editor.tab_size, false)
+                (self.config.editor.tab_size, self.config.editor.use_tabs)
             }
         } else {
-            (self.config.editor.tab_size, false)
+            (self.config.editor.tab_size, self.config.editor.use_tabs)
         };
 
         // Apply settings to buffer
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&buffer_id)
+        {
             state.buffer_settings.tab_size = tab_size;
             state.buffer_settings.use_tabs = use_tabs;
             state.buffer_settings.auto_close = auto_close;
             state.buffer_settings.whitespace = whitespace;
+            state.buffer_settings.word_characters = word_characters;
         }
 
         self.set_status_message(t!("toggle.buffer_settings_reset").to_string());
@@ -173,9 +161,9 @@ impl Editor {
     pub fn toggle_mouse_capture(&mut self) {
         use std::io::stdout;
 
-        self.mouse_enabled = !self.mouse_enabled;
+        self.active_window_mut().mouse_enabled = !self.active_window_mut().mouse_enabled;
 
-        if self.mouse_enabled {
+        if self.active_window_mut().mouse_enabled {
             // Best-effort terminal mouse capture toggle.
             #[allow(clippy::let_underscore_must_use)]
             let _ = crossterm::execute!(stdout(), crossterm::event::EnableMouseCapture);
@@ -190,20 +178,37 @@ impl Editor {
 
     /// Check if mouse capture is enabled
     pub fn is_mouse_enabled(&self) -> bool {
-        self.mouse_enabled
+        self.active_window().mouse_enabled
     }
 
     /// Toggle mouse hover for LSP on/off
+    ///
+    /// On Windows, this also switches the mouse tracking mode: mode 1003
+    /// (all motion) when enabled, mode 1002 (cell motion) when disabled.
     pub fn toggle_mouse_hover(&mut self) {
-        self.config.editor.mouse_hover_enabled = !self.config.editor.mouse_hover_enabled;
+        let new_value = !self.config.editor.mouse_hover_enabled;
+        self.config_mut().editor.mouse_hover_enabled = new_value;
 
         if self.config.editor.mouse_hover_enabled {
             self.set_status_message(t!("toggle.mouse_hover_enabled").to_string());
         } else {
             // Clear any pending hover state
-            self.mouse_state.lsp_hover_state = None;
-            self.mouse_state.lsp_hover_request_sent = false;
+            self.active_window_mut().mouse_state.lsp_hover_state = None;
+            self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
             self.set_status_message(t!("toggle.mouse_hover_disabled").to_string());
+        }
+
+        // On Windows, switch mouse tracking mode to match
+        #[cfg(windows)]
+        {
+            let mode = if self.config.editor.mouse_hover_enabled {
+                fresh_winterm::MouseMode::AllMotion
+            } else {
+                fresh_winterm::MouseMode::CellMotion
+            };
+            if let Err(e) = fresh_winterm::set_mouse_mode(mode) {
+                tracing::error!("Failed to switch mouse mode: {}", e);
+            }
         }
     }
 
@@ -218,12 +223,17 @@ impl Editor {
     /// our own mouse cursor because GPM can't draw on the alternate screen
     /// buffer used by TUI applications.
     pub fn set_gpm_active(&mut self, active: bool) {
-        self.gpm_active = active;
+        self.active_window_mut().gpm_active = active;
     }
 
     /// Toggle inlay hints visibility
     pub fn toggle_inlay_hints(&mut self) {
-        self.config.editor.enable_inlay_hints = !self.config.editor.enable_inlay_hints;
+        let new_value = !self.config.editor.enable_inlay_hints;
+        self.config_mut().editor.enable_inlay_hints = new_value;
+        // `Window::send_lsp_changes_for_buffer` reads
+        // `resources.config.editor.enable_inlay_hints`; sync so the per-edit
+        // LSP refresh sees the new value without waiting for a reload.
+        self.sync_windows_config();
 
         if self.config.editor.enable_inlay_hints {
             // Re-request inlay hints for the active buffer
@@ -231,7 +241,12 @@ impl Editor {
             self.set_status_message(t!("toggle.inlay_hints_enabled").to_string());
         } else {
             // Clear inlay hints from all buffers
-            for state in self.buffers.values_mut() {
+            for (_, state) in self
+                .windows
+                .get_mut(&self.active_window)
+                .map(|w| &mut w.buffers)
+                .expect("active window present")
+            {
                 state.virtual_texts.clear(&mut state.marker_list);
             }
             self.set_status_message(t!("toggle.inlay_hints_disabled").to_string());
@@ -241,7 +256,11 @@ impl Editor {
     /// Dump the current configuration to the user's config file
     pub fn dump_config(&mut self) {
         // Create the config directory if it doesn't exist
-        if let Err(e) = self.filesystem.create_dir_all(&self.dir_context.config_dir) {
+        if let Err(e) = self
+            .authority
+            .filesystem
+            .create_dir_all(&self.dir_context.config_dir)
+        {
             self.set_status_message(
                 t!("error.config_dir_failed", error = e.to_string()).to_string(),
             );
@@ -289,7 +308,8 @@ impl Editor {
     /// Returns Ok(()) on success, or an error message on failure
     pub fn save_config(&self) -> Result<(), String> {
         // Create the config directory if it doesn't exist
-        self.filesystem
+        self.authority
+            .filesystem
             .create_dir_all(&self.dir_context.config_dir)
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
 
@@ -306,15 +326,18 @@ impl Editor {
     /// Uses the layered config system to properly merge with defaults.
     pub fn reload_config(&mut self) {
         let old_theme = self.config.theme.clone();
-        self.config = Config::load_with_layers(&self.dir_context, &self.working_dir);
+        self.set_config(Config::load_with_layers(
+            &self.dir_context,
+            &self.working_dir,
+        ));
 
         // Refresh cached raw user config for plugins
-        self.user_config_raw = Config::read_user_config_raw(&self.working_dir);
+        self.set_user_config_raw(Config::read_user_config_raw(&self.working_dir));
 
         // Apply theme change if needed
         if old_theme != self.config.theme {
             if let Some(theme) = self.theme_registry.get_cloned(&self.config.theme) {
-                self.theme = theme;
+                *self.theme.write().unwrap() = theme;
                 tracing::info!("Theme changed to '{}'", self.config.theme.0);
             } else {
                 tracing::error!("Theme '{}' not found", self.config.theme.0);
@@ -322,21 +345,36 @@ impl Editor {
         }
 
         // Always reload keybindings (complex types don't implement PartialEq)
-        self.keybindings = KeybindingResolver::new(&self.config);
+        *self.keybindings.write().unwrap() = KeybindingResolver::new(&self.config);
 
         // Update clipboard configuration
         self.clipboard.apply_config(&self.config.clipboard);
 
         // Apply bar visibility changes immediately
-        self.menu_bar_visible = self.config.editor.show_menu_bar;
-        self.tab_bar_visible = self.config.editor.show_tab_bar;
-        self.status_bar_visible = self.config.editor.show_status_bar;
+        self.active_window_mut().menu_bar_visible = self.config.editor.show_menu_bar;
+        self.active_window_mut().tab_bar_visible = self.config.editor.show_tab_bar;
+        self.active_window_mut().status_bar_visible = self.config.editor.show_status_bar;
+        self.active_window_mut().prompt_line_visible = self.config.editor.show_prompt_line;
 
         // Update LSP configs
-        if let Some(ref mut lsp) = self.lsp {
-            for (language, lsp_config) in &self.config.lsp {
-                lsp.set_language_config(language.clone(), lsp_config.clone());
+        let __active_id = self.active_window;
+        if let Some(lsp) = self
+            .windows
+            .get_mut(&__active_id)
+            .and_then(|w| w.lsp.as_mut())
+        {
+            for (language, lsp_configs) in &self.config.lsp {
+                lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
             }
+            // Configure universal (global) LSP servers
+            let universal_servers: Vec<LspServerConfig> = self
+                .config
+                .universal_lsp
+                .values()
+                .flat_map(|lc| lc.as_slice().to_vec())
+                .filter(|c| c.enabled)
+                .collect();
+            lsp.set_universal_configs(universal_servers);
         }
 
         // Emit event so plugins know config changed
@@ -357,14 +395,23 @@ impl Editor {
         use crate::view::theme::ThemeLoader;
 
         let theme_loader = ThemeLoader::new(self.dir_context.themes_dir());
-        self.theme_registry = theme_loader.load_all();
+        self.theme_registry = std::sync::Arc::new(theme_loader.load_all(&[]));
+        self.expanded_menus_cache.invalidate();
+
+        // Propagate the new registry to every window's resources so
+        // window-side reads see the updated catalogue. (Theme registry
+        // is `Arc<ThemeRegistry>` not `Arc<RwLock<>>`, so swapping the
+        // Editor's pointer leaves Window clones stale unless we sync.)
+        for w in self.windows.values_mut() {
+            w.resources.theme_registry = self.theme_registry.clone();
+        }
 
         // Update shared theme cache for plugin access
         *self.theme_cache.write().unwrap() = self.theme_registry.to_json_map();
 
         // Re-apply current theme if it still exists, otherwise it might have been updated
         if let Some(theme) = self.theme_registry.get_cloned(&self.config.theme) {
-            self.theme = theme;
+            *self.theme.write().unwrap() = theme;
         }
 
         tracing::info!(

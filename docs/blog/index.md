@@ -8,6 +8,30 @@ Updates on new features and changes in Fresh.
 
 <div class="blog-grid">
 
+<a class="blog-card" href="./fresh-pipeline/">
+  <img src="./fresh-pipeline/showcase.gif" alt="The Architecture of Fresh" />
+  <div class="blog-card-body">
+    <h3>The Architecture of Fresh</h3>
+    <p>A deep dive into the memory-efficient design behind Fresh: piece tree storage, interval trees for markers, and the rendering pipeline.</p>
+  </div>
+</a>
+
+<a class="blog-card" href="./fresh-0.3.0/">
+  <img src="./fresh-0.3.0/review-diff/showcase.gif" alt="What's New (0.3.0)" />
+  <div class="blog-card-body">
+    <h3>What's New (0.3.0)</h3>
+    <p>Startup script (init.ts), dashboard, devcontainers, review diff rewrite, git log, preview tabs, customizable status bar, and more.</p>
+  </div>
+</a>
+
+<a class="blog-card" href="./fresh-0.2.18/">
+  <img src="./fresh-0.2.18/project-search-replace/showcase.gif" alt="What's New (0.2.18)" />
+  <div class="blog-card-body">
+    <h3>What's New (0.2.18)</h3>
+    <p>Project-wide search & replace, inline diagnostics, surround selection, 30 new syntax grammars, and more.</p>
+  </div>
+</a>
+
 <a class="blog-card" href="./fresh-0.2.9/">
   <img src="./fresh-0.2.9/compose-mode/showcase.gif" alt="What's New (0.2.9)" />
   <div class="blog-card-body">

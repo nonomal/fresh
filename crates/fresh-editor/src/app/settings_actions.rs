@@ -10,6 +10,7 @@
 use crate::config::Config;
 use crate::config_io::{ConfigLayer, ConfigResolver};
 use crate::input::keybindings::KeybindingResolver;
+use crate::types::LspServerConfig;
 use anyhow::Result as AnyhowResult;
 use rust_i18n::t;
 
@@ -21,27 +22,37 @@ impl Editor {
         // Include schema at compile time
         const SCHEMA_JSON: &str = include_str!("../../plugins/config-schema.json");
 
-        // Create settings state if not exists, or show existing
-        if self.settings_state.is_none() {
-            match crate::view::settings::SettingsState::new(SCHEMA_JSON, &self.config) {
-                Ok(mut state) => {
-                    // Load layer sources to show where each setting value comes from
-                    let resolver =
-                        ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
-                    if let Ok(sources) = resolver.get_layer_sources() {
-                        state.set_layer_sources(sources);
-                    }
-                    state.show();
-                    self.settings_state = Some(state);
+        // Snapshot of plugin-provided schemas to inject as a
+        // "Plugin Settings" category — clone the map so we can drop
+        // the read lock before constructing SettingsState. Rebuilt on
+        // every open so plugins that lazily register their schemas
+        // after startup (or via Reload Plugin) show up without
+        // requiring a full editor restart.
+        let plugin_schemas = self.plugin_schemas.read().unwrap().clone();
+
+        match crate::view::settings::SettingsState::new_with_plugin_schemas(
+            SCHEMA_JSON,
+            &self.config,
+            &plugin_schemas,
+        ) {
+            Ok(mut state) => {
+                // Load layer sources to show where each setting value comes from
+                let resolver =
+                    ConfigResolver::new(self.dir_context.clone(), self.working_dir.clone());
+                if let Ok(sources) = resolver.get_layer_sources() {
+                    state.set_layer_sources(sources);
                 }
-                Err(e) => {
-                    self.set_status_message(
-                        t!("settings.failed_to_open", error = e.to_string()).to_string(),
-                    );
-                }
+                // Snapshot plugin-registered status-bar tokens for the dual-list picker.
+                let tokens = self.status_bar_token_registry.lock().unwrap().clone();
+                state.set_status_bar_tokens(tokens);
+                state.show();
+                self.settings_state = Some(state);
             }
-        } else if let Some(ref mut state) = self.settings_state {
-            state.show();
+            Err(e) => {
+                self.set_status_message(
+                    t!("settings.failed_to_open", error = e.to_string()).to_string(),
+                );
+            }
         }
     }
 
@@ -66,6 +77,8 @@ impl Editor {
         let old_theme = self.config.theme.clone();
         let old_locale = self.config.locale.clone();
         let old_plugins = self.config.plugins.clone();
+        #[cfg(windows)]
+        let old_mouse_hover = self.config.editor.mouse_hover_enabled;
 
         // Get target layer, new config, and the actual changes made
         let (target_layer, new_config, pending_changes, pending_deletions) = {
@@ -93,15 +106,15 @@ impl Editor {
         };
 
         // Apply the new config
-        self.config = new_config.clone();
+        self.set_config(new_config.clone());
 
         // Refresh cached raw user config for plugins
-        self.user_config_raw = Config::read_user_config_raw(&self.working_dir);
+        self.set_user_config_raw(Config::read_user_config_raw(&self.working_dir));
 
         // Apply runtime changes
         if old_theme != self.config.theme {
             if let Some(theme) = self.theme_registry.get_cloned(&self.config.theme) {
-                self.theme = theme;
+                *self.theme.write().unwrap() = theme;
                 tracing::info!("Theme changed to '{}'", self.config.theme.0);
             } else {
                 tracing::error!("Theme '{}' not found", self.config.theme.0);
@@ -111,15 +124,16 @@ impl Editor {
 
         // Apply locale change at runtime
         if old_locale != self.config.locale {
-            if let Some(locale) = self.config.locale.as_option() {
-                crate::i18n::set_locale(locale);
+            let locale_owned = self.config.locale.as_option().map(|s| s.to_string());
+            if let Some(locale) = locale_owned {
+                crate::i18n::set_locale(&locale);
                 // Regenerate menus with the new locale
-                self.menus = crate::config::MenuConfig::translated();
+                self.set_menus(crate::config::MenuConfig::translated());
                 tracing::info!("Locale changed to '{}'", locale);
             } else {
                 // Auto-detect from environment
                 crate::i18n::init();
-                self.menus = crate::config::MenuConfig::translated();
+                self.set_menus(crate::config::MenuConfig::translated());
                 tracing::info!("Locale reset to auto-detect");
             }
             // Refresh command palette commands with new locale
@@ -132,17 +146,37 @@ impl Editor {
         self.apply_plugin_config_changes(&old_plugins);
 
         // Update keybindings
-        self.keybindings = KeybindingResolver::new(&self.config);
+        *self.keybindings.write().unwrap() = KeybindingResolver::new(&self.config);
 
         // Update LSP configs
-        if let Some(ref mut lsp) = self.lsp {
-            for (language, lsp_config) in &self.config.lsp {
-                lsp.set_language_config(language.clone(), lsp_config.clone());
+        let __active_id = self.active_window;
+        if let Some(lsp) = self
+            .windows
+            .get_mut(&__active_id)
+            .and_then(|w| w.lsp.as_mut())
+        {
+            for (language, lsp_configs) in &self.config.lsp {
+                lsp.set_language_configs(language.clone(), lsp_configs.as_slice().to_vec());
             }
+            // Configure universal (global) LSP servers
+            let universal_servers: Vec<LspServerConfig> = self
+                .config
+                .universal_lsp
+                .values()
+                .flat_map(|lc| lc.as_slice().to_vec())
+                .filter(|c| c.enabled)
+                .collect();
+            lsp.set_universal_configs(universal_servers);
         }
 
         // Propagate editor config to all split and buffer view states
-        for view_state in self.split_view_states.values_mut() {
+        for view_state in self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .values_mut()
+        {
             view_state.show_line_numbers = self.config.editor.line_numbers;
             for buf_state in view_state.keyed_states.values_mut() {
                 buf_state.rulers = self.config.editor.rulers.clone();
@@ -150,20 +184,60 @@ impl Editor {
         }
 
         // Apply bar visibility changes immediately
-        self.menu_bar_visible = self.config.editor.show_menu_bar;
-        self.tab_bar_visible = self.config.editor.show_tab_bar;
-        self.status_bar_visible = self.config.editor.show_status_bar;
+        self.active_window_mut().menu_bar_visible = self.config.editor.show_menu_bar;
+        self.active_window_mut().tab_bar_visible = self.config.editor.show_tab_bar;
+        self.active_window_mut().status_bar_visible = self.config.editor.show_status_bar;
+        self.active_window_mut().prompt_line_visible = self.config.editor.show_prompt_line;
+
+        // Propagate file-explorer settings to live runtime state (IgnorePatterns
+        // and width are shadows of config, not read live on each render).
+        self.active_window_mut().file_explorer_width = self.config.file_explorer.width;
+        self.active_window_mut().file_explorer_side = self.config.file_explorer.side;
+        let active_id = self.active_window;
+        if let Some(explorer) = self
+            .windows
+            .get_mut(&active_id)
+            .and_then(|w| w.file_explorer.as_mut())
+        {
+            let patterns = explorer.ignore_patterns_mut();
+            patterns.set_show_hidden(self.config.file_explorer.show_hidden);
+            patterns.set_show_gitignored(self.config.file_explorer.show_gitignored);
+            explorer.set_compact_directories(self.config.file_explorer.compact_directories);
+        }
+
+        // On Windows, switch mouse tracking mode when mouse_hover_enabled changes.
+        // Mode 1003 (all motion) is used for hover; mode 1002 (cell motion) otherwise.
+        #[cfg(windows)]
+        if old_mouse_hover != self.config.editor.mouse_hover_enabled {
+            let mode = if self.config.editor.mouse_hover_enabled {
+                fresh_winterm::MouseMode::AllMotion
+            } else {
+                // Clear any pending hover state when disabling
+                self.active_window_mut().mouse_state.lsp_hover_state = None;
+                self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
+                fresh_winterm::MouseMode::CellMotion
+            };
+            if let Err(e) = fresh_winterm::set_mouse_mode(mode) {
+                tracing::error!("Failed to switch mouse mode: {}", e);
+            }
+        }
 
         // Propagate tab_size/use_tabs/auto_close/whitespace visibility to all open buffers
         // Each buffer resolves its settings from its language + the new global config
-        for state in self.buffers.values_mut() {
+        for (_, state) in self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+        {
             let mut whitespace =
                 crate::config::WhitespaceVisibility::from_editor_config(&self.config.editor);
             state.buffer_settings.auto_close = self.config.editor.auto_close;
             if let Some(lang_config) = self.config.languages.get(&state.language) {
                 state.buffer_settings.tab_size =
                     lang_config.tab_size.unwrap_or(self.config.editor.tab_size);
-                state.buffer_settings.use_tabs = lang_config.use_tabs;
+                state.buffer_settings.use_tabs =
+                    lang_config.use_tabs.unwrap_or(self.config.editor.use_tabs);
                 whitespace =
                     whitespace.with_language_tab_override(lang_config.show_whitespace_tabs);
                 // Auto close: language override (only if globally enabled)
@@ -172,8 +246,15 @@ impl Editor {
                         state.buffer_settings.auto_close = lang_auto_close;
                     }
                 }
+                // Word characters: from language config
+                if let Some(ref wc) = lang_config.word_characters {
+                    state.buffer_settings.word_characters = wc.clone();
+                } else {
+                    state.buffer_settings.word_characters.clear();
+                }
             } else {
                 state.buffer_settings.tab_size = self.config.editor.tab_size;
+                state.buffer_settings.use_tabs = self.config.editor.use_tabs;
             }
             state.buffer_settings.whitespace = whitespace;
         }
@@ -232,11 +313,11 @@ impl Editor {
 
         // Create parent directory if needed
         if let Some(parent) = path.parent() {
-            self.filesystem.create_dir_all(parent)?;
+            self.authority.filesystem.create_dir_all(parent)?;
         }
 
         // Create file with template if it doesn't exist
-        if !self.filesystem.exists(&path) {
+        if !self.authority.filesystem.exists(&path) {
             let template = match layer {
                 ConfigLayer::User => {
                     r#"{
@@ -267,7 +348,9 @@ impl Editor {
                 }
                 ConfigLayer::System => unreachable!(),
             };
-            self.filesystem.write_file(&path, template.as_bytes())?;
+            self.authority
+                .filesystem
+                .write_file(&path, template.as_bytes())?;
         }
 
         // Close settings and open the config file
@@ -346,9 +429,18 @@ impl Editor {
                     }
                 }
                 1 => {
-                    // Reset button
+                    // Reset/Inherit button — for nullable items, set to null (inherit);
+                    // for non-nullable items, reset to default
                     if let Some(ref mut state) = self.settings_state {
-                        state.reset_current_to_default();
+                        let is_nullable_set = state
+                            .current_item()
+                            .map(|item| item.nullable && !item.is_null)
+                            .unwrap_or(false);
+                        if is_nullable_set {
+                            state.set_current_to_null();
+                        } else {
+                            state.reset_current_to_default();
+                        }
                     }
                 }
                 2 => {
@@ -379,6 +471,7 @@ impl Editor {
                     SettingControl::Dropdown(_) => "dropdown",
                     SettingControl::Text(_) => "text",
                     SettingControl::TextList(_) => "textlist",
+                    SettingControl::DualList(_) => "duallist",
                     SettingControl::Map(_) => "map",
                     SettingControl::ObjectArray(_) => "objectarray",
                     SettingControl::Json(_) => "json",
@@ -615,7 +708,8 @@ impl Editor {
                 // Plugin was disabled, now enabled - load it
                 if let Some(ref path) = path {
                     tracing::info!("Loading newly enabled plugin: {}", name);
-                    if let Err(e) = self.plugin_manager.load_plugin(path) {
+                    let load_result = self.plugin_manager.read().unwrap().load_plugin(path);
+                    if let Err(e) = load_result {
                         tracing::error!("Failed to load plugin '{}': {}", name, e);
                         self.set_status_message(format!("Failed to load plugin '{}': {}", name, e));
                     }
@@ -623,9 +717,13 @@ impl Editor {
             } else {
                 // Plugin was enabled, now disabled - unload it
                 tracing::info!("Unloading disabled plugin: {}", name);
-                if let Err(e) = self.plugin_manager.unload_plugin(&name) {
+                let unload_result = self.plugin_manager.write().unwrap().unload_plugin(&name);
+                if let Err(e) = unload_result {
                     tracing::error!("Failed to unload plugin '{}': {}", name, e);
                     self.set_status_message(format!("Failed to unload plugin '{}': {}", name, e));
+                } else {
+                    // Clean up status bar tokens for this plugin
+                    self.remove_plugin_status_bar_elements(&name);
                 }
             }
         }

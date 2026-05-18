@@ -37,6 +37,11 @@ function setGlobalComposeEnabled(value: boolean): void {
 interface TableWidthInfo {
   maxW: number[];
   allocated: number[];
+  // True iff this row is the markdown source separator (`|---|---|---|`) — the
+  // border code uses this to avoid drawing a duplicate `├─┼─┤` next to it.
+  // Optional for backwards-compat with persisted view states from older
+  // sessions.
+  isSourceSep?: boolean;
 }
 
 // Helper: check whether the active split has compose mode for this buffer
@@ -89,6 +94,161 @@ const HTML_ENTITY_MAP: Record<string, string> = {
   yen: "\u00A5", cent: "\u00A2", sect: "\u00A7", para: "\u00B6",
   laquo: "\u00AB", raquo: "\u00BB", ensp: "\u2002", emsp: "\u2003", thinsp: "\u2009",
 };
+
+// =============================================================================
+// Table border virtual lines (top/bottom + inter-row separators)
+// =============================================================================
+//
+// Markdown tables source-encode only an underline-style separator between the
+// header and the first data row.  In compose mode we already conceal the
+// pipe characters into Unicode box-drawing (`│`, `├`, `┼`, `┤`).  This module
+// adds the *missing* visual frame: a `┌─┬─┐` top border above the header,
+// `├─┼─┤` separators between consecutive data rows (so each row reads as a
+// distinct cell), and a `└─┴─┘` bottom border below the last row.
+//
+// Implementation:
+//
+//   * Borders are virtual lines (no source bytes), keyed per-line via a
+//     unique namespace `md-tb-${lineNumber}`.  The namespace lets us
+//     clear+rebuild borders for one row without disturbing other tables.
+//   * "First/last/source-separator" classification is derived from the
+//     cached widthMap (a row is "known" iff it has a TableWidthInfo entry).
+//     This is cheap and stable across scrolls because widthMap accumulates.
+//   * Border column widths come from the same `allocated` widths used by
+//     processLineConceals, so the borders line up exactly with the cell
+//     conceals.
+
+/** Build a horizontal table border line of the given style for a row. */
+function buildTableBorderLine(
+  allocated: number[],
+  left: string,
+  mid: string,
+  right: string,
+): string {
+  // Each cell render is `│ <text padded to allocated[i] - 2> │` (2 chars of
+  // inside padding).  The matching border slot must therefore be
+  // `allocated[i]` wide of `─` characters between the corner/junction marks.
+  const parts: string[] = [];
+  for (let i = 0; i < allocated.length; i++) {
+    const fill = "─".repeat(Math.max(1, allocated[i]));
+    parts.push(fill);
+  }
+  return left + parts.join(mid) + right;
+}
+
+/** True if `lineContent` looks like a markdown table separator row. */
+function isTableSeparatorContent(lineContent: string): boolean {
+  return /^\|[-:\s|]+\|$/.test(lineContent.trim());
+}
+
+/** Re-emit the table border virtual lines for the given table-row group.
+ *
+ * Detects the group's first/last visible rows by consulting `widthMap`
+ * (which is updated by `processTableAlignment` before this runs).  A row at
+ * `lineNumber - 1` or `lineNumber + 1` that is *not* in `widthMap` is treated
+ * as the boundary of the table's visible extent.
+ */
+function processTableBorders(
+  bufferId: number,
+  lines: Array<{
+    line_number: number;
+    byte_start: number;
+    byte_end: number;
+    content: string;
+  }>,
+  widthMap: Map<number, TableWidthInfo>,
+): void {
+  // Use theme keys (resolved at render time so the borders follow theme
+  // changes — same pattern as addOverlay's fg/bg options).
+  //
+  //   * fg → editor.fg (the default document foreground, matching the
+  //     concealed `│` / `─` glyphs inside row text so the virtual
+  //     `┌─┬─┐` / `├─┼─┤` / `└─┴─┘` frame doesn't create a visible seam
+  //     where it meets the in-text borders)
+  //   * bg → editor.bg (matches the document background so the borders
+  //     blend in rather than carving an opaque slab through the page)
+  const borderOptions = { fg: "editor.fg", bg: "editor.bg" };
+
+  for (const line of lines) {
+    const ns = `md-tb-${line.line_number}`;
+    // Always start by clearing this row's previous borders (handles
+    // edits that removed/widened the row, scrolls that change the
+    // first/last classification, etc.).
+    editor.clearVirtualTextNamespace(bufferId, ns);
+
+    const trimmed = line.content.trim();
+    const isTableRow = trimmed.startsWith("|") || trimmed.endsWith("|");
+    if (!isTableRow) continue;
+
+    const widthInfo = widthMap.get(line.line_number);
+    if (!widthInfo || widthInfo.allocated.length === 0) continue;
+
+    const allocated = widthInfo.allocated;
+    // Prefer the cached flag (set by processTableAlignment from the source
+    // text of this exact row); fall back to a regex check in case this row
+    // was loaded from a persisted view state without the flag.
+    const isSourceSep = widthInfo.isSourceSep === true
+      || isTableSeparatorContent(line.content);
+
+    const prevIsTable = widthMap.has(line.line_number - 1);
+    const nextIsTable = widthMap.has(line.line_number + 1);
+
+    // Top border: only above the very first known row of the table.
+    // ┌─┬─┐ — opens the frame above the header.
+    if (!prevIsTable) {
+      editor.addVirtualLine(
+        bufferId,
+        line.byte_start,
+        buildTableBorderLine(allocated, "┌", "┬", "┐"),
+        borderOptions,
+        true, // above
+        ns,
+        0,
+      );
+    }
+
+    // Inter-row separator: between consecutive *data* rows.
+    //
+    // Skip if either side is the source separator row (`|---|---|---|`)
+    // because the source already provides `├─┼─┤` there via conceals —
+    // adding another above/below would draw two adjacent separator lines.
+    //
+    // Drawn ABOVE the current row when its predecessor is also a (non-
+    // source-separator) table row, so each row owns the separator that
+    // appears above it.
+    const prevInfo = widthMap.get(line.line_number - 1);
+    const prevIsSourceSep = prevInfo?.isSourceSep === true;
+    if (prevIsTable && !isSourceSep && !prevIsSourceSep) {
+      editor.addVirtualLine(
+        bufferId,
+        line.byte_start,
+        buildTableBorderLine(allocated, "├", "┼", "┤"),
+        borderOptions,
+        true, // above
+        ns,
+        1,
+      );
+    }
+
+    // Bottom border: only below the last known row of the table.
+    // └─┴─┘ — closes the frame.  Anchor at the END of the row's bytes
+    // (one before the trailing newline) and place "below".
+    if (!nextIsTable) {
+      // byte_end points just past the newline; anchor at last byte of
+      // the row content so the virtual line renders directly under it.
+      const anchor = Math.max(line.byte_start, line.byte_end - 1);
+      editor.addVirtualLine(
+        bufferId,
+        anchor,
+        buildTableBorderLine(allocated, "└", "┴", "┘"),
+        borderOptions,
+        false, // below
+        ns,
+        0,
+      );
+    }
+  }
+}
 
 // =============================================================================
 // Block-based parser for hanging indent support
@@ -807,6 +967,23 @@ function concealedText(text: string): string {
 const MIN_COL_W = 3;
 
 /**
+ * Return the effective compose width for layout: the configured compose
+ * width clamped to the available viewport width.
+ *
+ * When `config.composeWidth` is explicitly set (e.g. 80) but the editor
+ * content area is smaller (e.g. after the File Explorer sidebar opens),
+ * using the configured value verbatim overflows the viewport. The Rust
+ * render layer already clamps the compose area the same way in
+ * `calculate_compose_layout`; plugin-side computations (table column
+ * allocation, soft-wrap width) need to match.
+ */
+function effectiveComposeWidth(viewportWidth: number): number {
+  const cw = config.composeWidth;
+  if (cw == null) return viewportWidth;
+  return Math.min(cw, viewportWidth);
+}
+
+/**
  * W3C-inspired column width distribution.
  * Constrains columns to fit within `available` width, distributing space
  * proportionally to each column's natural (max) width.
@@ -982,6 +1159,26 @@ function processLineConceals(
         if (lineContent[i] === '|') pipePositions.push(i);
       }
 
+      // Precompute which cells will be truncated. Per-character conceals
+      // that land inside a truncated cell must be suppressed — the cell-
+      // wide truncate conceal already renders the replacement. When both
+      // fire, the per-char conceal at the cell's first byte emits its
+      // replacement, and the cell-wide conceal emits its replacement one
+      // byte later, producing a cell one character wider than allocated.
+      const truncatedCellCharRanges: Array<{start: number; end: number}> = [];
+      if (!cursorStrictlyOnLine && colWidths) {
+        for (let ci = 0; ci < Math.min(cells.length, colWidths.length); ci++) {
+          const cellText = concealedText(cells[ci]);
+          if (cellText.length > colWidths[ci]) {
+            const prevPipe = pipePositions[ci];
+            const nextPipe = pipePositions[ci + 1];
+            if (prevPipe !== undefined && nextPipe !== undefined) {
+              truncatedCellCharRanges.push({ start: prevPipe + 1, end: nextPipe });
+            }
+          }
+        }
+      }
+
       // Track which pipe index we're on (0 = leading pipe)
       let pipeIdx = 0;
       for (let i = 0; i < lineContent.length; i++) {
@@ -1001,11 +1198,15 @@ function processLineConceals(
             const allocatedWidth = colWidths[cellIdx];
 
             if (cellWidth > allocatedWidth) {
-              // Truncate: conceal entire cell content and replace with truncated text
+              // Truncate: conceal entire cell content and replace with truncated text.
+              // Separator rows use box-drawing ─ to match the non-truncated path
+              // (per-char conceals replace source `-` with ─ and pad via pipe replacement).
               const prevPipeCharPos = pipePositions[pipeIdx - 1];
               const cellByteStart = charToByte(lineContent, prevPipeCharPos + 1, byteStart);
               const cellByteEnd = pipeByte;
-              const truncated = cellText.slice(0, allocatedWidth - 1) + '-';
+              const truncated = isSeparator
+                ? '─'.repeat(allocatedWidth)
+                : cellText.slice(0, allocatedWidth - 1) + '-';
               editor.addConceal(bufferId, "md-syntax", cellByteStart, cellByteEnd, truncated);
               truncatedByteRanges.push({start: cellByteStart, end: cellByteEnd});
             } else {
@@ -1028,6 +1229,10 @@ function processLineConceals(
           }
           pipeIdx++;
         } else if (isSeparator && lineContent[i] === '-') {
+          // Skip per-character conceals that land inside a truncated cell;
+          // the cell-wide truncate conceal already handles the rendering.
+          const inTruncated = truncatedCellCharRanges.some(r => i >= r.start && i < r.end);
+          if (inTruncated) continue;
           const db = charToByte(lineContent, i, byteStart);
           editor.addConceal(bufferId, "md-syntax", db, charToByte(lineContent, i + 1, byteStart), "─");
         }
@@ -1132,7 +1337,7 @@ function processLineSoftBreaks(
 
   const viewport = editor.getViewport();
   if (!viewport) return;
-  const width = config.composeWidth ?? viewport.width;
+  const width = effectiveComposeWidth(viewport.width);
 
   // Parse this single line to get block structure
   const blocks = parseMarkdownBlocks(lineContent);
@@ -1220,7 +1425,21 @@ function processLineSoftBreaks(
   }
 
   // Walk through the line content and find word-wrap break points
-  // We need to find Space positions where wrapping should occur
+  // We need to find Space positions where wrapping should occur.
+  //
+  // The wrap budget must reserve columns to match the Rust renderer's
+  // `apply_wrapping_transform`, which subtracts one from `content_width`
+  // to keep the end-of-line cursor off the scrollbar track. If the
+  // plugin uses the full viewport width, it produces lines that fit
+  // exactly N columns; the renderer then re-wraps them at N-1, splitting
+  // off the trailing word into a single-word "orphan" visual row
+  // (issue #1789).
+  //
+  // We subtract two rather than just one so the plugin's wrap output
+  // stays a column inside the renderer's threshold across platforms,
+  // covering minor differences in scrollbar / gutter / EOL-cursor
+  // reservation between terminals.
+  const wrapBudget = Math.max(1, width - 2);
   let column = 0;
   let i = 0;
 
@@ -1235,8 +1454,8 @@ function processLineSoftBreaks(
         nextWordLen += charW[j];
       }
 
-      // Check if space + next word would exceed width
-      if (column + 1 + nextWordLen > width && nextWordLen > 0) {
+      // Check if space + next word would exceed wrap budget
+      if (column + 1 + nextWordLen > wrapBudget && nextWordLen > 0) {
         // Add a soft break at this space's buffer position
         const breakBytePos = byteStart + editor.utf8ByteLength(lineContent.slice(0, i));
         editor.addSoftBreak(bufferId, "md-wrap", breakBytePos, hangingIndent);
@@ -1356,9 +1575,12 @@ function processTableAlignment(
       mergeWith(widthMap.get(ln)!.maxW);
     }
 
-    // Compute allocated widths constrained to viewport
+    // Compute allocated widths constrained to viewport. Clamp the
+    // configured compose width to the actual viewport — otherwise a
+    // large configured width overflows when the editor area shrinks
+    // (e.g. when the File Explorer sidebar opens).
     const viewport = editor.getViewport();
-    const composeW = config.composeWidth ?? (viewport ? viewport.width : 80);
+    const composeW = effectiveComposeWidth(viewport ? viewport.width : 80);
     const numCols = merged.length;
     const available = composeW - (numCols + 1); // subtract pipe/box-drawing characters
     const allocated = distributeColumnWidths(merged, available);
@@ -1375,18 +1597,25 @@ function processTableAlignment(
       if (allocGrew(widthMap.get(ln)!)) { needsRefresh = true; break; }
     }
 
-    // Store merged widths for all lines in the group AND propagate
-    // back to adjacent cached lines so they pick up wider columns
-    // without needing to be re-delivered by lines_changed.
-    const info: TableWidthInfo = { maxW: merged, allocated };
+    // Store merged widths for each line in the group.  We tag the source
+    // separator row (`|---|---|---|`) so the border renderer can skip
+    // drawing a duplicate `├─┼─┤` adjacent to it (the source separator is
+    // already concealed into one).  Each line gets its own info object so
+    // the per-row `isSourceSep` flag is independent.
     for (const line of group) {
-      widthMap.set(line.line_number, info);
+      const isSep = /^\|[-:\s|]+\|$/.test(line.content.trim());
+      widthMap.set(line.line_number, { maxW: merged, allocated, isSourceSep: isSep });
     }
+    // Adjacent cached lines (already-processed neighbours of this group)
+    // need their `allocated` updated but should keep their existing
+    // `isSourceSep` flag — they were classified when they were processed.
     for (let ln = firstLine - 1; widthMap.has(ln); ln--) {
-      widthMap.set(ln, info);
+      const prev = widthMap.get(ln)!;
+      widthMap.set(ln, { maxW: merged, allocated, isSourceSep: prev.isSourceSep });
     }
     for (let ln = lastLine + 1; widthMap.has(ln); ln++) {
-      widthMap.set(ln, info);
+      const prev = widthMap.get(ln)!;
+      widthMap.set(ln, { maxW: merged, allocated, isSourceSep: prev.isSourceSep });
     }
   }
 
@@ -1395,15 +1624,40 @@ function processTableAlignment(
 }
 
 // lines_changed: called for newly visible or invalidated lines
-function onMarkdownLinesChanged(data: {
-  buffer_id: number;
-  lines: Array<{
-    line_number: number;
-    byte_start: number;
-    byte_end: number;
-    content: string;
-  }>;
-}): void {
+
+
+// after_insert: no-op for conceals/overlays.
+// The edit automatically invalidates seen_byte_ranges for affected lines,
+// causing lines_changed to fire on the next render. processLineConceals
+// handles clearing and rebuilding atomically.
+// Marker-based positions auto-adjust with buffer edits, so existing conceals
+// remain visually correct until lines_changed rebuilds them.
+
+
+// after_delete: no-op for conceals/overlays (same reasoning as after_insert).
+
+
+// cursor_moved: update cursor-aware reveal/conceal for old and new cursor lines
+
+
+// view_transform_request is no longer needed — soft wrapping is handled by
+// marker-based soft breaks (computed in lines_changed), and layout hints
+// are set directly via setLayoutHints. This eliminates the one-frame flicker
+// caused by the async view_transform round-trip.
+
+// Handle buffer close events - clean up compose mode tracking
+
+
+// viewport_changed: recalculate table column widths on terminal resize
+
+
+// Re-enable compose mode for buffers restored from a saved session.
+// The Rust side restores ViewMode::Compose and compose_width, but the plugin
+// needs to re-apply line numbers, line wrap, and layout hints when activated.
+
+
+// Register hooks
+editor.on("lines_changed", (data) => {
   if (!isComposingInAnySplit(data.buffer_id)) return;
   const lineNums = data.lines.map(l => `${l.line_number}(${l.byte_start}..${l.byte_end})`).join(', ');
   editor.debug(`[mc] lines_changed: ${data.lines.length} lines: [${lineNums}]`);
@@ -1426,52 +1680,28 @@ function onMarkdownLinesChanged(data: {
     processLineSoftBreaks(data.buffer_id, line.content, line.byte_start, line.byte_end, cursors, line.line_number);
   }
 
+  // Add/refresh table border virtual lines (top/bottom + inter-row separators).
+  // Runs AFTER processTableAlignment so the widthMap reflects the latest
+  // allocated widths, and AFTER processLineConceals so the borders we draw
+  // line up with the cell pipes the conceals produce.
+  const widthMapForBorders = getTableWidths(data.buffer_id);
+  if (widthMapForBorders) {
+    processTableBorders(data.buffer_id, data.lines, widthMapForBorders);
+  }
+
   if (tableWidthsGrew) {
     editor.refreshLines(data.buffer_id);
   }
-}
-registerHandler("onMarkdownLinesChanged", onMarkdownLinesChanged);
-
-// after_insert: no-op for conceals/overlays.
-// The edit automatically invalidates seen_byte_ranges for affected lines,
-// causing lines_changed to fire on the next render. processLineConceals
-// handles clearing and rebuilding atomically.
-// Marker-based positions auto-adjust with buffer edits, so existing conceals
-// remain visually correct until lines_changed rebuilds them.
-function onMarkdownAfterInsert(data: {
-  buffer_id: number;
-  position: number;
-  text: string;
-  affected_start: number;
-  affected_end: number;
-}): void {
+});
+editor.on("after_insert", (data) => {
   if (!isComposingInAnySplit(data.buffer_id)) return;
   editor.debug(`[mc] after_insert: pos=${data.position} text="${data.text.replace(/\n/g,'\\n')}" affected=${data.affected_start}..${data.affected_end}`);
-}
-registerHandler("onMarkdownAfterInsert", onMarkdownAfterInsert);
-
-// after_delete: no-op for conceals/overlays (same reasoning as after_insert).
-function onMarkdownAfterDelete(data: {
-  buffer_id: number;
-  start: number;
-  end: number;
-  deleted_text: string;
-  affected_start: number;
-  deleted_len: number;
-}): void {
+});
+editor.on("after_delete", (data) => {
   if (!isComposingInAnySplit(data.buffer_id)) return;
   editor.debug(`[mc] after_delete: start=${data.start} end=${data.end} deleted="${data.deleted_text.replace(/\n/g,'\\n')}" affected_start=${data.affected_start} deleted_len=${data.deleted_len}`);
-}
-registerHandler("onMarkdownAfterDelete", onMarkdownAfterDelete);
-
-// cursor_moved: update cursor-aware reveal/conceal for old and new cursor lines
-function onMarkdownCursorMoved(data: {
-  buffer_id: number;
-  cursor_id: number;
-  old_position: number;
-  new_position: number;
-  line: number;
-}): void {
+});
+editor.on("cursor_moved", (data) => {
   if (!isComposingInAnySplit(data.buffer_id)) return;
 
   const prevLine = editor.getViewState(data.buffer_id, "last-cursor-line") as number | undefined;
@@ -1483,28 +1713,12 @@ function onMarkdownCursorMoved(data: {
   // auto-expose is span-level (cursor entering/leaving an emphasis or link
   // span within the same line must toggle its syntax markers).
   editor.refreshLines(data.buffer_id);
-}
-registerHandler("onMarkdownCursorMoved", onMarkdownCursorMoved);
-
-// view_transform_request is no longer needed — soft wrapping is handled by
-// marker-based soft breaks (computed in lines_changed), and layout hints
-// are set directly via setLayoutHints. This eliminates the one-frame flicker
-// caused by the async view_transform round-trip.
-
-// Handle buffer close events - clean up compose mode tracking
-function onMarkdownBufferClosed(data: { buffer_id: number }) : void {
+});
+// view_transform_request hook no longer needed — wrapping is handled by soft breaks
+editor.on("buffer_closed", (data) => {
   // View state is cleaned up automatically when the buffer is removed from keyed_states
-}
-registerHandler("onMarkdownBufferClosed", onMarkdownBufferClosed);
-
-// viewport_changed: recalculate table column widths on terminal resize
-function onMarkdownViewportChanged(data: {
-  split_id: number;
-  buffer_id: number;
-  top_byte: number;
-  width: number;
-  height: number;
-}): void {
+});
+editor.on("viewport_changed", (data) => {
   if (!isComposingInAnySplit(data.buffer_id)) return;
   if (data.width === lastViewportWidth) return;
   lastViewportWidth = data.width;
@@ -1512,7 +1726,7 @@ function onMarkdownViewportChanged(data: {
   // Recompute allocated table column widths for new viewport width
   const bufWidths = getTableWidths(data.buffer_id);
   if (bufWidths) {
-    const composeW = config.composeWidth ?? data.width;
+    const composeW = effectiveComposeWidth(data.width);
     const seen = new Set<string>(); // Track by JSON key to deduplicate shared TableWidthInfo
     for (const [lineNum, info] of bufWidths) {
       const key = info.maxW.join(",");
@@ -1525,62 +1739,8 @@ function onMarkdownViewportChanged(data: {
     setTableWidths(data.buffer_id, bufWidths);
   }
   editor.refreshLines(data.buffer_id);
-}
-registerHandler("onMarkdownViewportChanged", onMarkdownViewportChanged);
-
-// Re-enable compose mode for buffers restored from a saved session.
-// The Rust side restores ViewMode::Compose and compose_width, but the plugin
-// needs to re-apply line numbers, line wrap, and layout hints when activated.
-function onMarkdownBufferActivated(data: { buffer_id: number }) : void {
-  const bufferId = data.buffer_id;
-
-  const info = editor.getBufferInfo(bufferId);
-  if (!info || !isMarkdownFile(info.path)) return;
-
-  if (info.view_mode === "compose") {
-    // Restore config.composeWidth from the persisted session value
-    // before enabling compose mode, so enableMarkdownCompose uses
-    // the correct width (same path as a fresh toggle).
-    if (info.compose_width != null) {
-      config.composeWidth = info.compose_width;
-    }
-    enableMarkdownCompose(bufferId);
-  } else if (getGlobalComposeEnabled()) {
-    // Global compose/preview mode is active — auto-enable for newly opened
-    // markdown buffers that aren't already in compose mode.
-    enableMarkdownCompose(bufferId);
-  }
-}
-registerHandler("onMarkdownBufferActivated", onMarkdownBufferActivated);
-
-// Register hooks
-editor.on("lines_changed", "onMarkdownLinesChanged");
-editor.on("after_insert", "onMarkdownAfterInsert");
-editor.on("after_delete", "onMarkdownAfterDelete");
-editor.on("cursor_moved", "onMarkdownCursorMoved");
-// view_transform_request hook no longer needed — wrapping is handled by soft breaks
-editor.on("buffer_closed", "onMarkdownBufferClosed");
-editor.on("viewport_changed", "onMarkdownViewportChanged");
-editor.on("prompt_confirmed", "onMarkdownComposeWidthConfirmed");
-editor.on("buffer_activated", "onMarkdownBufferActivated");
-
-// Set compose width command - starts interactive prompt
-function markdownSetComposeWidth() : void {
-  const currentValue = config.composeWidth === null ? "None" : String(config.composeWidth);
-  editor.startPromptWithInitial(editor.t("prompt.compose_width"), "markdown-compose-width", currentValue);
-  editor.setPromptInputSync(true);
-  editor.setPromptSuggestions([
-    { text: "None", description: editor.t("suggestion.none") },
-    { text: "120", description: editor.t("suggestion.default") },
-  ]);
-}
-registerHandler("markdownSetComposeWidth", markdownSetComposeWidth);
-
-// Handle compose width prompt confirmation
-function onMarkdownComposeWidthConfirmed(args: {
-  prompt_type: string;
-  input: string;
-}): void {
+});
+editor.on("prompt_confirmed", (args) => {
   if (args.prompt_type !== "markdown-compose-width") return;
 
   const input = args.input.trim();
@@ -1610,8 +1770,42 @@ function onMarkdownComposeWidthConfirmed(args: {
   } else {
     editor.setStatus(editor.t("status.invalid_width"));
   }
+});
+editor.on("buffer_activated", (data) => {
+  const bufferId = data.buffer_id;
+
+  const info = editor.getBufferInfo(bufferId);
+  if (!info || !isMarkdownFile(info.path)) return;
+
+  if (info.view_mode === "compose") {
+    // Restore config.composeWidth from the persisted session value
+    // before enabling compose mode, so enableMarkdownCompose uses
+    // the correct width (same path as a fresh toggle).
+    if (info.compose_width != null) {
+      config.composeWidth = info.compose_width;
+    }
+    enableMarkdownCompose(bufferId);
+  } else if (getGlobalComposeEnabled()) {
+    // Global compose/preview mode is active — auto-enable for newly opened
+    // markdown buffers that aren't already in compose mode.
+    enableMarkdownCompose(bufferId);
+  }
+});
+
+// Set compose width command - starts interactive prompt
+function markdownSetComposeWidth() : void {
+  const currentValue = config.composeWidth === null ? "None" : String(config.composeWidth);
+  editor.startPromptWithInitial(editor.t("prompt.compose_width"), "markdown-compose-width", currentValue);
+  editor.setPromptInputSync(true);
+  editor.setPromptSuggestions([
+    { text: "None", description: editor.t("suggestion.none") },
+    { text: "120", description: editor.t("suggestion.default") },
+  ]);
 }
-registerHandler("onMarkdownComposeWidthConfirmed", onMarkdownComposeWidthConfirmed);
+registerHandler("markdownSetComposeWidth", markdownSetComposeWidth);
+
+// Handle compose width prompt confirmation
+
 
 // Register commands
 editor.registerCommand(

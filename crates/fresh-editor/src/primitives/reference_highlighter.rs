@@ -220,6 +220,7 @@ impl ReferenceHighlighter {
             Language::Lua => fresh_languages::tree_sitter_lua::LANGUAGE.into(),
             Language::Pascal => fresh_languages::tree_sitter_pascal::LANGUAGE.into(),
             Language::Json => fresh_languages::tree_sitter_json::LANGUAGE.into(),
+            Language::Jsonc => fresh_languages::tree_sitter_json::LANGUAGE.into(),
             Language::HTML => fresh_languages::tree_sitter_html::LANGUAGE.into(),
             Language::CSS => fresh_languages::tree_sitter_css::LANGUAGE.into(),
             Language::CSharp => fresh_languages::tree_sitter_c_sharp::LANGUAGE.into(),
@@ -519,6 +520,7 @@ impl ReferenceHighlighter {
                     highlights.push(HighlightSpan {
                         range: range.clone(),
                         color: self.highlight_color,
+                        bg: None,
                         category: None,
                     });
                 }
@@ -556,6 +558,7 @@ impl ReferenceHighlighter {
                         highlights.push(HighlightSpan {
                             range: range.clone(),
                             color: self.highlight_color,
+                            bg: None,
                             category: None,
                         });
                     }
@@ -570,6 +573,7 @@ impl ReferenceHighlighter {
                     highlights.push(HighlightSpan {
                         range: range.clone(),
                         color: self.highlight_color,
+                        bg: None,
                         category: None,
                     });
                 }
@@ -670,6 +674,7 @@ impl ReferenceHighlighter {
             .map(|(range, _)| HighlightSpan {
                 range,
                 color: self.highlight_color,
+                bg: None,
                 category: None,
             })
             .collect()
@@ -713,6 +718,7 @@ impl ReferenceHighlighter {
             .map(|range| HighlightSpan {
                 range,
                 color: self.highlight_color,
+                bg: None,
                 category: None,
             })
             .collect()

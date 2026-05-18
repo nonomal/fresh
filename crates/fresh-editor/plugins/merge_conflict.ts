@@ -100,33 +100,90 @@ const mergeState: MergeState = {
   resultContent: "",
 };
 
+// Caches for the buffer_activated / after_file_open detection path.
+// Without these, every tab switch re-spawns `git rev-parse` + `git ls-files`
+// even though their answers rarely change. The detection path is purely a
+// status-bar hint, so a stale answer for a few seconds is harmless.
+const inGitRepoCache: Map<string, boolean> = new Map();
+const detectionLastCheck: Map<string, number> = new Map();
+const DETECTION_TTL_MS = 30_000;
+const detectionInFlight: Map<string, Promise<void>> = new Map();
+
+async function isInGitRepo(fileDir: string): Promise<boolean> {
+  const cached = inGitRepoCache.get(fileDir);
+  if (cached !== undefined) return cached;
+  const gitCheck = await editor.spawnProcess(
+    "git",
+    ["rev-parse", "--is-inside-work-tree"],
+    fileDir,
+  );
+  const ok = gitCheck.exit_code === 0;
+  inGitRepoCache.set(fileDir, ok);
+  return ok;
+}
+
+async function detectMergeConflictFor(
+  path: string,
+  statusOnDetect: () => string,
+): Promise<void> {
+  if (mergeState.isActive) return;
+  if (!path) return;
+
+  const last = detectionLastCheck.get(path);
+  if (last !== undefined && Date.now() - last < DETECTION_TTL_MS) return;
+
+  // Coalesce concurrent callers for the same path onto one in-flight check
+  // (e.g. buffer_activated + after_file_open firing back-to-back).
+  const existing = detectionInFlight.get(path);
+  if (existing) return existing;
+
+  const fileDir = editor.pathDirname(path);
+  const promise = (async () => {
+    try {
+      if (!(await isInGitRepo(fileDir))) return;
+      const lsFiles = await editor.spawnProcess(
+        "git",
+        ["ls-files", "-u", path],
+        fileDir,
+      );
+      if (lsFiles.exit_code === 0 && lsFiles.stdout.trim().length > 0) {
+        editor.setStatus(statusOnDetect());
+      }
+      detectionLastCheck.set(path, Date.now());
+    } catch (_e) {
+      // Not in git repo or other error, ignore
+    } finally {
+      detectionInFlight.delete(path);
+    }
+  })();
+  detectionInFlight.set(path, promise);
+  return promise;
+}
+
 // =============================================================================
 // Color Definitions
 // =============================================================================
 
+// Theme keys preferred over hard-coded RGB so the look tracks the
+// active theme. `addOverlay` accepts theme key strings directly.
+const OURS_FG_KEY = "editor.diff_add_bg";        // green-ish in most themes
+const THEIRS_FG_KEY = "editor.diff_remove_bg";   // red-ish
+const UNRESOLVED_FG_KEY = "ui.file_status_conflicted_fg";
+
 const colors = {
-  // Panel headers
-  oursHeader: [100, 200, 255] as [number, number, number],    // Cyan for OURS
-  theirsHeader: [255, 180, 100] as [number, number, number],  // Orange for THEIRS
-  resultHeader: [150, 255, 150] as [number, number, number],  // Green for RESULT
-
-  // Conflict highlighting
-  conflictOurs: [50, 80, 100] as [number, number, number],    // Blue-tinted background
-  conflictTheirs: [100, 70, 50] as [number, number, number],  // Orange-tinted background
-  conflictBase: [70, 70, 70] as [number, number, number],     // Gray for base
-
-  // Intra-line diff colors
-  diffAdd: [50, 100, 50] as [number, number, number],         // Green for additions
-  diffDel: [100, 50, 50] as [number, number, number],         // Red for deletions
-  diffMod: [50, 50, 100] as [number, number, number],         // Blue for modifications
-
-  // Selection
-  selected: [80, 80, 120] as [number, number, number],        // Selection highlight
-
-  // Buttons/actions
-  button: [100, 149, 237] as [number, number, number],        // Cornflower blue
-  resolved: [100, 200, 100] as [number, number, number],      // Green for resolved
-  unresolved: [200, 100, 100] as [number, number, number],    // Red for unresolved
+  // RGB tuples retained for any future contributor who reaches for them
+  // — the active call sites use the theme keys above. None of these
+  // appear in the currently rendered UI.
+  oursHeader: [100, 200, 255] as [number, number, number],
+  theirsHeader: [255, 180, 100] as [number, number, number],
+  resultHeader: [150, 255, 150] as [number, number, number],
+  conflictBase: [70, 70, 70] as [number, number, number],
+  diffAdd: [50, 100, 50] as [number, number, number],
+  diffDel: [100, 50, 50] as [number, number, number],
+  diffMod: [50, 50, 100] as [number, number, number],
+  selected: [80, 80, 120] as [number, number, number],
+  button: [100, 149, 237] as [number, number, number],
+  resolved: [100, 200, 100] as [number, number, number],
 };
 
 // =============================================================================
@@ -950,7 +1007,7 @@ function highlightPanel(bufferId: number, side: "ours" | "theirs"): void {
   const lines = content.split("\n");
 
   let byteOffset = 0;
-  const conflictColor = side === "ours" ? colors.conflictOurs : colors.conflictTheirs;
+  const conflictColor = side === "ours" ? OURS_FG_KEY : THEIRS_FG_KEY;
 
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
     const line = lines[lineIdx];
@@ -989,7 +1046,7 @@ function highlightResultPanel(bufferId: number): void {
     // Highlight conflict markers
     if (line.startsWith("<<<<<<<") || line.startsWith("=======") || line.startsWith(">>>>>>>")) {
       editor.addOverlay(bufferId, `merge-marker-${lineIdx}`, lineStart, lineEnd, {
-        fg: colors.unresolved,
+        fg: UNRESOLVED_FG_KEY,
         underline: true,
       });
     }
@@ -1700,65 +1757,31 @@ registerHandler("merge_show_help", merge_show_help);
 /**
  * Handle buffer activation - check for conflict markers
  */
-async function onMergeBufferActivated(data: { buffer_id: number }) : Promise<void> {
-  // Don't trigger if already in merge mode
-  if (mergeState.isActive) return;
 
-  // Don't trigger for virtual buffers
-  const info = editor.getBufferInfo(data.buffer_id);
-  if (!info || !info.path) return;
-
-  // Get the directory of the file for running git commands
-  const fileDir = editor.pathDirname(info.path);
-
-  // Check if we're in a git repo first
-  try {
-    const gitCheck = await editor.spawnProcess("git", ["rev-parse", "--is-inside-work-tree"], fileDir);
-    if (gitCheck.exit_code !== 0) return;
-
-    // Check for unmerged entries
-    const lsFiles = await editor.spawnProcess("git", ["ls-files", "-u", info.path], fileDir);
-    if (lsFiles.exit_code === 0 && lsFiles.stdout.trim().length > 0) {
-      editor.setStatus(editor.t("status.detected"));
-    }
-  } catch (e) {
-    // Not in git repo or other error, ignore
-  }
-}
-registerHandler("onMergeBufferActivated", onMergeBufferActivated);
 
 /**
  * Handle file open - check for conflict markers
  */
-async function onMergeAfterFileOpen(data: { buffer_id: number; path: string }) : Promise<void> {
-  // Don't trigger if already in merge mode
-  if (mergeState.isActive) return;
 
-  // Get the directory of the file for running git commands
-  const fileDir = editor.pathDirname(data.path);
-
-  // Check if we're in a git repo first
-  try {
-    const gitCheck = await editor.spawnProcess("git", ["rev-parse", "--is-inside-work-tree"], fileDir);
-    if (gitCheck.exit_code !== 0) return;
-
-    // Check for unmerged entries
-    const lsFiles = await editor.spawnProcess("git", ["ls-files", "-u", data.path], fileDir);
-    if (lsFiles.exit_code === 0 && lsFiles.stdout.trim().length > 0) {
-      editor.setStatus(editor.t("status.detected_file", { path: data.path }));
-    }
-  } catch (e) {
-    // Not in git repo or other error, ignore
-  }
-}
-registerHandler("onMergeAfterFileOpen", onMergeAfterFileOpen);
 
 // =============================================================================
 // Hook Registration
 // =============================================================================
 
-editor.on("buffer_activated", "onMergeBufferActivated");
-editor.on("after_file_open", "onMergeAfterFileOpen");
+editor.on("buffer_activated", async (data) => {
+  const info = editor.getBufferInfo(data.buffer_id);
+  if (!info || !info.path) return;
+  await detectMergeConflictFor(info.path, () => editor.t("status.detected"));
+});
+editor.on("after_file_open", async (data) => {
+  // File-open is a strong signal that state may have changed externally
+  // (e.g. user ran `git merge` then opened the conflicted file). Bypass the
+  // per-path TTL so the detection still runs.
+  detectionLastCheck.delete(data.path);
+  await detectMergeConflictFor(data.path, () =>
+    editor.t("status.detected_file", { path: data.path }),
+  );
+});
 
 // =============================================================================
 // Command Registration - Dynamic based on merge mode state

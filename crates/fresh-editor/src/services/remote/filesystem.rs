@@ -85,6 +85,14 @@ impl RemoteFileSystem {
 
         let is_hidden = name.starts_with('.');
         let permissions = FilePermissions::from_mode(rm.mode);
+
+        #[cfg(unix)]
+        let is_readonly = {
+            let (euid, user_groups) =
+                crate::model::filesystem::StdFileSystem::current_user_groups();
+            permissions.is_readonly_for_user(euid, rm.uid, rm.gid, &user_groups)
+        };
+        #[cfg(not(unix))]
         let is_readonly = permissions.is_readonly();
 
         let mut meta = FileMetadata::new(rm.size)
@@ -468,6 +476,10 @@ impl FileSystem for RemoteFileSystem {
         Some(&self.connection_string)
     }
 
+    fn is_remote_connected(&self) -> bool {
+        self.channel.is_connected()
+    }
+
     fn home_dir(&self) -> io::Result<PathBuf> {
         let result = self
             .channel
@@ -585,6 +597,61 @@ impl FileSystem for RemoteFileSystem {
             .map_err(Self::to_io_error)?;
         Ok(())
     }
+
+    fn walk_files(
+        &self,
+        root: &Path,
+        skip_dirs: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+        on_file: &mut dyn FnMut(&Path, &str) -> bool,
+    ) -> io::Result<()> {
+        let path_str = root.to_string_lossy();
+        let params = serde_json::json!({
+            "path": path_str,
+            "skip_dirs": skip_dirs,
+        });
+
+        // Server-side walk: the remote agent walks the tree and streams
+        // back batches of relative paths.  We process each batch as it
+        // arrives, keeping memory bounded.
+        let (mut data_rx, result_rx) = self
+            .channel
+            .request_streaming_blocking("walk_files", params)
+            .map_err(Self::to_io_error)?;
+
+        // Process streaming batches
+        while let Some(data) = data_rx.blocking_recv() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                // Drop receivers — server sees send fail and stops
+                drop(data_rx);
+                drop(result_rx);
+                return Ok(());
+            }
+
+            if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
+                for file in files {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        drop(result_rx);
+                        return Ok(());
+                    }
+                    if let Some(rel) = file.as_str() {
+                        let abs = root.join(rel);
+                        if !on_file(&abs, rel) {
+                            // Caller limit reached — drop receivers to signal
+                            // cancellation to the server
+                            drop(result_rx);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain the final result — channel may already be closed if the
+        // server finished before we read this, which is fine.
+        drop(result_rx.blocking_recv());
+        Ok(())
+    }
 }
 
 /// Remote file reader - wraps in-memory data
@@ -700,12 +767,22 @@ mod tests {
 
     #[test]
     fn test_convert_metadata() {
+        // Use the current user's uid/gid so the file appears writable regardless
+        // of which user runs the test (on Unix, is_readonly checks effective user).
+        #[cfg(unix)]
+        let (uid, gid) = {
+            let (euid, groups) = crate::model::filesystem::StdFileSystem::current_user_groups();
+            (euid, *groups.first().unwrap_or(&0u32))
+        };
+        #[cfg(not(unix))]
+        let (uid, gid) = (1000u32, 1000u32);
+
         let rm = RemoteMetadata {
             size: 1234,
             mtime: 1700000000,
             mode: 0o644,
-            uid: 1000,
-            gid: 1000,
+            uid,
+            gid,
             dir: false,
             file: true,
             link: false,

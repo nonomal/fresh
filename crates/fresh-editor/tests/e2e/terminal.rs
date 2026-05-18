@@ -13,6 +13,7 @@
 
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
+use fresh::config::{Config, TerminalShellConfig};
 use fresh::services::terminal::TerminalState;
 use portable_pty::{native_pty_system, PtySize};
 
@@ -65,7 +66,10 @@ fn test_open_terminal() {
 /// Test closing a terminal
 #[test]
 fn test_close_terminal() {
-    let mut harness = harness_or_return!(80, 24);
+    // 120×24 instead of 80×24: with `{remote}` on the default
+    // status bar the trailing Messages element is truncated at
+    // 80 cols ("closed" wouldn't fit alongside ` Local | ...`).
+    let mut harness = harness_or_return!(120, 24);
 
     // Open a terminal
     harness.editor_mut().open_terminal();
@@ -135,23 +139,34 @@ fn test_terminal_buffer_identification() {
     let initial_buffer = harness.editor().active_buffer_id();
 
     // Initial buffer should not be a terminal
-    assert!(!harness.editor().is_terminal_buffer(initial_buffer));
+    assert!(!harness
+        .editor()
+        .active_window()
+        .is_terminal_buffer(initial_buffer));
 
     // Open a terminal
     harness.editor_mut().open_terminal();
 
     // Current buffer should now be a terminal
     let terminal_buffer = harness.editor().active_buffer_id();
-    assert!(harness.editor().is_terminal_buffer(terminal_buffer));
+    assert!(harness
+        .editor()
+        .active_window()
+        .is_terminal_buffer(terminal_buffer));
 
     // Should have a valid terminal ID
-    assert!(harness.editor().get_terminal_id(terminal_buffer).is_some());
+    assert!(harness
+        .editor()
+        .active_window()
+        .get_terminal_id(terminal_buffer)
+        .is_some());
 }
 
 /// Test closing terminal when not viewing one shows appropriate message
 #[test]
 fn test_close_terminal_not_viewing() {
-    let mut harness = harness_or_return!(80, 24);
+    // 120×24: see the comment on `test_close_terminal` above.
+    let mut harness = harness_or_return!(120, 24);
 
     // Try to close terminal when viewing regular buffer
     harness.editor_mut().close_terminal();
@@ -193,7 +208,11 @@ fn test_terminal_dimensions() {
 
     // Get the terminal
     let buffer_id = harness.editor().active_buffer_id();
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
 
     // Terminal manager should have this terminal
     let handle = harness
@@ -217,7 +236,10 @@ fn test_terminal_input() {
     harness.editor_mut().open_terminal();
 
     // Send some input
-    harness.editor_mut().send_terminal_input(b"echo hello\n");
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"echo hello\n");
 
     // The input should have been sent (we can't easily verify the output
     // without async processing, but we verify no panic)
@@ -350,7 +372,11 @@ fn test_terminal_state_initialization() {
 
     // Get terminal state
     let buffer_id = harness.editor().active_buffer_id();
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     let handle = harness
         .editor()
         .terminal_manager()
@@ -407,7 +433,11 @@ fn test_terminal_resize() {
     harness.editor_mut().open_terminal();
 
     let buffer_id = harness.editor().active_buffer_id();
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
 
     // Get initial size
     let handle = harness
@@ -418,7 +448,10 @@ fn test_terminal_resize() {
     let (initial_cols, initial_rows) = handle.size();
 
     // Resize the terminal
-    harness.editor_mut().resize_terminal(buffer_id, 120, 40);
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .resize_terminal(buffer_id, 120, 40);
 
     // Get new size
     let handle = harness
@@ -447,6 +480,7 @@ fn test_terminal_buffer_sync_on_exit() {
     // Send commands to the shell to generate output
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'SYNC_TEST_MARKER'\n");
 
     // Wait for the output to appear on screen
@@ -485,7 +519,11 @@ fn test_terminal_buffer_cursor_movement() {
     let buffer_id = harness.editor().active_buffer_id();
 
     // Write some content to the terminal
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
         if let Ok(mut state) = handle.state.lock() {
             state.process_output(b"Line 1\r\n");
@@ -615,7 +653,11 @@ fn test_bug_readonly_mode_rejects_input() {
     let buffer_id = harness.editor().active_buffer_id();
 
     // Write content to terminal
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
         if let Ok(mut state) = handle.state.lock() {
             state.process_output(b"Line 1\r\n");
@@ -671,7 +713,11 @@ fn test_bug_keybindings_work_in_readonly_mode() {
     let buffer_id = harness.editor().active_buffer_id();
 
     // Write content to terminal
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
         if let Ok(mut state) = handle.state.lock() {
             for i in 1..=20 {
@@ -731,6 +777,7 @@ fn test_bug_view_scrolls_to_cursor_on_resume() {
     // Use printf to generate numbered lines
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"for i in $(seq 1 100); do echo \"Line $i\"; done\n");
 
     // Wait for the last line to appear
@@ -741,6 +788,7 @@ fn test_bug_view_scrolls_to_cursor_on_resume() {
     // Add a unique marker at the prompt that we can search for
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'PROMPT_MARKER_XYZ'\n");
 
     // Wait for the marker to appear
@@ -803,7 +851,11 @@ fn test_cursor_at_last_row_no_panic() {
     let buffer_id = harness.editor().active_buffer_id();
 
     // Get the terminal and fill the screen to force cursor to the last row
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
         if let Ok(mut state) = handle.state.lock() {
             // Get the actual terminal size
@@ -842,7 +894,11 @@ fn test_terminal_cursor_boundary_condition() {
     harness.editor_mut().open_terminal();
     let buffer_id = harness.editor().active_buffer_id();
 
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
         if let Ok(mut state) = handle.state.lock() {
             let (_, rows) = state.size();
@@ -880,7 +936,11 @@ fn test_terminal_resize_cursor_out_of_bounds() {
     harness.editor_mut().open_terminal();
     let buffer_id = harness.editor().active_buffer_id();
 
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
 
     // First, position cursor at row 60 in a 70-row terminal
     if let Some(handle) = harness.editor().terminal_manager().get(terminal_id) {
@@ -987,7 +1047,10 @@ fn test_session_restore_terminal_active_buffer() {
         // Verify terminal is active
         let active_buffer_before = harness.editor().active_buffer_id();
         assert!(
-            harness.editor().is_terminal_buffer(active_buffer_before),
+            harness
+                .editor()
+                .active_window()
+                .is_terminal_buffer(active_buffer_before),
             "Terminal should be active buffer before save"
         );
 
@@ -1033,7 +1096,10 @@ fn test_session_restore_terminal_active_buffer() {
 
         // Check what buffer is active according to Editor's active_buffer field (for INPUT)
         let active_buffer_for_input = harness.editor().active_buffer_id();
-        let input_is_terminal = harness.editor().is_terminal_buffer(active_buffer_for_input);
+        let input_is_terminal = harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(active_buffer_for_input);
 
         eprintln!(
             "After restore: active_buffer (for input) = {:?}, is_terminal = {}",
@@ -1162,7 +1228,10 @@ fn test_ui_bindings_work_in_terminal_mode() {
     );
 
     let terminal_buffer = harness.editor().active_buffer_id();
-    assert!(harness.editor().is_terminal_buffer(terminal_buffer));
+    assert!(harness
+        .editor()
+        .active_window()
+        .is_terminal_buffer(terminal_buffer));
 
     // Use Alt+[ to switch to previous split (this should work in terminal mode
     // because it's a UI binding and keyboard capture is OFF)
@@ -1174,7 +1243,10 @@ fn test_ui_bindings_work_in_terminal_mode() {
     // Should have switched to the left split (non-terminal buffer)
     let new_buffer = harness.editor().active_buffer_id();
     assert!(
-        !harness.editor().is_terminal_buffer(new_buffer),
+        !harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(new_buffer),
         "Should have switched to non-terminal buffer via Alt+["
     );
 
@@ -1321,7 +1393,10 @@ fn test_terminal_split_switch_exits_terminal_mode() {
 
     let terminal_buffer = harness.editor().active_buffer_id();
     assert!(
-        harness.editor().is_terminal_buffer(terminal_buffer),
+        harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(terminal_buffer),
         "Active buffer should be terminal"
     );
 
@@ -1371,7 +1446,10 @@ fn test_terminal_split_switch_exits_terminal_mode() {
     // Verify the active buffer is no longer the terminal
     let active_after_click = harness.editor().active_buffer_id();
     assert!(
-        !harness.editor().is_terminal_buffer(active_after_click),
+        !harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(active_after_click),
         "Active buffer should be non-terminal after clicking left split"
     );
 
@@ -1442,7 +1520,10 @@ fn test_click_between_splits_terminal_focus() {
 
     let terminal_buffer = harness.editor().active_buffer_id();
     assert!(
-        harness.editor().is_terminal_buffer(terminal_buffer),
+        harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(terminal_buffer),
         "Active buffer should be terminal"
     );
 
@@ -1468,6 +1549,7 @@ fn test_click_between_splits_terminal_focus() {
         assert!(
             harness
                 .editor()
+                .active_window()
                 .is_terminal_buffer(harness.editor().active_buffer_id()),
             "Iteration {}: Active buffer should be terminal before clicking file split",
             iteration
@@ -1495,6 +1577,7 @@ fn test_click_between_splits_terminal_focus() {
         assert!(
             !harness
                 .editor()
+                .active_window()
                 .is_terminal_buffer(harness.editor().active_buffer_id()),
             "Iteration {}: Active buffer should be file (non-terminal) after clicking file split",
             iteration
@@ -1525,6 +1608,7 @@ fn test_click_between_splits_terminal_focus() {
         assert!(
             harness
                 .editor()
+                .active_window()
                 .is_terminal_buffer(harness.editor().active_buffer_id()),
             "Iteration {}: Active buffer should be terminal after clicking terminal split",
             iteration
@@ -1952,7 +2036,11 @@ fn test_terminal_view_follows_output_at_bottom() {
 
     // Get terminal dimensions
     let buffer_id = harness.editor().active_buffer_id();
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     let (_, rows) = harness
         .editor()
         .terminal_manager()
@@ -1981,6 +2069,7 @@ fn test_terminal_view_follows_output_at_bottom() {
     // Now type a unique marker that we can search for
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo BOTTOM_MARKER_XYZ\n");
 
     // Wait for the marker to appear on screen
@@ -2008,7 +2097,11 @@ fn test_terminal_resize_on_enter_mode() {
 
     // Get terminal size after opening
     let buffer_id = harness.editor().active_buffer_id();
-    let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
     let (cols1, rows1) = harness
         .editor()
         .terminal_manager()
@@ -2098,6 +2191,7 @@ fn test_session_restore_terminal_scrollback() {
         // Generate unique scrollback content
         harness
             .editor_mut()
+            .active_window_mut()
             .send_terminal_input(b"echo 'SCROLLBACK_MARKER_12345'\n");
 
         // Wait for the marker to appear
@@ -2133,7 +2227,11 @@ fn test_session_restore_terminal_scrollback() {
         harness.editor_mut().save_workspace().unwrap();
 
         // Get the backing file path for later verification
-        let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+        let terminal_id = harness
+            .editor()
+            .active_window()
+            .get_terminal_id(buffer_id)
+            .unwrap();
         backing_path_for_check = harness
             .editor()
             .terminal_backing_files()
@@ -2183,7 +2281,10 @@ fn test_session_restore_terminal_scrollback() {
 
         // Find the terminal buffer
         let buffer_id = harness.editor().active_buffer_id();
-        let is_terminal = harness.editor().is_terminal_buffer(buffer_id);
+        let is_terminal = harness
+            .editor()
+            .active_window()
+            .is_terminal_buffer(buffer_id);
 
         if is_terminal {
             // Get buffer content - CRITICAL: The scrollback content should be restored
@@ -2269,6 +2370,7 @@ fn test_scrollback_captured_after_session_restore() {
         // Generate scrollback content with FIRST marker
         harness
             .editor_mut()
+            .active_window_mut()
             .send_terminal_input(b"echo 'FIRST_SESSION_MARKER_AAA'\n");
 
         // Wait for the marker to appear
@@ -2293,7 +2395,11 @@ fn test_scrollback_captured_after_session_restore() {
 
         // Get the backing file path for later verification
         let buffer_id = harness.editor().active_buffer_id();
-        let terminal_id = harness.editor().get_terminal_id(buffer_id).unwrap();
+        let terminal_id = harness
+            .editor()
+            .active_window()
+            .get_terminal_id(buffer_id)
+            .unwrap();
         backing_path_for_check = harness
             .editor()
             .terminal_backing_files()
@@ -2343,6 +2449,7 @@ fn test_scrollback_captured_after_session_restore() {
         // Use many lines to ensure SECOND_MARKER gets pushed into scrollback history
         harness
             .editor_mut()
+            .active_window_mut()
             .send_terminal_input(b"echo 'SECOND_SESSION_MARKER_BBB'\n");
 
         harness
@@ -2352,6 +2459,7 @@ fn test_scrollback_captured_after_session_restore() {
         // Generate more output to push SECOND_MARKER into scrollback
         harness
             .editor_mut()
+            .active_window_mut()
             .send_terminal_input(b"for i in $(seq 1 50); do echo \"Post-restore line $i\"; done\n");
 
         harness
@@ -2429,6 +2537,7 @@ fn test_scrollback_stable_after_multiple_mode_toggles() {
     // Use a unique marker at the START that we can verify we can scroll back to
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'START_MARKER_12345'\n");
 
     // Wait for the start marker
@@ -2439,6 +2548,7 @@ fn test_scrollback_stable_after_multiple_mode_toggles() {
     // Generate many lines to push the start marker into scrollback
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"for i in $(seq 1 50); do echo \"Line $i of output\"; done\n");
 
     // Wait for the last line to appear (ensures command completed)
@@ -2449,6 +2559,7 @@ fn test_scrollback_stable_after_multiple_mode_toggles() {
     // Add an end marker
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'END_MARKER_67890'\n");
 
     harness
@@ -2644,6 +2755,7 @@ fn test_scrollback_viewport_resets_on_reentry() {
     // Generate enough output to create scrollback history
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'HISTORY_START_MARKER'\n");
 
     harness
@@ -2653,6 +2765,7 @@ fn test_scrollback_viewport_resets_on_reentry() {
     // Generate many lines to push the start marker into scrollback
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"for i in $(seq 1 50); do echo \"History line $i\"; done\n");
 
     harness
@@ -2662,6 +2775,7 @@ fn test_scrollback_viewport_resets_on_reentry() {
     // Add an end marker that will be visible at the bottom
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'BOTTOM_MARKER_XYZ'\n");
 
     harness
@@ -2743,6 +2857,7 @@ fn test_scrollback_viewport_resets_on_reentry_mouse_scroll() {
     // Generate enough output to create scrollback history
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'HISTORY_START_MARKER'\n");
 
     harness
@@ -2752,6 +2867,7 @@ fn test_scrollback_viewport_resets_on_reentry_mouse_scroll() {
     // Generate many lines to push the start marker into scrollback
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"for i in $(seq 1 50); do echo \"History line $i\"; done\n");
 
     harness
@@ -2761,6 +2877,7 @@ fn test_scrollback_viewport_resets_on_reentry_mouse_scroll() {
     // Add an end marker that will be visible at the bottom
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'BOTTOM_MARKER_XYZ'\n");
 
     harness
@@ -2838,6 +2955,7 @@ fn test_terminal_exit_keeps_buffer_with_message() {
     // Generate some output before exiting
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo 'BEFORE_EXIT_MARKER'\n");
 
     harness
@@ -2845,7 +2963,10 @@ fn test_terminal_exit_keeps_buffer_with_message() {
         .unwrap();
 
     // Exit the terminal by typing 'exit'
-    harness.editor_mut().send_terminal_input(b"exit\n");
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"exit\n");
 
     // Wait for terminal to exit and buffer to show the exit message
     harness
@@ -2872,7 +2993,7 @@ fn test_terminal_exit_keeps_buffer_with_message() {
 
     // Buffer should be read-only (editing disabled) - verify via is_editing_disabled
     assert!(
-        harness.editor().is_editing_disabled(),
+        harness.editor().active_window().is_editing_disabled(),
         "Buffer should be read-only after terminal exit"
     );
 
@@ -2930,7 +3051,10 @@ fn test_windows_terminal_shows_prompt_and_executes_command() {
     // Send a simple Windows command: echo with a unique marker
     let marker = "FRESH_TERMINAL_TEST_12345";
     let command = format!("echo {}\r\n", marker);
-    harness.editor_mut().send_terminal_input(command.as_bytes());
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(command.as_bytes());
 
     // Wait for the echo output to appear
     let output_result = harness.wait_until(|h| {
@@ -2976,13 +3100,17 @@ fn test_bracket_paste_in_terminal_mode() {
     // Wait for shell prompt to be ready by sending a simple command first
     harness
         .editor_mut()
+        .active_window_mut()
         .send_terminal_input(b"echo SHELL_READY\n");
     harness
         .wait_until(|h| h.screen_to_string().contains("SHELL_READY"))
         .unwrap();
 
     // Now start `cat` which echoes stdin back to stdout
-    harness.editor_mut().send_terminal_input(b"cat\n");
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"cat\n");
 
     // Wait for cat to start (it consumes the echo of the command)
     harness
@@ -3007,5 +3135,325 @@ fn test_bracket_paste_in_terminal_mode() {
     assert!(harness.editor().is_terminal_mode());
 
     // Clean up: send Ctrl+D to exit cat
-    harness.editor_mut().send_terminal_input(b"\x04");
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"\x04");
+}
+
+/// Test that arrow keys work in programs that enable application cursor keys (DECCKM).
+/// Programs like `less` and `git log` set DECCKM mode, which means arrow keys
+/// must be sent as SS3 sequences (\x1bOA) instead of CSI (\x1b[A).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_arrow_keys_in_less() {
+    use std::time::{Duration, Instant};
+
+    crate::common::tracing::init_tracing_from_env();
+
+    let mut harness = harness_or_return!(80, 24);
+
+    /// Helper: wait for `condition` with periodic screen dumps and a hard timeout.
+    /// Panics with full screen contents if the timeout is reached.
+    fn wait_until_with_logging(
+        harness: &mut EditorTestHarness,
+        label: &str,
+        timeout: Duration,
+        mut condition: impl FnMut(&EditorTestHarness) -> bool,
+    ) {
+        let start = Instant::now();
+        let mut iter: u32 = 0;
+        let wait_sleep = Duration::from_millis(50);
+
+        tracing::info!("[arrow_keys] waiting: {}", label);
+        eprintln!("[arrow_keys] waiting: {}", label);
+
+        loop {
+            harness.process_async_and_render().unwrap();
+            if condition(harness) {
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "[arrow_keys] ✓ {} — done after {:.1}s ({} iters)",
+                    label,
+                    elapsed.as_secs_f64(),
+                    iter
+                );
+                eprintln!(
+                    "[arrow_keys] ✓ {} — done after {:.1}s ({} iters)",
+                    label,
+                    elapsed.as_secs_f64(),
+                    iter
+                );
+                return;
+            }
+
+            // Periodic progress logging (every ~5s)
+            if iter % 100 == 0 && iter > 0 {
+                let screen = harness.screen_to_string();
+                let elapsed = start.elapsed();
+                tracing::info!(
+                    "[arrow_keys] still waiting: {} ({:.1}s)\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    elapsed.as_secs_f64(),
+                    screen
+                );
+                eprintln!(
+                    "[arrow_keys] still waiting: {} ({:.1}s)\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    elapsed.as_secs_f64(),
+                    screen
+                );
+            }
+
+            if start.elapsed() > timeout {
+                let screen = harness.screen_to_string();
+                tracing::error!(
+                    "[arrow_keys] TIMEOUT waiting: {} after {:.1}s\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    start.elapsed().as_secs_f64(),
+                    screen
+                );
+                eprintln!(
+                    "[arrow_keys] TIMEOUT waiting: {} after {:.1}s\n--- screen ---\n{}\n--- end screen ---",
+                    label,
+                    start.elapsed().as_secs_f64(),
+                    screen
+                );
+                panic!(
+                    "[arrow_keys] TIMEOUT after {:.1}s waiting for: {}\nScreen:\n{}",
+                    start.elapsed().as_secs_f64(),
+                    label,
+                    screen
+                );
+            }
+
+            std::thread::sleep(wait_sleep);
+            harness.advance_time(wait_sleep);
+            iter += 1;
+        }
+    }
+
+    let timeout = Duration::from_secs(60);
+
+    // Create a numbered file in an isolated temp directory
+    let tmp = tempfile::TempDir::new().unwrap();
+    let test_file = tmp.path().join("less_arrows.txt");
+    let content: String = (1..=100)
+        .map(|i| format!("TLINE_{}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&test_file, &content).unwrap();
+
+    harness.editor_mut().open_terminal();
+    eprintln!("[arrow_keys] terminal opened");
+
+    // Open the file in less (this enters alternate screen and enables DECCKM)
+    let less_cmd = format!("less {}\n", test_file.display());
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(less_cmd.as_bytes());
+    eprintln!("[arrow_keys] sent less command: {}", less_cmd.trim());
+
+    // Wait for less to show the file content
+    wait_until_with_logging(&mut harness, "less shows TLINE_1", timeout, |h| {
+        h.screen_to_string().contains("TLINE_1")
+    });
+
+    // Verify we see the first few lines
+    harness.assert_screen_contains("TLINE_2");
+    harness.assert_screen_contains("TLINE_3");
+
+    // Verify we're NOT seeing lines near the end yet
+    harness.assert_screen_not_contains("TLINE_100");
+    eprintln!("[arrow_keys] initial screen verified, sending Down arrows");
+
+    // Press Down arrow multiple times to scroll down.
+    // In less with DECCKM, this requires SS3 sequences to work.
+    // Send in batches with async processing to let less keep up under load.
+    for batch in 0..4 {
+        for _ in 0..10 {
+            harness
+                .editor_mut()
+                .handle_key(KeyCode::Down, KeyModifiers::NONE)
+                .unwrap();
+        }
+        harness.process_async_and_render().unwrap();
+        eprintln!("[arrow_keys] Down batch {}/4 sent", batch + 1);
+    }
+
+    // After scrolling down 40 lines, line 41 should be visible
+    wait_until_with_logging(
+        &mut harness,
+        "TLINE_41 visible after 40x Down",
+        timeout,
+        |h| h.screen_to_string().contains("TLINE_41"),
+    );
+
+    // The first line should no longer be visible
+    harness.assert_screen_not_contains("TLINE_1");
+    eprintln!("[arrow_keys] Down scroll verified, sending Up arrows");
+
+    // Now press Up arrow to scroll back up
+    for _ in 0..10 {
+        harness
+            .editor_mut()
+            .handle_key(KeyCode::Up, KeyModifiers::NONE)
+            .unwrap();
+    }
+
+    // After scrolling up 10 lines, line 31 should be visible
+    wait_until_with_logging(
+        &mut harness,
+        "TLINE_31 visible after 10x Up",
+        timeout,
+        |h| h.screen_to_string().contains("TLINE_31"),
+    );
+
+    eprintln!("[arrow_keys] Up scroll verified, exiting less");
+
+    // Exit less with 'q'
+    harness
+        .editor_mut()
+        .handle_key(KeyCode::Char('q'), KeyModifiers::NONE)
+        .unwrap();
+
+    eprintln!("[arrow_keys] test complete");
+}
+
+/// Regression test for issue #1637: `terminal.shell` config overrides the
+/// shell command used by the integrated terminal without having to
+/// change `$SHELL`. Picks a command that is definitely not the user's
+/// login shell — `/bin/cat` — and confirms the spawned terminal handle
+/// reports it back.
+#[test]
+fn test_terminal_shell_config_override() {
+    if native_pty_system()
+        .openpty(PtySize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_err()
+    {
+        eprintln!("Skipping terminal test: PTY not available in this environment");
+        return;
+    }
+
+    let override_cmd = "/bin/cat";
+    if !std::path::Path::new(override_cmd).exists() {
+        eprintln!("Skipping terminal test: {} not available", override_cmd);
+        return;
+    }
+
+    let mut config = Config::default();
+    config.terminal.shell = Some(TerminalShellConfig {
+        command: override_cmd.to_string(),
+        args: Vec::new(),
+    });
+
+    let mut harness = match EditorTestHarness::with_config(80, 24, config) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    let terminal_buffer = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(terminal_buffer)
+        .expect("terminal buffer should have a terminal id");
+    let shell = harness
+        .editor()
+        .terminal_manager()
+        .get(terminal_id)
+        .expect("terminal handle should exist")
+        .shell()
+        .to_string();
+
+    assert_eq!(
+        shell, override_cmd,
+        "terminal should spawn with the config-overridden shell"
+    );
+}
+
+/// Regression: a terminal hidden behind another tab during a window resize
+/// should pick up the new dimensions when the user switches back to it,
+/// rather than keeping the stale pre-resize PTY size.  Issue #1795.
+#[test]
+fn test_hidden_terminal_resyncs_pty_size_when_revealed() {
+    let mut harness = harness_or_return!(120, 35);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    let terminal_buffer = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(terminal_buffer)
+        .expect("terminal buffer should have a terminal id");
+    let (cols_before, rows_before) = harness
+        .editor()
+        .terminal_manager()
+        .get(terminal_id)
+        .expect("terminal handle should exist")
+        .size();
+
+    // Move the terminal off-screen by switching to a fresh empty buffer in the
+    // same split.  The terminal is now hidden behind the new tab.
+    harness.new_buffer().unwrap();
+    let other_buffer = harness.editor().active_buffer_id();
+    assert_ne!(other_buffer, terminal_buffer);
+    assert!(!harness
+        .editor()
+        .active_window()
+        .is_terminal_buffer(other_buffer));
+
+    // Shrink the host terminal while the PTY is hidden.  Without the fix,
+    // `resize_visible_terminals` skips the hidden buffer and the PTY keeps
+    // its original geometry.
+    harness.resize(80, 25).unwrap();
+
+    // Sanity: the PTY child still reports the original (stale) dimensions.
+    let (cols_hidden, rows_hidden) = harness
+        .editor()
+        .terminal_manager()
+        .get(terminal_id)
+        .expect("terminal handle should exist")
+        .size();
+    assert_eq!(
+        (cols_hidden, rows_hidden),
+        (cols_before, rows_before),
+        "hidden terminal should not have been resized while off-screen"
+    );
+
+    // Bring the terminal tab back to the front; the PTY size should now
+    // reflect the smaller window.
+    harness.editor_mut().switch_buffer(terminal_buffer);
+    harness.render().unwrap();
+
+    let (cols_after, rows_after) = harness
+        .editor()
+        .terminal_manager()
+        .get(terminal_id)
+        .expect("terminal handle should exist")
+        .size();
+
+    assert!(
+        cols_after < cols_before,
+        "expected PTY cols to shrink after reveal: before={}, after={}",
+        cols_before,
+        cols_after
+    );
+    assert!(
+        rows_after < rows_before,
+        "expected PTY rows to shrink after reveal: before={}, after={}",
+        rows_before,
+        rows_after
+    );
 }

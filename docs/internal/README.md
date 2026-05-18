@@ -11,6 +11,10 @@ architectural decision records for Fresh development.
 | [docs-audit-0.2.13.md](docs-audit-0.2.13.md) | Documentation gap analysis for 0.2.9–0.2.13 with validation checklist |
 | [markdown.md](markdown.md) | Markdown compose mode remaining work |
 | [code-review.md](code-review.md) | Code quality improvements to address |
+| [refactoring-planning-prompt.md](refactoring-planning-prompt.md) | LLM prompt for producing a refactoring plan in the shape of the existing `*-refactor-plan.md` docs |
+| [buffer-refactor-plan.md](buffer-refactor-plan.md) | Plan to decompose `model/buffer.rs` into field-cluster sub-structs (`BufferFormat`, `BufferFileKind`, `Persistence`) |
+| [PLAN-git-log-streaming.md](PLAN-git-log-streaming.md) | Plan to stream `git show` into a file-backed buffer (extend `spawnProcess` with `stdoutTo`; add lightweight `refreshBufferFromDisk`); eliminates 43 MB JS string + 1 M-entry FFI marshal on giant commits |
+| [PLAN-git-log-diff-folding-and-highlighting.md](PLAN-git-log-diff-folding-and-highlighting.md) | Plan for incremental per-file/per-hunk folding (toggleable via standard `toggle_fold` key) and principled syntect-driven diff highlighting (extend `HighlightCategory` + theme bg keys; per-chunk through existing lazy-load), scalable to 2 GB diffs |
 
 Individual design documents for specific features are preserved alongside
 the unified summary for deep-dive reference.

@@ -4,7 +4,7 @@ The Keybinding Editor provides a visual interface for browsing, searching, and c
 
 ## Overview
 
-The editor displays all active keybindings in a searchable, filterable table with five columns:
+The editor displays all active keybindings in a searchable, filterable table. Sections are collapsible, and plugin mode bindings are shown as first-class entries alongside built-in bindings. The table has five columns:
 
 | Column | Description |
 |--------|-------------|
@@ -28,7 +28,7 @@ Two search modes are available:
 
 ### Text Search
 
-Press `/` to start a text search. Type to filter bindings by action name, description, key display, or context. Press `Esc` to cancel.
+Press `/` to start a text search. Type to filter bindings by action name, description, key display, or context. Plugin-registered command names are included in search results. Press `Esc` to cancel.
 
 ### Key Recording Search
 
@@ -55,7 +55,7 @@ The current filter state is shown in the header bar.
 
 When adding or editing a binding, a dialog appears with three fields:
 
-1. **Key** — Press the desired key combination. The dialog starts in key recording mode.
+1. **Key** — Press the desired key combination. The dialog starts in key recording mode. To bind a special key like **Esc**, **Tab**, or **Enter**, press **Enter** on the key field first to enter recording, then press the key you want to bind; press **Escape** to cancel recording.
 2. **Action** — Type an action name. An autocomplete popup shows matching actions as you type. Use `↑`/`↓` to navigate suggestions and `Tab` or `Enter` to accept. Only valid action names are accepted.
 3. **Context** — Use `←`/`→` to cycle through available contexts (global, normal, prompt, popup, file\_explorer, menu, terminal).
 

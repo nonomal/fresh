@@ -9,6 +9,8 @@
 //! - Save conflict detection
 
 use crate::model::buffer::SudoSaveRequired;
+use crate::model::filesystem::FileSystem;
+use crate::view::file_tree::FileTreeView;
 use crate::view::prompt::PromptType;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +26,17 @@ use super::{BufferMetadata, Editor};
 impl Editor {
     /// Save the active buffer
     pub fn save(&mut self) -> anyhow::Result<()> {
+        // Fail fast if remote connection is down
+        if !self.authority.filesystem.is_remote_connected() {
+            anyhow::bail!(
+                "Cannot save: remote connection lost ({})",
+                self.authority
+                    .filesystem
+                    .remote_connection_info()
+                    .unwrap_or("unknown host")
+            );
+        }
+
         let path = self
             .active_state()
             .buffer
@@ -40,6 +53,29 @@ impl Editor {
                         PromptType::ConfirmSudoSave { info },
                     );
                     Ok(())
+                } else if let Some(path) = path {
+                    // Check if failure is due to non-existent parent directory
+                    let is_not_found = e
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound);
+                    if is_not_found {
+                        if let Some(parent) = path.parent() {
+                            if !self.authority.filesystem.exists(parent) {
+                                let dir_name = parent
+                                    .strip_prefix(&self.working_dir)
+                                    .unwrap_or(parent)
+                                    .display()
+                                    .to_string();
+                                self.start_prompt(
+                                    t!("buffer.create_directory_confirm", name = &dir_name)
+                                        .to_string(),
+                                    PromptType::ConfirmCreateDirectory { path },
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(e)
                 } else {
                     Err(e)
                 }
@@ -62,11 +98,19 @@ impl Editor {
     ) -> anyhow::Result<()> {
         // Auto-detect language if it's currently "text" and we have a path
         if let Some(ref p) = path {
-            if let Some(state) = self.buffers.get_mut(&buffer_id) {
+            if let Some(state) = self
+                .windows
+                .get_mut(&self.active_window)
+                .map(|w| &mut w.buffers)
+                .expect("active window present")
+                .get_mut(&buffer_id)
+            {
                 if state.language == "text" {
+                    let first_line = state.buffer.first_line_lossy();
                     let detected =
                         crate::primitives::detected_language::DetectedLanguage::from_path(
                             p,
+                            first_line.as_deref(),
                             &self.grammar_registry,
                             &self.config.languages,
                         );
@@ -76,25 +120,39 @@ impl Editor {
         }
 
         if !silent {
-            self.status_message = Some(t!("status.file_saved").to_string());
+            self.active_window_mut().status_message = Some(t!("status.file_saved").to_string());
         }
 
         // Mark the event log position as saved (for undo modified tracking)
-        if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
+        if let Some(event_log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
             event_log.mark_saved();
         }
 
         // Update file modification time after save
         if let Some(ref p) = path {
-            if let Ok(metadata) = self.filesystem.metadata(p) {
+            if let Ok(metadata) = self.authority.filesystem.metadata(p) {
                 if let Some(mtime) = metadata.modified {
-                    self.file_mod_times.insert(p.clone(), mtime);
+                    self.file_mod_times_mut().insert(p.clone(), mtime);
+                }
+            }
+        }
+
+        // Reload .gitignore in the file explorer when the user saves one.
+        // Otherwise the tree keeps filtering by the old rules until restart.
+        if let Some(ref p) = path {
+            if p.file_name().and_then(|n| n.to_str()) == Some(".gitignore") {
+                if let Some(parent) = p.parent() {
+                    let parent = parent.to_path_buf();
+                    let fs = self.authority.filesystem.clone();
+                    if let Some(explorer) = self.file_explorer_mut().as_mut() {
+                        load_gitignore_via_fs(fs.as_ref(), explorer, &parent);
+                    }
                 }
             }
         }
 
         // Notify LSP of save
-        self.notify_lsp_save_buffer(buffer_id);
+        self.active_window_mut().notify_lsp_save_buffer(buffer_id);
 
         // Delete recovery file (buffer is now saved)
         if let Err(e) = self.delete_buffer_recovery(buffer_id) {
@@ -113,7 +171,7 @@ impl Editor {
 
         // Fire AfterFileSave hook for plugins
         if let Some(ref p) = path {
-            self.plugin_manager.run_hook(
+            self.plugin_manager.read().unwrap().run_hook(
                 "after_file_save",
                 crate::services::plugins::hooks::HookArgs::AfterFileSave {
                     buffer_id,
@@ -132,8 +190,10 @@ impl Editor {
                 Ok(true) => {
                     // Actions ran successfully - if status_message was set by run_on_save_actions
                     // (e.g., for missing optional formatters), keep it. Otherwise update status.
-                    if self.status_message.as_deref() == Some(&t!("status.file_saved")) {
-                        self.status_message =
+                    if self.active_window_mut().status_message.as_deref()
+                        == Some(&t!("status.file_saved"))
+                    {
+                        self.active_window_mut().status_message =
                             Some(t!("status.file_saved_with_actions").to_string());
                     }
                     // else: keep the message set by run_on_save_actions (e.g., missing formatter)
@@ -143,7 +203,7 @@ impl Editor {
                 }
                 Err(e) => {
                     // Action failed, show error but don't fail the save
-                    self.status_message = Some(e);
+                    self.active_window_mut().status_message = Some(e);
                 }
             }
         }
@@ -163,17 +223,22 @@ impl Editor {
             std::time::Duration::from_secs(self.config.editor.auto_save_interval_secs as u64);
         if self
             .time_source
-            .elapsed_since(self.last_persistent_auto_save)
+            .elapsed_since(self.active_window().last_persistent_auto_save)
             < interval
         {
             return Ok(0);
         }
 
-        self.last_persistent_auto_save = self.time_source.now();
+        self.active_window_mut().last_persistent_auto_save = self.time_source.now();
 
         // Collect info for modified buffers that have a file path
         let mut to_save = Vec::new();
-        for (id, state) in &self.buffers {
+        for (id, state) in self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+        {
             if state.buffer.is_modified() {
                 if let Some(path) = state.buffer.file_path() {
                     to_save.push((*id, path.to_path_buf()));
@@ -183,7 +248,13 @@ impl Editor {
 
         let mut count = 0;
         for (id, path) in to_save {
-            if let Some(state) = self.buffers.get_mut(&id) {
+            if let Some(state) = self
+                .windows
+                .get_mut(&self.active_window)
+                .map(|w| &mut w.buffers)
+                .expect("active window present")
+                .get_mut(&id)
+            {
                 match state.buffer.save() {
                     Ok(()) => {
                         self.finalize_save_buffer(id, Some(path), true)?;
@@ -207,12 +278,81 @@ impl Editor {
         Ok(count)
     }
 
+    /// Collect ids of modified unnamed (no on-disk path) buffers in tab order.
+    ///
+    /// Used by the "save and quit" flow to walk a Save-As prompt over each
+    /// unnamed buffer before the editor actually exits.
+    pub(crate) fn collect_unnamed_modified_buffers(&self) -> Vec<BufferId> {
+        let mut out = Vec::new();
+        for (id, state) in self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+        {
+            if !state.buffer.is_modified() {
+                continue;
+            }
+            let is_unnamed = state
+                .buffer
+                .file_path()
+                .map(|p| p.as_os_str().is_empty())
+                .unwrap_or(true);
+            if is_unnamed {
+                out.push(*id);
+            }
+        }
+        out
+    }
+
+    /// Pop the next id from `pending_quit_unnamed_save` and start a Save-As
+    /// prompt for it. Returns true when a prompt was opened (and the editor
+    /// must keep running until the user finishes the chain).
+    pub(crate) fn start_next_quit_save_as(&mut self) -> bool {
+        while let Some(buffer_id) = self
+            .active_window_mut()
+            .pending_quit_unnamed_save
+            .first()
+            .copied()
+        {
+            // Skip ids that vanished or were already saved out from under us.
+            let still_dirty_unnamed = self
+                .buffers()
+                .get(&buffer_id)
+                .map(|s| {
+                    s.buffer.is_modified()
+                        && s.buffer
+                            .file_path()
+                            .map(|p| p.as_os_str().is_empty())
+                            .unwrap_or(true)
+                })
+                .unwrap_or(false);
+            if !still_dirty_unnamed {
+                self.active_window_mut().pending_quit_unnamed_save.remove(0);
+                continue;
+            }
+
+            self.set_active_buffer(buffer_id);
+            self.start_prompt(
+                t!("file.save_as_prompt").to_string(),
+                PromptType::SaveFileAs,
+            );
+            return true;
+        }
+        false
+    }
+
     /// Save all modified file-backed buffers to disk (called on exit when auto_save is enabled).
     /// Unlike `auto_save_persistent_buffers`, this skips the interval check and only saves
     /// named file-backed buffers (not unnamed buffers).
     pub fn save_all_on_exit(&mut self) -> anyhow::Result<usize> {
         let mut to_save = Vec::new();
-        for (id, state) in &self.buffers {
+        for (id, state) in self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+        {
             if state.buffer.is_modified() {
                 if let Some(path) = state.buffer.file_path() {
                     if !path.as_os_str().is_empty() {
@@ -224,7 +364,13 @@ impl Editor {
 
         let mut count = 0;
         for (id, path) in to_save {
-            if let Some(state) = self.buffers.get_mut(&id) {
+            if let Some(state) = self
+                .windows
+                .get_mut(&self.active_window)
+                .map(|w| &mut w.buffers)
+                .expect("active window present")
+                .get_mut(&id)
+            {
                 match state.buffer.save() {
                     Ok(()) => {
                         self.finalize_save_buffer(id, Some(path), true)?;
@@ -257,21 +403,32 @@ impl Editor {
         let path = match self.active_state().buffer.file_path() {
             Some(p) => p.to_path_buf(),
             None => {
-                self.status_message = Some(t!("status.no_file_to_revert").to_string());
+                self.active_window_mut().status_message =
+                    Some(t!("status.no_file_to_revert").to_string());
                 return Ok(false);
             }
         };
 
         if !path.exists() {
-            self.status_message =
+            self.active_window_mut().status_message =
                 Some(t!("status.file_not_exists", path = path.display().to_string()).to_string());
             return Ok(false);
         }
 
         // Save scroll position (from SplitViewState) and cursor positions before reloading
-        let active_split = self.split_manager.active_split();
+        let active_split = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
         let (old_top_byte, old_left_column) = self
-            .split_view_states
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(_, vs)| vs)
+            .expect("active window must have a populated split layout")
             .get(&active_split)
             .map(|vs| (vs.viewport.top_byte, vs.viewport.left_column))
             .unwrap_or((0, 0));
@@ -289,7 +446,7 @@ impl Editor {
             self.config.editor.large_file_threshold_bytes as usize,
             &self.grammar_registry,
             &self.config.languages,
-            std::sync::Arc::clone(&self.filesystem),
+            std::sync::Arc::clone(&self.authority.filesystem),
         )?;
 
         // Restore cursor positions (clamped to valid range for new file size)
@@ -307,53 +464,79 @@ impl Editor {
 
         // Replace the current buffer with the new state
         let buffer_id = self.active_buffer();
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&buffer_id)
+        {
             *state = new_state;
             // Note: line_wrap_enabled is now in SplitViewState.viewport
         }
 
         // Restore cursor positions in SplitViewState (clamped to valid range for new file size)
-        let active_split = self.split_manager.active_split();
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
+        let active_split = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
+        if let Some(view_state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .get_mut(&active_split)
+        {
             view_state.cursors = restored_cursors;
         }
 
         // Restore scroll position in SplitViewState (clamped to valid range for new file size)
-        if let Some(view_state) = self.split_view_states.get_mut(&active_split) {
+        if let Some(view_state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .get_mut(&active_split)
+        {
             view_state.viewport.top_byte = old_top_byte.min(new_file_size);
             view_state.viewport.left_column = old_left_column;
         }
 
         // Clear the undo/redo history for this buffer
-        if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
+        if let Some(event_log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
             *event_log = EventLog::new();
         }
 
         // Clear seen_byte_ranges so plugins get notified of all visible lines
-        self.seen_byte_ranges.remove(&buffer_id);
+        self.active_window_mut().seen_byte_ranges.remove(&buffer_id);
 
         // Update the file modification time
-        if let Ok(metadata) = self.filesystem.metadata(&path) {
+        if let Ok(metadata) = self.authority.filesystem.metadata(&path) {
             if let Some(mtime) = metadata.modified {
-                self.file_mod_times.insert(path.clone(), mtime);
+                self.file_mod_times_mut().insert(path.clone(), mtime);
             }
         }
 
         // Notify LSP that the file was changed
         self.notify_lsp_file_changed(&path);
 
-        self.status_message = Some(t!("status.reverted").to_string());
+        self.active_window_mut().status_message = Some(t!("status.reverted").to_string());
         Ok(true)
     }
 
     /// Toggle auto-revert mode
     pub fn toggle_auto_revert(&mut self) {
-        self.auto_revert_enabled = !self.auto_revert_enabled;
+        self.active_window_mut().auto_revert_enabled = !self.active_window().auto_revert_enabled;
 
-        if self.auto_revert_enabled {
-            self.status_message = Some(t!("status.auto_revert_enabled").to_string());
+        if self.active_window().auto_revert_enabled {
+            self.active_window_mut().status_message =
+                Some(t!("status.auto_revert_enabled").to_string());
         } else {
-            self.status_message = Some(t!("status.auto_revert_disabled").to_string());
+            self.active_window_mut().status_message =
+                Some(t!("status.auto_revert_disabled").to_string());
         }
     }
 
@@ -361,51 +544,93 @@ impl Editor {
     ///
     /// Checks modification times of open files to detect external changes.
     /// Returns true if any file was changed (requires re-render).
+    ///
+    /// To avoid blocking the event loop, metadata checks run on a background
+    /// thread. This method launches a poll if the interval has elapsed and no
+    /// poll is already in flight, then checks for results from a prior poll.
     pub fn poll_file_changes(&mut self) -> bool {
         // Skip if auto-revert is disabled
-        if !self.auto_revert_enabled {
+        if !self.active_window().auto_revert_enabled {
             return false;
+        }
+
+        // Check for results from a previous background poll
+        let mut any_changed = false;
+        if let Some(ref rx) = self.active_window_mut().pending_file_poll_rx {
+            match rx.try_recv() {
+                Ok(results) => {
+                    self.active_window_mut().pending_file_poll_rx = None;
+                    any_changed = self.process_file_poll_results(results);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still in progress — don't block, don't start another
+                    return false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Background task panicked or was dropped
+                    self.active_window_mut().pending_file_poll_rx = None;
+                }
+            }
         }
 
         // Check poll interval
         let poll_interval =
             std::time::Duration::from_millis(self.config.editor.auto_revert_poll_interval_ms);
-        let elapsed = self.time_source.elapsed_since(self.last_auto_revert_poll);
+        let last_poll = self.active_window().last_auto_revert_poll;
+        let elapsed = self.time_source.elapsed_since(last_poll);
         tracing::trace!(
             "poll_file_changes: elapsed={:?}, poll_interval={:?}",
             elapsed,
             poll_interval
         );
         if elapsed < poll_interval {
-            return false;
+            return any_changed;
         }
-        self.last_auto_revert_poll = self.time_source.now();
+        self.active_window_mut().last_auto_revert_poll = self.time_source.now();
 
         // Collect paths of open files that need checking
-        let files_to_check: Vec<PathBuf> = self
-            .buffers
-            .values()
-            .filter_map(|state| state.buffer.file_path().map(PathBuf::from))
-            .collect();
+        let files_to_check: Vec<PathBuf> = self.buffers().paths();
 
+        if files_to_check.is_empty() {
+            return any_changed;
+        }
+
+        // Spawn background metadata checks
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs = self.authority.filesystem.clone();
+        std::thread::Builder::new()
+            .name("poll-file-changes".to_string())
+            .spawn(move || {
+                let results: Vec<(PathBuf, Option<std::time::SystemTime>)> = files_to_check
+                    .into_iter()
+                    .map(|path| {
+                        let mtime = fs.metadata(&path).ok().and_then(|m| m.modified);
+                        (path, mtime)
+                    })
+                    .collect();
+                // Receiver may have been dropped if auto-revert was disabled
+                // or the editor is shutting down — that's fine.
+                if tx.send(results).is_err() {}
+            })
+            .ok();
+        self.active_window_mut().pending_file_poll_rx = Some(rx);
+
+        any_changed
+    }
+
+    /// Process results from a background file poll
+    fn process_file_poll_results(
+        &mut self,
+        results: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    ) -> bool {
         let mut any_changed = false;
-
-        for path in files_to_check {
-            // Get current mtime
-            let current_mtime = match self.filesystem.metadata(&path) {
-                Ok(meta) => match meta.modified {
-                    Some(mtime) => mtime,
-                    None => continue,
-                },
-                Err(_) => continue, // File might have been deleted
+        for (path, mtime_opt) in results {
+            let Some(current_mtime) = mtime_opt else {
+                continue;
             };
 
-            // Check if mtime has changed
-            if let Some(&stored_mtime) = self.file_mod_times.get(&path) {
+            if let Some(&stored_mtime) = self.file_mod_times().get(&path) {
                 if current_mtime != stored_mtime {
-                    // Handle the file change (this includes debouncing)
-                    // Note: file_mod_times is updated by handle_file_changed after successful revert,
-                    // not here, to avoid the race where the revert check sees the already-updated mtime
                     let path_str = path.display().to_string();
                     if self.handle_async_file_changed(path_str) {
                         any_changed = true;
@@ -413,10 +638,9 @@ impl Editor {
                 }
             } else {
                 // First time seeing this file, record its mtime
-                self.file_mod_times.insert(path, current_mtime);
+                self.file_mod_times_mut().insert(path, current_mtime);
             }
         }
-
         any_changed
     }
 
@@ -424,22 +648,73 @@ impl Editor {
     ///
     /// Checks modification times of expanded directories to detect new/deleted files.
     /// Returns true if any directory was refreshed (requires re-render).
+    ///
+    /// Like poll_file_changes, metadata checks run on a background thread to
+    /// avoid blocking the event loop.
     pub fn poll_file_tree_changes(&mut self) -> bool {
+        use crate::view::file_tree::NodeId;
+
+        // Check for results from a previous background poll
+        let mut any_refreshed = false;
+        let mut dir_poll_pending = false;
+        if let Some(ref rx) = self.active_window_mut().pending_dir_poll_rx {
+            match rx.try_recv() {
+                Ok((dir_results, git_index_mtime)) => {
+                    self.active_window_mut().pending_dir_poll_rx = None;
+                    any_refreshed = self.process_dir_poll_results(dir_results, git_index_mtime);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    dir_poll_pending = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.active_window_mut().pending_dir_poll_rx = None;
+                }
+            }
+        }
+
         // Check poll interval
         let poll_interval =
             std::time::Duration::from_millis(self.config.editor.file_tree_poll_interval_ms);
-        if self.time_source.elapsed_since(self.last_file_tree_poll) < poll_interval {
-            return false;
+        let last_tree_poll = self.active_window().last_file_tree_poll;
+        if self.time_source.elapsed_since(last_tree_poll) < poll_interval {
+            return any_refreshed;
         }
-        self.last_file_tree_poll = self.time_source.now();
+        self.active_window_mut().last_file_tree_poll = self.time_source.now();
+
+        // Re-stat every loaded .gitignore and reload/drop as needed, so
+        // external edits (git pull, sed, another editor) and deletions take
+        // effect without a restart. In-editor saves already reload eagerly
+        // via finalize_save_buffer. Sync I/O here — a handful of small files
+        // and all access goes through the filesystem authority.
+        if self.sync_gitignores_from_disk() {
+            any_refreshed = true;
+        }
+
+        // If a previous dir-poll is still in flight, don't stack another.
+        if dir_poll_pending {
+            return any_refreshed;
+        }
+
+        // Resolve the git index path once (first poll only). This uses the
+        // ProcessSpawner which may block briefly on the first call, but only
+        // happens once per session.
+        if !self.active_window_mut().git_index_resolved {
+            self.active_window_mut().git_index_resolved = true;
+            if let Some(path) = self.resolve_git_index() {
+                if let Ok(meta) = self.authority.filesystem.metadata(&path) {
+                    if let Some(mtime) = meta.modified {
+                        self.active_window_mut().dir_mod_times.insert(path, mtime);
+                    }
+                }
+            }
+        }
 
         // Get file explorer reference
-        let Some(explorer) = &self.file_explorer else {
-            return false;
+        let Some(explorer) = self.file_explorer() else {
+            return any_refreshed;
         };
 
         // Collect expanded directories (node_id, path)
-        use crate::view::file_tree::NodeId;
         let expanded_dirs: Vec<(NodeId, PathBuf)> = explorer
             .tree()
             .all_nodes()
@@ -447,49 +722,240 @@ impl Editor {
             .map(|node| (node.id, node.entry.path.clone()))
             .collect();
 
-        // Check mtimes and collect directories that need refresh
-        let mut dirs_to_refresh: Vec<NodeId> = Vec::new();
+        // Find the git index path to include in the background metadata check
+        let git_index_path: Option<PathBuf> = self
+            .active_window()
+            .dir_mod_times
+            .keys()
+            .find(|p| p.ends_with(".git/index") || p.ends_with(".git\\index"))
+            .cloned();
 
-        for (node_id, path) in expanded_dirs {
-            // Get current mtime
-            let current_mtime = match self.filesystem.metadata(&path) {
-                Ok(meta) => match meta.modified {
-                    Some(mtime) => mtime,
-                    None => continue,
-                },
-                Err(_) => continue, // Directory might have been deleted
+        if expanded_dirs.is_empty() && git_index_path.is_none() {
+            return any_refreshed;
+        }
+
+        // Spawn background metadata checks (directories + git index)
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs = self.authority.filesystem.clone();
+        std::thread::Builder::new()
+            .name("poll-dir-changes".to_string())
+            .spawn(move || {
+                let results: Vec<(NodeId, PathBuf, Option<std::time::SystemTime>)> = expanded_dirs
+                    .into_iter()
+                    .map(|(node_id, path)| {
+                        let mtime = fs.metadata(&path).ok().and_then(|m| m.modified);
+                        (node_id, path, mtime)
+                    })
+                    .collect();
+
+                // Also check git index mtime in the same background thread
+                let git_index_mtime = git_index_path.and_then(|path| {
+                    let mtime = fs.metadata(&path).ok().and_then(|m| m.modified);
+                    Some((path, mtime?))
+                });
+
+                // Receiver may have been dropped during shutdown — that's fine.
+                if tx.send((results, git_index_mtime)).is_err() {}
+            })
+            .ok();
+        self.active_window_mut().pending_dir_poll_rx = Some(rx);
+
+        any_refreshed
+    }
+
+    /// Process results from a background directory poll
+    fn process_dir_poll_results(
+        &mut self,
+        results: Vec<(
+            crate::view::file_tree::NodeId,
+            PathBuf,
+            Option<std::time::SystemTime>,
+        )>,
+        git_index_mtime: Option<(PathBuf, std::time::SystemTime)>,
+    ) -> bool {
+        let mut dirs_to_refresh: Vec<(crate::view::file_tree::NodeId, PathBuf)> = Vec::new();
+
+        for (node_id, path, mtime_opt) in results {
+            let Some(current_mtime) = mtime_opt else {
+                continue;
             };
 
-            // Check if mtime has changed
-            if let Some(&stored_mtime) = self.dir_mod_times.get(&path) {
+            if let Some(&stored_mtime) = self.active_window_mut().dir_mod_times.get(&path) {
                 if current_mtime != stored_mtime {
-                    // Update stored mtime
-                    self.dir_mod_times.insert(path.clone(), current_mtime);
-                    dirs_to_refresh.push(node_id);
+                    self.active_window_mut()
+                        .dir_mod_times
+                        .insert(path.clone(), current_mtime);
+                    dirs_to_refresh.push((node_id, path.clone()));
                     tracing::debug!("Directory changed: {:?}", path);
                 }
             } else {
-                // First time seeing this directory, record its mtime
-                self.dir_mod_times.insert(path, current_mtime);
+                self.active_window_mut()
+                    .dir_mod_times
+                    .insert(path, current_mtime);
             }
         }
 
-        // Refresh changed directories
-        if dirs_to_refresh.is_empty() {
+        // Check if .git/index mtime changed (detected in background thread)
+        let git_index_changed = if let Some((path, current_mtime)) = git_index_mtime {
+            if let Some(&stored_mtime) = self.active_window_mut().dir_mod_times.get(&path) {
+                if current_mtime != stored_mtime {
+                    self.active_window_mut()
+                        .dir_mod_times
+                        .insert(path, current_mtime);
+                    self.plugin_manager.read().unwrap().run_hook(
+                        "focus_gained",
+                        crate::services::plugins::hooks::HookArgs::FocusGained {},
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if dirs_to_refresh.is_empty() && !git_index_changed {
             return false;
         }
 
-        // Refresh each changed directory
-        if let (Some(runtime), Some(explorer)) = (&self.tokio_runtime, &mut self.file_explorer) {
-            for node_id in dirs_to_refresh {
-                let tree = explorer.tree_mut();
-                if let Err(e) = runtime.block_on(tree.refresh_node(node_id)) {
-                    tracing::warn!("Failed to refresh directory: {}", e);
-                }
+        // Refresh each changed directory and (re)load its .gitignore. A new
+        // .gitignore file inside an expanded dir bumps the dir's mtime so we
+        // land here; reload_expanded_node re-lists entries but doesn't parse
+        // rules — load_gitignore_via_fs handles the rules side.
+        let refreshed_dirs: Vec<PathBuf> = dirs_to_refresh.iter().map(|(_, p)| p.clone()).collect();
+        self.refresh_file_tree_dirs(&refreshed_dirs);
+        let fs = self.authority.filesystem.clone();
+        if let Some(explorer) = self.file_explorer_mut().as_mut() {
+            for dir in refreshed_dirs {
+                load_gitignore_via_fs(fs.as_ref(), explorer, &dir);
             }
         }
 
         true
+    }
+
+    /// Re-read the given directories in the file explorer, preserving
+    /// descendant expansion state and the cursor's path.
+    ///
+    /// Why reload_expanded_node and not refresh_node: refresh_node
+    /// collapses the directory and re-expands it, which recycles every
+    /// descendant NodeId and drops their expansion state. That's fatal
+    /// for this code path, which runs unprompted from a background timer:
+    /// after a cut+paste into the workspace root, the source parent's
+    /// mtime changes, we land here seconds later, and refresh_node would
+    /// collapse a user-expanded subtree and invalidate the cursor
+    /// NodeId (after which Up/Down become no-ops because
+    /// select_next/select_prev can't find the current id in the visible
+    /// list).
+    ///
+    /// We also snapshot the cursor path before the reload and
+    /// re-resolve it afterwards. reload_expanded_node still recycles
+    /// ids under the refreshed root, so the old id is gone; the path
+    /// survives unless the underlying file was deleted, in which case
+    /// we fall back to the root so the cursor stays live and visible
+    /// (a stale id is effectively no cursor at all).
+    ///
+    /// Exposed as `pub` so tests can drive the refresh path directly
+    /// without relying on filesystem mtime detection, which is too
+    /// environment-sensitive (especially across CI filesystems).
+    pub fn refresh_file_tree_dirs(&mut self, paths: &[PathBuf]) {
+        let active_id = self.active_window;
+        let (Some(runtime), Some(explorer)) = (
+            self.tokio_runtime.as_ref(),
+            self.windows
+                .get_mut(&active_id)
+                .and_then(|w| w.file_explorer.as_mut()),
+        ) else {
+            return;
+        };
+        let cursor_path: Option<PathBuf> = explorer.get_selected_entry().map(|e| e.path.clone());
+        // Re-resolve node ids by path at each step: an earlier
+        // reload_expanded_node in this loop may have recycled ids under
+        // its subtree, so any ids captured before this call can be
+        // stale.
+        for path in paths {
+            let Some(id_now) = explorer.tree().get_node_by_path(path).map(|n| n.id) else {
+                continue;
+            };
+            let tree = explorer.tree_mut();
+            if let Err(e) = runtime.block_on(tree.reload_expanded_node(id_now)) {
+                tracing::warn!("Failed to refresh directory {:?}: {}", path, e);
+            }
+        }
+        if let Some(path) = cursor_path {
+            if explorer.tree().get_node_by_path(&path).is_some() {
+                explorer.navigate_to_path(&path);
+            } else {
+                let root_id = explorer.tree().root_id();
+                explorer.set_selected(Some(root_id));
+            }
+        }
+    }
+
+    /// Re-stat every loaded .gitignore via the filesystem authority and
+    /// reload or drop as needed. Returns true if anything changed.
+    fn sync_gitignores_from_disk(&mut self) -> bool {
+        let fs = self.authority.filesystem.clone();
+        let Some(explorer) = self.file_explorer_mut() else {
+            return false;
+        };
+        let dirs = explorer.ignore_patterns().loaded_gitignore_dirs();
+        let mut changed = false;
+        for dir in dirs {
+            let gitignore_path = dir.join(".gitignore");
+            match fs.metadata(&gitignore_path) {
+                Err(_) => {
+                    explorer.ignore_patterns_mut().remove_gitignore(&dir);
+                    changed = true;
+                }
+                Ok(meta) => {
+                    let stored = explorer.ignore_patterns().stored_gitignore_mtime(&dir);
+                    if stored != meta.modified {
+                        load_gitignore_via_fs(fs.as_ref(), explorer, &dir);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Resolve the path to `.git/index` via `git rev-parse --git-dir`.
+    /// Uses the `ProcessSpawner` so it works transparently on both local
+    /// and remote (SSH) filesystems.
+    fn resolve_git_index(&self) -> Option<PathBuf> {
+        let spawner = &self.authority.process_spawner;
+        let cwd = self.working_dir.to_string_lossy().to_string();
+
+        // ProcessSpawner is async — run it on the tokio runtime if available,
+        // otherwise fall back to blocking (should only happen in tests without
+        // a runtime).
+        let result = if let Some(ref rt) = self.tokio_runtime {
+            rt.block_on(spawner.spawn(
+                "git".to_string(),
+                vec!["rev-parse".to_string(), "--git-dir".to_string()],
+                Some(cwd),
+            ))
+        } else {
+            // No runtime — can't run async spawner. This shouldn't happen
+            // in production but can in minimal test setups.
+            return None;
+        };
+
+        let output = result.ok()?;
+        if output.exit_code != 0 {
+            return None;
+        }
+        let git_dir = output.stdout.trim();
+        let git_dir_path = if std::path::Path::new(git_dir).is_absolute() {
+            PathBuf::from(git_dir)
+        } else {
+            self.working_dir.join(git_dir)
+        };
+        Some(git_dir_path.join("index"))
     }
 
     /// Notify LSP server about a newly opened file
@@ -501,7 +967,14 @@ impl Editor {
         metadata: &mut BufferMetadata,
     ) {
         // Get language from buffer state
-        let Some(language) = self.buffers.get(&buffer_id).map(|s| s.language.clone()) else {
+        let Some(language) = self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+            .get(&buffer_id)
+            .map(|s| s.language.clone())
+        else {
             tracing::debug!("No buffer state for file: {}", path.display());
             return;
         };
@@ -516,6 +989,7 @@ impl Editor {
 
         // Check file size
         let file_size = self
+            .authority
             .filesystem
             .metadata(path)
             .ok()
@@ -523,7 +997,7 @@ impl Editor {
             .unwrap_or(0);
         if file_size > self.config.editor.large_file_threshold_bytes {
             let reason = format!("File too large ({} bytes)", file_size);
-            tracing::warn!(
+            tracing::debug!(
                 "Skipping LSP for large file: {} ({})",
                 path.display(),
                 reason
@@ -534,7 +1008,7 @@ impl Editor {
 
         // Get text before borrowing lsp
         let text = match self
-            .buffers
+            .buffers()
             .get(&buffer_id)
             .and_then(|state| state.buffer.to_string())
         {
@@ -546,23 +1020,37 @@ impl Editor {
         };
 
         let enable_inlay_hints = self.config.editor.enable_inlay_hints;
-        let previous_result_id = self.diagnostic_result_ids.get(uri.as_str()).cloned();
+        let previous_result_id = self
+            .active_window()
+            .diagnostic_result_ids
+            .get(uri.as_str())
+            .cloned();
 
-        // Get buffer line count for inlay hints
-        let (last_line, last_char) = self
-            .buffers
+        // Get buffer line count and version for inlay hints
+        let (last_line, last_char, buffer_version) = self
+            .buffers()
             .get(&buffer_id)
             .map(|state| {
                 let line_count = state.buffer.line_count().unwrap_or(1000);
-                (line_count.saturating_sub(1) as u32, 10000u32)
+                (
+                    line_count.saturating_sub(1) as u32,
+                    10000u32,
+                    state.buffer.version(),
+                )
             })
-            .unwrap_or((999, 10000));
+            .unwrap_or((999, 10000, 0));
 
         // Now borrow lsp and do all LSP operations
-        let Some(lsp) = &mut self.lsp else {
+        let __active_id = self.active_window;
+        let Some(__win) = self.windows.get_mut(&__active_id) else {
             tracing::debug!("No LSP manager available");
             return;
         };
+        let Some(lsp) = __win.lsp.as_mut() else {
+            tracing::debug!("No LSP manager available");
+            return;
+        };
+        let __next_id = &mut __win.next_lsp_request_id;
 
         tracing::debug!("LSP manager available for file: {}", path.display());
         tracing::debug!(
@@ -573,30 +1061,44 @@ impl Editor {
         tracing::debug!("Using URI from metadata: {}", uri.as_str());
         tracing::debug!("Attempting to spawn LSP client for language: {}", language);
 
-        match lsp.try_spawn(&language) {
+        match lsp.try_spawn(&language, Some(path)) {
             LspSpawnResult::Spawned => {
-                if let Some(client) = lsp.get_handle_mut(&language) {
-                    // Send didOpen
-                    tracing::info!("Sending didOpen to LSP for: {}", uri.as_str());
-                    if let Err(e) = client.did_open(uri.clone(), text, language.clone()) {
-                        tracing::warn!("Failed to send didOpen to LSP: {}", e);
-                        return;
-                    }
-                    tracing::info!("Successfully sent didOpen to LSP");
-
-                    // Mark this buffer as opened with this server instance
-                    metadata.lsp_opened_with.insert(client.id());
-
-                    // Request pull diagnostics
-                    let request_id = self.next_lsp_request_id;
-                    self.next_lsp_request_id += 1;
+                // Send didOpen to ALL server handles for this language,
+                // not just the first one.  With multiple servers configured
+                // (e.g. error-server + warning-server) each needs to know
+                // about the open document.
+                for sh in lsp.get_handles_mut(&language) {
+                    tracing::info!("Sending didOpen to LSP '{}' for: {}", sh.name, uri.as_str());
                     if let Err(e) =
-                        client.document_diagnostic(request_id, uri.clone(), previous_result_id)
+                        sh.handle
+                            .did_open(uri.as_uri().clone(), text.clone(), language.clone())
                     {
-                        tracing::debug!(
-                            "Failed to request pull diagnostics (server may not support): {}",
-                            e
-                        );
+                        tracing::warn!("Failed to send didOpen to LSP '{}': {}", sh.name, e);
+                    } else {
+                        metadata.lsp_opened_with.insert(sh.handle.id());
+                    }
+                }
+
+                // Route each follow-up request through capability-aware
+                // routing so we never send an optional method to a server
+                // that didn't advertise it. On a cold spawn the capability
+                // check returns `None` (capabilities aren't known until the
+                // `initialize` response arrives); the `LspInitialized`
+                // handler replays these requests once capabilities land.
+                if let Some(sh) =
+                    lsp.handle_for_feature_mut(&language, crate::types::LspFeature::Diagnostics)
+                {
+                    let request_id = {
+                        let id = *__next_id;
+                        *__next_id += 1;
+                        id
+                    };
+                    if let Err(e) = sh.handle.document_diagnostic(
+                        request_id,
+                        uri.as_uri().clone(),
+                        previous_result_id,
+                    ) {
+                        tracing::debug!("Failed to request pull diagnostics: {}", e);
                     } else {
                         tracing::info!(
                             "Requested pull diagnostics for {} (request_id={})",
@@ -604,22 +1106,37 @@ impl Editor {
                             request_id
                         );
                     }
+                }
 
-                    // Request inlay hints
-                    if enable_inlay_hints {
-                        let request_id = self.next_lsp_request_id;
-                        self.next_lsp_request_id += 1;
-                        self.pending_inlay_hints_request = Some(request_id);
+                if enable_inlay_hints {
+                    if let Some(sh) =
+                        lsp.handle_for_feature_mut(&language, crate::types::LspFeature::InlayHints)
+                    {
+                        let request_id = {
+                            let id = *__next_id;
+                            *__next_id += 1;
+                            id
+                        };
 
-                        if let Err(e) =
-                            client.inlay_hints(request_id, uri.clone(), 0, 0, last_line, last_char)
-                        {
-                            tracing::debug!(
-                                "Failed to request inlay hints (server may not support): {}",
-                                e
-                            );
-                            self.pending_inlay_hints_request = None;
+                        if let Err(e) = sh.handle.inlay_hints(
+                            request_id,
+                            uri.as_uri().clone(),
+                            0,
+                            0,
+                            last_line,
+                            last_char,
+                        ) {
+                            tracing::debug!("Failed to request inlay hints: {}", e);
                         } else {
+                            self.active_window_mut()
+                                .pending_inlay_hints_requests
+                                .insert(
+                                    request_id,
+                                    super::InlayHintsRequest {
+                                        buffer_id,
+                                        version: buffer_version,
+                                    },
+                                );
                             tracing::info!(
                                 "Requested inlay hints for {} (request_id={})",
                                 uri.as_str(),
@@ -627,19 +1144,23 @@ impl Editor {
                             );
                         }
                     }
-
-                    // Schedule folding range refresh
-                    self.schedule_folding_ranges_refresh(buffer_id);
                 }
+
+                // Schedule folding range refresh
+                self.active_window_mut()
+                    .schedule_folding_ranges_refresh(buffer_id);
             }
             LspSpawnResult::NotAutoStart => {
                 tracing::debug!(
-                    "LSP for {} not auto-starting (auto_start=false). Use command palette to start manually.",
+                    "LSP for {} not auto-starting (auto_start=false). Click the LSP indicator to start manually.",
                     language
                 );
             }
             LspSpawnResult::NotConfigured => {
                 tracing::debug!("No LSP server configured for language: {}", language);
+            }
+            LspSpawnResult::Disabled => {
+                tracing::debug!("LSP disabled in config for language: {}", language);
             }
             LspSpawnResult::Failed => {
                 tracing::warn!("Failed to spawn LSP client for language: {}", language);
@@ -651,9 +1172,9 @@ impl Editor {
     /// This is used by the polling-based auto-revert to detect external changes
     pub(crate) fn watch_file(&mut self, path: &Path) {
         // Record current modification time for polling
-        if let Ok(metadata) = self.filesystem.metadata(path) {
+        if let Ok(metadata) = self.authority.filesystem.metadata(path) {
             if let Some(mtime) = metadata.modified {
-                self.file_mod_times.insert(path.to_path_buf(), mtime);
+                self.file_mod_times_mut().insert(path.to_path_buf(), mtime);
             }
         }
     }
@@ -662,13 +1183,16 @@ impl Editor {
     pub(crate) fn notify_lsp_file_changed(&mut self, path: &Path) {
         use crate::services::lsp::manager::LspSpawnResult;
 
-        let Some(lsp_uri) = super::types::file_path_to_lsp_uri(path) else {
+        let Some(lsp_uri) = super::types::file_path_to_lsp_uri_with_translation(
+            path,
+            self.authority.path_translation.as_ref(),
+        ) else {
             return;
         };
 
         // Find the buffer ID, content, and language for this path
         let Some((buffer_id, content, language)) = self
-            .buffers
+            .buffers()
             .iter()
             .find(|(_, s)| s.buffer.file_path() == Some(path))
             .and_then(|(id, state)| {
@@ -683,10 +1207,15 @@ impl Editor {
 
         // Check if we can spawn LSP (respects auto_start setting)
         let spawn_result = {
-            let Some(lsp) = self.lsp.as_mut() else {
+            let __active_id = self.active_window;
+            let Some(lsp) = self
+                .windows
+                .get_mut(&__active_id)
+                .and_then(|w| w.lsp.as_mut())
+            else {
                 return;
             };
-            lsp.try_spawn(&language)
+            lsp.try_spawn(&language, Some(path))
         };
 
         // Only proceed if spawned successfully (or already running)
@@ -694,59 +1223,77 @@ impl Editor {
             return;
         }
 
-        // Get handle ID (handle should exist now since try_spawn succeeded)
-        let handle_id = {
-            let Some(lsp) = self.lsp.as_mut() else {
-                return;
-            };
-            let Some(handle) = lsp.get_handle_mut(&language) else {
-                return;
-            };
-            handle.id()
-        };
+        // Send didOpen to any handles that haven't received it yet
+        {
+            let opened_with = self
+                .active_window()
+                .buffer_metadata
+                .get(&buffer_id)
+                .map(|m| m.lsp_opened_with.clone())
+                .unwrap_or_default();
 
-        // Check if didOpen needs to be sent first
-        let needs_open = {
-            let Some(metadata) = self.buffer_metadata.get(&buffer_id) else {
-                return;
-            };
-            !metadata.lsp_opened_with.contains(&handle_id)
-        };
+            let __active_id = self.active_window;
 
-        if needs_open {
-            // Send didOpen first
-            if let Some(lsp) = self.lsp.as_mut() {
-                if let Some(handle) = lsp.get_handle_mut(&language) {
-                    if let Err(e) =
-                        handle.did_open(lsp_uri.clone(), content.clone(), language.clone())
-                    {
-                        tracing::warn!("Failed to send didOpen before didChange: {}", e);
-                        return;
+            if let Some(lsp) = self
+                .windows
+                .get_mut(&__active_id)
+                .and_then(|w| w.lsp.as_mut())
+            {
+                for sh in lsp.get_handles_mut(&language) {
+                    if opened_with.contains(&sh.handle.id()) {
+                        continue;
                     }
-                    tracing::debug!(
-                        "Sent didOpen for {} to LSP handle {} before file change notification",
-                        lsp_uri.as_str(),
-                        handle_id
-                    );
+                    if let Err(e) =
+                        sh.handle
+                            .did_open(lsp_uri.clone(), content.clone(), language.clone())
+                    {
+                        tracing::warn!(
+                            "Failed to send didOpen to LSP '{}' before didChange: {}",
+                            sh.name,
+                            e
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Sent didOpen for {} to LSP '{}' before file change notification",
+                            lsp_uri.as_str(),
+                            sh.name
+                        );
+                    }
                 }
             }
 
-            // Mark as opened
-            if let Some(metadata) = self.buffer_metadata.get_mut(&buffer_id) {
-                metadata.lsp_opened_with.insert(handle_id);
+            // Mark all handles as opened
+            let active_id = self.active_window;
+            if let Some(__win) = self.windows.get_mut(&active_id) {
+                if let (Some(lsp), Some(metadata)) = (
+                    __win.lsp.as_ref(),
+                    __win.buffer_metadata.get_mut(&buffer_id),
+                ) {
+                    for sh in lsp.get_handles(&language) {
+                        metadata.lsp_opened_with.insert(sh.handle.id());
+                    }
+                }
             }
         }
 
-        // Use full document sync - send the entire new content
-        if let Some(lsp) = &mut self.lsp {
-            if let Some(client) = lsp.get_handle_mut(&language) {
-                let content_change = TextDocumentContentChangeEvent {
-                    range: None, // None means full document replacement
-                    range_length: None,
-                    text: content,
-                };
-                if let Err(e) = client.did_change(lsp_uri, vec![content_change]) {
-                    tracing::warn!("Failed to notify LSP of file change: {}", e);
+        // Use full document sync - broadcast to all handles
+        let __active_id = self.active_window;
+        if let Some(lsp) = self
+            .windows
+            .get_mut(&__active_id)
+            .and_then(|w| w.lsp.as_mut())
+        {
+            let content_change = TextDocumentContentChangeEvent {
+                range: None, // None means full document replacement
+                range_length: None,
+                text: content,
+            };
+            for sh in lsp.get_handles_mut(&language) {
+                if let Err(e) = sh
+                    .handle
+                    .did_change(lsp_uri.clone(), vec![content_change.clone()])
+                {
+                    tracing::warn!("Failed to notify LSP '{}' of file change: {}", sh.name, e);
                 }
             }
         }
@@ -766,7 +1313,11 @@ impl Editor {
         // TODO: Consider moving line numbers to SplitViewState (per-view setting)
         // Get cursors from split view states for this buffer (find any split showing it)
         let old_cursors = self
-            .split_view_states
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(_, vs)| vs)
+            .expect("active window must have a populated split layout")
             .values()
             .find_map(|vs| {
                 if vs.keyed_states.contains_key(&buffer_id) {
@@ -777,7 +1328,7 @@ impl Editor {
             })
             .unwrap_or_default();
         let (old_buffer_settings, old_editing_disabled) = self
-            .buffers
+            .buffers()
             .get(&buffer_id)
             .map(|s| (s.buffer_settings.clone(), s.editing_disabled))
             .unwrap_or_default();
@@ -790,7 +1341,7 @@ impl Editor {
             self.config.editor.large_file_threshold_bytes as usize,
             &self.grammar_registry,
             &self.config.languages,
-            std::sync::Arc::clone(&self.filesystem),
+            std::sync::Arc::clone(&self.authority.filesystem),
         )?;
 
         // Get the new file size for clamping
@@ -808,29 +1359,41 @@ impl Editor {
         // Line number visibility is in per-split BufferViewState (survives buffer replacement)
 
         // Replace the buffer content
-        if let Some(state) = self.buffers.get_mut(&buffer_id) {
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
+            .expect("active window present")
+            .get_mut(&buffer_id)
+        {
             *state = new_state;
         }
 
         // Restore cursors in any split view states that have this buffer
-        for vs in self.split_view_states.values_mut() {
+        for vs in self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_view_states_mut())
+            .expect("active window must have a populated split layout")
+            .values_mut()
+        {
             if let Some(buf_state) = vs.keyed_states.get_mut(&buffer_id) {
                 buf_state.cursors = restored_cursors.clone();
             }
         }
 
         // Clear the undo/redo history for this buffer
-        if let Some(event_log) = self.event_logs.get_mut(&buffer_id) {
+        if let Some(event_log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
             *event_log = EventLog::new();
         }
 
         // Clear seen_byte_ranges so plugins get notified of all visible lines
-        self.seen_byte_ranges.remove(&buffer_id);
+        self.active_window_mut().seen_byte_ranges.remove(&buffer_id);
 
         // Update the file modification time
-        if let Ok(metadata) = self.filesystem.metadata(path) {
+        if let Ok(metadata) = self.authority.filesystem.metadata(path) {
             if let Some(mtime) = metadata.modified {
-                self.file_mod_times.insert(path.to_path_buf(), mtime);
+                self.file_mod_times_mut().insert(path.to_path_buf(), mtime);
             }
         }
 
@@ -846,7 +1409,7 @@ impl Editor {
 
         // Find buffers that have this file open
         let buffer_ids: Vec<BufferId> = self
-            .buffers
+            .buffers()
             .iter()
             .filter(|(_, state)| state.buffer.file_path() == Some(&path))
             .map(|(id, _)| *id)
@@ -859,11 +1422,33 @@ impl Editor {
         for buffer_id in buffer_ids {
             // Skip terminal buffers - they manage their own content via PTY streaming
             // and should not be auto-reverted (which would reset editing_disabled and line_numbers)
-            if self.terminal_buffers.contains_key(&buffer_id) {
+            if self
+                .active_window()
+                .terminal_buffers
+                .contains_key(&buffer_id)
+            {
                 continue;
             }
 
-            let state = match self.buffers.get(&buffer_id) {
+            // Skip buffers that have opted out of auto-revert. The
+            // typical caller is `openFileStreaming`, which manages
+            // appends itself via `extend_streaming`; an auto-revert
+            // here would race with those appends, wiping the piece
+            // tree mid-stream and snapping the cursor back to byte 0
+            // on every kernel write notification.
+            if let Some(meta) = self.active_window().buffer_metadata.get(&buffer_id) {
+                if !meta.auto_revert_enabled {
+                    continue;
+                }
+            }
+
+            let state = match self
+                .windows
+                .get(&self.active_window)
+                .map(|w| &w.buffers)
+                .expect("active window present")
+                .get(&buffer_id)
+            {
                 Some(s) => s,
                 None => continue,
             };
@@ -872,6 +1457,7 @@ impl Editor {
             // We use optimistic concurrency: check mtime, and if we decide to revert,
             // re-check to handle the race where a save completed between our checks.
             let current_mtime = match self
+                .authority
                 .filesystem
                 .metadata(&path)
                 .ok()
@@ -882,7 +1468,7 @@ impl Editor {
             };
 
             let dominated_by_stored = self
-                .file_mod_times
+                .file_mod_times()
                 .get(&path)
                 .map(|stored| current_mtime <= *stored)
                 .unwrap_or(false);
@@ -893,7 +1479,7 @@ impl Editor {
 
             // If buffer has local modifications, show a warning (don't auto-revert)
             if state.buffer.is_modified() {
-                self.status_message = Some(format!(
+                self.active_window_mut().status_message = Some(format!(
                     "File {} changed on disk (buffer has unsaved changes)",
                     path.display()
                 ));
@@ -901,12 +1487,12 @@ impl Editor {
             }
 
             // Auto-revert if enabled and buffer is not modified
-            if self.auto_revert_enabled {
+            if self.active_window().auto_revert_enabled {
                 // Optimistic concurrency: re-check mtime before reverting.
                 // A save may have completed between our first check and now,
                 // updating file_mod_times. If so, skip the revert.
                 let still_needs_revert = self
-                    .file_mod_times
+                    .file_mod_times()
                     .get(&path)
                     .map(|stored| current_mtime > *stored)
                     .unwrap_or(true);
@@ -948,13 +1534,14 @@ impl Editor {
 
         // Get current file modification time
         let current_mtime = self
+            .authority
             .filesystem
             .metadata(path)
             .ok()
             .and_then(|m| m.modified)?;
 
         // Compare with our recorded modification time
-        match self.file_mod_times.get(path) {
+        match self.file_mod_times().get(path) {
             Some(recorded_mtime) if current_mtime > *recorded_mtime => {
                 // File was modified externally since we last loaded/saved it
                 Some(current_mtime)
@@ -962,4 +1549,24 @@ impl Editor {
             _ => None,
         }
     }
+}
+
+/// Stat and read `dir/.gitignore` via the filesystem authority and install
+/// the result on `explorer`. No-op (with a warn-level log on unexpected
+/// errors) when the file doesn't exist. Shared by the init, expand, save,
+/// and poll paths so everything routes through the same authority.
+pub(crate) fn load_gitignore_via_fs(fs: &dyn FileSystem, explorer: &mut FileTreeView, dir: &Path) {
+    let gitignore_path = dir.join(".gitignore");
+    let meta = match fs.metadata(&gitignore_path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let bytes = match fs.read_file(&gitignore_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("Failed to read {:?}: {}", gitignore_path, e);
+            return;
+        }
+    };
+    explorer.load_gitignore_from_bytes(dir, &bytes, meta.modified);
 }

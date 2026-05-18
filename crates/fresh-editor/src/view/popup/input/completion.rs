@@ -1,8 +1,12 @@
 //! Input handling for completion popups.
 //!
-//! Completion popups support:
+//! Accept and dismiss are resolved upstream against `KeyContext::Completion`
+//! (default: Tab → `completion_accept`, Esc → `completion_dismiss`). The keys
+//! handled here cover the behaviours that do *not* go through the keybinding
+//! system:
 //! - Type-to-filter: typing characters filters the completion list
-//! - Tab/Enter: accept the selected completion
+//! - Enter: dismiss the popup and insert newline (passthrough)
+//! - Ctrl+Space: toggle (dismiss) the popup
 //! - Backspace: remove last filter character
 //! - Arrow keys: navigate the list
 
@@ -17,7 +21,11 @@ pub fn handle_completion_input(
     popup: Option<&mut Popup>,
     ctx: &mut InputContext,
 ) -> InputResult {
-    // Try shared handling first (Esc, PageUp/Down, etc.)
+    // Accept (default: Tab) and dismiss (default: Esc) are resolved upstream
+    // against `KeyContext::Completion` before this handler runs, so we only
+    // see keys that the resolver did not claim.
+
+    // Try shared handling first (Esc fallback, PageUp/Down, etc.)
     match try_handle_shared(event, popup, ctx) {
         SharedHandleResult::Handled(result) => return result,
         SharedHandleResult::NotHandled => {}
@@ -27,16 +35,16 @@ pub fn handle_completion_input(
     // (we need to re-get it since try_handle_shared consumed the borrow)
 
     match event.code {
-        // Enter - behavior depends on accept_suggestion_on_enter config
-        KeyCode::Enter => {
-            ctx.defer(DeferredAction::CompletionEnterKey);
+        // Ctrl+Space toggles the popup off (consumed so it won't re-open)
+        KeyCode::Char(' ') if event.modifiers == KeyModifiers::CONTROL => {
+            ctx.defer(DeferredAction::ClosePopup);
             InputResult::Consumed
         }
 
-        // Tab always accepts the completion
-        KeyCode::Tab if event.modifiers.is_empty() => {
-            ctx.defer(DeferredAction::ConfirmPopup);
-            InputResult::Consumed
+        // Enter dismisses popup and inserts newline (passthrough)
+        KeyCode::Enter => {
+            ctx.defer(DeferredAction::ClosePopup);
+            InputResult::Ignored
         }
 
         // Arrow navigation (Up/Down navigate the list)
@@ -54,8 +62,12 @@ pub fn handle_completion_input(
             InputResult::Consumed
         }
 
-        // Backspace removes last filter character
-        KeyCode::Backspace if event.modifiers.is_empty() => {
+        // Backspace removes last filter character.
+        // Shift+Backspace is treated the same as plain Backspace so an
+        // accidentally-held Shift key doesn't dismiss the popup.
+        KeyCode::Backspace
+            if event.modifiers.is_empty() || event.modifiers == KeyModifiers::SHIFT =>
+        {
             ctx.defer(DeferredAction::PopupBackspace);
             InputResult::Consumed
         }
@@ -82,16 +94,16 @@ pub fn handle_completion_input_with_popup(
     }
 
     match event.code {
-        // Enter - behavior depends on accept_suggestion_on_enter config
-        KeyCode::Enter => {
-            ctx.defer(DeferredAction::CompletionEnterKey);
+        // Ctrl+Space toggles the popup off (consumed so it won't re-open)
+        KeyCode::Char(' ') if event.modifiers == KeyModifiers::CONTROL => {
+            ctx.defer(DeferredAction::ClosePopup);
             InputResult::Consumed
         }
 
-        // Tab always accepts the completion
-        KeyCode::Tab if event.modifiers.is_empty() => {
-            ctx.defer(DeferredAction::ConfirmPopup);
-            InputResult::Consumed
+        // Enter dismisses popup and inserts newline (passthrough)
+        KeyCode::Enter => {
+            ctx.defer(DeferredAction::ClosePopup);
+            InputResult::Ignored
         }
 
         // Arrow navigation (Up/Down navigate the list)
@@ -113,8 +125,12 @@ pub fn handle_completion_input_with_popup(
             InputResult::Consumed
         }
 
-        // Backspace removes last filter character
-        KeyCode::Backspace if event.modifiers.is_empty() => {
+        // Backspace removes last filter character.
+        // Shift+Backspace is treated the same as plain Backspace so an
+        // accidentally-held Shift key doesn't dismiss the popup.
+        KeyCode::Backspace
+            if event.modifiers.is_empty() || event.modifiers == KeyModifiers::SHIFT =>
+        {
             ctx.defer(DeferredAction::PopupBackspace);
             InputResult::Consumed
         }

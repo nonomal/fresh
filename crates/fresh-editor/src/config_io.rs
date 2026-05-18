@@ -171,13 +171,40 @@ fn find_changed_paths_recursive(
     }
 }
 
+/// Strip defaults/nulls from `value`, serialize to pretty JSON, ensure the parent
+/// directory exists, and write to `path`.
+fn write_clean_value_to_path(path: &Path, value: Value) -> Result<(), ConfigError> {
+    if let Some(parent_dir) = path.parent() {
+        std::fs::create_dir_all(parent_dir)
+            .map_err(|e| ConfigError::IoError(format!("{}: {}", parent_dir.display(), e)))?;
+    }
+    let stripped = strip_nulls(value).unwrap_or(Value::Object(Default::default()));
+    let clean = strip_empty_defaults(stripped).unwrap_or(Value::Object(Default::default()));
+    let json = serde_json::to_string_pretty(&clean)
+        .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
+    std::fs::write(path, json)
+        .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
+    Ok(())
+}
+
+/// Read an existing config file as raw JSON, returning an empty object when the file
+/// is absent or unparseable.
+fn read_existing_json(path: &Path) -> Result<Value, ConfigError> {
+    if !path.exists() {
+        return Ok(Value::Object(Default::default()));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
+    Ok(serde_json::from_str(&content).unwrap_or(Value::Object(Default::default())))
+}
+
 // ============================================================================
 // Configuration Migration System
 // ============================================================================
 
 /// Current config schema version.
 /// Increment this when making breaking changes to config structure.
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 /// Apply all necessary migrations to bring a config JSON to the current version.
 pub fn migrate_config(mut value: Value) -> Result<Value, ConfigError> {
@@ -187,8 +214,9 @@ pub fn migrate_config(mut value: Value) -> Result<Value, ConfigError> {
     if version < 1 {
         value = migrate_v0_to_v1(value)?;
     }
-    // Future migrations:
-    // if version < 2 { value = migrate_v1_to_v2(value)?; }
+    if version < 2 {
+        value = migrate_v1_to_v2(value)?;
+    }
 
     Ok(value)
 }
@@ -209,6 +237,36 @@ fn migrate_v0_to_v1(mut value: Value) -> Result<Value, ConfigError> {
             // lineNumbers -> line_numbers
             if let Some(val) = editor_map.remove("lineNumbers") {
                 editor_map.entry("line_numbers").or_insert(val);
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Migration from v1 to v2.
+///
+/// Injects `"{remote}"` at the front of `editor.status_bar.left` when
+/// the user has customized the list and the element is not already
+/// present. Users who never overrode the default get the element via
+/// `default_status_bar_left` at resolve time — we intentionally skip
+/// inserting a `status_bar` object here so those users stay on the
+/// rolling default if future versions reorder or rename elements.
+fn migrate_v1_to_v2(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut map) = value {
+        map.insert("version".to_string(), Value::Number(2.into()));
+
+        let left = map
+            .get_mut("editor")
+            .and_then(|editor| editor.as_object_mut())
+            .and_then(|editor| editor.get_mut("status_bar"))
+            .and_then(|status_bar| status_bar.as_object_mut())
+            .and_then(|status_bar| status_bar.get_mut("left"))
+            .and_then(|left| left.as_array_mut());
+
+        if let Some(left) = left {
+            let already_present = left.iter().any(|v| v.as_str() == Some("{remote}"));
+            if !already_present {
+                left.insert(0, Value::String("{remote}".to_string()));
             }
         }
     }
@@ -386,44 +444,29 @@ impl ConfigResolver {
         Ok(Some(partial))
     }
 
+    /// Resolve the writable path for `layer`, returning an error for the read-only
+    /// System layer.
+    fn layer_write_path(&self, layer: ConfigLayer) -> Result<PathBuf, ConfigError> {
+        match layer {
+            ConfigLayer::User => Ok(self.user_config_path()),
+            ConfigLayer::Project => Ok(self.project_config_write_path()),
+            ConfigLayer::Session => Ok(self.session_config_path()),
+            ConfigLayer::System => Err(ConfigError::ValidationError(
+                "Cannot write to System layer".to_string(),
+            )),
+        }
+    }
+
     /// Save a config to a specific layer, writing only the delta from parent layers.
     pub fn save_to_layer(&self, config: &Config, layer: ConfigLayer) -> Result<(), ConfigError> {
-        if layer == ConfigLayer::System {
-            return Err(ConfigError::ValidationError(
-                "Cannot write to System layer".to_string(),
-            ));
-        }
+        let path = self.layer_write_path(layer)?;
 
-        // Calculate parent config (merge all layers below target)
         let parent_partial = self.resolve_up_to_layer(layer)?;
-
-        // Resolve parent to full config and convert back to get all values populated.
-        // This ensures proper comparison - both current and parent have all fields set,
-        // so the diff will correctly identify only the actual differences.
         let parent = PartialConfig::from(&parent_partial.resolve());
-
-        // Convert current config to partial
         let current = PartialConfig::from(config);
-
-        // Calculate delta - now both are fully populated, so only actual differences are captured
         let delta = diff_partial_config(&current, &parent);
 
-        // Get path for target layer (use write paths for new configs)
-        let path = match layer {
-            ConfigLayer::User => self.user_config_path(),
-            ConfigLayer::Project => self.project_config_write_path(),
-            ConfigLayer::Session => self.session_config_path(),
-            ConfigLayer::System => unreachable!(),
-        };
-
-        // Ensure parent directory exists
-        if let Some(parent_dir) = path.parent() {
-            std::fs::create_dir_all(parent_dir)
-                .map_err(|e| ConfigError::IoError(format!("{}: {}", parent_dir.display(), e)))?;
-        }
-
-        // Read existing file content (if any) as PartialConfig.
-        // This preserves any manual edits made externally while the editor was running.
+        // Preserve any manual edits made externally; delta takes precedence.
         let existing: PartialConfig = if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
@@ -431,24 +474,12 @@ impl ConfigResolver {
         } else {
             PartialConfig::default()
         };
-
-        // Merge: delta values take precedence, existing fills in gaps where delta is None
         let mut merged = delta;
         merged.merge_from(&existing);
 
-        // Serialize to JSON, stripping null values and empty defaults to keep configs minimal
         let merged_value = serde_json::to_value(&merged)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        let stripped_nulls = strip_nulls(merged_value).unwrap_or(Value::Object(Default::default()));
-        let clean_merged =
-            strip_empty_defaults(stripped_nulls).unwrap_or(Value::Object(Default::default()));
-
-        let json = serde_json::to_string_pretty(&clean_merged)
-            .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        std::fs::write(&path, json)
-            .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
-
-        Ok(())
+        write_clean_value_to_path(&path, merged_value)
     }
 
     /// Save a config to a specific layer, using a baseline to track changes.
@@ -466,17 +497,11 @@ impl ConfigResolver {
         baseline: &Config,
         layer: ConfigLayer,
     ) -> Result<(), ConfigError> {
-        if layer == ConfigLayer::System {
-            return Err(ConfigError::ValidationError(
-                "Cannot write to System layer".to_string(),
-            ));
-        }
+        let path = self.layer_write_path(layer)?;
 
-        // Calculate parent config (defaults from layers below)
         let parent_partial = self.resolve_up_to_layer(layer)?;
         let parent = PartialConfig::from(&parent_partial.resolve());
 
-        // Convert configs to JSON for comparison
         let current_json = serde_json::to_value(current)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
         let baseline_json = serde_json::to_value(baseline)
@@ -484,58 +509,22 @@ impl ConfigResolver {
         let parent_json = serde_json::to_value(&parent)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
 
-        // Find which paths changed between baseline and current
         let changed_paths = find_changed_paths(&baseline_json, &current_json);
 
-        // Get path for target layer
-        let path = match layer {
-            ConfigLayer::User => self.user_config_path(),
-            ConfigLayer::Project => self.project_config_write_path(),
-            ConfigLayer::Session => self.session_config_path(),
-            ConfigLayer::System => unreachable!(),
-        };
+        let mut result = read_existing_json(&path)?;
 
-        // Ensure parent directory exists
-        if let Some(parent_dir) = path.parent() {
-            std::fs::create_dir_all(parent_dir)
-                .map_err(|e| ConfigError::IoError(format!("{}: {}", parent_dir.display(), e)))?;
-        }
-
-        // Read existing file content as JSON
-        let mut result: Value = if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
-            serde_json::from_str(&content).unwrap_or(Value::Object(Default::default()))
-        } else {
-            Value::Object(Default::default())
-        };
-
-        // For each changed path, update the file:
-        // - If current matches parent (default), remove from file
-        // - If current differs from parent, set in file
+        // For each changed path: remove if value reverted to default, otherwise set it.
         for pointer in &changed_paths {
             let current_val = current_json.pointer(pointer);
             let parent_val = parent_json.pointer(pointer);
-
             if current_val == parent_val {
-                // User changed to default - remove from file so default propagates
                 remove_json_pointer(&mut result, pointer);
             } else if let Some(val) = current_val {
-                // User changed to non-default - set in file
                 set_json_pointer(&mut result, pointer, val.clone());
             }
         }
 
-        // Strip nulls and empty defaults to keep config minimal
-        let stripped = strip_nulls(result).unwrap_or(Value::Object(Default::default()));
-        let clean = strip_empty_defaults(stripped).unwrap_or(Value::Object(Default::default()));
-
-        let json = serde_json::to_string_pretty(&clean)
-            .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        std::fs::write(&path, json)
-            .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
-
-        Ok(())
+        write_clean_value_to_path(&path, result)
     }
 
     /// Save specific changes to a layer file using JSON pointer paths.
@@ -548,60 +537,23 @@ impl ConfigResolver {
         deletions: &std::collections::HashSet<String>,
         layer: ConfigLayer,
     ) -> Result<(), ConfigError> {
-        if layer == ConfigLayer::System {
-            return Err(ConfigError::ValidationError(
-                "Cannot write to System layer".to_string(),
-            ));
-        }
+        let path = self.layer_write_path(layer)?;
 
-        // Get path for target layer
-        let path = match layer {
-            ConfigLayer::User => self.user_config_path(),
-            ConfigLayer::Project => self.project_config_write_path(),
-            ConfigLayer::Session => self.session_config_path(),
-            ConfigLayer::System => unreachable!(),
-        };
+        let mut config_value = read_existing_json(&path)?;
 
-        // Ensure parent directory exists
-        if let Some(parent_dir) = path.parent() {
-            std::fs::create_dir_all(parent_dir)
-                .map_err(|e| ConfigError::IoError(format!("{}: {}", parent_dir.display(), e)))?;
-        }
-
-        // Read existing file content as JSON
-        let mut config_value: Value = if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
-            serde_json::from_str(&content).unwrap_or(Value::Object(Default::default()))
-        } else {
-            Value::Object(Default::default())
-        };
-
-        // Apply deletions first
         for pointer in deletions {
             remove_json_pointer(&mut config_value, pointer);
         }
-
-        // Apply changes using JSON pointers
         for (pointer, value) in changes {
             set_json_pointer(&mut config_value, pointer, value.clone());
         }
 
-        // Validate the result can be deserialized
+        // Validate before writing.
         let _: PartialConfig = serde_json::from_value(config_value.clone()).map_err(|e| {
             ConfigError::ValidationError(format!("Result config would be invalid: {}", e))
         })?;
 
-        // Strip null values and empty defaults to keep configs minimal
-        let stripped = strip_nulls(config_value).unwrap_or(Value::Object(Default::default()));
-        let clean = strip_empty_defaults(stripped).unwrap_or(Value::Object(Default::default()));
-
-        let json = serde_json::to_string_pretty(&clean)
-            .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        std::fs::write(&path, json)
-            .map_err(|e| ConfigError::IoError(format!("{}: {}", path.display(), e)))?;
-
-        Ok(())
+        write_clean_value_to_path(&path, config_value)
     }
 
     /// Save a SessionConfig to the session layer file.
@@ -1258,7 +1210,86 @@ mod tests {
 
         let migrated = migrate_config(input).unwrap();
 
-        assert_eq!(migrated.get("version"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            migrated.get("version"),
+            Some(&serde_json::json!(CURRENT_CONFIG_VERSION))
+        );
+    }
+
+    #[test]
+    fn migration_v1_to_v2_injects_remote_element() {
+        // User who customized status_bar.left on v1 without the
+        // indicator: v2 migration prepends `"{remote}"`.
+        let input = serde_json::json!({
+            "version": 1,
+            "editor": {
+                "status_bar": {
+                    "left": ["{filename}", "{cursor}"]
+                }
+            }
+        });
+
+        let migrated = migrate_config(input).unwrap();
+
+        assert_eq!(migrated.get("version"), Some(&serde_json::json!(2)));
+        let left = migrated
+            .pointer("/editor/status_bar/left")
+            .and_then(|v| v.as_array())
+            .expect("status_bar.left should remain an array");
+        assert_eq!(left[0], serde_json::json!("{remote}"));
+        assert_eq!(left[1], serde_json::json!("{filename}"));
+        assert_eq!(left[2], serde_json::json!("{cursor}"));
+    }
+
+    #[test]
+    fn migration_v1_to_v2_is_idempotent() {
+        // User already has `"{remote}"` somewhere in left (e.g. they
+        // opted in manually before v2). Don't double-insert.
+        let input = serde_json::json!({
+            "version": 1,
+            "editor": {
+                "status_bar": {
+                    "left": ["{filename}", "{remote}", "{cursor}"]
+                }
+            }
+        });
+
+        let migrated = migrate_config(input).unwrap();
+
+        let left = migrated
+            .pointer("/editor/status_bar/left")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let remote_count = left
+            .iter()
+            .filter(|v| v.as_str() == Some("{remote}"))
+            .count();
+        assert_eq!(
+            remote_count, 1,
+            "migration should never duplicate an existing {{remote}} entry; left = {:?}",
+            left
+        );
+    }
+
+    #[test]
+    fn migration_v1_to_v2_leaves_default_users_alone() {
+        // User with no `status_bar` override stays on the rolling
+        // default — migration bumps the version but doesn't
+        // materialize a status_bar object.
+        let input = serde_json::json!({
+            "version": 1,
+            "editor": {"tab_size": 4}
+        });
+
+        let migrated = migrate_config(input).unwrap();
+
+        assert_eq!(migrated.get("version"), Some(&serde_json::json!(2)));
+        assert!(
+            migrated.pointer("/editor/status_bar").is_none(),
+            "migration must not fabricate a status_bar object for users \
+             who never overrode the default; migrated = {:?}",
+            migrated
+        );
     }
 
     #[test]
@@ -1308,6 +1339,42 @@ mod tests {
         let config = resolver.resolve().unwrap();
         assert_eq!(config.editor.tab_size, 3);
         assert!(!config.editor.line_numbers);
+        drop(temp);
+    }
+
+    #[test]
+    fn resolver_migrates_v1_status_bar_left_on_load() {
+        // A user with a v1 config that customized status_bar.left
+        // without {remote} loads the editor for the first time on
+        // v2. The resolver runs the migration in-memory; the
+        // resolved Config has {remote} at index 0.
+        let (temp, resolver) = create_test_resolver();
+
+        let user_config_path = resolver.user_config_path();
+        std::fs::create_dir_all(user_config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "version": 1,
+                "editor": {
+                    "status_bar": {
+                        "left": ["{filename}", "{cursor}"],
+                        "right": []
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = resolver.resolve().unwrap();
+        let left = &config.editor.status_bar.left;
+        assert_eq!(
+            left.first().cloned(),
+            Some(crate::config::StatusBarElement::RemoteIndicator),
+            "resolver should inject RemoteIndicator at index 0 during v1→v2 \
+             migration; left = {:?}",
+            left
+        );
         drop(temp);
     }
 
@@ -1498,8 +1565,10 @@ mod tests {
         assert_eq!(config.editor.tab_size, 2);
 
         // User disables LSP via UI
-        if let Some(lsp_config) = config.lsp.get_mut("python") {
-            lsp_config.enabled = false;
+        if let Some(lsp_configs) = config.lsp.get_mut("python") {
+            for c in lsp_configs.as_mut_slice().iter_mut() {
+                c.enabled = false;
+            }
         }
 
         // Save using save_to_layer
@@ -1540,9 +1609,9 @@ mod tests {
         let reloaded = resolver.resolve().unwrap();
         assert_eq!(reloaded.theme.0, "dracula");
         assert_eq!(reloaded.editor.tab_size, 2);
-        assert!(!reloaded.lsp["python"].enabled);
+        assert!(!reloaded.lsp["python"].as_slice()[0].enabled);
         // Command should come from defaults
-        assert_eq!(reloaded.lsp["python"].command, "pylsp");
+        assert_eq!(reloaded.lsp["python"].as_slice()[0].command, "pylsp");
     }
 
     /// Test that toggling LSP enabled/disabled preserves the command field.
@@ -1562,7 +1631,7 @@ mod tests {
 
         // Load and verify default command
         let config = resolver.resolve().unwrap();
-        let original_command = config.lsp["python"].command.clone();
+        let original_command = config.lsp["python"].as_slice()[0].command.clone();
         assert!(
             !original_command.is_empty(),
             "Default python LSP should have a command"
@@ -1570,7 +1639,7 @@ mod tests {
 
         // Step 2: Disable python LSP, save
         let mut config = resolver.resolve().unwrap();
-        config.lsp.get_mut("python").unwrap().enabled = false;
+        config.lsp.get_mut("python").unwrap().as_mut_slice()[0].enabled = false;
         resolver.save_to_layer(&config, ConfigLayer::User).unwrap();
 
         // Verify saved file only has enabled:false, not empty command/args
@@ -1588,16 +1657,17 @@ mod tests {
 
         // Step 3: Load again, enable python LSP, save
         let mut config = resolver.resolve().unwrap();
-        assert!(!config.lsp["python"].enabled);
-        config.lsp.get_mut("python").unwrap().enabled = true;
+        assert!(!config.lsp["python"].as_slice()[0].enabled);
+        config.lsp.get_mut("python").unwrap().as_mut_slice()[0].enabled = true;
         resolver.save_to_layer(&config, ConfigLayer::User).unwrap();
 
         // Step 4: Load and verify command is still the same
         let config = resolver.resolve().unwrap();
         assert_eq!(
-            config.lsp["python"].command, original_command,
+            config.lsp["python"].as_slice()[0].command,
+            original_command,
             "Command should be preserved after toggling enabled. Got: '{}'",
-            config.lsp["python"].command
+            config.lsp["python"].as_slice()[0].command
         );
     }
 
@@ -1668,12 +1738,13 @@ mod tests {
         // Load and check that command comes from defaults
         let config = resolver.resolve().unwrap();
         assert_eq!(
-            config.lsp["rust"].command, "rust-analyzer",
+            config.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Command should come from defaults when not in file. Got: '{}'",
-            config.lsp["rust"].command
+            config.lsp["rust"].as_slice()[0].command
         );
         assert!(
-            !config.lsp["rust"].enabled,
+            !config.lsp["rust"].as_slice()[0].enabled,
             "enabled should be false from file"
         );
     }
@@ -1695,11 +1766,12 @@ mod tests {
         // Load resolved config - should have rust with command="rust-analyzer"
         let config = resolver.resolve().unwrap();
         assert_eq!(
-            config.lsp["rust"].command, "rust-analyzer",
+            config.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Default rust command should be rust-analyzer"
         );
         assert!(
-            config.lsp["rust"].enabled,
+            config.lsp["rust"].as_slice()[0].enabled,
             "Default rust enabled should be true"
         );
 
@@ -1721,11 +1793,15 @@ mod tests {
         // Step 4: Reload and verify command is preserved
         let reloaded = resolver.resolve().unwrap();
         assert_eq!(
-            reloaded.lsp["rust"].command, "rust-analyzer",
+            reloaded.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Command should be preserved after save/reload (disabled). Got: '{}'",
-            reloaded.lsp["rust"].command
+            reloaded.lsp["rust"].as_slice()[0].command
         );
-        assert!(!reloaded.lsp["rust"].enabled, "rust should be disabled");
+        assert!(
+            !reloaded.lsp["rust"].as_slice()[0].enabled,
+            "rust should be disabled"
+        );
 
         // Step 5: Re-enable rust LSP (simulating Settings UI)
         let mut changes = std::collections::HashMap::new();
@@ -1744,11 +1820,15 @@ mod tests {
         // Step 7: Reload and verify command is STILL preserved
         let final_config = resolver.resolve().unwrap();
         assert_eq!(
-            final_config.lsp["rust"].command, "rust-analyzer",
+            final_config.lsp["rust"].as_slice()[0].command,
+            "rust-analyzer",
             "Command should be preserved after toggle cycle. Got: '{}'",
-            final_config.lsp["rust"].command
+            final_config.lsp["rust"].as_slice()[0].command
         );
-        assert!(final_config.lsp["rust"].enabled, "rust should be enabled");
+        assert!(
+            final_config.lsp["rust"].as_slice()[0].enabled,
+            "rust should be enabled"
+        );
     }
 
     /// Issue #806 REPRODUCTION: Manual config.json edits are lost when saving from Settings UI.
@@ -1792,7 +1872,7 @@ mod tests {
             config.lsp.contains_key("rust-analyzer"),
             "Config should contain manually-added 'rust-analyzer' LSP entry"
         );
-        let rust_analyzer = &config.lsp["rust-analyzer"];
+        let rust_analyzer = &config.lsp["rust-analyzer"].as_slice()[0];
         assert!(rust_analyzer.enabled, "rust-analyzer should be enabled");
         assert_eq!(
             rust_analyzer.command, "rust-analyzer",
@@ -1881,7 +1961,7 @@ mod tests {
             reloaded.lsp.contains_key("rust-analyzer"),
             "BUG #806: rust-analyzer should still exist after reload"
         );
-        let reloaded_ra = &reloaded.lsp["rust-analyzer"];
+        let reloaded_ra = &reloaded.lsp["rust-analyzer"].as_slice()[0];
         assert_eq!(
             reloaded_ra.args,
             vec!["--log-file", "/tmp/rust-analyzer-{pid}.log"],
@@ -2207,6 +2287,105 @@ mod tests {
              With save_to_layer_with_baseline, the theme field should be removed from file \
              so the default applies. File content: {}",
             saved_content
+        );
+    }
+
+    /// Test that universal_lsp config round-trips through save/load correctly.
+    /// This exercises the PartialConfig From/resolve_with_defaults paths.
+    #[test]
+    fn universal_lsp_round_trip_via_config_resolver() {
+        let (_temp, resolver) = create_test_resolver();
+        let user_config_path = resolver.user_config_path();
+        std::fs::create_dir_all(user_config_path.parent().unwrap()).unwrap();
+
+        // Write a config that enables quicklsp
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "universal_lsp": {
+                    "quicklsp": { "enabled": true, "auto_start": true }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = resolver.resolve().unwrap();
+
+        // quicklsp should be enabled (user override merged with defaults)
+        assert!(config.universal_lsp.contains_key("quicklsp"));
+        let server = &config.universal_lsp["quicklsp"].as_slice()[0];
+        assert!(server.enabled, "User override should enable quicklsp");
+        assert!(server.auto_start, "User override should enable auto_start");
+        assert_eq!(
+            server.command, "quicklsp",
+            "Command should come from defaults"
+        );
+    }
+
+    /// Test that universal_lsp supports adding custom servers alongside defaults.
+    #[test]
+    fn universal_lsp_custom_server_merges_with_defaults() {
+        let (_temp, resolver) = create_test_resolver();
+        let user_config_path = resolver.user_config_path();
+        std::fs::create_dir_all(user_config_path.parent().unwrap()).unwrap();
+
+        std::fs::write(
+            &user_config_path,
+            r#"{
+                "universal_lsp": {
+                    "my-universal-server": {
+                        "command": "my-server-bin",
+                        "enabled": true
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = resolver.resolve().unwrap();
+
+        // Custom server should be present
+        assert!(
+            config.universal_lsp.contains_key("my-universal-server"),
+            "Custom universal server should be loaded"
+        );
+        assert_eq!(
+            config.universal_lsp["my-universal-server"].as_slice()[0].command,
+            "my-server-bin"
+        );
+
+        // Default quicklsp should still be present (merged from defaults)
+        assert!(
+            config.universal_lsp.contains_key("quicklsp"),
+            "Default quicklsp should be preserved when adding custom servers"
+        );
+    }
+
+    /// Test that the PartialConfig conversion (Config -> PartialConfig -> Config)
+    /// preserves universal_lsp entries. This catches bugs where universal_lsp
+    /// is missing from the PartialConfig struct or its From/resolve impls.
+    #[test]
+    fn universal_lsp_partial_config_round_trip() {
+        use crate::partial_config::PartialConfig;
+
+        let mut config = Config::default();
+        // Enable quicklsp in the original config
+        if let Some(quicklsp) = config.universal_lsp.get_mut("quicklsp") {
+            quicklsp.as_mut_slice()[0].enabled = true;
+        }
+
+        // Convert to partial and back
+        let partial = PartialConfig::from(&config);
+        let resolved = partial.resolve();
+
+        // Verify universal_lsp survived the round trip
+        assert!(
+            resolved.universal_lsp.contains_key("quicklsp"),
+            "quicklsp should survive Config -> PartialConfig -> Config round trip"
+        );
+        assert!(
+            resolved.universal_lsp["quicklsp"].as_slice()[0].enabled,
+            "quicklsp enabled state should be preserved through round trip"
         );
     }
 }

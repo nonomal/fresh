@@ -6,7 +6,7 @@
 use super::terminal_input::{should_enter_terminal_mode, TerminalModeInputHandler};
 use super::Editor;
 use crate::input::handler::{DeferredAction, InputContext, InputHandler, InputResult};
-use crate::input::keybindings::Action;
+use crate::input::keybindings::{Action, KeyContext};
 use crate::view::file_browser_input::FileBrowserInputHandler;
 use crate::view::query_replace_input::QueryReplaceConfirmInputHandler;
 use crate::view::ui::MenuInputHandler;
@@ -21,33 +21,93 @@ impl Editor {
     /// `None` if not in terminal mode or if a modal is active.
     pub fn dispatch_terminal_input(&mut self, event: &KeyEvent) -> Option<InputResult> {
         // Skip if we're in a prompt/popup (those need to handle keys normally)
+        // — including the floating widget panel (Orchestrator picker,
+        // new-session form, plugin overlays), which is the editor-wide
+        // modal owner of the keyboard while it's up. Without this skip,
+        // a terminal-buffer-active window with `terminal_mode=true` would
+        // route keys to the PTY child even when the user's keystrokes
+        // are meant for the picker on top of it.
         let in_modal = self.is_prompting()
+            || self.global_popups.is_visible()
             || self.active_state().popups.is_visible()
             || self.menu_state.active_menu.is_some()
             || self.settings_state.as_ref().is_some_and(|s| s.visible)
             || self.calibration_wizard.is_some()
-            || self.keybinding_editor.is_some();
+            || self.keybinding_editor.is_some()
+            || self.floating_widget_panel.is_some();
 
         if in_modal {
             return None;
         }
 
         // Handle terminal mode input
-        if self.terminal_mode {
+        if self.active_window().terminal_mode {
+            // If the user navigated away from the terminal buffer (e.g. opened
+            // Review Diff via the command palette), the active buffer is no
+            // longer a terminal. Exit terminal mode so the new buffer's
+            // keybindings work.
+            if !self
+                .active_window()
+                .is_terminal_buffer(self.active_buffer())
+            {
+                self.active_window_mut().terminal_mode = false;
+                self.active_window_mut().key_context =
+                    crate::input::keybindings::KeyContext::Normal;
+                return None; // fall through to normal input dispatch
+            }
+            // Plugin commands flagged `terminalBypass: true` (via
+            // `editor.registerCommand(..., { terminalBypass: true })`)
+            // resolve to actions that must reach the editor even
+            // when a terminal pane owns the keyboard — that's how
+            // bound shortcuts to commands like `Orchestrator: Open`
+            // stay reachable from inside `top`/`htop`/a shell.
+            // Resolve the key against the regular (Normal) context;
+            // if it's a registered bypass action, dispatch it and
+            // return *before* the terminal handler claims the key.
+            // Builtin UI actions (CommandPalette, QuickOpen, …)
+            // still flow through `TerminalModeInputHandler`'s own
+            // `is_terminal_ui_action` allowlist below.
+            let bypass_action = {
+                let keybindings = self.keybindings.read().unwrap();
+                let action = keybindings.resolve(event, KeyContext::Normal);
+                if self
+                    .command_registry
+                    .read()
+                    .unwrap()
+                    .is_terminal_bypass_action(&action)
+                {
+                    Some(action)
+                } else {
+                    None
+                }
+            };
+            if let Some(action) = bypass_action {
+                if let Err(e) = self.handle_action(action) {
+                    tracing::warn!("terminal-bypass action failed: {e}");
+                }
+                return Some(InputResult::Consumed);
+            }
             let mut ctx = InputContext::new();
-            let mut handler =
-                TerminalModeInputHandler::new(self.keyboard_capture, &self.keybindings);
+            let keyboard_capture = self.active_window().keyboard_capture;
+            let keybindings = self.keybindings.read().unwrap();
+            let mut handler = TerminalModeInputHandler::new(keyboard_capture, &keybindings);
             let result = handler.dispatch_input(event, &mut ctx);
+            drop(keybindings);
             self.process_deferred_actions(ctx);
             return Some(result);
         }
 
         // Check for keys that should re-enter terminal mode from scrollback view.
         // Any plain character key exits scrollback and is forwarded to the terminal.
-        if self.is_terminal_buffer(self.active_buffer()) && should_enter_terminal_mode(event) {
+        if self
+            .active_window()
+            .is_terminal_buffer(self.active_buffer())
+            && should_enter_terminal_mode(event)
+        {
             self.enter_terminal_mode();
             // Forward the key to the terminal so the user's input isn't lost
-            self.send_terminal_key(event.code, event.modifiers);
+            self.active_window_mut()
+                .send_terminal_key(event.code, event.modifiers);
             return Some(InputResult::Consumed);
         }
 
@@ -99,7 +159,7 @@ impl Editor {
         }
 
         // Prompt is next
-        if self.prompt.is_some() {
+        if self.active_window().prompt.is_some() {
             // Check for Alt+key keybindings in Prompt context first
             // Use resolve_in_context_only to bypass Global bindings (like menu mnemonics)
             // This allows Prompt-specific Alt+key bindings (like encoding toggle) to work
@@ -108,10 +168,11 @@ impl Editor {
                 .contains(crossterm::event::KeyModifiers::ALT)
             {
                 if let crossterm::event::KeyCode::Char(_) = event.code {
-                    if let Some(action) = self.keybindings.resolve_in_context_only(
+                    let prompt_action = self.keybindings.read().unwrap().resolve_in_context_only(
                         event,
                         crate::input::keybindings::KeyContext::Prompt,
-                    ) {
+                    );
+                    if let Some(action) = prompt_action {
                         // For file browser actions, route to handle_file_open_action
                         if self.is_file_open_active() && self.handle_file_open_action(&action) {
                             return Some(InputResult::Consumed);
@@ -127,8 +188,13 @@ impl Editor {
 
             // File browser prompts use FileBrowserInputHandler
             if self.is_file_open_active() {
+                let active_window_id = self.active_window;
+                let __win = self
+                    .windows
+                    .get_mut(&active_window_id)
+                    .expect("active window present");
                 if let (Some(ref mut file_state), Some(ref mut prompt)) =
-                    (&mut self.file_open_state, &mut self.prompt)
+                    (&mut __win.file_open_state, &mut __win.prompt)
                 {
                     let mut handler = FileBrowserInputHandler::new(file_state, prompt);
                     let result = handler.dispatch_input(event, &mut ctx);
@@ -140,6 +206,7 @@ impl Editor {
             // QueryReplaceConfirm prompts use QueryReplaceConfirmInputHandler
             use crate::view::prompt::PromptType;
             let is_query_replace_confirm = self
+                .active_window()
                 .prompt
                 .as_ref()
                 .is_some_and(|p| p.prompt_type == PromptType::QueryReplaceConfirm);
@@ -150,7 +217,7 @@ impl Editor {
                 return Some(result);
             }
 
-            if let Some(ref mut prompt) = self.prompt {
+            if let Some(ref mut prompt) = self.active_window_mut().prompt {
                 let result = prompt.dispatch_input(event, &mut ctx);
                 // Only return and process deferred actions if the prompt handled the input
                 // If Ignored, fall through to check global keybindings
@@ -161,18 +228,52 @@ impl Editor {
             }
         }
 
-        // Popup is next
-        if self.active_state().popups.is_visible() {
-            let result = self
-                .active_state_mut()
-                .popups
-                .dispatch_input(event, &mut ctx);
-            self.process_deferred_actions(ctx);
-            // If the popup handler returned Ignored (e.g., non-word character,
-            // Ctrl+key, arrow keys), fall through to normal input handling.
-            // The deferred ClosePopup action was already processed above.
-            if result != InputResult::Ignored {
-                return Some(result);
+        // Editor-pane popups (global + buffer) belong to the editor pane and
+        // must not capture input when the file explorer is the focused pane.
+        // Mirrors the priority encoded in `get_key_context()` via the same
+        // `popups_capture_keys()` predicate so the two paths cannot drift —
+        // one source of truth for "is the popup eligible to eat this key?".
+        if self.popups_capture_keys() {
+            // Completion popups consult the keybinding resolver in the
+            // `Completion` context first, so accept/dismiss can be remapped
+            // via the keybinding editor. Falls through to the popup's own
+            // handler for everything else (type-to-filter, navigation, etc.).
+            if let Some(action) = self.resolve_completion_popup_action(event) {
+                self.process_deferred_actions(ctx);
+                if let Err(e) = self.handle_action(action) {
+                    tracing::warn!("Completion popup action failed: {}", e);
+                }
+                return Some(InputResult::Consumed);
+            }
+
+            // Editor-level (global) popups take precedence over buffer popups
+            // so that plugin notifications stay focused even when the active
+            // buffer owns its own popup stack.
+            if self.global_popups.is_visible() {
+                let result = self.global_popups.dispatch_input(event, &mut ctx);
+                self.process_deferred_actions(ctx);
+                if result != InputResult::Ignored {
+                    return Some(result);
+                }
+                // Re-check visibility — the dispatch may have queued a
+                // ClosePopup that the deferred-action processor has now fired.
+                return None;
+            }
+
+            // Popup is next
+            if self.active_state().popups.is_visible() {
+                let result = self
+                    .active_state_mut()
+                    .popups
+                    .dispatch_input(event, &mut ctx);
+                self.process_deferred_actions(ctx);
+                // If the popup handler returned Ignored (e.g., non-word
+                // character, Ctrl+key, arrow keys), fall through to normal
+                // input handling. The deferred ClosePopup action was already
+                // processed above.
+                if result != InputResult::Ignored {
+                    return Some(result);
+                }
             }
         }
 
@@ -249,7 +350,7 @@ impl Editor {
                 self.prompt_history_next();
             }
             DeferredAction::PreviewThemeFromPrompt => {
-                if let Some(prompt) = &self.prompt {
+                if let Some(prompt) = &self.active_window_mut().prompt {
                     if matches!(
                         prompt.prompt_type,
                         crate::view::prompt::PromptType::SelectTheme { .. }
@@ -261,63 +362,38 @@ impl Editor {
             }
             DeferredAction::PromptSelectionChanged { selected_index } => {
                 // Fire hook for plugin prompts so they can update live preview
-                if let Some(prompt) = &self.prompt {
-                    if let crate::view::prompt::PromptType::Plugin { custom_type } =
-                        &prompt.prompt_type
-                    {
-                        self.plugin_manager.run_hook(
-                            "prompt_selection_changed",
-                            crate::services::plugins::hooks::HookArgs::PromptSelectionChanged {
-                                prompt_type: custom_type.clone(),
-                                selected_index,
-                            },
-                        );
-                    }
+                let plugin_custom_type =
+                    self.active_window()
+                        .prompt
+                        .as_ref()
+                        .and_then(|p| match &p.prompt_type {
+                            crate::view::prompt::PromptType::Plugin { custom_type } => {
+                                Some(custom_type.clone())
+                            }
+                            _ => None,
+                        });
+                if let Some(custom_type) = plugin_custom_type {
+                    self.plugin_manager.read().unwrap().run_hook(
+                        "prompt_selection_changed",
+                        crate::services::plugins::hooks::HookArgs::PromptSelectionChanged {
+                            prompt_type: custom_type.clone(),
+                            selected_index,
+                        },
+                    );
                 }
             }
 
             // Popup actions
             DeferredAction::ClosePopup => {
-                self.hide_popup();
+                // Route through handle_popup_cancel so popup-specific
+                // cleanup runs (e.g. the LSP auto-prompt needs to mark
+                // the language as prompted and drop the pending queue
+                // entry — otherwise the render-time drain would just
+                // re-open the popup on the next frame, defeating Esc).
+                self.handle_popup_cancel();
             }
             DeferredAction::ConfirmPopup => {
                 self.handle_action(Action::PopupConfirm)?;
-            }
-            DeferredAction::CompletionEnterKey => {
-                use crate::config::AcceptSuggestionOnEnter;
-                match self.config.editor.accept_suggestion_on_enter {
-                    AcceptSuggestionOnEnter::On => {
-                        // Enter always accepts
-                        self.handle_action(Action::PopupConfirm)?;
-                    }
-                    AcceptSuggestionOnEnter::Off => {
-                        // Enter inserts newline - close popup and insert newline
-                        self.hide_popup();
-                        self.handle_action(Action::InsertNewline)?;
-                    }
-                    AcceptSuggestionOnEnter::Smart => {
-                        // Accept if completion differs from typed text
-                        // For now, we check if there's a selected item with data
-                        // that differs from what's in the buffer
-                        let should_accept = self
-                            .active_state()
-                            .popups
-                            .top()
-                            .and_then(|p| p.selected_item())
-                            .map(|item| {
-                                // If there's selection data, accept the completion
-                                item.data.is_some()
-                            })
-                            .unwrap_or(false);
-
-                        if should_accept {
-                            self.handle_action(Action::PopupConfirm)?;
-                        } else {
-                            self.hide_popup();
-                            self.handle_action(Action::InsertNewline)?;
-                        }
-                    }
-                }
             }
             DeferredAction::PopupTypeChar(c) => {
                 self.handle_popup_type_char(c);
@@ -337,7 +413,7 @@ impl Editor {
 
             // Character insertion with suggestion update
             DeferredAction::InsertCharAndUpdate(c) => {
-                if let Some(ref mut prompt) = self.prompt {
+                if let Some(ref mut prompt) = self.active_window_mut().prompt {
                     prompt.insert_char(c);
                 }
                 self.update_prompt_suggestions();
@@ -345,22 +421,22 @@ impl Editor {
 
             // File browser actions
             DeferredAction::FileBrowserSelectPrev => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.select_prev();
                 }
             }
             DeferredAction::FileBrowserSelectNext => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.select_next();
                 }
             }
             DeferredAction::FileBrowserPageUp => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.page_up(10);
                 }
             }
             DeferredAction::FileBrowserPageDown => {
-                if let Some(state) = &mut self.file_open_state {
+                if let Some(state) = &mut self.active_window_mut().file_open_state {
                     state.page_down(10);
                 }
             }
@@ -375,6 +451,7 @@ impl Editor {
             DeferredAction::FileBrowserGoParent => {
                 // Navigate to parent directory
                 let parent = self
+                    .active_window_mut()
                     .file_open_state
                     .as_ref()
                     .and_then(|s| s.current_dir.parent())
@@ -396,13 +473,14 @@ impl Editor {
             }
             DeferredAction::CancelInteractiveReplace => {
                 self.cancel_prompt();
-                self.interactive_replace_state = None;
+                self.active_window_mut().interactive_replace_state = None;
             }
 
             // Terminal mode actions
             DeferredAction::ToggleKeyboardCapture => {
-                self.keyboard_capture = !self.keyboard_capture;
-                if self.keyboard_capture {
+                self.active_window_mut().keyboard_capture =
+                    !self.active_window_mut().keyboard_capture;
+                if self.active_window_mut().keyboard_capture {
                     self.set_status_message(
                         "Keyboard capture ON - all keys go to terminal (F9 to toggle)".to_string(),
                     );
@@ -413,7 +491,7 @@ impl Editor {
                 }
             }
             DeferredAction::SendTerminalKey(code, modifiers) => {
-                self.send_terminal_key(code, modifiers);
+                self.active_window_mut().send_terminal_key(code, modifiers);
             }
             DeferredAction::SendTerminalMouse {
                 col,
@@ -421,24 +499,34 @@ impl Editor {
                 kind,
                 modifiers,
             } => {
-                self.send_terminal_mouse(col, row, kind, modifiers);
+                self.active_window_mut()
+                    .send_terminal_mouse(col, row, kind, modifiers);
             }
             DeferredAction::ExitTerminalMode { explicit } => {
-                self.terminal_mode = false;
-                self.key_context = crate::input::keybindings::KeyContext::Normal;
+                self.active_window_mut().terminal_mode = false;
+                self.active_window_mut().key_context =
+                    crate::input::keybindings::KeyContext::Normal;
                 if explicit {
                     // User explicitly exited - don't auto-resume when switching back
-                    self.terminal_mode_resume.remove(&self.active_buffer());
-                    self.sync_terminal_to_buffer(self.active_buffer());
+                    let buf = self.active_buffer();
+                    self.active_window_mut().terminal_mode_resume.remove(&buf);
+                    {
+                        let __b = self.active_buffer();
+                        self.active_window_mut().sync_terminal_to_buffer(__b);
+                    };
                     self.set_status_message(
                         "Terminal mode disabled - read only (Ctrl+Space to resume)".to_string(),
                     );
                 }
             }
             DeferredAction::EnterScrollbackMode => {
-                self.terminal_mode = false;
-                self.key_context = crate::input::keybindings::KeyContext::Normal;
-                self.sync_terminal_to_buffer(self.active_buffer());
+                self.active_window_mut().terminal_mode = false;
+                self.active_window_mut().key_context =
+                    crate::input::keybindings::KeyContext::Normal;
+                {
+                    let __b = self.active_buffer();
+                    self.active_window_mut().sync_terminal_to_buffer(__b);
+                };
                 self.set_status_message(
                     "Scrollback mode - use PageUp/Down to scroll (Ctrl+Space to resume)"
                         .to_string(),
@@ -473,6 +561,7 @@ impl Editor {
     fn prompt_history_prev(&mut self) {
         // Get the prompt type and current input
         let prompt_info = self
+            .active_window()
             .prompt
             .as_ref()
             .map(|p| (p.prompt_type.clone(), p.input.clone()));
@@ -480,9 +569,9 @@ impl Editor {
         if let Some((prompt_type, current_input)) = prompt_info {
             // Get the history key for this prompt type
             if let Some(key) = Self::prompt_type_to_history_key(&prompt_type) {
-                if let Some(history) = self.prompt_histories.get_mut(&key) {
+                if let Some(history) = self.active_window_mut().prompt_histories.get_mut(&key) {
                     if let Some(entry) = history.navigate_prev(&current_input) {
-                        if let Some(ref mut prompt) = self.prompt {
+                        if let Some(ref mut prompt) = self.active_window_mut().prompt {
                             prompt.set_input(entry);
                         }
                     }
@@ -493,14 +582,18 @@ impl Editor {
 
     /// Navigate to next history entry in prompt.
     fn prompt_history_next(&mut self) {
-        let prompt_type = self.prompt.as_ref().map(|p| p.prompt_type.clone());
+        let prompt_type = self
+            .active_window()
+            .prompt
+            .as_ref()
+            .map(|p| p.prompt_type.clone());
 
         if let Some(prompt_type) = prompt_type {
             // Get the history key for this prompt type
             if let Some(key) = Self::prompt_type_to_history_key(&prompt_type) {
-                if let Some(history) = self.prompt_histories.get_mut(&key) {
+                if let Some(history) = self.active_window_mut().prompt_histories.get_mut(&key) {
                     if let Some(entry) = history.navigate_next() {
-                        if let Some(ref mut prompt) = self.prompt {
+                        if let Some(ref mut prompt) = self.active_window_mut().prompt {
                             prompt.set_input(entry);
                         }
                     }

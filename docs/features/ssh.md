@@ -1,16 +1,36 @@
 # Remote Editing (Experimental)
 
-Fresh supports editing files on remote machines via SSH using the `user@host:path` syntax. This is useful for editing files on servers without needing to install Fresh remotely.
+> **Activation:** command-line only — no palette command or settings toggle. Launch Fresh with a remote path as the first argument (see forms below).
+
+Fresh supports editing files on remote machines via SSH. Two wire
+forms are accepted and do the same thing — pick whichever is easier
+to type:
+
+- scp-style: `user@host:path[:line[:col]]`
+- URL-style: `ssh://[user@]host[:port]/path[:line[:col]]`
+
+The URL form is the only one that accepts a non-standard port and is
+the only one where the user is optional (it defaults to `$USER` /
+`$USERNAME`).
 
 ```bash
-# Open a specific file
+# scp-style: open a specific file
 fresh deploy@server.example.com:/etc/nginx/nginx.conf
 
-# Open home directory in file explorer
+# scp-style: open home directory in file explorer
 fresh user@host:~
 
-# Open with line number
+# scp-style: open with line number
 fresh user@host:/var/log/app.log:100
+
+# URL-style: default user from the environment
+fresh ssh://host.example/etc/hosts
+
+# URL-style: non-standard SSH port
+fresh ssh://deploy@server.example.com:2222/etc/nginx/nginx.conf
+
+# URL-style: line and column
+fresh ssh://alice@host/home/alice/src/main.rs:42:7
 ```
 
 **Features:**
@@ -18,6 +38,9 @@ fresh user@host:/var/log/app.log:100
 - File explorer shows remote directory
 - Sudo save support for protected files
 - Status bar shows `[SSH:user@host]` indicator
+- Background auto-reconnect after a dropped connection, with a disconnected indicator in the status bar
+
+Under the hood, attaching to an SSH remote points the editor's filesystem and process [Authority](../plugins/api/) at that host — file I/O, the embedded terminal, spawned LSP servers, and any process Fresh launches all run on the remote.
 
 **Requirements:**
 - SSH access to the remote host

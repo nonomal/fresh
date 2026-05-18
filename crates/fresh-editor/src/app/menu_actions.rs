@@ -9,6 +9,40 @@ use crate::input::keybindings::Action;
 use anyhow::Result as AnyhowResult;
 
 impl Editor {
+    /// Replace `self.menus` and invalidate the expanded-menu cache. Use this
+    /// in place of a direct `self.menus = …` assignment so the cached
+    /// `DynamicSubmenu` expansion can never go stale relative to the
+    /// underlying menu config.
+    pub fn set_menus(&mut self, menus: crate::config::MenuConfig) {
+        self.menus = menus;
+        self.expanded_menus_cache.invalidate();
+    }
+
+    /// Find a built-in or plugin menu by `label`, mutate it via `f`, and
+    /// invalidate the expanded-menu cache. Returns `None` if no matching
+    /// menu was found (in which case the cache is left alone).
+    pub fn with_menu_by_label<F, R>(&mut self, label: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Menu) -> R,
+    {
+        if let Some(idx) = self.menus.menus.iter().position(|m| m.label == label) {
+            let r = f(&mut self.menus.menus[idx]);
+            self.expanded_menus_cache.invalidate();
+            return Some(r);
+        }
+        if let Some(idx) = self
+            .menu_state
+            .plugin_menus
+            .iter()
+            .position(|m| m.label == label)
+        {
+            let r = f(&mut self.menu_state.plugin_menus[idx]);
+            self.expanded_menus_cache.invalidate();
+            return Some(r);
+        }
+        None
+    }
+
     /// Get all menus (built-in menus + plugin menus) with DynamicSubmenus expanded.
     fn all_menus(&self) -> Vec<Menu> {
         self.menus
@@ -27,11 +61,11 @@ impl Editor {
     /// If the menu bar is hidden, it will be temporarily shown.
     pub fn handle_menu_activate(&mut self) {
         // Auto-show menu bar if hidden
-        if !self.menu_bar_visible {
-            self.menu_bar_visible = true;
-            self.menu_bar_auto_shown = true;
+        if !self.active_window_mut().menu_bar_visible {
+            self.active_window_mut().menu_bar_visible = true;
+            self.active_window_mut().menu_bar_auto_shown = true;
         }
-        self.on_editor_focus_lost();
+        self.active_window_mut().on_editor_focus_lost();
         self.menu_state.open_menu(0);
     }
 
@@ -39,9 +73,9 @@ impl Editor {
     /// Use this method instead of `menu_state.close_menu()` to ensure auto-hide works.
     pub fn close_menu_with_auto_hide(&mut self) {
         self.menu_state.close_menu();
-        if self.menu_bar_auto_shown {
-            self.menu_bar_visible = false;
-            self.menu_bar_auto_shown = false;
+        if self.active_window_mut().menu_bar_auto_shown {
+            self.active_window_mut().menu_bar_visible = false;
+            self.active_window_mut().menu_bar_auto_shown = false;
         }
     }
 
@@ -101,13 +135,13 @@ impl Editor {
 
         // Update context before checking if action is enabled
         use crate::view::ui::context_keys;
+        let has_sel = self.has_active_selection();
+        let fe_focused =
+            self.active_window().key_context == crate::input::keybindings::KeyContext::FileExplorer;
         self.menu_state
             .context
-            .set(context_keys::HAS_SELECTION, self.has_active_selection())
-            .set(
-                context_keys::FILE_EXPLORER_FOCUSED,
-                self.key_context == crate::input::keybindings::KeyContext::FileExplorer,
-            );
+            .set(context_keys::HAS_SELECTION, has_sel)
+            .set(context_keys::FILE_EXPLORER_FOCUSED, fe_focused);
 
         if let Some((action_name, args)) = self.menu_state.get_highlighted_action(&all_menus) {
             // Close the menu with auto-hide support
@@ -129,11 +163,11 @@ impl Editor {
     /// If the menu bar is hidden, it will be temporarily shown.
     pub fn handle_menu_open(&mut self, menu_name: &str) {
         // Auto-show menu bar if hidden
-        if !self.menu_bar_visible {
-            self.menu_bar_visible = true;
-            self.menu_bar_auto_shown = true;
+        if !self.active_window_mut().menu_bar_visible {
+            self.active_window_mut().menu_bar_visible = true;
+            self.active_window_mut().menu_bar_auto_shown = true;
         }
-        self.on_editor_focus_lost();
+        self.active_window_mut().on_editor_focus_lost();
 
         let all_menus = self.all_menus();
         for (idx, menu) in all_menus.iter().enumerate() {
@@ -153,7 +187,7 @@ impl Editor {
         row: u16,
         menu_index: usize,
     ) -> Option<HoverTarget> {
-        let menu_layout = self.cached_layout.menu_layout.as_ref()?;
+        let menu_layout = self.active_chrome().menu_layout.as_ref()?;
 
         // Check submenu items first (they're rendered on top)
         if let Some((depth, item_idx)) = menu_layout.submenu_item_at(col, row) {
@@ -179,7 +213,7 @@ impl Editor {
     ) -> AnyhowResult<Option<AnyhowResult<()>>> {
         use crate::view::ui::menu::MenuHit;
 
-        let menu_layout = match &self.cached_layout.menu_layout {
+        let menu_layout = match &self.active_chrome().menu_layout {
             Some(layout) => layout.clone(),
             None => return Ok(None),
         };

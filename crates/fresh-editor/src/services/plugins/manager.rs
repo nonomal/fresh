@@ -26,6 +26,13 @@ pub struct PluginManager {
     inner: Option<PluginThreadHandle>,
     #[cfg(not(feature = "plugins"))]
     _phantom: std::marker::PhantomData<()>,
+    /// Test-only side channel: commands pushed via
+    /// [`Self::test_inject_command`] are returned by the next
+    /// `process_commands()` call as if they had come from the plugin
+    /// thread. Always present (zero overhead — empty `Vec`) so
+    /// integration tests in `tests/` can use it without an extra
+    /// feature flag.
+    pending_injected_commands: Vec<super::api::PluginCommand>,
 }
 
 impl PluginManager {
@@ -51,6 +58,7 @@ impl PluginManager {
                     Ok(handle) => {
                         return Self {
                             inner: Some(handle),
+                            pending_injected_commands: Vec::new(),
                         }
                     }
                     Err(e) => {
@@ -62,7 +70,10 @@ impl PluginManager {
             } else {
                 tracing::info!("Plugins disabled via --no-plugins flag");
             }
-            Self { inner: None }
+            Self {
+                inner: None,
+                pending_injected_commands: Vec::new(),
+            }
         }
 
         #[cfg(not(feature = "plugins"))]
@@ -75,12 +86,29 @@ impl PluginManager {
             }
             Self {
                 _phantom: std::marker::PhantomData,
+                pending_injected_commands: Vec::new(),
             }
         }
     }
 
-    /// Check if the plugin system is active (has a running plugin thread).
+    /// Inject a [`PluginCommand`](super::api::PluginCommand) into the
+    /// manager's pending queue as if it had arrived from the plugin
+    /// thread. Returned by the next `process_commands()` call.
+    ///
+    /// Intended for tests that need to deterministically reproduce
+    /// renderer/plugin races (e.g. the mid-render `process_commands`
+    /// path in `Editor::render`) without spinning up the real plugin
+    /// runtime. Production code should not call this.
+    pub fn test_inject_command(&mut self, command: super::api::PluginCommand) {
+        self.pending_injected_commands.push(command);
+    }
+
+    /// Check if the plugin system is active (has a running plugin thread,
+    /// or — in tests — has commands queued via [`Self::test_inject_command`]).
     pub fn is_active(&self) -> bool {
+        if !self.pending_injected_commands.is_empty() {
+            return true;
+        }
         #[cfg(feature = "plugins")]
         {
             self.inner.is_some()
@@ -243,17 +271,18 @@ impl PluginManager {
 
     /// Process pending plugin commands (non-blocking).
     pub fn process_commands(&mut self) -> Vec<super::api::PluginCommand> {
+        // Drain any test-injected commands first so they appear at the
+        // front of the returned batch — matching the order the real
+        // plugin thread would have produced if the inject call were a
+        // genuine plugin response.
+        let mut commands = std::mem::take(&mut self.pending_injected_commands);
         #[cfg(feature = "plugins")]
         {
             if let Some(ref mut manager) = self.inner {
-                return manager.process_commands();
+                commands.extend(manager.process_commands());
             }
-            Vec::new()
         }
-        #[cfg(not(feature = "plugins"))]
-        {
-            Vec::new()
-        }
+        commands
     }
 
     /// Process commands, blocking until `HookCompleted` for the given hook arrives.
@@ -288,6 +317,21 @@ impl PluginManager {
         self.inner.as_ref().map(|m| m.state_snapshot_handle())
     }
 
+    /// Streaming-search handle registry shared with the plugin runtime.
+    /// Producers spawned by `BeginSearch` look up the handle here and write
+    /// directly into its `SearchHandleState`; consumers (the plugin) drain
+    /// the same state via `_searchHandleTake`.
+    #[cfg(feature = "plugins")]
+    pub fn search_handles_handle(&self) -> Option<fresh_core::api::SearchHandleRegistry> {
+        self.inner.as_ref().map(|m| m.search_handles_handle())
+    }
+
+    /// Streaming-search registry accessor (no-op build).
+    #[cfg(not(feature = "plugins"))]
+    pub fn search_handles_handle(&self) -> Option<fresh_core::api::SearchHandleRegistry> {
+        None
+    }
+
     /// Execute a plugin action asynchronously.
     #[cfg(feature = "plugins")]
     pub fn execute_action_async(
@@ -311,6 +355,27 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
+    /// Collect the isolated-declarations `.d.ts` emit of every loaded
+    /// plugin that produced one. Returns `(plugin_name, d_ts_source)`
+    /// pairs — callers use this to assemble `plugins.d.ts`.
+    ///
+    /// Available in all builds: without the `plugins` feature it
+    /// returns an empty vec, letting `editor_init` call this
+    /// unconditionally.
+    pub fn plugin_declarations(&self) -> Vec<(String, String)> {
+        #[cfg(feature = "plugins")]
+        {
+            self.list_plugins()
+                .into_iter()
+                .filter_map(|info| info.declarations.map(|d| (info.name, d)))
+                .collect()
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Reload a plugin by name.
     #[cfg(feature = "plugins")]
     pub fn reload_plugin(&self, name: &str) -> anyhow::Result<()> {
@@ -320,13 +385,86 @@ impl PluginManager {
             .reload_plugin(name)
     }
 
+    /// Submit a "load plugins from dir with config" request without
+    /// blocking. Returns `None` when the plugin runtime is inactive (no
+    /// thread), or when the request couldn't be submitted. Used by the
+    /// startup async-load path.
+    #[cfg(feature = "plugins")]
+    pub fn load_plugins_from_dir_with_config_request(
+        &self,
+        dir: &Path,
+        plugin_configs: &HashMap<String, PluginConfig>,
+    ) -> Option<
+        fresh_plugin_runtime::thread::oneshot::Receiver<
+            fresh_plugin_runtime::thread::PluginsDirLoadResult,
+        >,
+    > {
+        self.inner.as_ref().and_then(|m| {
+            m.load_plugins_from_dir_with_config_request(dir, plugin_configs)
+                .ok()
+        })
+    }
+
+    /// Submit a "load plugin from source" request without blocking.
+    /// Returns `None` when the plugin runtime is inactive.
+    #[cfg(feature = "plugins")]
+    pub fn load_plugin_from_source_request(
+        &self,
+        source: &str,
+        name: &str,
+        is_typescript: bool,
+    ) -> Option<fresh_plugin_runtime::thread::oneshot::Receiver<anyhow::Result<()>>> {
+        self.inner.as_ref().and_then(|m| {
+            m.load_plugin_from_source_request(source, name, is_typescript)
+                .ok()
+        })
+    }
+
+    /// Submit a "list plugins" request without blocking. Submitted after
+    /// a batch of dir-load requests, this guarantees the response covers
+    /// every plugin loaded by that batch (FIFO request channel).
+    #[cfg(feature = "plugins")]
+    pub fn list_plugins_request(
+        &self,
+    ) -> Option<
+        fresh_plugin_runtime::thread::oneshot::Receiver<
+            Vec<fresh_plugin_runtime::backend::quickjs_backend::TsPluginInfo>,
+        >,
+    > {
+        self.inner
+            .as_ref()
+            .and_then(|m| m.list_plugins_request().ok())
+    }
+
     /// Check if any handlers are registered for a hook.
+    ///
+    /// Blocking call (round-trips through the plugin thread). Suitable for
+    /// rare events (mouse clicks, command dispatch). For per-render gating
+    /// use `has_subscribers` instead — it reads a shared registry directly.
     pub fn has_hook_handlers(&self, hook_name: &str) -> bool {
         #[cfg(feature = "plugins")]
         {
             self.inner
                 .as_ref()
                 .map(|m| m.has_hook_handlers(hook_name))
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = hook_name;
+            false
+        }
+    }
+
+    /// Non-blocking variant of `has_hook_handlers`. Reads the shared
+    /// `event_handlers` registry directly — safe to call on the hot
+    /// render path. Returns `false` when plugins are disabled.
+    pub fn has_subscribers(&self, hook_name: &str) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            self.inner
+                .as_ref()
+                .map(|m| m.has_subscribers(hook_name))
                 .unwrap_or(false)
         }
         #[cfg(not(feature = "plugins"))]
@@ -366,30 +504,5 @@ impl PluginManager {
     #[cfg(not(feature = "plugins"))]
     pub fn reject_callback(&self, callback_id: fresh_core::api::JsCallbackId, error: String) {
         let _ = (callback_id, error);
-    }
-
-    /// Call a streaming callback with partial data (does not consume the callback).
-    /// When `done` is true, the JS side cleans up.
-    #[cfg(feature = "plugins")]
-    pub fn call_streaming_callback(
-        &self,
-        callback_id: fresh_core::api::JsCallbackId,
-        result_json: String,
-        done: bool,
-    ) {
-        if let Some(inner) = &self.inner {
-            inner.call_streaming_callback(callback_id, result_json, done);
-        }
-    }
-
-    /// Call a streaming callback (no-op when plugins disabled)
-    #[cfg(not(feature = "plugins"))]
-    pub fn call_streaming_callback(
-        &self,
-        callback_id: fresh_core::api::JsCallbackId,
-        result_json: String,
-        done: bool,
-    ) {
-        let _ = (callback_id, result_json, done);
     }
 }

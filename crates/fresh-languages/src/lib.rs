@@ -53,13 +53,38 @@ pub enum HighlightCategory {
     Keyword,
     Number,
     Operator,
+    PunctuationBracket,
+    PunctuationDelimiter,
     Property,
     String,
     Type,
     Variable,
+    /// `markup.inserted.*` — added lines in a diff. The renderer
+    /// fills the whole row's background with the theme's
+    /// `editor.diff_add_bg`. Foreground stays default so the row
+    /// stays readable.
+    Inserted,
+    /// `markup.deleted.*` — removed lines. Background fill from
+    /// `editor.diff_remove_bg`.
+    Deleted,
+    /// `meta.diff.range.*` / `markup.changed.*` — hunk header rows
+    /// and any "changed" markers. Background fill from
+    /// `editor.diff_modify_bg`.
+    Changed,
 }
 
 impl HighlightCategory {
+    /// Whether this category's background fill should extend past
+    /// the scoped text to the end of the visible row.
+    ///
+    /// Syntect's `Diff` grammar scopes each `+`/`-`/`@@` line up to
+    /// the trailing newline; without this flag the renderer would
+    /// stop the bg wash at the row's last character, leaving short
+    /// rows half-coloured.
+    pub fn bg_extends_to_line_end(&self) -> bool {
+        matches!(self, Self::Inserted | Self::Deleted | Self::Changed)
+    }
+
     /// Map a default language highlight index to a category
     pub fn from_default_index(index: usize) -> Option<Self> {
         match index {
@@ -70,10 +95,12 @@ impl HighlightCategory {
             4 => Some(Self::Keyword),
             5 => Some(Self::Number),
             6 => Some(Self::Operator),
-            7 => Some(Self::Property),
-            8 => Some(Self::String),
-            9 => Some(Self::Type),
-            10 => Some(Self::Variable),
+            7 => Some(Self::PunctuationBracket),
+            8 => Some(Self::PunctuationDelimiter),
+            9 => Some(Self::Property),
+            10 => Some(Self::String),
+            11 => Some(Self::Type),
+            12 => Some(Self::Variable),
             _ => None,
         }
     }
@@ -81,29 +108,29 @@ impl HighlightCategory {
     /// Map a TypeScript highlight index to a category.
     pub fn from_typescript_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(Self::Attribute), // attribute
-            1 => Some(Self::Comment),   // comment
-            2 => Some(Self::Constant),  // constant
-            3 => Some(Self::Constant),  // constant.builtin
-            4 => Some(Self::Type),      // constructor
-            5 => Some(Self::String),    // embedded (template substitutions)
-            6 => Some(Self::Function),  // function
-            7 => Some(Self::Function),  // function.builtin
-            8 => Some(Self::Function),  // function.method
-            9 => Some(Self::Keyword),   // keyword
-            10 => Some(Self::Number),   // number
-            11 => Some(Self::Operator), // operator
-            12 => Some(Self::Property), // property
-            13 => Some(Self::Operator), // punctuation.bracket
-            14 => Some(Self::Operator), // punctuation.delimiter
-            15 => Some(Self::Constant), // punctuation.special (template ${})
-            16 => Some(Self::String),   // string
-            17 => Some(Self::String),   // string.special (regex)
-            18 => Some(Self::Type),     // type
-            19 => Some(Self::Type),     // type.builtin
-            20 => Some(Self::Variable), // variable
-            21 => Some(Self::Constant), // variable.builtin (this, super, arguments)
-            22 => Some(Self::Variable), // variable.parameter
+            0 => Some(Self::Attribute),             // attribute
+            1 => Some(Self::Comment),               // comment
+            2 => Some(Self::Constant),              // constant
+            3 => Some(Self::Constant),              // constant.builtin
+            4 => Some(Self::Type),                  // constructor
+            5 => Some(Self::String),                // embedded (template substitutions)
+            6 => Some(Self::Function),              // function
+            7 => Some(Self::Function),              // function.builtin
+            8 => Some(Self::Function),              // function.method
+            9 => Some(Self::Keyword),               // keyword
+            10 => Some(Self::Number),               // number
+            11 => Some(Self::Operator),             // operator
+            12 => Some(Self::Property),             // property
+            13 => Some(Self::PunctuationBracket),   // punctuation.bracket
+            14 => Some(Self::PunctuationDelimiter), // punctuation.delimiter
+            15 => Some(Self::Constant),             // punctuation.special (template ${})
+            16 => Some(Self::String),               // string
+            17 => Some(Self::String),               // string.special (regex)
+            18 => Some(Self::Type),                 // type
+            19 => Some(Self::Type),                 // type.builtin
+            20 => Some(Self::Variable),             // variable
+            21 => Some(Self::Constant),             // variable.builtin (this, super, arguments)
+            22 => Some(Self::Variable),             // variable.parameter
             _ => None,
         }
     }
@@ -119,6 +146,15 @@ impl HighlightCategory {
             Self::Variable | Self::Property => "syntax.variable",
             Self::Constant | Self::Number | Self::Attribute => "syntax.constant",
             Self::Operator => "syntax.operator",
+            Self::PunctuationBracket => "syntax.punctuation_bracket",
+            Self::PunctuationDelimiter => "syntax.punctuation_delimiter",
+            // Diff categories are bg-driven; the inspector surfaces
+            // the existing editor-level diff keys (also used by
+            // live_diff / side-by-side diff) rather than a separate
+            // syntax.* key.
+            Self::Inserted => "editor.diff_add_bg",
+            Self::Deleted => "editor.diff_remove_bg",
+            Self::Changed => "editor.diff_modify_bg",
         }
     }
 
@@ -132,16 +168,21 @@ impl HighlightCategory {
             Self::Keyword => "Keyword",
             Self::Number => "Number",
             Self::Operator => "Operator",
+            Self::PunctuationBracket => "Punctuation Bracket",
+            Self::PunctuationDelimiter => "Punctuation Delimiter",
             Self::Property => "Property",
             Self::String => "String",
             Self::Type => "Type",
             Self::Variable => "Variable",
+            Self::Inserted => "Diff Inserted",
+            Self::Deleted => "Diff Deleted",
+            Self::Changed => "Diff Changed",
         }
     }
 }
 
 /// Language configuration for syntax highlighting
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
     Python,
@@ -153,6 +194,7 @@ pub enum Language {
     Cpp,
     Go,
     Json,
+    Jsonc,
     Java,
     CSharp,
     Php,
@@ -164,29 +206,17 @@ pub enum Language {
 }
 
 impl Language {
-    /// Detect language from file extension
+    /// Detect language from file extension.
+    ///
+    /// Derived from `extensions()` — see `Self::all` / `Self::extensions` for
+    /// the authoritative table. A linear scan over ~18 languages is cheap
+    /// enough that the nicer invariant (no duplicate tables) beats a match.
     pub fn from_path(path: &Path) -> Option<Self> {
-        match path.extension()?.to_str()? {
-            "rs" => Some(Language::Rust),
-            "py" => Some(Language::Python),
-            "js" | "jsx" => Some(Language::JavaScript),
-            "ts" | "tsx" => Some(Language::TypeScript),
-            "html" => Some(Language::HTML),
-            "css" => Some(Language::CSS),
-            "c" | "h" => Some(Language::C),
-            "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "cppm" | "ixx" => Some(Language::Cpp),
-            "go" => Some(Language::Go),
-            "json" => Some(Language::Json),
-            "java" => Some(Language::Java),
-            "cs" => Some(Language::CSharp),
-            "php" => Some(Language::Php),
-            "rb" => Some(Language::Ruby),
-            "sh" | "bash" => Some(Language::Bash),
-            "lua" => Some(Language::Lua),
-            "pas" | "p" => Some(Language::Pascal),
-            "odin" => Some(Language::Odin),
-            _ => None,
-        }
+        let ext = path.extension()?.to_str()?;
+        Self::all()
+            .iter()
+            .find(|lang| lang.extensions().contains(&ext))
+            .copied()
     }
 
     /// Get tree-sitter highlight configuration for this language
@@ -370,6 +400,27 @@ impl Language {
                 #[cfg(not(feature = "tree-sitter-json"))]
                 Err("JSON language support not enabled".to_string())
             }
+            Self::Jsonc => {
+                // JSONC (JSON with Comments) reuses the tree-sitter-json parser.
+                // A dedicated JSONC grammar isn't published as a Rust crate; the
+                // JSON parser recovers past comments and trailing commas well
+                // enough for highlighting, which is the only consumer here.
+                #[cfg(feature = "tree-sitter-json")]
+                {
+                    let mut config = HighlightConfiguration::new(
+                        tree_sitter_json::LANGUAGE.into(),
+                        "jsonc",
+                        tree_sitter_json::HIGHLIGHTS_QUERY,
+                        "",
+                        "",
+                    )
+                    .map_err(|e| format!("Failed to create JSONC highlight config: {e}"))?;
+                    config.configure(DEFAULT_HIGHLIGHT_CAPTURES);
+                    Ok(config)
+                }
+                #[cfg(not(feature = "tree-sitter-json"))]
+                Err("JSONC language support not enabled".to_string())
+            }
             Self::Java => {
                 #[cfg(feature = "tree-sitter-java")]
                 {
@@ -532,6 +583,7 @@ impl Language {
             Language::Cpp,
             Language::Go,
             Language::Json,
+            Language::Jsonc,
             Language::Java,
             Language::CSharp,
             Language::Php,
@@ -556,6 +608,7 @@ impl Language {
             Self::Cpp => "cpp",
             Self::Go => "go",
             Self::Json => "json",
+            Self::Jsonc => "jsonc",
             Self::Java => "java",
             Self::CSharp => "csharp",
             Self::Php => "php",
@@ -583,6 +636,35 @@ impl Language {
         }
     }
 
+    /// File extensions associated with this language.
+    ///
+    /// Keep in sync with `from_path`. Used by the grammar catalog so that
+    /// tree-sitter-only languages (like TypeScript) still advertise the
+    /// extensions they can highlight.
+    pub fn extensions(&self) -> &'static [&'static str] {
+        match self {
+            Self::Rust => &["rs"],
+            Self::Python => &["py"],
+            Self::JavaScript => &["js", "jsx", "mjs", "cjs"],
+            Self::TypeScript => &["ts", "tsx", "mts", "cts"],
+            Self::HTML => &["html"],
+            Self::CSS => &["css"],
+            Self::C => &["c", "h"],
+            Self::Cpp => &["cpp", "hpp", "cc", "hh", "cxx", "hxx", "cppm", "ixx"],
+            Self::Go => &["go"],
+            Self::Json => &["json"],
+            Self::Jsonc => &["jsonc"],
+            Self::Java => &["java"],
+            Self::CSharp => &["cs"],
+            Self::Php => &["php"],
+            Self::Ruby => &["rb"],
+            Self::Bash => &["sh", "bash"],
+            Self::Lua => &["lua"],
+            Self::Pascal => &["pas", "p"],
+            Self::Odin => &["odin"],
+        }
+    }
+
     /// Returns the human-readable display name
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -596,6 +678,7 @@ impl Language {
             Self::Cpp => "C++",
             Self::Go => "Go",
             Self::Json => "JSON",
+            Self::Jsonc => "JSON with Comments",
             Self::Java => "Java",
             Self::CSharp => "C#",
             Self::Php => "PHP",
@@ -621,6 +704,7 @@ impl Language {
             "cpp" | "c++" => Some(Self::Cpp),
             "go" => Some(Self::Go),
             "json" => Some(Self::Json),
+            "jsonc" => Some(Self::Jsonc),
             "java" => Some(Self::Java),
             "c_sharp" | "c#" | "csharp" => Some(Self::CSharp),
             "php" => Some(Self::Php),
@@ -662,6 +746,7 @@ impl Language {
             "c++" => Some(Self::Cpp),
             "go" | "golang" => Some(Self::Go),
             "json" => Some(Self::Json),
+            "jsonc" | "json with comments" => Some(Self::Jsonc),
             "java" => Some(Self::Java),
             "c#" => Some(Self::CSharp),
             "php" => Some(Self::Php),
@@ -694,6 +779,8 @@ const DEFAULT_HIGHLIGHT_CAPTURES: &[&str] = &[
     "keyword",
     "number",
     "operator",
+    "punctuation.bracket",
+    "punctuation.delimiter",
     "property",
     "string",
     "type",
@@ -782,5 +869,28 @@ mod tests {
         // Language::id() must return "csharp" to match the config key
         // used for LSP server lookup and language detection.
         assert_eq!(Language::CSharp.id(), "csharp");
+    }
+
+    /// Guard: `from_path` and `extensions()` must stay in sync — they used to
+    /// be two hand-maintained tables with a "keep in sync" comment, which
+    /// silently drifted when either was edited in isolation.
+    #[test]
+    fn test_from_path_matches_extensions() {
+        for lang in Language::all() {
+            for ext in lang.extensions() {
+                let path = std::path::PathBuf::from(format!("x.{}", ext));
+                let detected = Language::from_path(&path).unwrap_or_else(|| {
+                    panic!(
+                        "extension .{} listed by {:?} but from_path returned None",
+                        ext, lang
+                    )
+                });
+                assert_eq!(
+                    detected, *lang,
+                    "extension .{} listed by {:?} but from_path returned {:?}",
+                    ext, lang, detected
+                );
+            }
+        }
     }
 }

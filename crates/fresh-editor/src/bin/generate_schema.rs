@@ -7,6 +7,7 @@
 //!   cargo run --features dev-bins --bin generate_schema theme > plugins/schemas/theme.schema.json
 
 use fresh::config::Config;
+use fresh::services::packages::PackageManifest;
 use fresh::view::theme::ThemeFile;
 use schemars::schema_for;
 use std::env;
@@ -35,8 +36,25 @@ fn main() {
             let schema = schema_for!(ThemeFile);
             serde_json::to_value(&schema).expect("Failed to serialize schema")
         }
+        "package" => {
+            let schema = schema_for!(PackageManifest);
+            let mut json = serde_json::to_value(&schema).expect("Failed to serialize schema");
+            // Add $id for the package schema
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "$id".to_string(),
+                    serde_json::Value::String(
+                        "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json".to_string()
+                    ),
+                );
+            }
+            json
+        }
         other => {
-            eprintln!("Unknown schema type: {}. Use 'config' or 'theme'.", other);
+            eprintln!(
+                "Unknown schema type: {}. Use 'config', 'theme', or 'package'.",
+                other
+            );
             std::process::exit(1);
         }
     };

@@ -109,30 +109,29 @@ else
     echo "Warning: No themes directory found at $BINARY_DIR/themes"
 fi
 
-# Create desktop file
-cat > "$APPDIR/fresh.desktop" << EOF
-[Desktop Entry]
-Name=Fresh
-GenericName=Text Editor
-Comment=A lightweight, fast terminal-based text editor with LSP support
-Exec=fresh %F
-Icon=fresh
-Terminal=true
-Type=Application
-Categories=Development;TextEditor;Utility;
-Keywords=editor;terminal;text;code;programming;lsp;
-MimeType=text/plain;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-java;text/x-python;text/x-script.python;application/x-python;text/x-rust;text/x-go;text/javascript;application/javascript;text/x-typescript;application/json;text/html;text/css;text/x-shellscript;text/x-lua;text/x-ruby;text/x-php;text/x-csharp;text/markdown;
-StartupNotify=false
-X-AppImage-Version=${VERSION}
-EOF
+# Copy desktop file from source and add AppImage version
+DESKTOP_SRC="$(cd "$REPO_ROOT/../.." && pwd)/crates/fresh-editor/resources/fresh.desktop"
+cp "$DESKTOP_SRC" "$APPDIR/fresh.desktop"
+echo "X-AppImage-Version=${VERSION}" >> "$APPDIR/fresh.desktop"
 
 # Also place in standard location
 cp "$APPDIR/fresh.desktop" "$APPDIR/usr/share/applications/"
 
-# Copy icon
+# Copy icon (SVG + hicolor PNGs)
 ICON_SRC="$REPO_ROOT/flatpak/${APP_ID}.svg"
 cp "$ICON_SRC" "$APPDIR/fresh.svg"
 cp "$ICON_SRC" "$APPDIR/usr/share/icons/hicolor/scalable/apps/fresh.svg"
+
+# Install hicolor PNG icons for desktop environments that prefer raster icons
+ICONS_ROOT="$(cd "$REPO_ROOT/../.." && pwd)/docs/icons/linux/hicolor"
+if [ -d "$ICONS_ROOT" ]; then
+    for size_dir in "$ICONS_ROOT"/*/apps; do
+        size=$(basename "$(dirname "$size_dir")")
+        mkdir -p "$APPDIR/usr/share/icons/hicolor/${size}/apps"
+        cp "$size_dir/fresh.png" "$APPDIR/usr/share/icons/hicolor/${size}/apps/fresh.png"
+    done
+    echo "Installed hicolor PNG icons"
+fi
 
 # Copy and update AppStream metadata (filename must match the app ID)
 METAINFO="$APPDIR/usr/share/metainfo/${APP_ID}.metainfo.xml"

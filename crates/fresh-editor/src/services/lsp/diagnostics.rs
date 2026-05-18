@@ -77,6 +77,17 @@ pub fn invalidate_cache_for_file(file_path: &str) {
     }
 }
 
+/// Invalidate the entire diagnostic cache.
+///
+/// Call this when the theme changes so that re-applying stored diagnostics
+/// produces overlays with the new theme colors (the hash is content-based,
+/// so without invalidation the cache would suppress the update).
+pub fn invalidate_cache_all() {
+    if let Ok(mut cache) = DIAGNOSTIC_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 /// Apply LSP diagnostics to editor state with hash-based caching
 ///
 /// This is the recommended entry point that skips redundant work when diagnostics haven't changed.
@@ -140,7 +151,7 @@ pub fn diagnostic_to_overlay(
     diagnostic: &Diagnostic,
     buffer: &Buffer,
     theme: &crate::view::theme::Theme,
-) -> Option<(Range<usize>, OverlayFace, i32)> {
+) -> Option<(Range<usize>, OverlayFace, i32, &'static str)> {
     // Convert LSP positions (line/character) to byte offsets
     // LSP uses 0-indexed lines and characters (UTF-16 code units)
     let start_line = diagnostic.range.start.line as usize;
@@ -153,36 +164,54 @@ pub fn diagnostic_to_overlay(
     let start_byte = buffer.lsp_position_to_byte(start_line, start_char);
     let end_byte = buffer.lsp_position_to_byte(end_line, end_char);
 
+    // Log the conversion for debugging diagnostic highlight positions
+    tracing::debug!(
+        "DIAG OVERLAY: LSP {}:{}..{}:{} -> bytes {}..{} (len={}) severity={:?} msg={:?}",
+        start_line,
+        start_char,
+        end_line,
+        end_char,
+        start_byte,
+        end_byte,
+        end_byte.saturating_sub(start_byte),
+        diagnostic.severity,
+        diagnostic.message,
+    );
+
     // Determine overlay face based on diagnostic severity using theme colors
-    let (face, priority) = match diagnostic.severity {
+    let (face, priority, theme_key) = match diagnostic.severity {
         Some(DiagnosticSeverity::ERROR) => (
             OverlayFace::Background {
                 color: theme.diagnostic_error_bg,
             },
             100, // Highest priority
+            "diagnostic.error_bg",
         ),
         Some(DiagnosticSeverity::WARNING) => (
             OverlayFace::Background {
                 color: theme.diagnostic_warning_bg,
             },
             50, // Medium priority
+            "diagnostic.warning_bg",
         ),
         Some(DiagnosticSeverity::INFORMATION) => (
             OverlayFace::Background {
                 color: theme.diagnostic_info_bg,
             },
             30, // Lower priority
+            "diagnostic.info_bg",
         ),
         Some(DiagnosticSeverity::HINT) | None => (
             OverlayFace::Background {
                 color: theme.diagnostic_hint_bg,
             },
             10, // Lowest priority
+            "diagnostic.hint_bg",
         ),
         _ => return None, // Unknown severity
     };
 
-    Some((start_byte..end_byte, face, priority))
+    Some((start_byte..end_byte, face, priority, theme_key))
 }
 
 /// Apply LSP diagnostics to editor state as overlays
@@ -203,14 +232,15 @@ pub fn apply_diagnostics_to_state(
     // Add overlays for all current diagnostics
     let mut added_count = 0;
     for diagnostic in diagnostics {
-        if let Some((range, face, priority)) =
+        if let Some((range, face, priority, theme_key)) =
             diagnostic_to_overlay(diagnostic, &state.buffer, theme)
         {
             let message = diagnostic.message.clone();
 
             let overlay = Overlay::with_namespace(&mut state.marker_list, range, face, ns.clone())
                 .with_priority_value(priority)
-                .with_message(message);
+                .with_message(message)
+                .with_theme_key(theme_key);
 
             state.overlays.add(overlay);
             added_count += 1;
@@ -281,9 +311,10 @@ mod tests {
         let result = diagnostic_to_overlay(&diagnostic, &buffer, &theme);
         assert!(result.is_some());
 
-        let (range, face, priority) = result.unwrap();
+        let (range, face, priority, theme_key) = result.unwrap();
         assert_eq!(range, 0..5);
         assert_eq!(priority, 100); // Error has highest priority
+        assert_eq!(theme_key, "diagnostic.error_bg");
 
         match face {
             OverlayFace::Background { color } => {
@@ -322,9 +353,10 @@ mod tests {
         let result = diagnostic_to_overlay(&diagnostic, &buffer, &theme);
         assert!(result.is_some());
 
-        let (range, face, priority) = result.unwrap();
+        let (range, face, priority, theme_key) = result.unwrap();
         assert_eq!(range, 6..11);
         assert_eq!(priority, 50); // Warning has medium priority
+        assert_eq!(theme_key, "diagnostic.warning_bg");
 
         match face {
             OverlayFace::Background { color } => {
@@ -363,7 +395,7 @@ mod tests {
         let result = diagnostic_to_overlay(&diagnostic, &buffer, &theme);
         assert!(result.is_some());
 
-        let (range, _, _) = result.unwrap();
+        let (range, _, _, _) = result.unwrap();
         // "line1\n" is 6 bytes, "li" is 2 bytes
         // start: line 0, char 3 = byte 3 ("e1")
         // end: line 1, char 2 = byte 8 ("ne")

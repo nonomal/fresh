@@ -13,6 +13,8 @@ pub mod theme;
 
 // WASM-compatible modules (pure rendering, no runtime deps)
 #[cfg(any(feature = "runtime", feature = "wasm"))]
+pub mod animation;
+#[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod color_support;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod composite_view;
@@ -24,6 +26,8 @@ pub mod controls;
 pub mod dimming;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod folding;
+#[cfg(any(feature = "runtime", feature = "wasm"))]
+pub mod line_wrap_cache;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod margin;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
@@ -38,6 +42,8 @@ pub mod ui;
 pub mod viewport;
 #[cfg(any(feature = "runtime", feature = "wasm"))]
 pub mod virtual_text;
+#[cfg(any(feature = "runtime", feature = "wasm"))]
+pub mod visual_row_index;
 
 // Settings module has internal gating (schema is WASM-compatible)
 #[cfg(any(feature = "runtime", feature = "wasm"))]

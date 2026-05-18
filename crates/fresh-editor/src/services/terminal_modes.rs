@@ -20,10 +20,7 @@ use crossterm::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
-    terminal::{
-        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
 use std::io::{stdout, Write};
@@ -170,39 +167,64 @@ impl TerminalModes {
         modes.alternate_screen = true;
         tracing::debug!("Entered alternate screen");
 
-        // Check and enable keyboard enhancement flags (if any are configured)
-        // This must happen AFTER entering alternate screen so the flags are pushed
-        // to the alternate screen's stack, not the main screen's stack.
+        // Push keyboard enhancement flags (if any are configured).
+        //
+        // Must happen AFTER entering alternate screen so the flags land on
+        // the alternate screen's stack, not the main screen's.
+        //
+        // We push optimistically — no detection probe. The kitty keyboard
+        // protocol [1] is explicit that push/pop CSIs are silently ignored
+        // by terminals that don't implement it, so an unconditional push
+        // is safe; we still pop in `undo()` to leave the user's terminal
+        // exactly as we found it.
+        //
+        // The detection probe `crossterm::supports_keyboard_enhancement`
+        // exists, but at version 0.29 it has a 2-second timeout that
+        // fires on every terminal answering the universal `\x1B[c`
+        // (primary device attributes) query but not the kitty-specific
+        // `\x1B[?u` query — i.e., gnome-terminal, konsole, xterm, Apple
+        // Terminal, screen, tmux without kitty passthrough, etc. That's
+        // a 2 s hang on every startup for those users, with no upside
+        // (the editor still works fine without the enhancement).
+        //
+        // [1] https://sw.kovidgoyal.net/kitty/keyboard-protocol/
         if keyboard_config.any_enabled() {
-            match supports_keyboard_enhancement() {
-                Ok(true) => {
-                    let flags = keyboard_config.to_flags();
-                    if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(flags)) {
-                        tracing::warn!("Failed to enable keyboard enhancement: {}", e);
-                        // Non-fatal, continue without it
-                    } else {
-                        modes.keyboard_enhancement = true;
-                        tracing::debug!("Enabled keyboard enhancement flags: {:?}", flags);
-                    }
-                }
-                Ok(false) => {
-                    tracing::info!("Keyboard enhancement not supported by terminal");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to query keyboard enhancement support: {}", e);
-                }
+            let flags = keyboard_config.to_flags();
+            if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(flags)) {
+                tracing::warn!("Failed to push keyboard enhancement flags: {}", e);
+                // Non-fatal, continue without it
+            } else {
+                modes.keyboard_enhancement = true;
+                tracing::debug!(
+                    "Pushed keyboard enhancement flags optimistically: {:?}",
+                    flags
+                );
             }
         } else {
             tracing::debug!("Keyboard enhancement disabled by config");
         }
 
-        // Enable mouse capture
-        if let Err(e) = stdout().execute(EnableMouseCapture) {
-            tracing::warn!("Failed to enable mouse capture: {}", e);
-            // Non-fatal, continue without it
-        } else {
+        // Enable mouse capture.
+        // On Windows, skip crossterm's EnableMouseCapture — it replaces the
+        // entire console mode with ENABLE_MOUSE_INPUT (removing VT input mode)
+        // and doesn't write VT tracking sequences. Mouse is handled by
+        // win_vt_input::enable_vt_input() + enable_mouse_tracking() instead.
+        #[cfg(not(windows))]
+        {
+            if let Err(e) = stdout().execute(EnableMouseCapture) {
+                tracing::warn!("Failed to enable mouse capture: {}", e);
+                // Non-fatal, continue without it
+            } else {
+                modes.mouse_capture = true;
+                tracing::debug!("Enabled mouse capture");
+            }
+        }
+        #[cfg(windows)]
+        {
             modes.mouse_capture = true;
-            tracing::debug!("Enabled mouse capture");
+            tracing::debug!(
+                "Skipped crossterm EnableMouseCapture on Windows (handled by win_vt_input)"
+            );
         }
 
         // Enable bracketed paste
@@ -225,7 +247,11 @@ impl TerminalModes {
     pub fn undo(&mut self) {
         // Best-effort terminal teardown — if stdout is broken, we can't recover.
         // Disable mouse capture
+        // On Windows, skip crossterm's DisableMouseCapture (same reason as enable).
+        // Mouse cleanup is handled by win_vt_input::disable_mouse_tracking() +
+        // restore_console_mode() in the event loop.
         if self.mouse_capture {
+            #[cfg(not(windows))]
             let _ = stdout().execute(DisableMouseCapture);
             self.mouse_capture = false;
             tracing::debug!("Disabled mouse capture");
@@ -299,6 +325,34 @@ impl Drop for TerminalModes {
     fn drop(&mut self) {
         self.undo();
     }
+}
+
+/// Suspend the editor process with SIGTSTP and restore terminal modes on resume.
+///
+/// Tears the terminal back down to a normal cooked-mode shell, raises SIGTSTP
+/// so the shell regains control (the user can then `fg` to resume), and on
+/// resume re-enables the same set of modes we started with.
+///
+/// The caller is responsible for requesting a full redraw after this returns —
+/// the screen has been wiped and repainted by the shell.
+#[cfg(unix)]
+pub fn suspend_and_resume(
+    terminal_modes: &mut TerminalModes,
+    keyboard_config: Option<&KeyboardConfig>,
+) -> Result<()> {
+    use nix::sys::signal::{raise, Signal};
+
+    terminal_modes.undo();
+
+    // Block until the shell sends SIGCONT (typically via `fg`).
+    raise(Signal::SIGTSTP)?;
+
+    // Re-enable everything we tore down. If enable() fails we drop the
+    // old (empty) TerminalModes and return the error — the caller can
+    // surface it and still keep running in a degraded state.
+    let restored = TerminalModes::enable(keyboard_config)?;
+    *terminal_modes = restored;
+    Ok(())
 }
 
 /// Unconditionally restore terminal state without tracking.

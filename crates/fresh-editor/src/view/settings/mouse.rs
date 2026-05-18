@@ -9,6 +9,7 @@ use rust_i18n::t;
 
 use super::items::SettingControl;
 use super::{FocusPanel, SettingsHit, SettingsLayout};
+use crate::view::controls::DualListColumn;
 
 /// Computed layout for entry dialog hit testing
 struct EntryDialogLayout {
@@ -146,7 +147,7 @@ impl Editor {
         match mouse_event.kind {
             MouseEventKind::Moved => {
                 let hover_hit = self
-                    .cached_layout
+                    .active_chrome()
                     .settings_layout
                     .as_ref()
                     .and_then(|layout: &SettingsLayout| layout.hit_test(col, row));
@@ -179,6 +180,13 @@ impl Editor {
                         return Ok(state.search_scroll_up(3));
                     }
                 }
+                // Wheel over the categories panel scrolls it independently.
+                if self.over_categories_panel(col, row) {
+                    if let Some(ref mut state) = self.settings_state {
+                        state.categories_scroll.scroll.scroll_by(-3);
+                        return Ok(true);
+                    }
+                }
                 return Ok(self.settings_scroll_up(3));
             }
             MouseEventKind::ScrollDown => {
@@ -191,6 +199,12 @@ impl Editor {
                     // If search is active and we have results, scroll search results
                     if state.search_active && !state.search_results.is_empty() {
                         return Ok(state.search_scroll_down(3));
+                    }
+                }
+                if self.over_categories_panel(col, row) {
+                    if let Some(ref mut state) = self.settings_state {
+                        state.categories_scroll.scroll.scroll_by(3);
+                        return Ok(true);
                     }
                 }
                 return Ok(self.settings_scroll_down(3));
@@ -212,7 +226,7 @@ impl Editor {
 
         // Use cached settings layout for hit testing
         let Some(hit) = self
-            .cached_layout
+            .active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|layout: &SettingsLayout| layout.hit_test(col, row))
@@ -244,6 +258,31 @@ impl Editor {
                     state.selected_item = 0;
                     state.scroll_panel = crate::view::ui::ScrollablePanel::new();
                     state.sub_focus = None;
+                    // Click lands the cursor on the category row itself
+                    // (not on a section), even after auto-expand reveals
+                    // child sections — matches keyboard Up/Down arriving
+                    // here.
+                    state.tree_cursor_section = None;
+                    // Deliberate click on a category — auto-expand so the
+                    // user immediately sees its sections.
+                    state.auto_expand_current_category();
+                }
+            }
+            SettingsHit::CategoryDisclosure(idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.toggle_category_expanded(idx);
+                }
+            }
+            SettingsHit::CategorySection(cat_idx, section_idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.jump_to_section(cat_idx, section_idx);
+                }
+            }
+            SettingsHit::CategoriesPanel | SettingsHit::CategoriesScrollbar => {
+                // Click without scroll wheel — no-op for now (the panel-area
+                // hit only fires when no other category/section row was hit).
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Categories);
                 }
             }
             SettingsHit::SearchResult(idx) => {
@@ -287,6 +326,15 @@ impl Editor {
                     state.selected_item = idx;
                 }
                 self.settings_increment_current();
+            }
+            SettingsHit::ControlNumberValue(idx) => {
+                // Click on the value between the brackets — focus the item
+                // and enter inline editing mode (matches the Enter-key flow).
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.start_number_editing();
+                }
             }
             SettingsHit::ControlText(idx) | SettingsHit::ControlTextListRow(idx, _) => {
                 if let Some(ref mut state) = self.settings_state {
@@ -339,6 +387,70 @@ impl Editor {
                 // Single click on add-new activates immediately
                 self.settings_activate_current();
             }
+            SettingsHit::ControlDualListAvailable(idx, row) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.with_dual_list_mut(idx, |dl| {
+                        dl.active_column = DualListColumn::Available;
+                        dl.available_cursor = row;
+                    });
+                    state.start_editing();
+                }
+            }
+            SettingsHit::ControlDualListIncluded(idx, row) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.with_dual_list_mut(idx, |dl| {
+                        dl.active_column = DualListColumn::Included;
+                        dl.included_cursor = row;
+                    });
+                    state.start_editing();
+                }
+            }
+            SettingsHit::ControlDualListAdd(idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.with_dual_list_mut(idx, |dl| dl.add_selected());
+                    state.on_value_changed();
+                    state.refresh_dual_list_sibling();
+                }
+            }
+            SettingsHit::ControlDualListRemove(idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.with_dual_list_mut(idx, |dl| dl.remove_selected());
+                    state.on_value_changed();
+                    state.refresh_dual_list_sibling();
+                }
+            }
+            SettingsHit::ControlDualListMoveUp(idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.with_dual_list_mut(idx, |dl| dl.move_up());
+                    state.on_value_changed();
+                }
+            }
+            SettingsHit::ControlDualListMoveDown(idx) => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.with_dual_list_mut(idx, |dl| dl.move_down());
+                    state.on_value_changed();
+                }
+            }
+            SettingsHit::ControlInherit(idx) => {
+                // Click on [Inherit] button - set value to null (inherited)
+                if let Some(ref mut state) = self.settings_state {
+                    state.focus.set(FocusPanel::Settings);
+                    state.selected_item = idx;
+                    state.set_current_to_null();
+                }
+            }
             SettingsHit::LayerButton => {
                 if let Some(ref mut state) = self.settings_state {
                     state.cycle_target_layer();
@@ -360,6 +472,11 @@ impl Editor {
                     state.reset_current_to_default();
                 }
             }
+            SettingsHit::ClearCategoryButton => {
+                if let Some(ref mut state) = self.settings_state {
+                    state.clear_current_category();
+                }
+            }
             SettingsHit::EditButton => {
                 // Open config file for the selected layer
                 if let Some(ref state) = self.settings_state {
@@ -379,6 +496,21 @@ impl Editor {
         Ok(true)
     }
 
+    /// Whether the given screen coords sit inside the categories panel —
+    /// used to route mouse-wheel events to the correct scroll target.
+    fn over_categories_panel(&self, col: u16, row: u16) -> bool {
+        self.active_chrome()
+            .settings_layout
+            .as_ref()
+            .and_then(|layout| layout.categories_panel_area)
+            .is_some_and(|area| {
+                col >= area.x
+                    && col < area.x.saturating_add(area.width)
+                    && row >= area.y
+                    && row < area.y.saturating_add(area.height)
+            })
+    }
+
     fn settings_scroll_up(&mut self, delta: usize) -> bool {
         self.settings_state
             .as_mut()
@@ -395,7 +527,7 @@ impl Editor {
 
     fn settings_scrollbar_click(&mut self, row: u16) {
         if let Some(ref scrollbar_area) = self
-            .cached_layout
+            .active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.scrollbar_area)
@@ -412,7 +544,7 @@ impl Editor {
 
     fn settings_scrollbar_drag(&mut self, col: u16, row: u16) -> bool {
         if let Some(ref scrollbar_area) = self
-            .cached_layout
+            .active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.scrollbar_area)
@@ -432,7 +564,7 @@ impl Editor {
 
     fn search_scrollbar_click(&mut self, row: u16) {
         if let Some(ref scrollbar_area) = self
-            .cached_layout
+            .active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.search_scrollbar_area)
@@ -449,7 +581,7 @@ impl Editor {
 
     fn search_scrollbar_drag(&mut self, col: u16, row: u16) -> Option<bool> {
         if let Some(ref scrollbar_area) = self
-            .cached_layout
+            .active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| l.search_scrollbar_area)
@@ -468,7 +600,7 @@ impl Editor {
     }
 
     fn entry_dialog_layout(&self) -> Option<EntryDialogLayout> {
-        self.cached_layout
+        self.active_chrome()
             .settings_layout
             .as_ref()
             .and_then(|l| EntryDialogLayout::from_modal(l.modal_area))
@@ -709,7 +841,7 @@ impl Editor {
     /// Returns which confirm dialog button (0-2) is at the given position, if any
     fn get_confirm_dialog_button_at(&self, col: u16, row: u16) -> Option<usize> {
         let modal_area = self
-            .cached_layout
+            .active_chrome()
             .settings_layout
             .as_ref()
             .map(|l| l.modal_area)?;

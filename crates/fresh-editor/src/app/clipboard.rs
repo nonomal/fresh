@@ -8,22 +8,17 @@
 use rust_i18n::t;
 
 use crate::input::multi_cursor::{
-    add_cursor_above, add_cursor_at_next_match, add_cursor_below, AddCursorResult,
+    add_cursor_above, add_cursor_at_next_match, add_cursor_below, line_end_positions_in_selection,
+    AddCursorResult,
 };
-use crate::model::buffer::Buffer;
-use crate::model::cursor::Position2D;
+use crate::model::buffer_position::byte_to_2d;
+use crate::model::cursor::Cursor;
 use crate::model::event::{CursorId, Event};
-use crate::primitives::word_navigation::{find_word_start_left, find_word_start_right};
+use crate::primitives::word_navigation::{
+    find_vi_word_end, find_word_start_left, find_word_start_right,
+};
 
 use super::Editor;
-
-/// Convert byte offset to 2D position (line, column)
-fn byte_to_2d(buffer: &Buffer, byte_pos: usize) -> Position2D {
-    let line = buffer.get_line_number(byte_pos);
-    let line_start = buffer.line_start_offset(line).unwrap_or(0);
-    let column = byte_pos.saturating_sub(line_start);
-    Position2D { line, column }
-}
 
 // These are the clipboard and multi-cursor operations on Editor.
 //
@@ -53,7 +48,7 @@ impl Editor {
             let text = self.copy_block_selection_text();
             if !text.is_empty() {
                 self.clipboard.copy(text);
-                self.status_message = Some(t!("clipboard.copied").to_string());
+                self.active_window_mut().status_message = Some(t!("clipboard.copied").to_string());
             }
             return;
         }
@@ -84,7 +79,7 @@ impl Editor {
 
             if !text.is_empty() {
                 self.clipboard.copy(text);
-                self.status_message = Some(t!("clipboard.copied").to_string());
+                self.active_window_mut().status_message = Some(t!("clipboard.copied").to_string());
             }
         } else {
             // No selection: copy entire line(s) for each cursor
@@ -111,7 +106,8 @@ impl Editor {
 
             if !text.is_empty() {
                 self.clipboard.copy(text);
-                self.status_message = Some(t!("clipboard.copied_line").to_string());
+                self.active_window_mut().status_message =
+                    Some(t!("clipboard.copied_line").to_string());
             }
         }
     }
@@ -221,7 +217,8 @@ impl Editor {
             .any(|(_, cursor)| cursor.selection_range().is_some());
 
         if !has_selection {
-            self.status_message = Some(t!("clipboard.no_selection").to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.no_selection").to_string());
             return;
         }
 
@@ -236,7 +233,8 @@ impl Editor {
         let theme = match self.theme_registry.get_cloned(theme_name) {
             Some(t) => t,
             None => {
-                self.status_message = Some(format!("Theme '{}' not found", theme_name));
+                self.active_window_mut().status_message =
+                    Some(format!("Theme '{}' not found", theme_name));
                 return;
             }
         };
@@ -249,7 +247,8 @@ impl Editor {
             .collect();
 
         if ranges.is_empty() {
-            self.status_message = Some(t!("clipboard.no_selection").to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.no_selection").to_string());
             return;
         }
 
@@ -287,7 +286,7 @@ impl Editor {
         };
 
         if text.is_empty() {
-            self.status_message = Some(t!("clipboard.no_text").to_string());
+            self.active_window_mut().status_message = Some(t!("clipboard.no_text").to_string());
             return;
         }
 
@@ -306,6 +305,7 @@ impl Editor {
                         Some(crate::primitives::highlighter::HighlightSpan {
                             range: start..end,
                             color: span.color,
+                            bg: None,
                             category: span.category,
                         })
                     } else {
@@ -322,11 +322,12 @@ impl Editor {
 
         // Copy the HTML to clipboard (with plain text fallback)
         if self.clipboard.copy_html(&html, &text) {
-            self.status_message =
+            self.active_window_mut().status_message =
                 Some(t!("clipboard.copied_with_theme", theme = theme_name).to_string());
         } else {
             self.clipboard.copy(text);
-            self.status_message = Some(t!("clipboard.copied_plain").to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.copied_plain").to_string());
         }
     }
 
@@ -335,28 +336,39 @@ impl Editor {
         use crate::view::prompt::PromptType;
 
         let available_themes = self.theme_registry.list();
-        let current_theme_name = &self.theme.name;
+        // Resolve the config value (portable form) to a canonical registry
+        // key so the picker can pre-highlight the current theme.
+        let resolved_current = self
+            .theme_registry
+            .resolve_key(&self.config.theme.0)
+            .unwrap_or_else(|| self.config.theme.0.clone());
+        let current_theme_key = resolved_current.as_str();
 
-        // Find the index of the current theme
+        // Find the index of the current theme (match by key first, then name)
         let current_index = available_themes
             .iter()
-            .position(|info| info.name == *current_theme_name)
+            .position(|info| info.key == *current_theme_key)
+            .or_else(|| {
+                let normalized = crate::view::theme::normalize_theme_name(current_theme_key);
+                available_themes.iter().position(|info| {
+                    crate::view::theme::normalize_theme_name(&info.name) == normalized
+                })
+            })
             .unwrap_or(0);
 
         let suggestions: Vec<crate::input::commands::Suggestion> = available_themes
             .iter()
             .map(|info| {
-                let is_current = info.name == *current_theme_name;
-                let description = match (is_current, info.pack.is_empty()) {
-                    (true, true) => Some("(current)".to_string()),
-                    (true, false) => Some(format!("{} (current)", info.pack)),
-                    (false, true) => None,
-                    (false, false) => Some(info.pack.clone()),
+                let is_current = Some(info) == available_themes.get(current_index);
+                let description = if is_current {
+                    Some(format!("{} (current)", info.key))
+                } else {
+                    Some(info.key.clone())
                 };
                 crate::input::commands::Suggestion {
                     text: info.name.clone(),
                     description,
-                    value: Some(info.name.clone()),
+                    value: Some(info.key.clone()),
                     disabled: false,
                     keybinding: None,
                     source: None,
@@ -364,16 +376,16 @@ impl Editor {
             })
             .collect();
 
-        self.prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
             "Copy with theme: ".to_string(),
             PromptType::CopyWithFormattingTheme,
             suggestions,
         ));
 
-        if let Some(prompt) = self.prompt.as_mut() {
+        if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
                 prompt.selected_suggestion = Some(current_index);
-                prompt.input = current_theme_name.to_string();
+                prompt.input = current_theme_key.to_string();
                 prompt.cursor_pos = prompt.input.len();
             }
         }
@@ -425,12 +437,11 @@ impl Editor {
                     self.active_event_log_mut().append(bulk_edit);
                 }
             } else if let Some(event) = events.into_iter().next() {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
 
             if !deletions.is_empty() {
-                self.status_message = Some(t!("clipboard.cut").to_string());
+                self.active_window_mut().status_message = Some(t!("clipboard.cut").to_string());
             }
         } else {
             // No selection: delete entire line(s) for each cursor
@@ -484,12 +495,12 @@ impl Editor {
                     self.active_event_log_mut().append(bulk_edit);
                 }
             } else if let Some(event) = events.into_iter().next() {
-                self.active_event_log_mut().append(event.clone());
-                self.apply_event_to_active_buffer(&event);
+                self.log_and_apply_event(&event);
             }
 
             if !deletions.is_empty() {
-                self.status_message = Some(t!("clipboard.cut_line").to_string());
+                self.active_window_mut().status_message =
+                    Some(t!("clipboard.cut_line").to_string());
             }
         }
     }
@@ -518,6 +529,10 @@ impl Editor {
     /// - Line ending normalization (CRLF/CR → buffer's format)
     /// - Single cursor paste
     /// - Multi-cursor paste (pastes at each cursor)
+    /// - Column-mode paste: when the cursor count equals the number of
+    ///   clipboard lines, each cursor receives a distinct line (matches
+    ///   VSCode/Notepad++ behavior, see issue #1057). This makes a
+    ///   block-selected copy/paste round-trip preserve its rectangular shape.
     /// - Selection replacement (deletes selection before inserting)
     /// - Atomic undo (single undo step for entire operation)
     /// - Routing to prompt if one is open
@@ -531,28 +546,19 @@ impl Editor {
         let normalized = paste_text.replace("\r\n", "\n").replace('\r', "\n");
 
         // If a prompt is open, paste into the prompt (prompts use LF internally)
-        if let Some(prompt) = self.prompt.as_mut() {
+        if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             prompt.insert_str(&normalized);
             self.update_prompt_suggestions();
-            self.status_message = Some(t!("clipboard.pasted").to_string());
+            self.active_window_mut().status_message = Some(t!("clipboard.pasted").to_string());
             return;
         }
 
         // If in terminal mode, send paste to the terminal PTY
-        if self.terminal_mode {
-            self.send_terminal_input(normalized.as_bytes());
+        if self.active_window().terminal_mode {
+            self.active_window_mut()
+                .send_terminal_input(normalized.as_bytes());
             return;
         }
-
-        // Convert to buffer's line ending format
-        let buffer_line_ending = self.active_state().buffer.line_ending();
-        let paste_text = match buffer_line_ending {
-            crate::model::buffer::LineEnding::LF => normalized,
-            crate::model::buffer::LineEnding::CRLF => normalized.replace('\n', "\r\n"),
-            crate::model::buffer::LineEnding::CR => normalized.replace('\n', "\r"),
-        };
-
-        let mut events = Vec::new();
 
         // Collect cursor info sorted in reverse order by position
         let mut cursor_data: Vec<_> = self
@@ -569,6 +575,26 @@ impl Editor {
             .collect();
         cursor_data.sort_by_key(|(_, _, pos)| std::cmp::Reverse(*pos));
 
+        // Decide whether to distribute one clipboard line per cursor
+        // (column-mode paste). We split on LF (after normalization above) and
+        // ignore a single trailing empty entry from a trailing newline so that
+        // "a\nb\nc" and "a\nb\nc\n" both yield 3 lines.
+        let mut lines_for_distribution: Vec<&str> = normalized.split('\n').collect();
+        if lines_for_distribution.len() > 1 && lines_for_distribution.last() == Some(&"") {
+            lines_for_distribution.pop();
+        }
+        let use_column_paste = cursor_data.len() > 1
+            && lines_for_distribution.len() > 1
+            && lines_for_distribution.len() == cursor_data.len();
+
+        // Convert to buffer's line ending format (only used in non-column mode;
+        // a single column-paste line never contains an embedded newline).
+        let paste_text_full = match self.active_state().buffer.line_ending() {
+            crate::model::buffer::LineEnding::LF => normalized.clone(),
+            crate::model::buffer::LineEnding::CRLF => normalized.replace('\n', "\r\n"),
+            crate::model::buffer::LineEnding::CR => normalized.replace('\n', "\r"),
+        };
+
         // Get deleted text for each selection
         let cursor_data_with_text: Vec<_> = {
             let state = self.active_state_mut();
@@ -583,8 +609,18 @@ impl Editor {
                 .collect()
         };
 
-        // Build events for each cursor
-        for (cursor_id, selection, insert_position, deleted_text) in cursor_data_with_text {
+        // Build events for each cursor.
+        //
+        // cursor_data_with_text is sorted by position DESCENDING (so events
+        // applied in vector order don't invalidate earlier offsets). For column
+        // paste we want the topmost cursor (smallest position) to receive the
+        // first clipboard line, so we index into `lines_for_distribution` from
+        // the back when iterating.
+        let total = cursor_data_with_text.len();
+        let mut events = Vec::new();
+        for (i, (cursor_id, selection, insert_position, deleted_text)) in
+            cursor_data_with_text.into_iter().enumerate()
+        {
             if let (Some(range), Some(text)) = (selection, deleted_text) {
                 events.push(Event::Delete {
                     range,
@@ -592,9 +628,14 @@ impl Editor {
                     cursor_id,
                 });
             }
+            let text = if use_column_paste {
+                lines_for_distribution[total - 1 - i].to_string()
+            } else {
+                paste_text_full.clone()
+            };
             events.push(Event::Insert {
                 position: insert_position,
-                text: paste_text.clone(),
+                text,
                 cursor_id,
             });
         }
@@ -606,11 +647,10 @@ impl Editor {
                 self.active_event_log_mut().append(bulk_edit);
             }
         } else if let Some(event) = events.into_iter().next() {
-            self.active_event_log_mut().append(event.clone());
-            self.apply_event_to_active_buffer(&event);
+            self.log_and_apply_event(&event);
         }
 
-        self.status_message = Some(t!("clipboard.pasted").to_string());
+        self.active_window_mut().status_message = Some(t!("clipboard.pasted").to_string());
     }
 
     /// Set clipboard content for testing purposes
@@ -643,9 +683,73 @@ impl Editor {
         self.clipboard.get_internal().to_string()
     }
 
+    /// Copy a buffer's file path to the clipboard.
+    ///
+    /// When `relative` is true the path is made relative to the workspace root;
+    /// if the file lives outside the workspace the absolute path is used as a
+    /// safe fallback (the user still gets a usable path rather than nothing).
+    /// When `relative` is false the absolute path is always copied.
+    ///
+    /// If the buffer has no associated file (unsaved scratch buffer) or the
+    /// buffer id is unknown, a status message is shown and the clipboard is
+    /// left untouched.
+    pub fn copy_buffer_path(&mut self, buffer_id: crate::model::event::BufferId, relative: bool) {
+        let path = self
+            .buffers()
+            .get(&buffer_id)
+            .and_then(|state| state.buffer.file_path().map(|p| p.to_path_buf()));
+        let Some(path) = path else {
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.no_file_path").to_string());
+            return;
+        };
+
+        let path_str = if relative {
+            path.strip_prefix(&self.working_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path.to_string_lossy().into_owned()
+        };
+
+        self.clipboard.copy(path_str.clone());
+        self.active_window_mut().status_message =
+            Some(t!("clipboard.copied_path", path = &path_str).to_string());
+    }
+
+    /// Copy the active buffer's file path. See [`Self::copy_buffer_path`].
+    pub fn copy_active_buffer_path(&mut self, relative: bool) {
+        let buffer_id = self.active_buffer();
+        self.copy_buffer_path(buffer_id, relative);
+    }
+
     /// Add a cursor at the next occurrence of the selected text
-    /// If no selection, first selects the entire word at cursor position
+    /// If no selection, first selects the entire word at cursor position.
+    ///
+    /// When an active substring search has placed the cursor at a match
+    /// (cursor inside `search_state.matches[i]..matches[i] + match_lengths[i]`),
+    /// the search match is selected instead of the surrounding word.  This
+    /// way subsequent presses look for the search substring rather than the
+    /// whole word, which would skip other substring occurrences (issue #1697).
     pub fn add_cursor_at_next_match(&mut self) {
+        if let Some(range) = self.active_window().search_match_at_primary_cursor() {
+            let primary_id = self.active_cursors().primary_id();
+            let primary = self.active_cursors().primary();
+            let event = Event::MoveCursor {
+                cursor_id: primary_id,
+                old_position: primary.position,
+                new_position: range.end,
+                old_anchor: primary.anchor,
+                new_anchor: Some(range.start),
+                old_sticky_column: primary.sticky_column,
+                new_sticky_column: 0,
+            };
+            self.active_event_log_mut().append(event.clone());
+            self.apply_event_to_active_buffer(&event);
+            return;
+        }
+
         let cursors = self.active_cursors().clone();
         let state = self.active_state_mut();
         match add_cursor_at_next_match(state, &cursors) {
@@ -665,7 +769,7 @@ impl Editor {
                 self.active_event_log_mut().append(event.clone());
                 self.apply_event_to_active_buffer(&event);
 
-                self.status_message =
+                self.active_window_mut().status_message =
                     Some(t!("clipboard.added_cursor_match", count = total_cursors).to_string());
             }
             AddCursorResult::WordSelected {
@@ -690,7 +794,7 @@ impl Editor {
                 self.apply_event_to_active_buffer(&event);
             }
             AddCursorResult::Failed { message } => {
-                self.status_message = Some(message);
+                self.active_window_mut().status_message = Some(message);
             }
         }
     }
@@ -716,11 +820,11 @@ impl Editor {
                 self.active_event_log_mut().append(event.clone());
                 self.apply_event_to_active_buffer(&event);
 
-                self.status_message =
+                self.active_window_mut().status_message =
                     Some(t!("clipboard.added_cursor_above", count = total_cursors).to_string());
             }
             AddCursorResult::Failed { message } => {
-                self.status_message = Some(message);
+                self.active_window_mut().status_message = Some(message);
             }
             AddCursorResult::WordSelected { .. } => unreachable!(),
         }
@@ -747,14 +851,96 @@ impl Editor {
                 self.active_event_log_mut().append(event.clone());
                 self.apply_event_to_active_buffer(&event);
 
-                self.status_message =
+                self.active_window_mut().status_message =
                     Some(t!("clipboard.added_cursor_below", count = total_cursors).to_string());
             }
             AddCursorResult::Failed { message } => {
-                self.status_message = Some(message);
+                self.active_window_mut().status_message = Some(message);
             }
             AddCursorResult::WordSelected { .. } => unreachable!(),
         }
+    }
+
+    /// Place a cursor at the end of every line covered by ANY existing
+    /// cursor's selection (or each cursor's own line if it has no selection).
+    /// Matches VSCode's "Add Cursor to Line Ends" / Sublime's "Split Selection
+    /// into Lines": every existing cursor contributes, no cursor is silently
+    /// dropped. Two cursors on the same line collapse to a single cursor.
+    /// All selections are cleared.
+    pub fn add_cursors_to_line_ends(&mut self) {
+        let cursors = self.active_cursors().clone();
+        let state = self.active_state_mut();
+        let positions = line_end_positions_in_selection(state, &cursors);
+
+        if positions.is_empty() {
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.added_cursors_to_line_ends_failed").to_string());
+            return;
+        }
+
+        // Sort the existing cursors in document order and map them index-wise
+        // onto the new positions. This preserves cursor IDs where possible —
+        // important for undo/redo — and minimises the move distance for each
+        // surviving cursor.
+        let mut existing: Vec<(CursorId, Cursor)> =
+            cursors.iter().map(|(id, c)| (id, *c)).collect();
+        existing.sort_by_key(|(_, c)| c.position);
+
+        let mut events: Vec<Event> = Vec::new();
+        let reuse = existing.len().min(positions.len());
+
+        for i in 0..reuse {
+            let (cursor_id, cur) = existing[i];
+            let target = positions[i];
+            events.push(Event::MoveCursor {
+                cursor_id,
+                old_position: cur.position,
+                new_position: target,
+                old_anchor: cur.anchor,
+                new_anchor: None,
+                old_sticky_column: cur.sticky_column,
+                new_sticky_column: 0,
+            });
+        }
+
+        // If two cursors collapsed onto the same line, dedup left us with
+        // fewer positions than cursors — drop the extras.
+        for &(cursor_id, cur) in existing.iter().skip(reuse) {
+            events.push(Event::RemoveCursor {
+                cursor_id,
+                position: cur.position,
+                anchor: cur.anchor,
+            });
+        }
+
+        // Add fresh cursors for any extra line ends, with IDs strictly above
+        // the highest existing one so we never collide with a cursor an undo
+        // could re-insert later.
+        let next_free_id = cursors
+            .iter()
+            .map(|(id, _)| id.0)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        for (i, &pos) in positions.iter().enumerate().skip(reuse) {
+            let new_id = CursorId(next_free_id + i - reuse);
+            events.push(Event::AddCursor {
+                cursor_id: new_id,
+                position: pos,
+                anchor: None,
+            });
+        }
+
+        let total = positions.len();
+        let batch = Event::Batch {
+            events,
+            description: "Add cursors to line ends".to_string(),
+        };
+        self.active_event_log_mut().append(batch.clone());
+        self.apply_event_to_active_buffer(&batch);
+
+        self.active_window_mut().status_message =
+            Some(t!("clipboard.added_cursors_to_line_ends", count = total).to_string());
     }
 
     // =========================================================================
@@ -801,7 +987,53 @@ impl Editor {
         if !text.is_empty() {
             let len = text.len();
             self.clipboard.copy(text);
-            self.status_message = Some(t!("clipboard.yanked", count = len).to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.yanked", count = len).to_string());
+        }
+    }
+
+    /// Yank (copy) from cursor to vim word end (inclusive)
+    pub fn yank_vi_word_end(&mut self) {
+        let cursor_positions: Vec<_> = self
+            .active_cursors()
+            .iter()
+            .map(|(_, c)| c.position)
+            .collect();
+        let ranges: Vec<_> = {
+            let state = self.active_state();
+            cursor_positions
+                .into_iter()
+                .filter_map(|start| {
+                    let word_end = find_vi_word_end(&state.buffer, start);
+                    let end = (word_end + 1).min(state.buffer.len());
+                    if end > start {
+                        Some(start..end)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if ranges.is_empty() {
+            return;
+        }
+
+        let mut text = String::new();
+        let state = self.active_state_mut();
+        for range in ranges {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let range_text = state.get_text_range(range.start, range.end);
+            text.push_str(&range_text);
+        }
+
+        if !text.is_empty() {
+            let len = text.len();
+            self.clipboard.copy(text);
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.yanked", count = len).to_string());
         }
     }
 
@@ -844,7 +1076,8 @@ impl Editor {
         if !text.is_empty() {
             let len = text.len();
             self.clipboard.copy(text);
-            self.status_message = Some(t!("clipboard.yanked", count = len).to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.yanked", count = len).to_string());
         }
     }
 
@@ -891,7 +1124,8 @@ impl Editor {
         if !text.is_empty() {
             let len = text.len();
             self.clipboard.copy(text);
-            self.status_message = Some(t!("clipboard.yanked", count = len).to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.yanked", count = len).to_string());
         }
     }
 
@@ -933,7 +1167,8 @@ impl Editor {
         if !text.is_empty() {
             let len = text.len();
             self.clipboard.copy(text);
-            self.status_message = Some(t!("clipboard.yanked", count = len).to_string());
+            self.active_window_mut().status_message =
+                Some(t!("clipboard.yanked", count = len).to_string());
         }
     }
 }

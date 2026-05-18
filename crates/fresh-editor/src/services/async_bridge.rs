@@ -14,8 +14,7 @@ use crate::services::terminal::TerminalId;
 use crate::view::file_tree::{FileTreeView, NodeId};
 use lsp_types::{
     CodeActionOrCommand, CompletionItem, Diagnostic, FoldingRange, InlayHint, Location,
-    SemanticTokensFullDeltaResult, SemanticTokensLegend, SemanticTokensRangeResult,
-    SemanticTokensResult, SignatureHelp,
+    SemanticTokensFullDeltaResult, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
 };
 use serde_json::Value;
 use std::sync::mpsc;
@@ -35,23 +34,17 @@ pub enum AsyncMessage {
     LspDiagnostics {
         uri: String,
         diagnostics: Vec<Diagnostic>,
+        /// Name of the server that sent these diagnostics (for per-server tracking)
+        server_name: String,
     },
 
     /// LSP server initialized successfully
     LspInitialized {
         language: String,
-        /// Completion trigger characters from server capabilities
-        completion_trigger_characters: Vec<String>,
-        /// Legend describing semantic token types supported by the server
-        semantic_tokens_legend: Option<SemanticTokensLegend>,
-        /// Whether the server supports full document semantic tokens
-        semantic_tokens_full: bool,
-        /// Whether the server supports full document semantic token deltas
-        semantic_tokens_full_delta: bool,
-        /// Whether the server supports range semantic tokens
-        semantic_tokens_range: bool,
-        /// Whether the server supports folding ranges
-        folding_ranges_supported: bool,
+        /// Name of the specific server (for per-server capability tracking)
+        server_name: String,
+        /// Capabilities reported by this server
+        capabilities: crate::services::lsp::manager::ServerCapabilitySummary,
     },
 
     /// LSP server crashed or failed
@@ -108,6 +101,25 @@ pub enum AsyncMessage {
     LspCodeActions {
         request_id: u64,
         actions: Vec<CodeActionOrCommand>,
+    },
+
+    /// LSP completionItem/resolve response
+    LspCompletionResolved {
+        request_id: u64,
+        item: Result<lsp_types::CompletionItem, String>,
+    },
+
+    /// LSP textDocument/formatting response
+    LspFormatting {
+        request_id: u64,
+        uri: String,
+        edits: Vec<lsp_types::TextEdit>,
+    },
+
+    /// LSP textDocument/prepareRename response
+    LspPrepareRename {
+        request_id: u64,
+        result: Result<serde_json::Value, String>,
     },
 
     /// LSP pulled diagnostics response (textDocument/diagnostic)
@@ -183,8 +195,29 @@ pub enum AsyncMessage {
     /// Terminal output received (triggers redraw)
     TerminalOutput { terminal_id: TerminalId },
 
-    /// Terminal process exited
-    TerminalExited { terminal_id: TerminalId },
+    /// File watcher delivered an event for a path under a
+    /// `WatchPath`-registered watcher. Routed to the
+    /// `path_changed` plugin hook by the main loop.
+    PathChanged {
+        /// Watch handle the event came from (matches the value
+        /// returned by `WatchPath`).
+        handle: u64,
+        path: std::path::PathBuf,
+        /// Conservative bucketing of `notify::EventKind`.
+        kind: PathChangeKind,
+    },
+
+    /// Terminal process exited.
+    ///
+    /// `exit_code` is `None` when the editor cannot determine a status
+    /// (the wait happens in a separate thread, signal exits, kill
+    /// before wait, etc.). Populated end-to-end is a follow-up; the
+    /// initial wiring sends `None` so plugin handlers see the variant
+    /// shape that matches `HookArgs::TerminalExited`.
+    TerminalExited {
+        terminal_id: TerminalId,
+        exit_code: Option<i32>,
+    },
 
     /// LSP progress notification ($/progress)
     LspProgress {
@@ -205,6 +238,19 @@ pub enum AsyncMessage {
         language: String,
         message_type: LspMessageType,
         message: String,
+    },
+
+    /// LSP workspace/applyEdit (server -> client request)
+    /// Server asks client to apply a workspace edit (during executeCommand, etc.)
+    LspApplyEdit {
+        edit: lsp_types::WorkspaceEdit,
+        label: Option<String>,
+    },
+
+    /// LSP codeAction/resolve response
+    LspCodeActionResolved {
+        request_id: u64,
+        action: Result<lsp_types::CodeAction, String>,
     },
 
     /// LSP server request (server -> client)
@@ -238,6 +284,8 @@ pub enum AsyncMessage {
     /// LSP server status update (progress, messages, etc.)
     LspStatusUpdate {
         language: String,
+        /// Name of the specific server (for multi-server status tracking)
+        server_name: String,
         status: LspServerStatus,
         message: Option<String>,
     },
@@ -249,6 +297,71 @@ pub enum AsyncMessage {
         registry: std::sync::Arc<crate::primitives::grammar::GrammarRegistry>,
         callback_ids: Vec<fresh_core::api::JsCallbackId>,
     },
+
+    /// Quick Open file list loaded by a background task.
+    /// `complete` is `true` when the scan is finished, `false` for incremental
+    /// partial updates sent while the walk is still in progress.
+    QuickOpenFilesLoaded {
+        files: std::sync::Arc<Vec<crate::input::quick_open::providers::FileEntry>>,
+        complete: bool,
+    },
+
+    /// Startup-async: a single plugin directory finished loading on the
+    /// plugin thread. Carries the same payload as the blocking
+    /// `load_plugins_from_dir_with_config` return value.
+    PluginsDirLoaded {
+        dir: std::path::PathBuf,
+        errors: Vec<String>,
+        discovered_plugins: std::collections::HashMap<String, fresh_core::config::PluginConfig>,
+    },
+
+    /// Startup-async: every directory in the startup batch has loaded and
+    /// the resulting `.d.ts` declarations have been collected from the
+    /// plugin runtime. Triggers `init_script::write_plugin_declarations`.
+    PluginDeclarationsReady { declarations: Vec<(String, String)> },
+
+    /// Startup-async: `init.ts` (auto-loaded source plugin) finished
+    /// running its top level and has either succeeded, failed, or was
+    /// skipped/fused. The handler logs and applies the corresponding
+    /// status message, and (on `Loaded`) clears the crash fuse.
+    PluginInitScriptLoaded(PluginInitScriptOutcome),
+}
+
+/// Async equivalent of `init_script::InitOutcome`. Wraps the same set
+/// of states but is plain data so it can travel across the bridge.
+#[derive(Debug, Clone)]
+pub enum PluginInitScriptOutcome {
+    NotFound,
+    Disabled,
+    CrashFused { failures: u32 },
+    Loaded,
+    Failed { message: String },
+}
+
+/// Conservative bucketing of `notify::EventKind`. We don't expose
+/// the full notify enum to plugins because the kind set varies by
+/// platform and changes between notify releases. Plugins switch on
+/// these strings; refining requires a new variant + a new string
+/// (additive, no breakage).
+#[derive(Debug, Clone, Copy)]
+pub enum PathChangeKind {
+    Modify,
+    Create,
+    Delete,
+    Rename,
+    Other,
+}
+
+impl PathChangeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PathChangeKind::Modify => "modify",
+            PathChangeKind::Create => "create",
+            PathChangeKind::Delete => "delete",
+            PathChangeKind::Rename => "rename",
+            PathChangeKind::Other => "other",
+        }
+    }
 }
 
 /// LSP progress value types
@@ -372,12 +485,8 @@ mod tests {
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "rust".to_string(),
-                completion_trigger_characters: vec![".".to_string()],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
 
@@ -388,11 +497,11 @@ mod tests {
         match &messages[0] {
             AsyncMessage::LspInitialized {
                 language,
-                completion_trigger_characters,
+                server_name,
                 ..
             } => {
                 assert_eq!(language, "rust");
-                assert_eq!(completion_trigger_characters, &vec![".".to_string()]);
+                assert_eq!(server_name, "test");
             }
             _ => panic!("Wrong message type"),
         }
@@ -407,23 +516,15 @@ mod tests {
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "rust".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "typescript".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
 
@@ -451,23 +552,15 @@ mod tests {
         sender1
             .send(AsyncMessage::LspInitialized {
                 language: "rust".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
         sender2
             .send(AsyncMessage::LspInitialized {
                 language: "typescript".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
 
@@ -506,6 +599,7 @@ mod tests {
             .send(AsyncMessage::LspDiagnostics {
                 uri: "file:///test.rs".to_string(),
                 diagnostics: diagnostics.clone(),
+                server_name: "rust-analyzer".to_string(),
             })
             .unwrap();
 
@@ -516,10 +610,12 @@ mod tests {
             AsyncMessage::LspDiagnostics {
                 uri,
                 diagnostics: diags,
+                server_name,
             } => {
                 assert_eq!(uri, "file:///test.rs");
                 assert_eq!(diags.len(), 1);
                 assert_eq!(diags[0].message, "test error");
+                assert_eq!(server_name, "rust-analyzer");
             }
             _ => panic!("Expected LspDiagnostics message"),
         }
@@ -565,12 +661,8 @@ mod tests {
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "rust".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
 
@@ -587,12 +679,8 @@ mod tests {
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "rust".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
 
@@ -614,34 +702,22 @@ mod tests {
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "rust".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "typescript".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
         sender
             .send(AsyncMessage::LspInitialized {
                 language: "python".to_string(),
-                completion_trigger_characters: vec![],
-                semantic_tokens_legend: None,
-                semantic_tokens_full: false,
-                semantic_tokens_full_delta: false,
-                semantic_tokens_range: false,
-                folding_ranges_supported: false,
+                server_name: "test".to_string(),
+                capabilities: Default::default(),
             })
             .unwrap();
 

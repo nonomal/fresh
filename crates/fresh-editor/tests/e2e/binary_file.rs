@@ -29,7 +29,7 @@ fn test_png_file_detected_as_binary() {
 
     // Verify the file is detected as binary by checking editing is disabled
     assert!(
-        harness.editor().is_editing_disabled(),
+        harness.editor().active_window().is_editing_disabled(),
         "Binary file should have editing disabled"
     );
 
@@ -64,7 +64,7 @@ fn test_jpeg_file_detected_as_binary() {
     harness.render().unwrap();
 
     assert!(
-        harness.editor().is_editing_disabled(),
+        harness.editor().active_window().is_editing_disabled(),
         "JPEG file should have editing disabled"
     );
     harness.assert_screen_contains("[BIN]");
@@ -92,7 +92,7 @@ fn test_elf_executable_detected_as_binary() {
     harness.render().unwrap();
 
     assert!(
-        harness.editor().is_editing_disabled(),
+        harness.editor().active_window().is_editing_disabled(),
         "ELF binary should have editing disabled"
     );
     harness.assert_screen_contains("[BIN]");
@@ -112,7 +112,7 @@ fn test_text_file_not_detected_as_binary() {
 
     // Text files should allow editing
     assert!(
-        !harness.editor().is_editing_disabled(),
+        !harness.editor().active_window().is_editing_disabled(),
         "Text file should allow editing"
     );
 
@@ -136,7 +136,7 @@ fn test_ansi_escape_sequences_not_binary() {
 
     // ANSI files should allow editing (not binary)
     assert!(
-        !harness.editor().is_editing_disabled(),
+        !harness.editor().active_window().is_editing_disabled(),
         "File with ANSI escape sequences should allow editing"
     );
 }

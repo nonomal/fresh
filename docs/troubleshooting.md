@@ -32,6 +32,10 @@ FRESH_COLOR_MODE=16 fresh
 FRESH_COLOR_MODE=truecolor fresh
 ```
 
+### 256-Color Contrast
+
+When running in a 256-color terminal, Fresh automatically adjusts foreground colors to maintain readable contrast against their background.
+
 ### Common Issues
 
 | Symptom | Likely Cause | Solution |
@@ -49,6 +53,10 @@ echo $TERM
 # Check COLORTERM (if set, indicates truecolor support)
 echo $COLORTERM
 ```
+
+## Corrupted Display
+
+If something outside Fresh scribbles over the TUI — a stray shell message, an external program's output, a paste with unbalanced escape sequences, or a terminal that got wedged during a resize — the screen can end up with ghost text or misaligned cells. Run **Redraw Screen** from the command palette (`Ctrl+P`) to clear the terminal and repaint the UI from scratch.
 
 ## Advanced Topics
 

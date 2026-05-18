@@ -87,10 +87,13 @@ const blameState: BlameState = {
 // Color Definitions for Header Styling
 // =============================================================================
 
-const colors = {
-  headerFg: [0, 0, 0] as [number, number, number],           // Black text
-  headerBg: [200, 200, 200] as [number, number, number],     // Light gray background
-};
+// Blame headers are rendered via `addVirtualLine`, which accepts theme
+// keys directly — so we don't expose colors as plugin settings. Themes
+// drive the look; if a theme lacks specific blame keys, these fall
+// through to the editor's status-bar palette which is what every theme
+// defines.
+const HEADER_FG_KEY = "ui.status_bar_fg";
+const HEADER_BG_KEY = "ui.status_bar_bg";
 
 // =============================================================================
 // Mode Definition
@@ -373,7 +376,8 @@ function addBlameHeaders(): void {
   // Clear existing headers first
   editor.clearVirtualTextNamespace(blameState.bufferId, BLAME_NAMESPACE);
 
-  // Add a virtual line above each block
+  // Add a virtual line above each block. Pass theme keys so the headers
+  // restyle automatically when the user switches themes.
   for (const block of blameState.blocks) {
     const headerText = formatBlockHeader(block);
 
@@ -381,12 +385,7 @@ function addBlameHeaders(): void {
       blameState.bufferId,
       block.startByte,        // anchor position
       headerText,             // text content
-      colors.headerFg[0],     // fg_r
-      colors.headerFg[1],     // fg_g
-      colors.headerFg[2],     // fg_b
-      colors.headerBg[0],     // bg_r
-      colors.headerBg[1],     // bg_g
-      colors.headerBg[2],     // bg_b
+      { fg: HEADER_FG_KEY, bg: HEADER_BG_KEY },
       true,                   // above (LineAbove)
       BLAME_NAMESPACE,        // namespace for bulk removal
       0                       // priority

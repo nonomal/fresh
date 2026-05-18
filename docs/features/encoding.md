@@ -15,7 +15,7 @@ The in-memory encoding is always UTF-8. Files are converted to UTF-8 when loaded
 - **UTF-8** (default)
 - **UTF-16 LE/BE** (with BOM detection)
 - **Latin-1** (ISO-8859-1)
-- **Windows-1252**, **Windows-1250**
+- **Windows-1252**, **Windows-1250**, **Windows-1251**
 - **GBK**, **GB18030** (Chinese)
 - **Shift-JIS** (Japanese)
 - **EUC-KR** (Korean)
@@ -24,13 +24,15 @@ The in-memory encoding is always UTF-8. Files are converted to UTF-8 when loaded
 
 The current encoding is shown in the status bar. Click it to change the encoding.
 
-## Reload with Different Encoding
+## Fixing Wrong Encoding Detection
 
-If a file is detected incorrectly, reload it with a specific encoding:
+Encoding detection is heuristic — Fresh sniffs byte patterns to guess the on-disk encoding, and short or ambiguous files (especially those without any non-ASCII bytes) can end up tagged incorrectly. If a file opens as garbled text, the fix is to reload it with the right encoding:
 
 1. **Command Palette**: `Ctrl+P` → type "Reload with Encoding"
 2. **File Menu**: File → Reload with Encoding...
 3. **Status Bar**: Click the encoding indicator
+
+Cyrillic-script files (Windows-1251) with a mix of uppercase and lowercase letters are detected automatically.
 
 ## File Browser Encoding Toggle
 

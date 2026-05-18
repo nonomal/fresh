@@ -126,6 +126,14 @@ const finder = new Finder<DiagnosticItem>(editor, {
   groupBy: "file",
   syncWithEditor: true,
   navigateOnCursorMove: true,
+  // Diagnostics is a generic "list of locations" UX — route into
+  // the shared Utility Dock so it shares space with Quickfix,
+  // search-replace results, etc. See issue #1796.
+  useUtilityDock: true,
+  onClose: () => {
+    isOpen = false;
+    sourceBufferId = null;
+  },
 });
 
 // Get title based on current filter state
@@ -208,20 +216,18 @@ registerHandler("toggle_diagnostics_panel", toggle_diagnostics_panel);
 // Event Handlers
 
 // When diagnostics update, notify the provider
-function on_diagnostics_updated(_data: {
-  uri: string;
-  count: number;
-}): void {
+
+
+// When a different buffer becomes active, update filter context
+
+
+// Register event handlers
+editor.on("diagnostics_updated", (_data) => {
   if (isOpen) {
     provider.notify();
   }
-}
-registerHandler("on_diagnostics_updated", on_diagnostics_updated);
-
-// When a different buffer becomes active, update filter context
-function on_diagnostics_buffer_activated(data: {
-  buffer_id: number;
-}): void {
+});
+editor.on("buffer_activated", (data) => {
   if (!isOpen) return;
 
   // Skip virtual buffers (e.g. the diagnostics panel itself) — they have no
@@ -237,24 +243,7 @@ function on_diagnostics_buffer_activated(data: {
     provider.notify();
     finder.updateTitle(getTitle());
   }
-}
-registerHandler("on_diagnostics_buffer_activated", on_diagnostics_buffer_activated);
-
-// Register event handlers
-editor.on("diagnostics_updated", "on_diagnostics_updated");
-editor.on("buffer_activated", "on_diagnostics_buffer_activated");
-
-// Mode Definition (for custom keybindings beyond Enter/Escape)
-editor.defineMode(
-  "diagnostics-extra",
-  [
-    ["a", "diagnostics_toggle_all"],
-    ["r", "diagnostics_refresh"],
-    ["Return", `_finder_diagnostics_panel_select`],
-    ["Escape", `_finder_diagnostics_panel_close`],
-  ],
-  true
-);
+});
 
 // Command Registration
 editor.registerCommand(

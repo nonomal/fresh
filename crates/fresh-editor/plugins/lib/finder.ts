@@ -115,6 +115,24 @@ export interface FinderConfig<T> {
 
   /** Panel-specific: navigate source split when cursor moves (preview without focus change) */
   navigateOnCursorMove?: boolean;
+
+  /** Called when the panel or prompt is closed (e.g. via Escape) */
+  onClose?: () => void;
+
+  /**
+   * When true, panels created by this Finder are routed into the
+   * shared Utility Dock (issue #1796 / Section 2 of
+   * `docs/internal/tui-editor-layout-design.md`). The first
+   * dock-aware utility creates the dock leaf; subsequent ones swap
+   * the dock's active buffer instead of spawning new splits.
+   *
+   * Defaults to `false` so panels with bespoke layouts (e.g.
+   * `theme_editor`'s buffer groups, `pkg`'s side-by-side panes)
+   * keep their independent split. Plugins that present a generic
+   * "list of locations" UX (Diagnostics, Find References, Live
+   * Grep Quickfix) should opt in.
+   */
+  useUtilityDock?: boolean;
 }
 
 /**
@@ -125,6 +143,14 @@ export interface PromptOptions<T> {
   source: SearchSource<T> | FilterSource<T>;
   /** Initial query value */
   initialQuery?: string;
+  /**
+   * Render the prompt as a centred floating overlay with an
+   * embedded preview pane (issue #1796). When true, the editor
+   * draws the input + results + preview inside one floating frame
+   * over the editor area; the underlying split tree is not
+   * mutated. Defaults to false.
+   */
+  floatingOverlay?: boolean;
 }
 
 /**
@@ -274,7 +300,16 @@ export function defaultFuzzyFilter<T>(
 // ============================================================================
 
 /**
- * Parse a grep-style output line (file:line:column:content)
+ * Parse a grep-style output line.
+ *
+ * Accepts both `file:line:column:content` (ripgrep, ag, git-grep with
+ * `--column`, GNU grep with `--column`) and `file:line:content`
+ * (POSIX grep, BSD grep, plenty of custom wrappers that omit the
+ * column). When the column is missing it defaults to 1.
+ *
+ * Returns null only if the line lacks even a `file:line:` prefix —
+ * pure header lines (ripgrep without `--no-heading`, blank lines)
+ * are filtered upstream by the caller's `if (!line.trim()) continue`.
  */
 export function parseGrepLine(line: string): {
   file: string;
@@ -282,13 +317,25 @@ export function parseGrepLine(line: string): {
   column: number;
   content: string;
 } | null {
-  const match = line.match(/^([^:]+):(\d+):(\d+):(.*)$/);
-  if (match) {
+  // Try the four-field shape first so a content payload that
+  // happens to start with digits (e.g. `42 = solve(...)`) doesn't
+  // get mistaken for a column number under the three-field path.
+  const four = line.match(/^([^:]+):(\d+):(\d+):(.*)$/);
+  if (four) {
     return {
-      file: match[1],
-      line: parseInt(match[2], 10),
-      column: parseInt(match[3], 10),
-      content: match[4],
+      file: four[1],
+      line: parseInt(four[2], 10),
+      column: parseInt(four[3], 10),
+      content: four[4],
+    };
+  }
+  const three = line.match(/^([^:]+):(\d+):(.*)$/);
+  if (three) {
+    return {
+      file: three[1],
+      line: parseInt(three[2], 10),
+      column: 1,
+      content: three[3],
     };
   }
   return null;
@@ -299,7 +346,8 @@ export function parseGrepLine(line: string): {
  */
 export function parseGrepOutput(
   stdout: string,
-  maxResults: number = 100
+  maxResults: number = 100,
+  debug?: (msg: string) => void
 ): Array<{ file: string; line: number; column: number; content: string }> {
   const results: Array<{
     file: string;
@@ -308,14 +356,16 @@ export function parseGrepOutput(
     content: string;
   }> = [];
 
-  for (const line of stdout.split("\n")) {
-    if (!line.trim()) continue;
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line) continue;
     const match = parseGrepLine(line);
     if (match) {
       results.push(match);
       if (results.length >= maxResults) {
         break;
       }
+    } else if (debug) {
+      debug(`[parseGrepOutput] failed to parse line: ${line}`);
     }
   }
 
@@ -462,18 +512,40 @@ export class Finder<T> {
     }
 
     // Start the prompt
+    const overlay = options.floatingOverlay === true;
     if (options.initialQuery) {
       this.editor.startPromptWithInitial(
         options.title,
         this.config.id,
-        options.initialQuery
+        options.initialQuery,
+        overlay
       );
     } else {
-      this.editor.debug(`[Finder] calling startPrompt with title="${options.title}", id="${this.config.id}"`);
-      const result = this.editor.startPrompt(options.title, this.config.id);
+      this.editor.debug(`[Finder] calling startPrompt with title="${options.title}", id="${this.config.id}", overlay=${overlay}`);
+      const result = this.editor.startPrompt(options.title, this.config.id, overlay);
       this.editor.debug(`[Finder] startPrompt returned: ${result}`);
     }
     this.editor.setStatus("Type to search...");
+  }
+
+  /**
+   * Re-run the current search against `lastQuery`, bypassing the
+   * "skip-if-same-query" dedup. Useful when the *backend* has
+   * changed (e.g. user cycled Live Grep providers) and the same
+   * query needs to produce different results.
+   *
+   * No-op for filter-mode sources (results are already correct
+   * client-side) and when no prompt is open.
+   */
+  async refresh(): Promise<void> {
+    if (!this.isPromptMode || !this.currentSource) return;
+    if (this.currentSource.mode !== "search") return;
+    const query = this.promptState.lastQuery;
+    // Reset dedup so runSearch doesn't short-circuit on the
+    // unchanged query.
+    this.promptState.lastQuery = "";
+    if (query.length === 0) return;
+    await this.runSearch(query, this.currentSource);
   }
 
   /**
@@ -715,7 +787,8 @@ export class Finder<T> {
           // Parse as grep output by default
           const parsed = parseGrepOutput(
             result.stdout,
-            this.config.maxResults
+            this.config.maxResults,
+            (msg) => this.editor.debug(msg)
           ) as unknown as T[];
           this.updatePromptResults(parsed);
 
@@ -758,9 +831,26 @@ export class Finder<T> {
       }
     } catch (e) {
       const errorMsg = String(e);
-      if (!errorMsg.includes("killed") && !errorMsg.includes("not found")) {
-        this.editor.setStatus(`Search error: ${e}`);
+      // "killed" / "not found" come from the cancellation path (a
+      // newer search aborted this one). Suppress those entirely —
+      // the user didn't ask for them.
+      if (errorMsg.includes("killed") || errorMsg.includes("not found")) {
+        return;
       }
+      // Render the error inside the overlay's result list itself.
+      // The status bar is shared and clobbered by other code paths,
+      // so it's not a reliable place to surface a feature-scoped
+      // error — the overlay is where the user is looking.
+      this.promptState.results = [];
+      this.promptState.entries = [];
+      const display = errorMsg.replace(/^Error:\s*/, "");
+      this.editor.setPromptSuggestions([
+        {
+          text: `⚠ ${display}`,
+          value: "",
+          disabled: true,
+        },
+      ]);
     }
   }
 
@@ -1092,6 +1182,11 @@ export class Finder<T> {
         ratio,
         direction: "horizontal",
         panelId: this.config.id,
+        // Per-finder opt-in via `useUtilityDock` — many Finder
+        // consumers (theme_editor's buffer groups, pkg's side-by-
+        // side panes, …) need their own independent splits and
+        // would break if routed into the shared dock.
+        ...(this.config.useUtilityDock ? { role: "utility_dock" } : {}),
         showLineNumbers: false,
         showCursors: true,
         editingDisabled: true,
@@ -1254,18 +1349,17 @@ export class Finder<T> {
     if (this.config.onSelect) {
       this.config.onSelect(item, entry);
     } else if (entry.location) {
-      // Default: open file at location
-      if (this.panelState.sourceSplitId !== null) {
-        this.editor.focusSplit(this.panelState.sourceSplitId);
-      }
-      this.editor.openFile(
-        entry.location.file,
-        entry.location.line,
-        entry.location.column
-      );
-      this.editor.setStatus(
-        `Jumped to ${entry.location.file}:${entry.location.line}`
-      );
+      const loc = entry.location;
+
+      // Close the panel first. This is necessary because
+      // navigateOnCursorMove's focusSplit(panelSplitId) can interfere with
+      // the jump — it queues a FocusSplit that runs after OpenFileInSplit
+      // and restores the panel as the active split.
+      this.closePanel();
+
+      // Now navigate with the panel gone — only one split remains
+      this.editor.openFile(loc.file, loc.line, loc.column);
+      this.editor.setStatus(`Jumped to ${loc.file}:${loc.line}`);
     }
   }
 
@@ -1306,6 +1400,11 @@ export class Finder<T> {
     }
 
     this.editor.setStatus("Closed");
+
+    // Notify the caller that the panel was closed
+    if (this.config.onClose) {
+      this.config.onClose();
+    }
   }
 
   private revealItem(index: number): void {

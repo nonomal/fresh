@@ -3,14 +3,9 @@
 //! Parses raw bytes from the client into crossterm events.
 //! This allows the server to handle all input parsing, keeping the client ultra-light.
 
-use std::time::Instant;
-
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-
-/// How long to wait for more bytes after receiving ESC before treating it as standalone Escape.
-const ESC_TIMEOUT_MS: u128 = 50;
 
 /// Parser state for incremental input parsing
 #[derive(Debug)]
@@ -20,7 +15,6 @@ pub struct InputParser {
     /// Maximum buffer size before we give up on an escape sequence
     max_buffer_size: usize,
     /// When the buffer last received a byte (for ESC timeout)
-    last_byte_time: Option<Instant>,
     /// Buffer for bracketed paste content (between \x1b[200~ and \x1b[201~)
     paste_buffer: Option<Vec<u8>>,
 }
@@ -36,14 +30,46 @@ impl InputParser {
         Self {
             buffer: Vec::with_capacity(32),
             max_buffer_size: 256,
-            last_byte_time: None,
             paste_buffer: None,
         }
     }
 
-    /// Parse input bytes and return any complete events
+    /// Suggests a timeout for the next input read (matching Microsoft Edit).
+    ///
+    /// Returns 100ms if the parser has a buffered ESC (might be standalone
+    /// Escape or the start of an escape sequence). Returns `Duration::MAX`
+    /// otherwise (no timeout needed — wait indefinitely for input).
+    ///
+    /// Parse input bytes and return any complete events.
+    ///
+    /// If called with empty input and the buffer contains a standalone ESC,
+    /// emits it as an Escape key event (matching Microsoft Edit's pattern:
+    /// timeout expired, no more input coming, so the ESC is standalone).
     pub fn parse(&mut self, bytes: &[u8]) -> Vec<Event> {
         let mut events = Vec::new();
+
+        if !bytes.is_empty() || !self.buffer.is_empty() {
+            tracing::trace!(
+                "InputParser.parse: input={} bytes, buffer={} bytes ({:02x?})",
+                bytes.len(),
+                self.buffer.len(),
+                &self.buffer,
+            );
+        }
+
+        // If buffer has a lone ESC and new bytes arrived, the next byte
+        // disambiguates: `[` means CSI sequence, anything else means the
+        // ESC was standalone. We never flush ESC on timeout — we always
+        // wait for the next byte. This prevents the bug where a mouse
+        // sequence split across ReadConsoleInput batches at the \x1b
+        // boundary gets its ESC flushed as standalone, causing the
+        // continuation `[<35;...M` to be dumped as literal text.
+        //
+        // Empty input (timeout) is a no-op when ESC is buffered — the
+        // ESC stays in the buffer until real bytes arrive.
+        if bytes.is_empty() {
+            return events;
+        }
 
         for &byte in bytes {
             // If we're inside a bracketed paste, buffer bytes until end marker
@@ -61,20 +87,17 @@ impl InputParser {
             }
 
             self.buffer.push(byte);
-            self.last_byte_time = Some(Instant::now());
 
             // Try to parse the buffer
             match self.try_parse() {
                 ParseResult::Complete(event) => {
                     events.push(event);
                     self.buffer.clear();
-                    self.last_byte_time = None;
                 }
                 ParseResult::PasteStart => {
                     // Enter bracketed paste mode
                     self.paste_buffer = Some(Vec::new());
                     self.buffer.clear();
-                    self.last_byte_time = None;
                 }
                 ParseResult::Incomplete => {
                     // Need more bytes
@@ -86,11 +109,14 @@ impl InputParser {
                             }
                         }
                         self.buffer.clear();
-                        self.last_byte_time = None;
                     }
                 }
                 ParseResult::Invalid => {
                     // Invalid sequence, treat first byte as raw and retry rest
+                    tracing::trace!(
+                        "InputParser: Invalid sequence, buffer={:02x?}",
+                        &self.buffer,
+                    );
                     if !self.buffer.is_empty() {
                         let first = self.buffer[0];
                         if let Some(event) = self.byte_to_event(first) {
@@ -98,7 +124,6 @@ impl InputParser {
                         }
                         let rest: Vec<u8> = self.buffer[1..].to_vec();
                         self.buffer.clear();
-                        self.last_byte_time = None;
                         // Re-parse the rest
                         events.extend(self.parse(&rest));
                     }
@@ -106,37 +131,6 @@ impl InputParser {
             }
         }
 
-        events
-    }
-
-    /// Flush any pending escape sequence that has timed out.
-    ///
-    /// Call this periodically (e.g., every server tick) to ensure standalone
-    /// ESC keystrokes are emitted promptly instead of waiting indefinitely
-    /// for a follow-up byte that may never arrive.
-    pub fn flush_timeout(&mut self) -> Vec<Event> {
-        if self.buffer.is_empty() {
-            return Vec::new();
-        }
-
-        let timed_out = self
-            .last_byte_time
-            .map(|t| t.elapsed().as_millis() >= ESC_TIMEOUT_MS)
-            .unwrap_or(false);
-
-        if !timed_out {
-            return Vec::new();
-        }
-
-        // Buffer has been sitting too long - flush as individual bytes
-        let mut events = Vec::new();
-        let buf = std::mem::take(&mut self.buffer);
-        for &b in &buf {
-            if let Some(event) = self.byte_to_event(b) {
-                events.push(event);
-            }
-        }
-        self.last_byte_time = None;
         events
     }
 
@@ -153,12 +147,42 @@ impl InputParser {
             return self.parse_escape_sequence();
         }
 
+        // UTF-8 multi-byte sequence
+        if is_utf8_start_byte(bytes[0]) {
+            return self.parse_utf8_sequence();
+        }
+
         // Single byte - convert directly
         if let Some(event) = self.byte_to_event(bytes[0]) {
             return ParseResult::Complete(event);
         }
 
         ParseResult::Invalid
+    }
+
+    /// Parse a UTF-8 multi-byte character sequence
+    fn parse_utf8_sequence(&self) -> ParseResult {
+        let bytes = &self.buffer;
+        let needed = utf8_char_width(bytes[0]);
+        if needed == 0 {
+            return ParseResult::Invalid;
+        }
+        if bytes.len() < needed {
+            return ParseResult::Incomplete;
+        }
+        match std::str::from_utf8(&bytes[..needed]) {
+            Ok(s) => {
+                if let Some(c) = s.chars().next() {
+                    ParseResult::Complete(Event::Key(KeyEvent::new(
+                        KeyCode::Char(c),
+                        KeyModifiers::empty(),
+                    )))
+                } else {
+                    ParseResult::Invalid
+                }
+            }
+            Err(_) => ParseResult::Invalid,
+        }
     }
 
     /// Parse an escape sequence
@@ -269,12 +293,38 @@ impl InputParser {
             b'I' => ParseResult::Complete(Event::FocusGained),
             b'O' => ParseResult::Complete(Event::FocusLost),
 
+            // CSI u (fixterms / kitty keyboard protocol): CSI keycode ; modifiers u
+            b'u' => self.parse_csi_u_sequence(params),
+
             _ => ParseResult::Invalid,
         }
     }
 
     /// Parse tilde sequences: CSI number ~
     fn parse_tilde_sequence(&self, params: &[u8]) -> ParseResult {
+        let params_str = std::str::from_utf8(params).unwrap_or("");
+        let parts: Vec<&str> = params_str.split(';').collect();
+
+        // xterm modifyOtherKeys mode 2: CSI 27 ; modifier ; keycode ~
+        if parts.len() == 3 && parts[0] == "27" {
+            let mods_param: u8 = parts[1].parse().unwrap_or(1);
+            let codepoint: u32 = parts[2].parse().unwrap_or(0);
+            let modifiers = modifiers_from_param(mods_param);
+
+            let keycode = match codepoint {
+                9 => KeyCode::Tab,
+                13 => KeyCode::Enter,
+                27 => KeyCode::Esc,
+                127 => KeyCode::Backspace,
+                cp => match char::from_u32(cp) {
+                    Some(c) => KeyCode::Char(c),
+                    None => return ParseResult::Invalid,
+                },
+            };
+
+            return ParseResult::Complete(Event::Key(KeyEvent::new(keycode, modifiers)));
+        }
+
         let (num, modifiers) = self.parse_num_and_modifiers(params);
 
         // Bracketed paste start: CSI 200 ~
@@ -313,6 +363,33 @@ impl InputParser {
             23 => KeyCode::F(11),
             24 => KeyCode::F(12),
             _ => return ParseResult::Invalid,
+        };
+
+        ParseResult::Complete(Event::Key(KeyEvent::new(keycode, modifiers)))
+    }
+
+    /// Parse CSI u (fixterms / kitty keyboard protocol): CSI keycode ; modifiers u
+    ///
+    /// The keycode is a Unicode codepoint. Special codepoints map to functional
+    /// keys (Enter, Tab, Esc, Backspace, etc.); printable codepoints map to
+    /// Char. Modifiers use the same encoding as standard CSI sequences.
+    fn parse_csi_u_sequence(&self, params: &[u8]) -> ParseResult {
+        let params_str = std::str::from_utf8(params).unwrap_or("");
+        let parts: Vec<&str> = params_str.split(';').collect();
+
+        let codepoint: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mods_param: u8 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let modifiers = modifiers_from_param(mods_param);
+
+        let keycode = match codepoint {
+            9 => KeyCode::Tab,
+            13 => KeyCode::Enter,
+            27 => KeyCode::Esc,
+            127 => KeyCode::Backspace,
+            cp => match char::from_u32(cp) {
+                Some(c) => KeyCode::Char(c),
+                None => return ParseResult::Invalid,
+            },
         };
 
         ParseResult::Complete(Event::Key(KeyEvent::new(keycode, modifiers)))
@@ -488,6 +565,23 @@ impl InputParser {
         };
 
         Some(Event::Key(KeyEvent::new(keycode, modifiers)))
+    }
+}
+
+/// Returns true if `b` is the leading byte of a UTF-8 multi-byte sequence.
+/// 0xC0 and 0xC1 are excluded per RFC 3629 (overlong encodings).
+fn is_utf8_start_byte(b: u8) -> bool {
+    matches!(b, 0xC2..=0xF7)
+}
+
+/// Returns the total byte width of a UTF-8 sequence given its leading byte.
+/// Returns 0 for invalid leading bytes.
+fn utf8_char_width(first_byte: u8) -> usize {
+    match first_byte {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 0,
     }
 }
 
@@ -832,46 +926,104 @@ mod tests {
     }
 
     #[test]
-    fn test_standalone_esc_flush_timeout() {
+    fn test_esc_waits_for_next_byte() {
         let mut parser = InputParser::new();
 
         // ESC buffered
         let events = parser.parse(&[0x1b]);
         assert!(events.is_empty());
 
-        // Simulate time passing (replace last_byte_time with a past timestamp)
-        parser.last_byte_time =
-            Some(Instant::now() - std::time::Duration::from_millis(ESC_TIMEOUT_MS as u64 + 10));
+        // Buffer still has the ESC
+        assert_eq!(parser.buffer.len(), 1);
 
-        // Flush should emit the standalone Escape
-        let events = parser.flush_timeout();
+        // Next byte `[` disambiguates: it's a CSI sequence, not standalone ESC
+        let events = parser.parse(b"[A");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Key(ke) => assert_eq!(ke.code, KeyCode::Up),
+            _ => panic!("Expected Up"),
+        }
+    }
+
+    #[test]
+    fn test_esc_then_printable_byte_emits_alt_key() {
+        let mut parser = InputParser::new();
+
+        // ESC buffered
+        let events = parser.parse(&[0x1b]);
+        assert!(events.is_empty());
+
+        // Next byte `a` completes the sequence as Alt+a (standard terminal behavior)
+        let events = parser.parse(b"a");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Key(ke) => {
+                assert_eq!(ke.code, KeyCode::Char('a'));
+                assert!(ke.modifiers.contains(KeyModifiers::ALT));
+            }
+            _ => panic!("Expected Alt+a"),
+        }
+    }
+
+    #[test]
+    fn test_esc_then_esc_emits_standalone_esc() {
+        let mut parser = InputParser::new();
+
+        // First ESC buffered
+        let events = parser.parse(&[0x1b]);
+        assert!(events.is_empty());
+
+        // Second ESC: first ESC is standalone, second starts new sequence
+        let events = parser.parse(&[0x1b]);
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::Key(ke) => {
                 assert_eq!(ke.code, KeyCode::Esc);
                 assert!(ke.modifiers.is_empty());
             }
-            _ => panic!("Expected Esc key event"),
+            _ => panic!("Expected standalone Esc"),
         }
-
-        // Buffer should be empty now
-        assert!(parser.buffer.is_empty());
+        // Second ESC still buffered
+        assert_eq!(parser.buffer, vec![0x1b]);
     }
 
     #[test]
-    fn test_flush_timeout_does_nothing_when_recent() {
+    fn test_split_mouse_sequence_across_batches() {
         let mut parser = InputParser::new();
 
-        // ESC buffered just now
+        // Batch 1: just the ESC byte (split at batch boundary)
         let events = parser.parse(&[0x1b]);
         assert!(events.is_empty());
-
-        // Flush should NOT emit anything (too recent)
-        let events = parser.flush_timeout();
-        assert!(events.is_empty());
-
-        // Buffer still has the ESC
         assert_eq!(parser.buffer.len(), 1);
+
+        // Batch 2: rest of mouse sequence arrives
+        let events = parser.parse(b"[<35;42;5M");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Mouse(_) => {} // Mouse event parsed correctly
+            other => panic!("Expected mouse event, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_csi_sequence_not_flushed() {
+        let mut parser = InputParser::new();
+
+        // Partial CSI mouse sequence (split across batches)
+        let events = parser.parse(b"\x1b[<35;");
+        assert!(events.is_empty());
+        assert_eq!(parser.buffer.len(), 6);
+
+        // Now the rest of the sequence arrives
+        let events = parser.parse(b"42;5M");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Mouse(me) => {
+                assert_eq!(me.column, 41); // 42 - 1 (1-indexed to 0-indexed)
+                assert_eq!(me.row, 4); // 5 - 1
+            }
+            _ => panic!("Expected mouse event, got {:?}", events[0]),
+        }
     }
 
     #[test]
@@ -1001,5 +1153,110 @@ mod tests {
             Event::Paste(text) => assert_eq!(text, "pasted"),
             _ => panic!("Expected Paste event"),
         }
+    }
+
+    // ---- UTF-8 multi-byte character tests ----
+
+    #[test]
+    fn test_utf8_three_byte_chinese_char() {
+        let mut parser = InputParser::new();
+        // '中' = U+4E2D = [0xE4, 0xB8, 0xAD]
+        let events = parser.parse(&[0xE4, 0xB8, 0xAD]);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Key(ke) => {
+                assert_eq!(ke.code, KeyCode::Char('中'));
+                assert!(ke.modifiers.is_empty());
+            }
+            _ => panic!("Expected key event for '中'"),
+        }
+    }
+
+    #[test]
+    fn test_utf8_two_byte_char() {
+        let mut parser = InputParser::new();
+        // 'é' = U+00E9 = [0xC3, 0xA9]
+        let events = parser.parse(&[0xC3, 0xA9]);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Key(ke) => {
+                assert_eq!(ke.code, KeyCode::Char('é'));
+                assert!(ke.modifiers.is_empty());
+            }
+            _ => panic!("Expected key event for 'é'"),
+        }
+    }
+
+    #[test]
+    fn test_utf8_four_byte_emoji() {
+        let mut parser = InputParser::new();
+        // '😀' = U+1F600 = [0xF0, 0x9F, 0x98, 0x80]
+        let events = parser.parse(&[0xF0, 0x9F, 0x98, 0x80]);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Key(ke) => {
+                assert_eq!(ke.code, KeyCode::Char('😀'));
+                assert!(ke.modifiers.is_empty());
+            }
+            _ => panic!("Expected key event for '😀'"),
+        }
+    }
+
+    #[test]
+    fn test_utf8_incomplete_sequence_returns_no_events() {
+        let mut parser = InputParser::new();
+        // Send only the leading byte of a 3-byte sequence
+        let events = parser.parse(&[0xE4]);
+        assert!(
+            events.is_empty(),
+            "Incomplete UTF-8 sequence should produce no events"
+        );
+    }
+
+    #[test]
+    fn test_utf8_sequence_split_across_batches() {
+        let mut parser = InputParser::new();
+        // First batch: leading byte only
+        let events = parser.parse(&[0xE4]);
+        assert!(events.is_empty(), "Should buffer leading byte");
+
+        // Second batch: remaining bytes complete the character
+        let events = parser.parse(&[0xB8, 0xAD]);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::Key(ke) => assert_eq!(ke.code, KeyCode::Char('中')),
+            _ => panic!("Expected key event for '中'"),
+        }
+    }
+
+    #[test]
+    fn test_utf8_invalid_continuation_byte_does_not_panic() {
+        let mut parser = InputParser::new();
+        // 0xE4 expects continuation bytes 0x80..=0xBF, but 0x00 is invalid
+        let events = parser.parse(&[0xE4, 0x00, 0xAD]);
+        // Should not panic; the invalid sequence produces some events (graceful recovery)
+        assert!(
+            !events.is_empty(),
+            "Invalid sequence should emit events (graceful recovery)"
+        );
+    }
+
+    #[test]
+    fn test_overlong_encoding_0xc0_rejected() {
+        let mut parser = InputParser::new();
+        // 0xC0 is a forbidden overlong encoding start byte (RFC 3629)
+        // It should NOT be treated as a UTF-8 start byte
+        let events = parser.parse(&[0xC0, 0x80]);
+        // Both bytes handled as single bytes / Invalid, not as a 2-byte UTF-8 sequence
+        let _ = events;
+    }
+
+    #[test]
+    fn test_overlong_encoding_0xc1_rejected() {
+        let mut parser = InputParser::new();
+        // 0xC1 is also a forbidden overlong encoding start byte (RFC 3629)
+        let events = parser.parse(&[0xC1, 0xA0]);
+        // Both bytes handled as single bytes / Invalid, not as a 2-byte UTF-8 sequence
+        let _ = events;
     }
 }

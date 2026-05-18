@@ -489,7 +489,11 @@ fn test_add_new_binding() {
     harness.render().unwrap();
     harness.assert_screen_contains("Add Keybinding");
 
-    // Record a key: press Ctrl+K (the dialog starts in RecordingKey mode)
+    // Enter capture mode, then record Ctrl+K
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
     harness
         .send_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
         .unwrap();
@@ -729,7 +733,10 @@ fn test_unsaved_changes_confirm_dialog() {
         .unwrap();
     harness.render().unwrap();
 
-    // Record key
+    // Enter capture mode, then record key
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
     harness
         .send_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
         .unwrap();
@@ -775,6 +782,9 @@ fn test_confirm_dialog_cancel() {
         .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
         .unwrap();
     harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
         .send_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
         .unwrap();
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
@@ -816,6 +826,9 @@ fn test_confirm_dialog_discard() {
     // Add a binding to create unsaved changes
     harness
         .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness
         .send_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
@@ -874,7 +887,49 @@ fn test_mouse_scroll() {
     let screen_after = harness.screen_to_string();
     assert_ne!(
         screen_before, screen_after,
-        "Mouse scroll should move the selection"
+        "Mouse scroll should move the viewport"
+    );
+}
+
+/// After a scrollbar drag the wheel must continue scrolling from the new
+/// viewport — not snap selection back into view. Regression test for the
+/// "wheel-bounces-back-after-drag" bug.
+#[test]
+fn test_wheel_after_scrollbar_drag_does_not_snap_back() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    let (sb_col, sb_top, sb_bottom) = scrollbar_track_for_120x40();
+
+    // Drag the scrollbar to the bottom — viewport now far from selection.
+    harness
+        .mouse_drag(sb_col, sb_top, sb_col, sb_bottom)
+        .unwrap();
+    let after_drag = harness.screen_to_string();
+
+    // Tick the wheel up once. With the old behaviour this called
+    // `select_prev` + `ensure_visible`, snapping the viewport to wherever
+    // the (still-near-the-top) selection lives. The new behaviour scrolls
+    // a few rows up from the dragged position.
+    harness.mouse_scroll_up(60, 20).unwrap();
+    let after_wheel = harness.screen_to_string();
+
+    assert_ne!(
+        after_drag, after_wheel,
+        "Wheel must move the viewport even after a scrollbar drag"
+    );
+
+    // Sanity: the screen after a single wheel tick should look much more
+    // like the dragged-to-bottom view than the initial view (the selection
+    // would have snapped back to the very top in the old behaviour).
+    let before_anything = {
+        let mut other = EditorTestHarness::new(120, 40).unwrap();
+        open_keybinding_editor(&mut other);
+        other.screen_to_string()
+    };
+    assert_ne!(
+        before_anything, after_wheel,
+        "Wheel after drag must NOT snap the viewport back to the start"
     );
 }
 
@@ -894,6 +949,103 @@ fn test_mouse_click_selects_row() {
     assert_ne!(
         screen_before, screen_after,
         "Mouse click should select a different row"
+    );
+}
+
+/// Compute the scrollbar track position for a 120×40 keybinding editor.
+///
+/// The modal is centred (`min(W × 0.90, 120) × (H × 0.90)`); the table chunk
+/// sits below a 3-row header, and `render_table` reserves the first 2 rows of
+/// that chunk for the column-header + separator. The scrollbar is 1 column
+/// wide at the rightmost column of the (post-header) table area.
+fn scrollbar_track_for_120x40() -> (u16, u16, u16) {
+    let modal_w = ((120.0_f32 * 0.90).min(120.0)) as u16;
+    let modal_h = (40.0_f32 * 0.90) as u16;
+    let modal_x = (120 - modal_w) / 2;
+    let modal_y = (40 - modal_h) / 2;
+    let inner_x = modal_x + 1;
+    let inner_y = modal_y + 1;
+    let inner_w = modal_w - 2;
+    let inner_h = modal_h - 2;
+    let table_chunk_y = inner_y + 3;
+    let table_chunk_h = inner_h - 3 - 1;
+    let sb_top = table_chunk_y + 2; // skip column-header + separator
+    let sb_height = table_chunk_h - 2;
+    let sb_col = inner_x + inner_w - 1;
+    (sb_col, sb_top, sb_top + sb_height - 1)
+}
+
+/// Click on the bottom of the scrollbar — the visible rows should scroll
+/// (regression test for issue #1593: scrollbar was unresponsive to mouse).
+#[test]
+fn test_scrollbar_click_scrolls_table() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    let (sb_col, sb_top, sb_bottom) = scrollbar_track_for_120x40();
+
+    let screen_before = harness.screen_to_string();
+
+    // Click near the bottom of the scrollbar track.
+    harness.mouse_click(sb_col, sb_bottom).unwrap();
+
+    let screen_after = harness.screen_to_string();
+    assert_ne!(
+        screen_before, screen_after,
+        "Clicking the bottom of the scrollbar must scroll the table"
+    );
+
+    // Click back at the top — should scroll back to the start.
+    harness.mouse_click(sb_col, sb_top).unwrap();
+    let screen_back = harness.screen_to_string();
+    assert_ne!(
+        screen_after, screen_back,
+        "Clicking the top of the scrollbar must scroll the table back"
+    );
+}
+
+/// Drag the scrollbar thumb — the viewport should follow the cursor.
+#[test]
+fn test_scrollbar_drag_scrolls_table() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    let (sb_col, sb_top, sb_bottom) = scrollbar_track_for_120x40();
+
+    let screen_before = harness.screen_to_string();
+
+    harness
+        .mouse_drag(sb_col, sb_top, sb_col, sb_bottom)
+        .unwrap();
+
+    let screen_after = harness.screen_to_string();
+    assert_ne!(
+        screen_before, screen_after,
+        "Dragging the scrollbar thumb to the bottom must scroll the table"
+    );
+}
+
+/// Pressing on the thumb itself (anywhere within it) and dragging by zero
+/// rows must NOT move the viewport — the cursor should stay pinned to its
+/// position on the thumb. Regression test for the click-jumps-to-row bug.
+#[test]
+fn test_scrollbar_press_on_thumb_does_not_jump() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    let (sb_col, sb_top, _) = scrollbar_track_for_120x40();
+    // At rest the thumb is anchored at the top of the track. Press one
+    // row down from the top — that's still inside the thumb (which is
+    // multiple rows tall for ~370 bindings in a 28-row track).
+    let press_row = sb_top + 1;
+
+    let screen_before = harness.screen_to_string();
+    harness.mouse_click(sb_col, press_row).unwrap();
+    let screen_after = harness.screen_to_string();
+
+    assert_eq!(
+        screen_before, screen_after,
+        "A press inside the thumb (without movement) must not move the viewport"
     );
 }
 
@@ -966,6 +1118,9 @@ fn test_save_changes_with_ctrl_s() {
         .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
         .unwrap();
     harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
         .send_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
         .unwrap();
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
@@ -1011,7 +1166,10 @@ fn test_action_field_autocomplete() {
         .unwrap();
     harness.render().unwrap();
 
-    // Record a key first
+    // Enter capture mode, then record a key
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
     harness
         .send_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
         .unwrap();
@@ -1297,7 +1455,10 @@ fn test_deleted_binding_appears_as_unbound() {
     harness.render().unwrap();
     harness.assert_screen_contains("Add Keybinding");
 
-    // Record key: Ctrl+Shift+D
+    // Enter capture mode, then record key: Ctrl+Shift+D
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
     harness
         .send_key(
             KeyCode::Char('d'),
@@ -1433,7 +1594,10 @@ fn test_delete_binding_full_flow() {
     harness.render().unwrap();
     harness.assert_screen_contains("Add Keybinding");
 
-    // Record key: Ctrl+Shift+D
+    // Enter capture mode, then record key: Ctrl+Shift+D
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
     harness
         .send_key(
             KeyCode::Char('d'),
@@ -1647,7 +1811,10 @@ fn test_add_binding_conflict_warning_for_existing_key() {
     harness.render().unwrap();
     harness.assert_screen_contains("Add Keybinding");
 
-    // Record a key that is already in use: Ctrl+S (bound to "save" in the keymap)
+    // Enter capture mode, then record a key already in use: Ctrl+S (bound to "save")
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
         .unwrap();
@@ -1724,4 +1891,329 @@ fn test_keybinding_editor_captures_keys_over_terminal_mode() {
 
     // Keybinding editor should be closed now
     harness.assert_screen_not_contains("Keybinding Editor");
+}
+
+/// Regression test: deleting a custom keybinding that uses Shift+letter fails.
+/// The bug: when recording Shift+N, crossterm sends KeyCode::Char('N') (uppercase).
+/// key_code_to_config_name stores it as "N". After save+reload, parse_key lowercases
+/// it to KeyCode::Char('n'), so key_code_to_config_name returns "n". The deletion
+/// matching compares "N" (in config) vs "n" (from resolved round-trip) and fails.
+#[test]
+fn test_delete_shift_letter_binding_full_flow() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+
+    // === Phase 1: Add a custom binding Shift+N → search_next ===
+    open_keybinding_editor(&mut harness);
+
+    // Press 'a' to open Add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Add Keybinding");
+
+    // Enter capture mode, then record key: Shift+N (crossterm sends uppercase 'N' with SHIFT)
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('N'), KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Shift+N");
+
+    // Tab to Action field
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+
+    // Type "duplicate_line" and accept autocomplete
+    for ch in "duplicate_line".chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Tab to context, then to Save button, press Enter to save the dialog
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("modified");
+
+    // Save and close keybinding editor with Ctrl+S
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_not_contains("Keybinding Editor");
+
+    // === Phase 2: Reopen keybinding editor and delete the binding ===
+    open_keybinding_editor(&mut harness);
+
+    // Search for "duplicate_line"
+    harness
+        .send_key(KeyCode::Char('/'), KeyModifiers::NONE)
+        .unwrap();
+    for ch in "duplicate_line".chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify the custom binding appears
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Shift+N"),
+        "Before delete: table should show Shift+N.\nScreen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("custom"),
+        "Before delete: table should show 'custom' source.\nScreen:\n{}",
+        screen
+    );
+
+    // Navigate to the custom binding row
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    let mut found_custom = false;
+    for _ in 0..10 {
+        let current_screen = harness.screen_to_string();
+        for line in current_screen.lines() {
+            if line.contains(">") && line.contains("custom") {
+                found_custom = true;
+                break;
+            }
+        }
+        if found_custom {
+            break;
+        }
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+        harness.render().unwrap();
+    }
+    assert!(found_custom, "Should find the custom binding row to delete");
+
+    // Delete the custom binding
+    harness
+        .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Verify deletion happened in the UI
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Shift+N"),
+        "After delete (before save): Shift+N should be gone from the table.\nScreen:\n{}",
+        screen
+    );
+
+    // Save and close
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_not_contains("Keybinding Editor");
+
+    // === Phase 3: Reopen and verify the binding is truly gone (persisted) ===
+    open_keybinding_editor(&mut harness);
+
+    // Search for "duplicate_line"
+    harness
+        .send_key(KeyCode::Char('/'), KeyModifiers::NONE)
+        .unwrap();
+    for ch in "duplicate_line".chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Shift+N"),
+        "After save+reopen: Shift+N should NOT appear (deletion should persist).\nScreen:\n{}",
+        screen
+    );
+    assert!(
+        !screen.contains("custom"),
+        "After save+reopen: 'custom' source should NOT appear.\nScreen:\n{}",
+        screen
+    );
+}
+
+// ========================
+// Special key capture mode
+// ========================
+
+/// Test that pressing Enter on the key field enters capture mode and shows
+/// the capture hint text.
+#[test]
+fn test_capture_mode_shows_hint() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Add Keybinding");
+
+    // Key field is focused, should show the capture hint
+    harness.assert_screen_contains("Enter: capture key");
+
+    // Press Enter to enter capture mode
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Should show capture-mode instruction
+    harness.assert_screen_contains("press any key");
+}
+
+/// Test that Escape can be captured as a keybinding via capture mode.
+#[test]
+fn test_capture_escape_key() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Add Keybinding");
+
+    // Enter capture mode
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Press Escape — should be captured, not close the dialog
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Dialog should still be open with Esc recorded
+    harness.assert_screen_contains("Add Keybinding");
+    harness.assert_screen_contains("Esc");
+}
+
+/// Test that Tab can be captured as a keybinding via capture mode.
+#[test]
+fn test_capture_tab_key() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Enter capture mode, then press Tab
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // Dialog should still be open with Tab recorded (not moved focus)
+    harness.assert_screen_contains("Add Keybinding");
+    harness.assert_screen_contains("Tab");
+    // The hint should be back to normal (capture mode exited)
+    harness.assert_screen_contains("Enter: capture key");
+}
+
+/// Test that Enter can be captured as a keybinding via capture mode.
+#[test]
+fn test_capture_enter_key() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Enter capture mode (first Enter), then capture Enter (second Enter)
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    // Dialog should still be open with Enter recorded
+    harness.assert_screen_contains("Add Keybinding");
+    // Check the key field shows "Enter"
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Key:") && screen.contains("Enter"),
+        "Key field should show 'Enter' as the captured key.\nScreen:\n{}",
+        screen
+    );
+}
+
+/// Test that Escape still closes the dialog when NOT in capture mode.
+#[test]
+fn test_escape_still_closes_dialog_without_capture_mode() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Add Keybinding");
+
+    // Press Escape directly (without entering capture mode) — should close dialog
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    harness.assert_screen_not_contains("Add Keybinding");
+    harness.assert_screen_contains("Keybinding Editor");
+}
+
+/// Test that pressing a key (e.g. arrow) in the key field does NOT record it
+/// unless the user has entered capture mode with Enter first.
+#[test]
+fn test_key_not_recorded_without_capture_mode() {
+    let mut harness = EditorTestHarness::new(120, 40).unwrap();
+    open_keybinding_editor(&mut harness);
+
+    // Open add dialog
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Add Keybinding");
+
+    // Press Down arrow directly WITHOUT entering capture mode
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    // The key field should still be empty — the arrow should NOT have been recorded
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("\u{2193}"),
+        "Down arrow should NOT be recorded without entering capture mode first.\nScreen:\n{}",
+        screen
+    );
 }

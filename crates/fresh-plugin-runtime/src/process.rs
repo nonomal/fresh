@@ -9,6 +9,16 @@ use std::sync::mpsc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+/// Consume and discard a `Result` from a fire-and-forget channel send.
+///
+/// Use when the receiver may have been dropped (e.g. during shutdown) and
+/// failure is expected and non-actionable.
+fn fire_and_forget<E: std::fmt::Debug>(result: Result<(), E>) {
+    if let Err(e) = result {
+        tracing::trace!(error = ?e, "fire-and-forget send failed");
+    }
+}
+
 /// Spawn an external process for a plugin
 ///
 /// This function:
@@ -36,6 +46,12 @@ pub async fn spawn_plugin_process(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // On Windows, suppress the transient console window that the OS
+    // would otherwise flash for a console-subsystem child spawned from
+    // the GUI editor. CREATE_NO_WINDOW = 0x0800_0000.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
     // Set working directory if provided
     if let Some(ref dir) = cwd {
         cmd.current_dir(dir);
@@ -46,12 +62,12 @@ pub async fn spawn_plugin_process(
         Ok(child) => child,
         Err(e) => {
             // Failed to spawn - send error result
-            let _ = sender.send(AsyncMessage::ProcessOutput {
+            fire_and_forget(sender.send(AsyncMessage::ProcessOutput {
                 process_id,
                 stdout: String::new(),
                 stderr: format!("Failed to spawn process: {}", e),
                 exit_code: -1,
-            });
+            }));
             return;
         }
     };
@@ -104,12 +120,12 @@ pub async fn spawn_plugin_process(
     };
 
     // Send results back to main loop
-    let _ = sender.send(AsyncMessage::ProcessOutput {
+    fire_and_forget(sender.send(AsyncMessage::ProcessOutput {
         process_id,
         stdout,
         stderr,
         exit_code,
-    });
+    }));
 }
 
 #[cfg(test)]
